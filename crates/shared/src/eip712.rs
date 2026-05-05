@@ -12,8 +12,8 @@
 //! below asserts byte-equality at compile-test time so a future Solidity
 //! refactor that touches the typehash string fails the Rust suite loudly.
 
-use alloy_primitives::{keccak256, B256, U256};
-use alloy_sol_types::sol;
+use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
 
 sol! {
     /// Attestation payload signed by each k-of-n signer. The on-chain
@@ -50,6 +50,28 @@ pub fn attestation(intent_id: B256, slot_index: U256, attested_amount: U256) -> 
     }
 }
 
+/// EIP-712 domain mirroring `AttestationOracle`'s constructor:
+/// `EIP712("Xindex AttestationOracle", "1")`. The chainId + verifyingContract
+/// fields complete the domain separator the on-chain verifier compares
+/// against during ECDSA recovery.
+#[must_use]
+pub fn attestation_oracle_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
+    eip712_domain! {
+        name: "Xindex AttestationOracle",
+        version: "1",
+        chain_id: chain_id,
+        verifying_contract: verifying_contract,
+    }
+}
+
+/// Compute the EIP-712 signing hash for an `Attestation`. This is the
+/// 32-byte digest each k-of-n signer signs over with their secp256k1 key.
+/// Equivalent to `AttestationOracle.attestationHash(attestation)` on-chain.
+#[must_use]
+pub fn attestation_signing_hash(attestation: &Attestation, domain: &Eip712Domain) -> B256 {
+    attestation.eip712_signing_hash(domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,7 +104,10 @@ mod tests {
 
     /// Sanity-check the struct's ABI encoding round-trips.
     #[test]
-    #[expect(clippy::expect_used, reason = "test code: panic on bad fixture is fine")]
+    #[expect(
+        clippy::expect_used,
+        reason = "test code: panic on bad fixture is fine"
+    )]
     fn attestation_round_trip() {
         let a = attestation(
             B256::repeat_byte(0xab),

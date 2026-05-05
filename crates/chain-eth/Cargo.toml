@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 xindex-shared.workspace = true
+xindex-signer = { path = "../signer" }
 alloy = { workspace = true }
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
@@ -25,3 +26,7 @@ serde_json.workspace = true
 [[bin]]
 name = "xindex-watch"
 path = "src/bin/xindex-watch.rs"
+
+[[bin]]
+name = "xindex-attest"
+path = "src/bin/xindex-attest.rs"
