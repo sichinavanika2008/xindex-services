@@ -9,5 +9,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
-# M1: empty stub; deps land in M3 (bdk_wallet, miniscript, bitcoin RPC).
 [dependencies]
+bitcoin.workspace = true
+bdk_esplora.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

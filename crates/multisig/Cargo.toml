@@ -9,5 +9,8 @@ repository.workspace = true
 [lints]
 workspace = true
 
-# M1: empty stub; deps land in M4 (bdk_wallet, miniscript PSBT signing).
 [dependencies]
+bitcoin.workspace = true
+miniscript.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

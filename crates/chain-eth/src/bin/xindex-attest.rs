@@ -17,6 +17,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use alloy::eips::BlockNumberOrTag;
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
@@ -26,7 +27,7 @@ use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::StreamExt;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
 use xindex_shared::eip712::{attestation, attestation_oracle_domain};
 use xindex_signer::{aggregate_signatures, SoftwareSigner};
@@ -62,6 +63,18 @@ struct Args {
     /// Pays gas. Anvil deterministic account 0 is the conventional choice.
     #[arg(long, env = "POSTER_KEY")]
     poster_key: String,
+
+    /// Block number to start replay from when the daemon (re)starts.
+    /// Use 0 (the default) to subscribe only to new events. Use a specific
+    /// historical block to backfill missed events after downtime — the
+    /// daemon will fetch logs `[from_block, latest)` then transition to
+    /// the live subscription.
+    ///
+    /// On-chain replay is safe: posting an attest for an already-attested
+    /// slot reverts cleanly via `IntentQueue_SlotAlreadyAttested`. The
+    /// daemon catches that revert (M-1 fix) and continues.
+    #[arg(long, env = "FROM_BLOCK", default_value_t = 0)]
+    from_block: u64,
 }
 
 #[tokio::main]
@@ -78,6 +91,10 @@ async fn main() -> Result<()> {
     run(args).await
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "single sequential pipeline; the inline closure handles per-event work and splitting it into helpers fights alloy 0.8's deeply nested fillers generic type"
+)]
 async fn run(args: Args) -> Result<()> {
     let intent_queue = Address::from_str(&args.intent_queue)
         .context("INTENT_QUEUE_ADDR must be a 20-byte hex address")?;
@@ -126,6 +143,90 @@ async fn run(args: Args) -> Result<()> {
     info!(chain_id, "domain initialized");
 
     let oracle = AttestationOracle::new(attestation_oracle, provider.clone());
+
+    // Inline closure handles each event. Errors are LOGGED, not propagated
+    // (M-1 fix) so a single bad event never crashes the daemon. Used by both
+    // the backfill loop (M-2 fix) and the live subscription loop below.
+    let process = async |ev: &IntentQueue::MintIntentCreated| {
+        let intent_id = ev.intentId;
+        info!(
+            intent_id = %intent_id,
+            slot_count = ev.slotExpectedAmounts.len(),
+            "MintIntentCreated observed; signing all slots"
+        );
+        for (slot_idx, expected) in ev.slotExpectedAmounts.iter().enumerate() {
+            let slot_index_u256 = alloy_primitives::U256::from(slot_idx);
+            let attestation_payload = attestation(intent_id, slot_index_u256, *expected);
+            let backends: Vec<&SoftwareSigner> = signers.iter().take(args.threshold).collect();
+            let sigs = match aggregate_signatures(&backends, &domain, &attestation_payload) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(intent_id = %intent_id, slot_index = slot_idx, error = %e,
+                           "aggregate failed; skipping slot");
+                    continue;
+                }
+            };
+            let sig_bytes: Vec<Bytes> = sigs.into_iter().map(Bytes::from).collect();
+            info!(
+                intent_id = %intent_id,
+                slot_index = slot_idx,
+                attested_amount = %expected,
+                signers = backends.len(),
+                "posting attest()"
+            );
+            let pending = match oracle
+                .attest(intent_id, slot_index_u256, *expected, sig_bytes)
+                .send()
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    error!(intent_id = %intent_id, slot_index = slot_idx, error = %e,
+                           "attest send failed; skipping slot (already attested, oracle paused, or amount=0)");
+                    continue;
+                }
+            };
+            match pending.get_receipt().await {
+                Ok(receipt) => info!(
+                    intent_id = %intent_id,
+                    slot_index = slot_idx,
+                    tx_hash = %receipt.transaction_hash,
+                    gas_used = receipt.gas_used,
+                    "attest() confirmed"
+                ),
+                Err(e) => error!(intent_id = %intent_id, slot_index = slot_idx, error = %e,
+                                  "attest receipt failed"),
+            }
+        }
+    };
+
+    // Replay from a checkpoint if the operator passed one (M-2 fix).
+    if args.from_block > 0 {
+        let latest = provider
+            .get_block_number()
+            .await
+            .context("get block number")?;
+        info!(
+            from_block = args.from_block,
+            latest, "backfilling missed events"
+        );
+        let backfill_filter = Filter::new()
+            .address(intent_queue)
+            .event_signature(IntentQueue::MintIntentCreated::SIGNATURE_HASH)
+            .from_block(BlockNumberOrTag::Number(args.from_block))
+            .to_block(BlockNumberOrTag::Number(latest));
+        let logs = provider
+            .get_logs(&backfill_filter)
+            .await
+            .context("backfill get_logs")?;
+        info!(count = logs.len(), "backfill batch");
+        for log in logs {
+            if let Ok(decoded) = log.log_decode::<IntentQueue::MintIntentCreated>() {
+                process(&decoded.inner.data).await;
+            }
+        }
+    }
+
     let filter = Filter::new()
         .address(intent_queue)
         .event_signature(IntentQueue::MintIntentCreated::SIGNATURE_HASH);
@@ -142,50 +243,7 @@ async fn run(args: Args) -> Result<()> {
             warn!("failed to decode MintIntentCreated log");
             continue;
         };
-        let ev = &decoded.inner.data;
-        let intent_id = ev.intentId;
-        info!(
-            intent_id = %intent_id,
-            slot_count = ev.slotExpectedAmounts.len(),
-            "MintIntentCreated observed; signing all slots"
-        );
-
-        // Sign and post one attestation per slot. The off-chain validity
-        // check that confirms the corresponding native deposit landed at
-        // our multisig is M3 — for M2 we use `slotExpectedAmounts[i]`
-        // verbatim as `attestedAmount`, simulating a perfect off-chain
-        // observation.
-        for (slot_idx, expected) in ev.slotExpectedAmounts.iter().enumerate() {
-            let slot_index_u256 = alloy_primitives::U256::from(slot_idx);
-            let attestation_payload = attestation(intent_id, slot_index_u256, *expected);
-
-            let backends: Vec<&SoftwareSigner> = signers.iter().take(args.threshold).collect();
-            let sigs = aggregate_signatures(&backends, &domain, &attestation_payload)
-                .context("aggregate signatures")?;
-            let sig_bytes: Vec<Bytes> = sigs.into_iter().map(Bytes::from).collect();
-
-            info!(
-                intent_id = %intent_id,
-                slot_index = slot_idx,
-                attested_amount = %expected,
-                signers = backends.len(),
-                "posting attest()"
-            );
-
-            let pending = oracle
-                .attest(intent_id, slot_index_u256, *expected, sig_bytes)
-                .send()
-                .await
-                .context("send attest")?;
-            let receipt = pending.get_receipt().await.context("attest receipt")?;
-            info!(
-                intent_id = %intent_id,
-                slot_index = slot_idx,
-                tx_hash = %receipt.transaction_hash,
-                gas_used = receipt.gas_used,
-                "attest() confirmed"
-            );
-        }
+        process(&decoded.inner.data).await;
     }
 
     Ok(())

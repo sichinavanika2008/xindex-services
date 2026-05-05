@@ -77,6 +77,23 @@ mod tests {
     use super::*;
     use alloy_sol_types::SolValue;
 
+    /// The `sol!` macro auto-derives a typehash from the struct definition.
+    /// This test asserts byte-equality against the manually-pinned typehash
+    /// constant. If a future macro upgrade ever changes how the typehash is
+    /// derived (e.g., handling of trailing whitespace, parameter naming),
+    /// the two paths would silently diverge — this test catches that.
+    #[test]
+    fn macro_derived_typehash_matches_constant() {
+        // The sol!-generated typehash. SolStruct trait exposes `eip712_root_type`
+        // (the verbatim type string) — keccak256 of it must equal our pinned const.
+        let macro_typehash = keccak256(Attestation::eip712_root_type().as_bytes());
+        assert_eq!(
+            macro_typehash,
+            attestation_typehash(),
+            "sol! macro-derived typehash drifted from manually-pinned constant"
+        );
+    }
+
     /// Cross-implementation invariant: the typehash this crate computes
     /// MUST exactly match `AttestationOracle.ATTESTATION_TYPEHASH` on-chain.
     ///

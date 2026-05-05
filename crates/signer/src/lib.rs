@@ -8,6 +8,11 @@
 //! - [`aggregate_signatures`] helper that aggregates k-of-n signatures
 //!   across multiple backends and produces the `signatures: bytes[]`
 //!   argument `AttestationOracle.attest` expects.
+//! - [`crosscheck`] module — production policy that REQUIRES both `THORChain`
+//!   outbound observation AND a confirmed Bitcoin UTXO at our multisig
+//!   before signing. The signer's #1 trust surface; never sign without it.
+
+pub mod crosscheck;
 
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
@@ -54,8 +59,28 @@ pub trait HsmBackend {
 }
 
 /// Software-backed [`HsmBackend`] holding a raw secp256k1 private key in
-/// memory. Suitable for local Anvil testing only — production deployments
-/// use the `YubiHSM2` backend (M5).
+/// process memory.
+///
+/// # ⚠ DEV / TEST USE ONLY — NEVER FOR PRODUCTION FUNDS
+///
+/// The private key sits in regular Rust heap memory and is **not zeroized
+/// on drop**. After the process exits the bytes can persist in:
+/// - swap files (if the page was paged out)
+/// - core dumps (if the process crashes)
+/// - heap snapshots (debugger or memory profiler attached)
+/// - sibling-process address-space scrapes (compromised host)
+///
+/// Production keys MUST live inside a `YubiHSM2` (or equivalent HSM)
+/// implementing [`HsmBackend`]; the key never enters this process's
+/// address space. That backend lands in M5.
+///
+/// Acceptable callers today:
+/// - Local Anvil end-to-end tests (`xindex-attest` driving a 31337 chain)
+/// - The signature round-trip property test
+///
+/// Unacceptable:
+/// - Sepolia / mainnet / any chain holding real value
+/// - CI environments where the key file is committed
 pub struct SoftwareSigner {
     inner: PrivateKeySigner,
 }
@@ -76,11 +101,14 @@ impl SoftwareSigner {
     /// # Errors
     /// Returns [`SignerError::InvalidKey`] if the hex string does not
     /// decode to exactly 32 bytes or is not a valid secp256k1 scalar.
+    /// The error message is intentionally generic — we never echo the
+    /// caller's input back into a log to avoid leaking partial key bytes
+    /// from a malformed-but-recoverable hex string.
     pub fn from_hex(hex: &str) -> Result<Self, SignerError> {
         let inner: PrivateKeySigner =
             hex.parse()
-                .map_err(|e: alloy::signers::local::LocalSignerError| {
-                    SignerError::InvalidKey(e.to_string())
+                .map_err(|_: alloy::signers::local::LocalSignerError| {
+                    SignerError::InvalidKey("invalid private key hex".to_string())
                 })?;
         Ok(Self { inner })
     }

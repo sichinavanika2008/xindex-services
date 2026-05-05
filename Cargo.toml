@@ -32,11 +32,22 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros"
 # CLI + tests
 clap = { version = "4", features = ["derive", "env"] }
 rstest = "0.23"
+wiremock = "0.6"
 # Async stream helpers
 futures-util = "0.3"
+# Bitcoin stack (chain-btc + multisig + executor)
+bitcoin = { version = "0.32", default-features = false, features = ["std", "secp-recovery", "rand-std"] }
+miniscript = { version = "12", default-features = false, features = ["std"] }
+bdk_esplora = { version = "0.20", default-features = false, features = ["blocking", "std"] }
+bdk_wallet = { version = "1", default-features = false, features = ["std"] }
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
 xindex-chain-eth = { path = "crates/chain-eth" }
+xindex-chain-thor = { path = "crates/chain-thor" }
+xindex-chain-btc = { path = "crates/chain-btc" }
+xindex-multisig = { path = "crates/multisig" }
+xindex-executor = { path = "crates/executor" }
+xindex-relayer = { path = "crates/relayer" }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

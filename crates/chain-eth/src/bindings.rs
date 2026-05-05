@@ -32,3 +32,17 @@ sol!(
     IndexFactory,
     "../shared/abi/IndexFactory.json"
 );
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ThorchainAdapter constructor has 8 args; the sol! macro expansion exposes them"
+)]
+mod thorchain_adapter_binding {
+    use alloy::sol;
+    sol!(
+        #[sol(rpc)]
+        ThorchainAdapter,
+        "../shared/abi/ThorchainAdapter.json"
+    );
+}
+pub use thorchain_adapter_binding::ThorchainAdapter;

@@ -38,6 +38,10 @@ allow = [
     "Unicode-DFS-2016",
     "Unlicense",
     "Zlib",
+    # MIT + No False Attribs — used by `hex_lit` (transitive via bitcoin crate).
+    # Adds an "advertising / endorsement" non-attribution clause on top of MIT.
+    # Permissive in spirit; no copyleft surface.
+    "MITNFA",
 ]
 confidence-threshold = 0.93
 
