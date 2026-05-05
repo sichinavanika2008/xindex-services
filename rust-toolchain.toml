@@ -1,0 +1,7 @@
+[toolchain]
+# Floats to latest stable. M1 dep tree (alloy 0.8.x → ruint 1.18+) requires
+# 1.90+. Will be re-pinned to a specific version once M1 ships and audits
+# need reproducibility.
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"

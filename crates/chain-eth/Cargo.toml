@@ -1,0 +1,27 @@
+[package]
+name = "xindex-chain-eth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xindex-shared.workspace = true
+alloy = { workspace = true }
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "xindex-watch"
+path = "src/bin/xindex-watch.rs"

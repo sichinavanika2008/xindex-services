@@ -1,0 +1,17 @@
+[package]
+name = "xindex-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xindex-shared.workspace = true
+xindex-chain-eth.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

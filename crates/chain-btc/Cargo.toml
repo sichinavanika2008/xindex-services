@@ -1,0 +1,13 @@
+[package]
+name = "xindex-chain-btc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# M1: empty stub; deps land in M3 (bdk_wallet, miniscript, bitcoin RPC).
+[dependencies]

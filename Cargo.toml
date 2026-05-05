@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xindex/xindex-services"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+# Ethereum: alloy ecosystem
+alloy = { version = "0.8", features = ["full", "node-bindings"] }
+alloy-sol-types = "0.8"
+alloy-primitives = "0.8"
+# HTTP client (rustls, no system openssl)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Errors
+thiserror = "1"
+anyhow = "1"
+# Tracing / logs
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# DB (placeholder — first user is M2)
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
+# CLI + tests
+clap = { version = "4", features = ["derive", "env"] }
+rstest = "0.23"
+# Async stream helpers
+futures-util = "0.3"
+# Inter-crate
+xindex-shared = { path = "crates/shared" }
+xindex-chain-eth = { path = "crates/chain-eth" }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+allow_attributes = "deny"
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+module_name_repetitions = "allow"
+similar_names = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"

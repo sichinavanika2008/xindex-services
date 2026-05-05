@@ -1,0 +1,16 @@
+target/
+Cargo.lock.bak
+*.swp
+*.swo
+.DS_Store
+.env
+.env.local
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Local Anvil broadcast artifacts (we vendor only stable ABIs)
+broadcast/
