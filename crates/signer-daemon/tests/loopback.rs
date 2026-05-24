@@ -168,7 +168,7 @@ fn make_descriptor(secp: &Secp256k1<All>, btc_pk: bitcoin::PublicKey) -> Multisi
         bitcoin::PublicKey::new(sk2.public_key(secp)),
         bitcoin::PublicKey::new(sk3.public_key(secp)),
     ];
-    MultisigDescriptor::new(2, &pks).expect("descriptor")
+    MultisigDescriptor::new_p2wsh(2, &pks).expect("descriptor")
 }
 
 #[tokio::test]

@@ -437,7 +437,7 @@ mod tests {
             .map(|sk| bitcoin::PublicKey::new(sk.public_key(secp)))
             .collect();
         #[expect(clippy::expect_used, reason = "test code")]
-        let desc = MultisigDescriptor::new(k, &pks).expect("descriptor");
+        let desc = MultisigDescriptor::new_p2wsh(k, &pks).expect("descriptor");
         (desc, sks)
     }
 

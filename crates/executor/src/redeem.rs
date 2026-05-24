@@ -430,7 +430,10 @@ mod tests {
             .iter()
             .map(|sk| PublicKey::new(sk.public_key(&secp)))
             .collect();
-        (MultisigDescriptor::new(k, &pks).expect("descriptor"), sks)
+        (
+            MultisigDescriptor::new_p2wsh(k, &pks).expect("descriptor"),
+            sks,
+        )
     }
 
     #[expect(clippy::expect_used, reason = "test code")]

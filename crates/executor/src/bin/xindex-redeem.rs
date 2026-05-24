@@ -459,7 +459,7 @@ where
     let network = parse_network(&args.btc_network)?;
 
     let pubkeys = parse_pubkeys(&args.multisig_pubkeys)?;
-    let descriptor = MultisigDescriptor::new(args.multisig_threshold, &pubkeys)
+    let descriptor = MultisigDescriptor::new_p2wsh(args.multisig_threshold, &pubkeys)
         .context("build multisig descriptor")?;
     let multisig_addr = descriptor
         .address(network)

@@ -254,7 +254,7 @@ mod tests {
             .map(|sk| PublicKey::new(sk.public_key(&secp)))
             .collect();
         (
-            MultisigDescriptor::new(threshold, &pks).expect("descriptor"),
+            MultisigDescriptor::new_p2wsh(threshold, &pks).expect("descriptor"),
             sks,
         )
     }
