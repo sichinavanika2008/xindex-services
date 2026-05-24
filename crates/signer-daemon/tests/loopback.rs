@@ -43,13 +43,14 @@ use std::sync::Mutex;
 use xindex_executor::remote_cosigner::RemoteMultisigCosigner;
 use xindex_executor::MultisigCosigner;
 use xindex_multisig::MultisigDescriptor;
+use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::{
     attestation, attestation_oracle_domain, attestation_signing_hash, redemption_attestation,
     refund_attestation,
 };
 use xindex_signer::remote::RemoteHsmBackend;
 use xindex_signer::HsmBackend;
-use xindex_signer_daemon::psbt::BtcSignerConfig;
+use xindex_signer_daemon::psbt::UtxoSignerConfig;
 use xindex_signer_daemon::replay::InMemoryReplayStore;
 use xindex_signer_daemon::server::{router, DaemonConfig, DaemonState};
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HsmError};
@@ -116,7 +117,7 @@ impl std::fmt::Debug for SoftHsm {
 /// Boot a real daemon on a random loopback port + return its base URL +
 /// the SoftHsm so tests can observe HSM invocation counts.
 async fn spawn_daemon(
-    btc: Option<BtcSignerConfig>,
+    btc: Option<UtxoSignerConfig>,
 ) -> (String, Address, bitcoin::PublicKey, Arc<SoftHsm>) {
     use alloy::signers::local::PrivateKeySigner;
     let eth: PrivateKeySigner =
@@ -142,7 +143,7 @@ async fn spawn_daemon(
     };
     let mut state = DaemonState::new(cfg, replay, Arc::clone(&hsm));
     if let Some(btc_cfg) = btc {
-        state = state.with_btc(btc_cfg);
+        state = state.with_utxo(btc_cfg);
     }
     let app = router(state);
 
@@ -330,7 +331,8 @@ async fn coordinator_to_daemon_psbt_input_signs_with_real_ecdsa_and_finalizes() 
     let btc_sk_1 = SecretKey::from_slice(&[0x11u8; 32]).expect("sk1");
     let btc_pk_1 = bitcoin::PublicKey::new(btc_sk_1.public_key(&secp));
     let descriptor = make_descriptor(&secp, btc_pk_1);
-    let btc_cfg = BtcSignerConfig {
+    let btc_cfg = UtxoSignerConfig {
+        chain_id: ChainId::Btc,
         network: Network::Bitcoin,
         descriptor: descriptor.clone(),
         my_pubkey: btc_pk_1,
@@ -381,7 +383,7 @@ async fn coordinator_to_daemon_psbt_input_signs_with_real_ecdsa_and_finalizes() 
     let url_for_sign = url;
     let psbt_send = psbt.clone();
     let (got_pk, got_sig) = tokio::task::spawn_blocking(move || {
-        let cosigner = RemoteMultisigCosigner::new(url_for_sign, btc_pk);
+        let cosigner = RemoteMultisigCosigner::new(ChainId::Btc, url_for_sign, btc_pk);
         cosigner.sign_input(&psbt_send, 0)
     })
     .await

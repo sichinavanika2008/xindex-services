@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::chain_registry::ChainId;
+
 /// `POST /api/v1/sign/eip712-attestation`
 ///
 /// Mint slot attestation. Mirrors the on-chain
@@ -81,16 +83,24 @@ pub struct RefundSignRequest {
 
 /// `POST /api/v1/sign/psbt-input`
 ///
-/// Bitcoin multisig partial-signature endpoint. The daemon:
-///   1. Decodes the PSBT.
-///   2. Verifies the witness script at `input_index` matches its
-///      configured multisig descriptor (refuses unknown scripts).
-///   3. Verifies `vin[0]` of the unsigned tx belongs to that descriptor
+/// UTXO-family multisig partial-signature endpoint. The daemon:
+///   1. Routes to the per-chain config keyed by `chain_id` (404 if
+///      this daemon is not configured for that chain — U8 multi-role).
+///   2. Decodes the PSBT.
+///   3. Verifies the witness/redeem script at `input_index` matches
+///      that chain's configured multisig descriptor (refuses unknown
+///      scripts).
+///   4. Verifies `vin[0]` of the unsigned tx belongs to that descriptor
 ///      (the Part-3 refund-address invariant — `THORChain` resolves
 ///      refund-sender to `vin[0]`'s prev-out).
-///   4. Signs the input sighash with its single secp256k1 key.
+///   5. Signs the input sighash with its single secp256k1 key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PsbtInputSignRequest {
+    /// Which UTXO chain this PSBT is for (selects the daemon's
+    /// per-chain descriptor + key + script-kind). Required since U8;
+    /// daemon returns `endpoint_disabled` if it has no config for the
+    /// requested chain.
+    pub chain_id: ChainId,
     /// Base64-encoded PSBT (BIP-174 v0).
     pub psbt_base64: String,
     /// Which input index of the PSBT to partial-sign.
@@ -250,12 +260,40 @@ mod tests {
     #[expect(clippy::expect_used, reason = "test code")]
     fn psbt_input_request_json_round_trip() {
         let req = PsbtInputSignRequest {
+            chain_id: ChainId::Btc,
             psbt_base64: "cHNidP8BAA==".to_string(),
             input_index: 0,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, req);
+        // chain_id serialised as lowercase string per the ChainId
+        // serde-rename convention.
+        assert!(s.contains("\"chain_id\":\"btc\""));
+    }
+
+    /// U8: `PsbtInputSignRequest` accepts non-BTC chain ids (LTC, BCH,
+    /// DOGE, ZEC) on the wire. Per-chain routing happens at the
+    /// daemon's request handler.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn psbt_input_request_accepts_every_utxo_chain() {
+        for chain in [
+            ChainId::Btc,
+            ChainId::Ltc,
+            ChainId::Bch,
+            ChainId::Doge,
+            ChainId::Zec,
+        ] {
+            let req = PsbtInputSignRequest {
+                chain_id: chain,
+                psbt_base64: "cHNidP8BAA==".to_string(),
+                input_index: 0,
+            };
+            let s = serde_json::to_string(&req).expect("serialize");
+            let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
+            assert_eq!(back, req);
+        }
     }
 
     #[test]

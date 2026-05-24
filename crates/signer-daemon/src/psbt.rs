@@ -29,30 +29,42 @@ use bitcoin::{
     Network,
 };
 use xindex_multisig::MultisigDescriptor;
+use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{error_codes, ErrorBody, PsbtInputSignRequest, PsbtSignResponse};
 
 use crate::replay::{CheckOutcome, ReplayStore};
 use crate::server::DaemonState;
 use crate::web3signer::HsmDigestSigner;
 
-/// Bitcoin-role configuration. The daemon refuses any PSBT input whose
-/// witness script doesn't match `descriptor`'s derived `witness_script`,
-/// and refuses any PSBT whose `vin[0]` is not itself spending a
-/// multisig UTXO under the same descriptor (Part-3 refund invariant).
+/// Per-chain UTXO signing role configuration. One entry per UTXO chain
+/// this daemon is configured for. The daemon refuses any PSBT input
+/// whose witness script doesn't match `descriptor`'s derived
+/// `witness_script`, and refuses any PSBT whose `vin[0]` is not itself
+/// spending a multisig UTXO under the same descriptor (Part-3 refund
+/// invariant).
 #[derive(Debug)]
-pub struct BtcSignerConfig {
-    /// Network the multisig lives on (mainnet / signet / testnet /
-    /// regtest). Used only for the configured address — the descriptor
-    /// already determines the script.
+pub struct UtxoSignerConfig {
+    /// Which UTXO chain this config serves. Matches the
+    /// `PsbtInputSignRequest::chain_id` field — the daemon's
+    /// `DaemonState.utxo: HashMap<ChainId, Arc<UtxoSignerConfig>>`
+    /// dispatches per request.
+    pub chain_id: ChainId,
+    /// Bitcoin-crate network used only for the configured address
+    /// (mainnet / signet / testnet / regtest for BTC; placeholder for
+    /// non-BTC chains until the per-chain codec layer wires through).
     pub network: Network,
-    /// The 3-of-5 multisig descriptor this daemon's BTC key sits in.
+    /// The 3-of-5 multisig descriptor this daemon's key sits in for
+    /// this chain. Distinct per chain because each chain has its own
+    /// 3-of-5 ceremony (no cross-chain key sharing per DL-P3-7).
     pub descriptor: MultisigDescriptor,
-    /// This daemon's compressed secp256k1 BTC pubkey (Set A per
-    /// `docs/runbooks/key-ceremony.md`). Must appear in `descriptor`.
+    /// This daemon's compressed secp256k1 pubkey for this chain (Set
+    /// A per `docs/runbooks/key-ceremony.md`). Must appear in
+    /// `descriptor`.
     pub my_pubkey: bitcoin::PublicKey,
-    /// Address used to identify this BTC key inside the HSM frontend
-    /// (same secp256k1 curve as Ethereum; HSM frontends commonly
-    /// address keys by ETH-style 20-byte hash regardless of usage).
+    /// Address used to identify this chain's key inside the HSM
+    /// frontend (same secp256k1 curve as Ethereum; HSM frontends
+    /// commonly address keys by ETH-style 20-byte hash regardless of
+    /// usage).
     pub hsm_address: Address,
 }
 
@@ -88,13 +100,13 @@ fn now_unix_secs() -> i64 {
 /// the replay store. Passed via `DaemonState`'s additional bitcoin
 /// role payload. Kept generic to preserve static dispatch.
 #[derive(Debug)]
-pub struct BtcSignerState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
-    pub config: Arc<BtcSignerConfig>,
+pub struct UtxoSignerState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
+    pub config: Arc<UtxoSignerConfig>,
     pub replay: Arc<S>,
     pub hsm: Arc<H>,
 }
 
-impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for BtcSignerState<S, H> {
+impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for UtxoSignerState<S, H> {
     fn clone(&self) -> Self {
         Self {
             config: Arc::clone(&self.config),
@@ -104,9 +116,11 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for BtcSigner
     }
 }
 
-/// Axum handler. Pulls the BTC role out of `DaemonState`; if the
-/// daemon was started without a BTC role this route is not registered
-/// and the request reaches a 404 from the router itself.
+/// Axum handler. Looks up the per-chain UTXO role from `DaemonState`
+/// by `req.chain_id`; returns 404 `endpoint_disabled` if this daemon
+/// has no config for the requested chain (the route is always
+/// registered when at least one UTXO chain is configured — per-chain
+/// dispatch happens inside the handler).
 ///
 /// # Errors
 /// Returns an `(StatusCode, Json<ErrorBody>)` tuple with one of the
@@ -126,11 +140,14 @@ where
     S: ReplayStore + 'static,
     H: HsmDigestSigner + 'static,
 {
-    let btc = state.btc.as_ref().ok_or_else(|| {
+    let btc = state.utxo.get(&req.chain_id).cloned().ok_or_else(|| {
         err(
             error_codes::ENDPOINT_DISABLED,
             StatusCode::NOT_FOUND,
-            "BTC role not enabled on this daemon",
+            format!(
+                "UTXO role for chain {:?} not enabled on this daemon",
+                req.chain_id
+            ),
         )
     })?;
 
@@ -489,12 +506,15 @@ mod tests {
         hsm: Arc<SoftHsm>,
     ) -> (DaemonState<InMemoryReplayStore, SoftHsm>, Router) {
         let replay = Arc::new(InMemoryReplayStore::new());
-        let btc = Some(Arc::new(BtcSignerConfig {
+        let cfg = UtxoSignerConfig {
+            chain_id: ChainId::Btc,
             network: Network::Bitcoin,
             descriptor,
             my_pubkey,
             hsm_address: Address::repeat_byte(0xcd),
-        }));
+        };
+        let mut utxo = std::collections::HashMap::new();
+        utxo.insert(ChainId::Btc, Arc::new(cfg));
         let state = DaemonState {
             config: DaemonConfig {
                 chain_id: 31337,
@@ -503,7 +523,7 @@ mod tests {
             },
             replay,
             hsm,
-            btc,
+            utxo,
         };
         let app = Router::new()
             .route(
@@ -524,7 +544,12 @@ mod tests {
                     .uri("/api/v1/sign/psbt-input")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({"psbt_base64": b64, "input_index": idx}).to_string(),
+                        serde_json::json!({
+                            "chain_id": "btc",
+                            "psbt_base64": b64,
+                            "input_index": idx
+                        })
+                        .to_string(),
                     ))
                     .expect("req"),
             )

@@ -17,6 +17,7 @@ use std::time::Duration;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use bitcoin::ecdsa::Signature as BtcEcdsaSig;
 use bitcoin::psbt::Psbt;
+use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{PsbtInputSignRequest, PsbtSignResponse};
 
 use crate::redeem::{ExecuteError, MultisigCosigner};
@@ -26,9 +27,12 @@ const DEFAULT_TIMEOUT_SECS: u64 = 10;
 /// HTTP client implementing [`MultisigCosigner`] against one signer
 /// daemon's PSBT-input endpoint. Holds the publicly-disclosed pubkey
 /// (Set A per `docs/runbooks/key-ceremony.md`) — pinned and verified
-/// against every daemon response.
+/// against every daemon response. Bound to one UTXO chain (since U8 —
+/// daemons are multi-role internally but each cosigner instance speaks
+/// for one chain on behalf of the coordinator).
 #[derive(Debug, Clone)]
 pub struct RemoteMultisigCosigner {
+    chain_id: ChainId,
     base_url: String,
     expected_pubkey: bitcoin::PublicKey,
     inner: reqwest::blocking::Client,
@@ -36,12 +40,19 @@ pub struct RemoteMultisigCosigner {
 
 impl RemoteMultisigCosigner {
     /// Construct against `base_url` (e.g. `http://127.0.0.1:9101`).
-    /// `expected_pubkey` is the daemon's disclosed Set-A pubkey; every
-    /// response is verified to match it. A misdirected daemon returning
-    /// the wrong pubkey is a hard fail, never accepted.
+    /// `chain_id` selects which of the daemon's per-chain configs to
+    /// dispatch against (U8 multi-role). `expected_pubkey` is the
+    /// daemon's disclosed Set-A pubkey FOR THIS CHAIN; every response
+    /// is verified to match it. A misdirected daemon returning the
+    /// wrong pubkey is a hard fail, never accepted.
     #[must_use]
-    pub fn new(base_url: impl Into<String>, expected_pubkey: bitcoin::PublicKey) -> Self {
+    pub fn new(
+        chain_id: ChainId,
+        base_url: impl Into<String>,
+        expected_pubkey: bitcoin::PublicKey,
+    ) -> Self {
         Self::with_timeout(
+            chain_id,
             base_url,
             expected_pubkey,
             Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -50,6 +61,7 @@ impl RemoteMultisigCosigner {
 
     #[must_use]
     pub fn with_timeout(
+        chain_id: ChainId,
         base_url: impl Into<String>,
         expected_pubkey: bitcoin::PublicKey,
         timeout: Duration,
@@ -59,6 +71,7 @@ impl RemoteMultisigCosigner {
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
+            chain_id,
             base_url: base_url.into(),
             expected_pubkey,
             inner,
@@ -81,6 +94,7 @@ impl MultisigCosigner for RemoteMultisigCosigner {
             ExecuteError::InvalidMemo(format!("input_index {input_index} > u32::MAX"))
         })?;
         let req = PsbtInputSignRequest {
+            chain_id: self.chain_id,
             psbt_base64: B64.encode(&bytes),
             input_index: idx_u32,
         };
@@ -248,7 +262,7 @@ mod tests {
         let url = server.uri();
         let psbt_clone = psbt.clone();
         let (got_pk, got_sig) = tokio::task::spawn_blocking(move || {
-            let cosigner = RemoteMultisigCosigner::new(url, pk);
+            let cosigner = RemoteMultisigCosigner::new(ChainId::Btc, url, pk);
             cosigner.sign_input(&psbt_clone, 0)
         })
         .await
@@ -285,7 +299,7 @@ mod tests {
         let url = server.uri();
         let psbt_clone = psbt.clone();
         let err = tokio::task::spawn_blocking(move || {
-            RemoteMultisigCosigner::new(url, pk).sign_input(&psbt_clone, 0)
+            RemoteMultisigCosigner::new(ChainId::Btc, url, pk).sign_input(&psbt_clone, 0)
         })
         .await
         .expect("join")
@@ -310,7 +324,7 @@ mod tests {
         let url = server.uri();
         let psbt_clone = psbt.clone();
         let err = tokio::task::spawn_blocking(move || {
-            RemoteMultisigCosigner::new(url, pk).sign_input(&psbt_clone, 0)
+            RemoteMultisigCosigner::new(ChainId::Btc, url, pk).sign_input(&psbt_clone, 0)
         })
         .await
         .expect("join")

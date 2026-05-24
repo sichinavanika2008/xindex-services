@@ -39,7 +39,11 @@ use xindex_shared::signer_wire::{
     KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest,
 };
 
-use crate::psbt::{handle_psbt_input, BtcSignerConfig};
+use std::collections::HashMap;
+
+use xindex_shared::chain_registry::ChainId;
+
+use crate::psbt::{handle_psbt_input, UtxoSignerConfig};
 use crate::replay::{CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore};
 use crate::web3signer::{HsmDigestSigner, HsmError};
 
@@ -75,11 +79,13 @@ pub struct DaemonState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
     pub config: DaemonConfig,
     pub replay: Arc<S>,
     pub hsm: Arc<H>,
-    /// `Some(_)` when this daemon has a Bitcoin signing role
-    /// configured (Set A per `docs/runbooks/key-ceremony.md`). When
-    /// `None`, the `/api/v1/sign/psbt-input` route is not registered
-    /// and the handler short-circuits to `endpoint_disabled`.
-    pub btc: Option<Arc<BtcSignerConfig>>,
+    /// Per-chain UTXO signing roles. Empty map = no UTXO key
+    /// configured; the `/api/v1/sign/psbt-input` route is then not
+    /// registered. A request for a chain absent from this map gets a
+    /// 404 `endpoint_disabled`. Distinct configs per chain because
+    /// each chain has its own 3-of-5 ceremony (no cross-chain key
+    /// sharing per DL-P3-7).
+    pub utxo: HashMap<ChainId, Arc<UtxoSignerConfig>>,
 }
 
 // Manual `Clone` impl: every field is cheap to clone (`Arc<_>` +
@@ -94,7 +100,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for DaemonSta
             config: self.config.clone(),
             replay: Arc::clone(&self.replay),
             hsm: Arc::clone(&self.hsm),
-            btc: self.btc.as_ref().map(Arc::clone),
+            utxo: self.utxo.clone(),
         }
     }
 }
@@ -106,14 +112,16 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             config,
             replay,
             hsm,
-            btc: None,
+            utxo: HashMap::new(),
         }
     }
 
-    /// Builder: attach a Bitcoin signing role to an existing state.
+    /// Builder: attach a per-chain UTXO signing role to an existing
+    /// state. Call once per chain this daemon serves; the chain id is
+    /// taken from `config.chain_id`.
     #[must_use]
-    pub fn with_btc(mut self, btc: BtcSignerConfig) -> Self {
-        self.btc = Some(Arc::new(btc));
+    pub fn with_utxo(mut self, config: UtxoSignerConfig) -> Self {
+        self.utxo.insert(config.chain_id, Arc::new(config));
         self
     }
 }
@@ -138,7 +146,7 @@ where
             post(handle_redemption_delivery::<S, H>),
         )
         .route("/api/v1/sign/eip712-refund", post(handle_refund::<S, H>));
-    if state.btc.is_some() {
+    if !state.utxo.is_empty() {
         r = r.route("/api/v1/sign/psbt-input", post(handle_psbt_input::<S, H>));
     }
     r.with_state(state)
@@ -168,10 +176,16 @@ where
     S: ReplayStore + 'static,
     H: HsmDigestSigner + 'static,
 {
-    let btc_pubkey = state.btc.as_ref().map(|btc| {
+    // KeysResponse.btc_pubkey reports the ChainId::Btc role's pubkey
+    // specifically (the wire field name is historical, pre-U8). Other
+    // chains' pubkeys are not exposed on this endpoint; per-chain
+    // discovery is a U10+ runbook concern. Coordinator pins pubkeys
+    // per-(daemon, chain) at deploy time, so this field is only an
+    // identity probe for the BTC role.
+    let btc_pubkey = state.utxo.get(&ChainId::Btc).map(|cfg| {
         format!(
             "0x{}",
-            alloy_primitives::hex::encode(btc.my_pubkey.to_bytes())
+            alloy_primitives::hex::encode(cfg.my_pubkey.to_bytes())
         )
     });
     Json(KeysResponse {

@@ -434,8 +434,11 @@ fn build_executor(
                 }
             }
             let mut cosigners: Vec<Box<dyn MultisigCosigner>> = Vec::with_capacity(pks.len());
+            // BTC-only today; U10 will route per ChainId based on a
+            // --chain CLI arg.
             for (url, pk) in urls.iter().zip(pks.iter()) {
                 cosigners.push(Box::new(RemoteMultisigCosigner::new(
+                    ChainId::Btc,
                     (*url).to_string(),
                     *pk,
                 )));

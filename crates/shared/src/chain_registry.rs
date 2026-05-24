@@ -13,11 +13,20 @@
 //! (`CustodyFamily::Utxo`). EVM / Cosmos / Solana / Substrate families
 //! are Phase 3.2+ and will reuse this enum.
 
+use std::fmt;
+use std::str::FromStr;
+
 use alloy_primitives::{keccak256, B256};
+use serde::{Deserialize, Serialize};
 
 /// Per-chain identifier. UTXO family today; other families land in
-/// Phase 3.2+.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Phase 3.2+. The string form (`"btc"`, `"ltc"`, ...) is the wire
+/// representation everywhere — JSON requests (`PsbtInputSignRequest`),
+/// `SQLite` TEXT columns (`redemption_dispatch.chain`), and CLI args
+/// (`--chain ltc`). Hex / decimal is reserved for byte-level
+/// quantities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ChainId {
     /// Bitcoin (mainnet/signet — distinguished at the client layer).
     Btc,
@@ -29,6 +38,46 @@ pub enum ChainId {
     Doge,
     /// Zcash (transparent t-addr only; z-addr is out of scope).
     Zec,
+}
+
+impl fmt::Display for ChainId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Btc => "btc",
+            Self::Ltc => "ltc",
+            Self::Bch => "bch",
+            Self::Doge => "doge",
+            Self::Zec => "zec",
+        })
+    }
+}
+
+/// Error returned by [`ChainId::from_str`] when the input doesn't
+/// match a known chain. Case-insensitive on input (`"BTC"` /
+/// `"Btc"` / `"btc"` all parse).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseChainIdError(pub String);
+
+impl fmt::Display for ParseChainIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown chain id: {}", self.0)
+    }
+}
+
+impl std::error::Error for ParseChainIdError {}
+
+impl FromStr for ChainId {
+    type Err = ParseChainIdError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "btc" => Ok(Self::Btc),
+            "ltc" => Ok(Self::Ltc),
+            "bch" => Ok(Self::Bch),
+            "doge" => Ok(Self::Doge),
+            "zec" => Ok(Self::Zec),
+            other => Err(ParseChainIdError(other.to_string())),
+        }
+    }
 }
 
 /// Custody-side classification used to dispatch to the right
@@ -210,6 +259,38 @@ mod tests {
     /// `asset_id_hash` is `keccak256(thor_asset.as_bytes())`. Both
     /// pinning the formula (mirror of Solidity) and verifying distinct
     /// chains produce distinct hashes (anti-collision sanity).
+    /// Round-trip: `ChainId` ↔ string form (`Display` + `FromStr`).
+    /// Used by JSON wire (`PsbtInputSignRequest`), `SQLite` TEXT columns,
+    /// and CLI args. Mixed-case input is normalised to lowercase.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn display_fromstr_round_trip_and_case_insensitive() {
+        for c in [
+            ChainId::Btc,
+            ChainId::Ltc,
+            ChainId::Bch,
+            ChainId::Doge,
+            ChainId::Zec,
+        ] {
+            let s = c.to_string();
+            let back: ChainId = s.parse().expect("parse");
+            assert_eq!(back, c);
+        }
+        assert_eq!("BTC".parse::<ChainId>().expect("uppercase"), ChainId::Btc);
+        assert_eq!("Ltc".parse::<ChainId>().expect("mixed"), ChainId::Ltc);
+        assert!("ada".parse::<ChainId>().is_err());
+    }
+
+    /// Serde uses the lowercase string form (matches Display/FromStr).
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn serde_uses_lowercase_strings() {
+        let json = serde_json::to_string(&ChainId::Btc).expect("ser");
+        assert_eq!(json, "\"btc\"");
+        let back: ChainId = serde_json::from_str("\"ltc\"").expect("de");
+        assert_eq!(back, ChainId::Ltc);
+    }
+
     #[test]
     fn asset_id_hash_matches_keccak256_of_thor_asset_bytes() {
         for c in [
