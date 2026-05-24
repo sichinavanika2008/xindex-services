@@ -110,6 +110,14 @@ struct Args {
     #[arg(long, env = "BTC_NETWORK", default_value = "signet")]
     btc_network: String,
 
+    /// UTXO chain this executor instance serves. One of `btc`, `ltc`,
+    /// `bch`, `doge`, `zec`. Determines (a) which `ChainId` is recorded
+    /// in the dispatch store so the signer's per-leg cross-check finds
+    /// the right inbound, and (b) which per-chain config the
+    /// signer-daemon dispatches against. Default `btc`.
+    #[arg(long, env = "CHAIN", default_value = "btc")]
+    chain: String,
+
     /// Comma-separated 33-byte (compressed) secp256k1 public keys of the
     /// N multisig signers, hex-encoded. The order MUST match the order
     /// the multisig descriptor was built with at deploy time.
@@ -376,6 +384,7 @@ fn resolve_fee_sats(chain: &EsploraClient, args: &Args) -> u64 {
 ///   holds zero key material.
 fn build_executor(
     args: &Args,
+    chain_id: ChainId,
     descriptor: MultisigDescriptor,
     pubkeys: &[PublicKey],
     chain: EsploraClient,
@@ -434,11 +443,9 @@ fn build_executor(
                 }
             }
             let mut cosigners: Vec<Box<dyn MultisigCosigner>> = Vec::with_capacity(pks.len());
-            // BTC-only today; U10 will route per ChainId based on a
-            // --chain CLI arg.
             for (url, pk) in urls.iter().zip(pks.iter()) {
                 cosigners.push(Box::new(RemoteMultisigCosigner::new(
-                    ChainId::Btc,
+                    chain_id,
                     (*url).to_string(),
                     *pk,
                 )));
@@ -460,6 +467,10 @@ where
     let adapter_addr = EvmAddress::from_str(&args.thorchain_adapter)
         .context("THORCHAIN_ADAPTER_ADDR must be a 20-byte hex address")?;
     let network = parse_network(&args.btc_network)?;
+    let chain: ChainId = args
+        .chain
+        .parse()
+        .with_context(|| format!("--chain {:?} is not a known UTXO chain", args.chain))?;
 
     let pubkeys = parse_pubkeys(&args.multisig_pubkeys)?;
     let descriptor = MultisigDescriptor::new_p2wsh(args.multisig_threshold, &pubkeys)
@@ -484,11 +495,8 @@ where
     // + stuck-tx re-broadcast). Both point at the same URL; the cost is
     // a second HTTP connection pool, far cheaper than refactoring
     // InProcessExecutor to share an `Arc<C>` with the watcher.
-    let executor_chain = EsploraClient::for_chain(
-        UtxoParams::for_chain(ChainId::Btc),
-        network,
-        &args.esplora_url,
-    );
+    let executor_chain =
+        EsploraClient::for_chain(UtxoParams::for_chain(chain), network, &args.esplora_url);
 
     // Live Esplora fee estimate (L-R5); floor + cap + fallback handled
     // inside `resolve_fee_sats`. Extracted so `run` stays inside the
@@ -496,6 +504,7 @@ where
     let fee_sats = resolve_fee_sats(&executor_chain, &args);
     let executor = build_executor(
         &args,
+        chain,
         descriptor.clone(),
         &pubkeys,
         executor_chain,
@@ -504,7 +513,7 @@ where
     )
     .context("build executor")?;
     let watcher_chain = Arc::new(EsploraClient::for_chain(
-        UtxoParams::for_chain(ChainId::Btc),
+        UtxoParams::for_chain(chain),
         network,
         &args.esplora_url,
     ));
@@ -671,13 +680,7 @@ where
                 // 3.1 (U10) routes per ChainId::from_asset_id and will
                 // populate this from the dispatched event's leg.
                 if let Err(e) = dispatch_store
-                    .record(
-                        task.redemption_id,
-                        0u32,
-                        ChainId::Btc,
-                        txid.to_string(),
-                        now,
-                    )
+                    .record(task.redemption_id, 0u32, chain, txid.to_string(), now)
                     .await
                 {
                     error!(redemption_id = %task.redemption_id, %txid, error = %e,

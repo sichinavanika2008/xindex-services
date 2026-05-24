@@ -186,6 +186,20 @@ impl ChainId {
     pub fn asset_id_hash(self) -> B256 {
         keccak256(self.thor_asset().as_bytes())
     }
+
+    /// Reverse of [`asset_id_hash`]: lookup the `ChainId` for an
+    /// on-chain `legAssetIds[i]` value. Returns `None` if the asset
+    /// hash doesn't match any Phase 3.1 UTXO-family chain.
+    ///
+    /// Used by `xindex-attest-redeem` to route per-leg cross-checks:
+    /// `ev.legAssetIds[i]` → `ChainId` → per-chain dispatch lookup +
+    /// Esplora client + `THORChain` chain-query endpoint.
+    #[must_use]
+    pub fn from_asset_id(asset_id: B256) -> Option<Self> {
+        [Self::Btc, Self::Ltc, Self::Bch, Self::Doge, Self::Zec]
+            .into_iter()
+            .find(|c| c.asset_id_hash() == asset_id)
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +303,25 @@ mod tests {
         assert_eq!(json, "\"btc\"");
         let back: ChainId = serde_json::from_str("\"ltc\"").expect("de");
         assert_eq!(back, ChainId::Ltc);
+    }
+
+    /// U10: round-trip `ChainId` → `asset_id_hash` → `ChainId` via
+    /// `from_asset_id`. Bogus hash returns None. Used by
+    /// `xindex-attest-redeem` to route per-leg cross-checks.
+    #[test]
+    fn from_asset_id_round_trip_and_rejects_unknown() {
+        for c in [
+            ChainId::Btc,
+            ChainId::Ltc,
+            ChainId::Bch,
+            ChainId::Doge,
+            ChainId::Zec,
+        ] {
+            assert_eq!(ChainId::from_asset_id(c.asset_id_hash()), Some(c));
+        }
+        // Unknown / bogus asset hash → None (not silently mapped to BTC).
+        let bogus = B256::repeat_byte(0xff);
+        assert_eq!(ChainId::from_asset_id(bogus), None);
     }
 
     #[test]

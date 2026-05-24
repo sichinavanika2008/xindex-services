@@ -371,6 +371,21 @@ async fn run(args: Args) -> Result<()> {
             return;
         };
 
+        // U10: route per-leg by ChainId derived from `asset_id`
+        // (= keccak256(thor_asset)). An unknown asset is a hard
+        // skip — never sign for a chain we don't know how to
+        // cross-check. Once any chain is in production, an unknown
+        // asset_id is a runbook alert (likely a new chain being
+        // recognised on-chain ahead of the off-chain rollout).
+        let Some(leg_chain) = xindex_shared::chain_registry::ChainId::from_asset_id(asset_id)
+        else {
+            warn!(redemption_id = %rid, %asset_id,
+                  "leg asset_id does not match any known UTXO chain; skipping (runbook)");
+            return;
+        };
+        info!(redemption_id = %rid, chain = ?leg_chain,
+              "leg routed by asset_id");
+
         // F2 correlation: the executor records (redemptionId, legIndex)
         // → inbound_txid AFTER it broadcasts the Asgard deposit. If
         // absent, the executor hasn't dispatched this leg yet — skip;
