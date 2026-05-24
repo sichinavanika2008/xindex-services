@@ -43,7 +43,7 @@ use futures_util::StreamExt;
 use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::ThorchainAdapter;
 use xindex_chain_thor::ThorClient;
-use xindex_chain_utxo::{EsploraClient, UtxoChainClient};
+use xindex_chain_utxo::{EsploraClient, UtxoChainClient, UtxoParams};
 use xindex_executor::remote_cosigner::RemoteMultisigCosigner;
 use xindex_executor::{
     decode_redeem_event, now_unix_secs, run_watcher, BroadcastRegistry, InMemoryBroadcastRegistry,
@@ -61,6 +61,7 @@ enum SignerMode {
     Remote,
 }
 use xindex_multisig::MultisigDescriptor;
+use xindex_shared::chain_registry::ChainId;
 use xindex_shared::redemption_dispatch::{AnyRedemptionDispatch, RedemptionDispatchStore};
 
 #[derive(Parser, Debug)]
@@ -480,7 +481,11 @@ where
     // + stuck-tx re-broadcast). Both point at the same URL; the cost is
     // a second HTTP connection pool, far cheaper than refactoring
     // InProcessExecutor to share an `Arc<C>` with the watcher.
-    let executor_chain = EsploraClient::with_url(network, &args.esplora_url);
+    let executor_chain = EsploraClient::for_chain(
+        UtxoParams::for_chain(ChainId::Btc),
+        network,
+        &args.esplora_url,
+    );
 
     // Live Esplora fee estimate (L-R5); floor + cap + fallback handled
     // inside `resolve_fee_sats`. Extracted so `run` stays inside the
@@ -495,7 +500,11 @@ where
         fee_sats,
     )
     .context("build executor")?;
-    let watcher_chain = Arc::new(EsploraClient::with_url(network, &args.esplora_url));
+    let watcher_chain = Arc::new(EsploraClient::for_chain(
+        UtxoParams::for_chain(ChainId::Btc),
+        network,
+        &args.esplora_url,
+    ));
 
     // THORChain client — resolves the live BTC Asgard inbound vault
     // (rotates per churn) the reverse deposit is sent to.

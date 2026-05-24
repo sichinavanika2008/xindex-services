@@ -190,6 +190,24 @@ impl EsploraClient {
         Self::build(network, base_url.into())
     }
 
+    /// Build a client for the chain described by `params`. Today this
+    /// forwards to [`Self::with_url`] — BTC is the only chain whose
+    /// `network` carries meaning here (`require_network` validates
+    /// addresses against it). For Phase 3.1 non-BTC chains, the
+    /// per-chain address codec (U6) is the real validator; the
+    /// `bitcoin::Network` field on this struct is a placeholder
+    /// (`Network::Bitcoin`) and `require_network` is bypassed at the
+    /// codec layer. The signature is locked here so U6 can swap the
+    /// network derivation in one place.
+    pub fn for_chain(
+        params: &crate::params::UtxoParams,
+        network: Network,
+        base_url: impl Into<String>,
+    ) -> Self {
+        let _ = params; // params drives the codec / sighash branches, not the HTTP transport.
+        Self::build(network, base_url.into())
+    }
+
     fn build(network: Network, base_url: String) -> Self {
         let inner = esplora_client::Builder::new(&base_url)
             .timeout(DEFAULT_TIMEOUT_SECS)

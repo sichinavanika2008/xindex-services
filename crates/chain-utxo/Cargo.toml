@@ -15,6 +15,10 @@ bdk_esplora.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Per-chain constants live in xindex-shared::chain_registry; UtxoParams
+# (this crate) re-references them so callers can switch chains by passing
+# a `ChainId` rather than re-deriving the constants here.
+xindex-shared.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
