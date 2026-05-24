@@ -169,9 +169,15 @@ sync-abi:
     @echo "ABIs vendored to crates/shared/abi/"
 
 # Strict gate: matches CI exactly. Run before every commit.
+#
+# `--ignore RUSTSEC-2023-0071`: rsa 0.9.x Marvin timing-sidechannel.
+# rsa is pulled by sqlx-mysql which sqlx 0.8 lists as an optional
+# transitive in its lockfile entry even with `default-features = false`
+# + sqlite-only features. We do not compile mysql; the vulnerable code
+# is not reachable. No upstream fix available. Documented in deny.toml.
 gate:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --workspace
     cargo deny check
-    cargo audit
+    cargo audit --ignore RUSTSEC-2023-0071

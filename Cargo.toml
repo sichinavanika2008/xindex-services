@@ -27,8 +27,12 @@ anyhow = "1"
 # Tracing / logs
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# DB (placeholder — first user is M2)
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
+# DB (placeholder — first user is M2). `default-features = false` drops
+# sqlx-mysql / sqlx-postgres / `any` driver bundle we don't use, which
+# also removes the transitive `rsa` crate (RUSTSEC-2023-0071: Marvin
+# timing-sidechannel; no fixed upgrade upstream) and the unmaintained
+# `derivative` (RUSTSEC-2024-0388).
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
 # CLI + tests
 clap = { version = "4", features = ["derive", "env"] }
 rstest = "0.23"

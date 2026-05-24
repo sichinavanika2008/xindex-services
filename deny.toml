@@ -19,6 +19,12 @@ ignore = [
     # uses `lru::LruCache` but does NOT call the affected `iter_mut`. No runtime
     # exposure for our usage; bump alloy when 0.12.6+ ships in their dep tree.
     "RUSTSEC-2026-0002",
+    # `rsa` 0.9.x Marvin timing-sidechannel. Pulled transitively via
+    # sqlx-mysql which sqlx 0.8 keeps in its lockfile entry even with
+    # `default-features = false` + sqlite-only features. We do not
+    # compile the mysql driver; the vulnerable code is not reachable.
+    # No upstream fix available. Mirrored in justfile gate.
+    "RUSTSEC-2023-0071",
 ]
 
 [licenses]
