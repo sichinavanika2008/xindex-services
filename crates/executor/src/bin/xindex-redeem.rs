@@ -671,7 +671,13 @@ where
                 // 3.1 (U10) routes per ChainId::from_asset_id and will
                 // populate this from the dispatched event's leg.
                 if let Err(e) = dispatch_store
-                    .record(task.redemption_id, 0u32, txid.to_string(), now)
+                    .record(
+                        task.redemption_id,
+                        0u32,
+                        ChainId::Btc,
+                        txid.to_string(),
+                        now,
+                    )
                     .await
                 {
                     error!(redemption_id = %task.redemption_id, %txid, error = %e,

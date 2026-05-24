@@ -19,6 +19,15 @@
 //! For the current single-async-slot `THORChain` rail, `leg_index` is
 //! always 0 and behavior is unchanged.
 //!
+//! ## Per-chain field (U9 / Phase 3.1)
+//!
+//! Each row also carries the `ChainId` of the recorded inbound — the
+//! signer's cross-check needs to know which chain to query for the
+//! `inbound_txid` (BTC mainnet, LTC mainnet, etc.). Stored as lowercase
+//! string in `SQLite` matching `ChainId`'s Display + Serde form. The
+//! schema's CHECK constraint locks the value set to the Phase 3.1
+//! UTXO family; Phase 3.2+ chains require a follow-on migration.
+//!
 //! Lives in `xindex-shared` because both `xindex-executor` (writer) and
 //! `xindex-signer` (reader) depend on `shared` but not on each other.
 //!
@@ -34,6 +43,8 @@ use alloy_primitives::B256;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+use crate::chain_registry::ChainId;
 
 /// Errors surfaced by dispatch-store operations.
 #[derive(Debug, Error)]
@@ -59,10 +70,14 @@ pub struct DispatchRecord {
     /// `RedemptionLegRecord` array position; 0 for single-async-slot
     /// baskets).
     pub leg_index: u32,
+    /// Which UTXO chain this dispatch hit. The signer's cross-check
+    /// uses this to pick the right `THORChain` chain-query endpoint
+    /// and the right Esplora client. BTC for the current rail;
+    /// LTC/BCH/DOGE/ZEC after U10 wires the per-chain executor.
+    pub chain: ChainId,
     /// Inbound txid (display hex) of the deposit the executor broadcast
     /// to the leg's `THORChain` Asgard vault. Passed verbatim to
-    /// `ThorClient::tx_status`. Per-chain (BTC for the current rail;
-    /// LTC/BCH/DOGE/ZEC once Phase 3.1 multi-chain routing lands).
+    /// `ThorClient::tx_status` for the chain identified by `chain`.
     pub inbound_txid: String,
     /// Unix seconds at which the executor recorded the dispatch.
     pub dispatched_at_unix_secs: u64,
@@ -76,11 +91,14 @@ pub trait RedemptionDispatchStore: Send + Sync {
     /// Record the inbound dispatch for `(redemption_id, leg_index)`.
     /// Idempotent per leg: the FIRST write wins (a re-broadcast must
     /// not overwrite the original `inbound_txid` the signer correlates
-    /// against).
+    /// against). `chain` is persisted alongside the txid so the
+    /// signer's cross-check can pick the right per-chain Esplora /
+    /// `THORChain` query path.
     fn record(
         &self,
         redemption_id: B256,
         leg_index: u32,
+        chain: ChainId,
         inbound_txid: String,
         now_unix_secs: u64,
     ) -> impl std::future::Future<Output = Result<(), DispatchError>> + Send;
@@ -124,6 +142,7 @@ impl RedemptionDispatchStore for InMemoryRedemptionDispatch {
         &self,
         redemption_id: B256,
         leg_index: u32,
+        chain: ChainId,
         inbound_txid: String,
         now_unix_secs: u64,
     ) -> Result<(), DispatchError> {
@@ -135,6 +154,7 @@ impl RedemptionDispatchStore for InMemoryRedemptionDispatch {
             .entry((redemption_id, leg_index))
             .or_insert(DispatchRecord {
                 leg_index,
+                chain,
                 inbound_txid,
                 dispatched_at_unix_secs: now_unix_secs,
             });
@@ -199,22 +219,26 @@ impl RedemptionDispatchStore for SqliteRedemptionDispatch {
         &self,
         redemption_id: B256,
         leg_index: u32,
+        chain: ChainId,
         inbound_txid: String,
         now_unix_secs: u64,
     ) -> Result<(), DispatchError> {
         let at = Self::cast_secs(now_unix_secs)?;
         // `INSERT OR IGNORE` = first-write-wins PER LEG (idempotent
         // re-broadcast). PK is (redemption_id, leg_index) so distinct
-        // legs of the same rid never collide.
+        // legs of the same rid never collide. `chain` stored as
+        // lowercase string (ChainId Display form) — CHECK constraint
+        // in the migration enforces the value set.
         sqlx::query(
             r"
             INSERT OR IGNORE INTO redemption_dispatch
-                (redemption_id, leg_index, inbound_txid, dispatched_at_unix_secs)
-            VALUES (?, ?, ?, ?)
+                (redemption_id, leg_index, chain, inbound_txid, dispatched_at_unix_secs)
+            VALUES (?, ?, ?, ?, ?)
             ",
         )
         .bind(redemption_id.as_slice())
         .bind(i64::from(leg_index))
+        .bind(chain.to_string())
         .bind(&inbound_txid)
         .bind(at)
         .execute(&self.pool)
@@ -227,8 +251,8 @@ impl RedemptionDispatchStore for SqliteRedemptionDispatch {
         redemption_id: &B256,
         leg_index: u32,
     ) -> Result<Option<DispatchRecord>, DispatchError> {
-        let row: Option<(String, i64)> = sqlx::query_as(
-            "SELECT inbound_txid, dispatched_at_unix_secs
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT chain, inbound_txid, dispatched_at_unix_secs
              FROM redemption_dispatch
              WHERE redemption_id = ? AND leg_index = ?",
         )
@@ -238,12 +262,16 @@ impl RedemptionDispatchStore for SqliteRedemptionDispatch {
         .await?;
         match row {
             None => Ok(None),
-            Some((inbound_txid, at)) => {
+            Some((chain_str, inbound_txid, at)) => {
                 let dispatched_at_unix_secs = u64::try_from(at).map_err(|e| {
                     DispatchError::Decode(format!("stored dispatched_at negative: {e}"))
                 })?;
+                let chain: ChainId = chain_str.parse().map_err(|e| {
+                    DispatchError::Decode(format!("stored chain {chain_str:?} unknown: {e}"))
+                })?;
                 Ok(Some(DispatchRecord {
                     leg_index,
+                    chain,
                     inbound_txid,
                     dispatched_at_unix_secs,
                 }))
@@ -281,16 +309,17 @@ impl RedemptionDispatchStore for AnyRedemptionDispatch {
         &self,
         redemption_id: B256,
         leg_index: u32,
+        chain: ChainId,
         inbound_txid: String,
         now_unix_secs: u64,
     ) -> Result<(), DispatchError> {
         match self {
             Self::Mem(s) => {
-                s.record(redemption_id, leg_index, inbound_txid, now_unix_secs)
+                s.record(redemption_id, leg_index, chain, inbound_txid, now_unix_secs)
                     .await
             }
             Self::Sql(s) => {
-                s.record(redemption_id, leg_index, inbound_txid, now_unix_secs)
+                s.record(redemption_id, leg_index, chain, inbound_txid, now_unix_secs)
                     .await
             }
         }
@@ -328,13 +357,13 @@ mod tests {
         let id = b256!("0000000000000000000000000000000000000000000000000000000000000001");
         assert!(!store.has(&id, 0).await.expect("has"));
         store
-            .record(id, 0, "txid-aaa".into(), 100)
+            .record(id, 0, ChainId::Btc, "txid-aaa".into(), 100)
             .await
             .expect("record");
         assert!(store.has(&id, 0).await.expect("has"));
         // First-write-wins PER LEG: a re-broadcast must not clobber.
         store
-            .record(id, 0, "txid-bbb".into(), 200)
+            .record(id, 0, ChainId::Btc, "txid-bbb".into(), 200)
             .await
             .expect("re-record");
         let got = store.get(&id, 0).await.expect("get").expect("present");
@@ -352,11 +381,11 @@ mod tests {
         let id = b256!("00000000000000000000000000000000000000000000000000000000000000bb");
         assert_eq!(store.get(&id, 0).await.expect("get"), None);
         store
-            .record(id, 0, "txid-aaa".into(), 100)
+            .record(id, 0, ChainId::Btc, "txid-aaa".into(), 100)
             .await
             .expect("record");
         store
-            .record(id, 0, "txid-bbb".into(), 200)
+            .record(id, 0, ChainId::Btc, "txid-bbb".into(), 200)
             .await
             .expect("re-record");
         let got = store.get(&id, 0).await.expect("get").expect("present");
@@ -379,12 +408,12 @@ mod tests {
         assert_eq!(store.get(&id, 0).await.expect("get"), None);
         assert!(!store.has(&id, 0).await.expect("has"));
         store
-            .record(id, 0, "txid-any".into(), 314)
+            .record(id, 0, ChainId::Btc, "txid-any".into(), 314)
             .await
             .expect("record");
         // First-write-wins survives the delegate.
         store
-            .record(id, 0, "txid-other".into(), 999)
+            .record(id, 0, ChainId::Btc, "txid-other".into(), 999)
             .await
             .expect("re-record");
         let got = store.get(&id, 0).await.expect("get").expect("present");
@@ -396,7 +425,9 @@ mod tests {
             .await
             .expect("connect sql");
         assert_eq!(sql.get(&id, 0).await.expect("get"), None);
-        sql.record(id, 0, "s".into(), 7).await.expect("record sql");
+        sql.record(id, 0, ChainId::Btc, "s".into(), 7)
+            .await
+            .expect("record sql");
         assert_eq!(
             sql.get(&id, 0)
                 .await
@@ -419,11 +450,11 @@ mod tests {
         let id = b256!("0000000000000000000000000000000000000000000000000000000000000aa1");
 
         store
-            .record(id, 0, "txid-leg0".into(), 100)
+            .record(id, 0, ChainId::Btc, "txid-leg0".into(), 100)
             .await
             .expect("leg 0");
         store
-            .record(id, 1, "txid-leg1".into(), 200)
+            .record(id, 1, ChainId::Btc, "txid-leg1".into(), 200)
             .await
             .expect("leg 1");
 
@@ -436,7 +467,7 @@ mod tests {
 
         // Per-leg first-write-wins: re-record leg 0, leg 1 untouched.
         store
-            .record(id, 0, "txid-leg0-redo".into(), 999)
+            .record(id, 0, ChainId::Btc, "txid-leg0-redo".into(), 999)
             .await
             .expect("re-leg0");
         let leg0_again = store.get(&id, 0).await.expect("get").expect("present");
@@ -457,11 +488,11 @@ mod tests {
         let id = b256!("0000000000000000000000000000000000000000000000000000000000000aa2");
 
         store
-            .record(id, 0, "txid-leg0".into(), 100)
+            .record(id, 0, ChainId::Btc, "txid-leg0".into(), 100)
             .await
             .expect("leg 0");
         store
-            .record(id, 1, "txid-leg1".into(), 200)
+            .record(id, 1, ChainId::Btc, "txid-leg1".into(), 200)
             .await
             .expect("leg 1");
 
@@ -474,7 +505,7 @@ mod tests {
 
         // Per-leg first-write-wins under SQLite's INSERT OR IGNORE.
         store
-            .record(id, 0, "txid-leg0-redo".into(), 999)
+            .record(id, 0, ChainId::Btc, "txid-leg0-redo".into(), 999)
             .await
             .expect("re-leg0");
         let leg0_again = store.get(&id, 0).await.expect("get").expect("present");
