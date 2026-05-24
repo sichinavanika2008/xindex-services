@@ -21,7 +21,7 @@
 //! - [`PassThroughPolicy`] — for local Anvil testing ONLY. Always
 //!   succeeds; emits a `WARN` log so accidentally enabling it in
 //!   production is loud rather than silent.
-//! - [`ThorBtcPolicy`] — production. Hits `THORChain` RPC + a Bitcoin
+//! - [`ThorUtxoPolicy`] — production. Hits `THORChain` RPC + a Bitcoin
 //!   client; both must agree before [`CrossCheck::verify`] returns Ok.
 //!
 //! Tests use a hand-rolled in-memory mock to exercise the success path,
@@ -105,7 +105,7 @@ impl CrossCheck for PassThroughPolicy {
 /// same address.
 ///
 /// Holds owned clones of both clients; both must outlive the policy.
-pub struct ThorBtcPolicy<C: UtxoChainClient + Send + Sync> {
+pub struct ThorUtxoPolicy<C: UtxoChainClient + Send + Sync> {
     thor: ThorClient,
     btc: C,
     btc_multisig_address: Address,
@@ -119,9 +119,9 @@ pub struct ThorBtcPolicy<C: UtxoChainClient + Send + Sync> {
     tolerance_sats: u64,
 }
 
-impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorBtcPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorUtxoPolicy<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ThorBtcPolicy")
+        f.debug_struct("ThorUtxoPolicy")
             .field("btc_multisig_address", &self.btc_multisig_address)
             .field("min_confirmations", &self.min_confirmations)
             .field("tolerance_sats", &self.tolerance_sats)
@@ -129,7 +129,7 @@ impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorBtcPolicy<C> {
     }
 }
 
-impl<C: UtxoChainClient + Send + Sync> ThorBtcPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
     /// Construct a production policy.
     ///
     /// `btc_multisig_address` MUST be parsed for the same network the
@@ -159,7 +159,7 @@ impl<C: UtxoChainClient + Send + Sync> ThorBtcPolicy<C> {
 }
 
 #[async_trait]
-impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorBtcPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorUtxoPolicy<C> {
     async fn verify(
         &self,
         thor_inbound_tx_hash: &str,
@@ -235,7 +235,7 @@ impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorBtcPolicy<C> {
 /// API, regardless of the asset's native decimals. USDT on-chain is
 /// 1e6. Converting a `THORChain` ETH.USDT figure to the on-chain ERC20
 /// value divides by this factor (1e8 / 1e6 = 100). The mint-side
-/// `ThorBtcPolicy` never needed this because BTC is 1e8 BOTH sides
+/// `ThorUtxoPolicy` never needed this because BTC is 1e8 BOTH sides
 /// (coincidentally aligned). For USDT they differ — handled explicitly
 /// below, with the ON-CHAIN observed value treated as authoritative for
 /// the attestation (the `THORChain` figure is only a scaled cross-check),
@@ -405,8 +405,8 @@ fn eth_addr_lc(a: EthAddress) -> String {
 
 /// Production delivery policy: `THORChain` swapped BTC→USDT and the
 /// USDT actually landed at the `IndexToken` contract (R1). Two
-/// independent observations, like the mint-side `ThorBtcPolicy`.
-pub struct ThorBtcToUsdtPolicy<E: Erc20ArrivalClient> {
+/// independent observations, like the mint-side `ThorUtxoPolicy`.
+pub struct ThorUtxoToUsdtPolicy<E: Erc20ArrivalClient> {
     thor: ThorClient,
     erc20: E,
     /// Mainnet USDT ERC20 address.
@@ -416,9 +416,9 @@ pub struct ThorBtcToUsdtPolicy<E: Erc20ArrivalClient> {
     tolerance_1e6: u128,
 }
 
-impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorBtcToUsdtPolicy<E> {
+impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorUtxoToUsdtPolicy<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ThorBtcToUsdtPolicy")
+        f.debug_struct("ThorUtxoToUsdtPolicy")
             .field("usdt_token", &self.usdt_token)
             .field("min_confirmations", &self.min_confirmations)
             .field("tolerance_1e6", &self.tolerance_1e6)
@@ -426,7 +426,7 @@ impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorBtcToUsdtPolicy<E> {
     }
 }
 
-impl<E: Erc20ArrivalClient> ThorBtcToUsdtPolicy<E> {
+impl<E: Erc20ArrivalClient> ThorUtxoToUsdtPolicy<E> {
     #[must_use]
     pub fn new(
         thor: ThorClient,
@@ -446,7 +446,7 @@ impl<E: Erc20ArrivalClient> ThorBtcToUsdtPolicy<E> {
 }
 
 #[async_trait]
-impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorBtcToUsdtPolicy<E> {
+impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorUtxoToUsdtPolicy<E> {
     async fn verify(
         &self,
         btc_txid: &str,
@@ -523,7 +523,7 @@ impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorBtcToUsdtPolicy<E> {
 /// Production refund policy: `THORChain` slip-refunded the BTC to our
 /// multisig (`REFUND:<txid>` outbound) and the UTXO actually returned.
 /// Disambiguated ONLY by the `REFUND:` memo — never by time.
-pub struct ThorBtcRefundPolicy<C: UtxoChainClient + Send + Sync> {
+pub struct ThorUtxoRefundPolicy<C: UtxoChainClient + Send + Sync> {
     thor: ThorClient,
     btc: C,
     btc_multisig_address: Address,
@@ -531,9 +531,9 @@ pub struct ThorBtcRefundPolicy<C: UtxoChainClient + Send + Sync> {
     tolerance_sats: u64,
 }
 
-impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorBtcRefundPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorUtxoRefundPolicy<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ThorBtcRefundPolicy")
+        f.debug_struct("ThorUtxoRefundPolicy")
             .field("btc_multisig_address", &self.btc_multisig_address)
             .field("min_confirmations", &self.min_confirmations)
             .field("tolerance_sats", &self.tolerance_sats)
@@ -541,7 +541,7 @@ impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorBtcRefundPolicy<C
     }
 }
 
-impl<C: UtxoChainClient + Send + Sync> ThorBtcRefundPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> ThorUtxoRefundPolicy<C> {
     #[must_use]
     pub fn new(
         thor: ThorClient,
@@ -561,7 +561,7 @@ impl<C: UtxoChainClient + Send + Sync> ThorBtcRefundPolicy<C> {
 }
 
 #[async_trait]
-impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorBtcRefundPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy<C> {
     async fn verify(&self, btc_txid: &str) -> Result<u64, RefundCrossCheckError> {
         let resp = self.thor.tx_status(btc_txid).await?;
         if resp.observed_tx.status != "done" {
@@ -702,7 +702,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        let policy = ThorBtcPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
             .verify("abc", 100_000)
             .await
@@ -739,7 +739,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        let policy = ThorBtcPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         // Claim is 100_000 sats but `THORChain` says 50_000 → mismatch.
         let err = policy
             .verify("abc", 100_000)
@@ -787,7 +787,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        let policy = ThorBtcPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
             .verify("abc", 100_000)
             .await
@@ -831,7 +831,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        let policy = ThorBtcPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
             .verify("abc", 100_000)
             .await
@@ -865,7 +865,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        let policy = ThorBtcPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
             .verify("abc", 100_000)
             .await
@@ -913,7 +913,7 @@ mod tests {
             confirmations: 6,
             block_hash: None,
         });
-        let policy = ThorBtcPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         policy.verify("abc", 100_000).await.expect("should pass");
     }
 
@@ -1020,7 +1020,7 @@ mod tests {
             value: 70_000_000,
             confirmations: 6,
         }); // 70 USDT 1e6
-        let policy = ThorBtcToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0);
         let attested = policy.verify("btc-in", idx_token()).await.expect("ok");
         assert_eq!(attested, 70_000_000, "attest the on-chain 1e6 value");
     }
@@ -1046,7 +1046,7 @@ mod tests {
             .mount(&server)
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-        let policy = ThorBtcToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
         let err = policy
             .verify("btc-in", idx_token())
             .await
@@ -1087,7 +1087,7 @@ mod tests {
             confirmations: 6,
             block_hash: None,
         });
-        let policy = ThorBtcRefundPolicy::new(thor, btc, test_address(), 1, 0);
+        let policy = ThorUtxoRefundPolicy::new(thor, btc, test_address(), 1, 0);
         let attested = policy.verify("btc-in").await.expect("ok");
         assert_eq!(attested, 99_990_000, "attest the on-chain UTXO sats");
     }
@@ -1113,7 +1113,7 @@ mod tests {
             .mount(&server)
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-        let policy = ThorBtcRefundPolicy::new(thor, StubBtc::default(), test_address(), 1, 0);
+        let policy = ThorUtxoRefundPolicy::new(thor, StubBtc::default(), test_address(), 1, 0);
         let err = policy
             .verify("btc-in")
             .await
@@ -1147,7 +1147,7 @@ mod tests {
             .mount(&server)
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-        let policy = ThorBtcToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
         let err = policy
             .verify("btc-in", idx_token())
             .await
@@ -1182,7 +1182,7 @@ mod tests {
             .mount(&server)
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-        let policy = ThorBtcToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
         let err = policy
             .verify("btc-in", idx_token())
             .await
@@ -1230,7 +1230,7 @@ mod tests {
             value: 70_000_000,
             confirmations: 6,
         });
-        let policy = ThorBtcToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0);
         let attested = policy
             .verify("btc-in", idx_token())
             .await
@@ -1281,7 +1281,7 @@ mod tests {
             confirmations: 6,
             block_hash: None,
         });
-        let policy = ThorBtcRefundPolicy::new(thor, btc, test_address(), 1, 0);
+        let policy = ThorUtxoRefundPolicy::new(thor, btc, test_address(), 1, 0);
         let attested = policy
             .verify("btc-in")
             .await
@@ -1330,7 +1330,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-            let policy = ThorBtcRefundPolicy::new(thor, StubBtc::default(), test_address(), 1, 0);
+            let policy = ThorUtxoRefundPolicy::new(thor, StubBtc::default(), test_address(), 1, 0);
             let err = policy
                 .verify("btc-in")
                 .await
@@ -1378,7 +1378,7 @@ mod tests {
             confirmations: 6,
             block_hash: None,
         });
-        let policy = ThorBtcRefundPolicy::new(thor, btc, test_address(), 1, 5);
+        let policy = ThorUtxoRefundPolicy::new(thor, btc, test_address(), 1, 5);
         let err = policy
             .verify("btc-in")
             .await

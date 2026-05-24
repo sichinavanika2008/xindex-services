@@ -33,7 +33,7 @@ use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::EsploraClient;
 use xindex_shared::eip712::{attestation, attestation_oracle_domain};
-use xindex_signer::crosscheck::{CrossCheck, PassThroughPolicy, ThorBtcPolicy};
+use xindex_signer::crosscheck::{CrossCheck, PassThroughPolicy, ThorUtxoPolicy};
 use xindex_signer::remote::{AnyHsmBackend, RemoteHsmBackend};
 use xindex_signer::{aggregate_signatures, SoftwareSigner};
 
@@ -297,7 +297,7 @@ async fn run(args: Args) -> Result<()> {
     //
     // **Phase 3 hazard**: when ETH.ETH or any second native chain ships,
     // the array will have multiple entries in different units (sats vs
-    // wei vs uatom...). The current `ThorBtcPolicy` cross-check is
+    // wei vs uatom...). The current `ThorUtxoPolicy` cross-check is
     // BTC-specific. A naive multi-slot loop would happily attest the
     // wrong slot under the wrong policy. We REJECT multi-slot intents
     // here as a hard guard — Phase 3 must refactor this to per-slot
@@ -482,7 +482,7 @@ fn build_cross_check(args: &Args) -> Result<Arc<dyn CrossCheck>> {
             let thor =
                 ThorClient::with_base_url(thor_url.to_string()).context("build ThorClient")?;
             let btc = EsploraClient::with_url(network, esplora_url);
-            let policy = ThorBtcPolicy::new(
+            let policy = ThorUtxoPolicy::new(
                 thor,
                 btc,
                 multisig,

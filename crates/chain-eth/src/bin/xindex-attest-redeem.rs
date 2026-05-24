@@ -43,7 +43,7 @@ use xindex_shared::eip712::{
 use xindex_shared::redemption_dispatch::{AnyRedemptionDispatch, RedemptionDispatchStore};
 use xindex_signer::crosscheck::{
     PassThroughRedemption, PassThroughRefund, RedemptionCrossCheck, RedemptionCrossCheckError,
-    RefundCrossCheck, ThorBtcRefundPolicy, ThorBtcToUsdtPolicy,
+    RefundCrossCheck, ThorUtxoRefundPolicy, ThorUtxoToUsdtPolicy,
 };
 use xindex_signer::remote::{AnyHsmBackend, RemoteHsmBackend};
 use xindex_signer::{aggregate_redemption_signatures, aggregate_refund_signatures, SoftwareSigner};
@@ -234,14 +234,14 @@ fn build_cross_checks(
 
             let thor = ThorClient::with_base_url(thor_url.to_string()).context("ThorClient")?;
             let erc20 = RpcErc20LogClient::new(http, args.eth_lookback_blocks);
-            let delivery = ThorBtcToUsdtPolicy::new(
+            let delivery = ThorUtxoToUsdtPolicy::new(
                 thor.clone(),
                 erc20,
                 usdt,
                 args.eth_min_confirmations,
                 args.usdt_tolerance_1e6,
             );
-            let refund = ThorBtcRefundPolicy::new(
+            let refund = ThorUtxoRefundPolicy::new(
                 thor,
                 EsploraClient::with_url(net, esplora),
                 multisig,

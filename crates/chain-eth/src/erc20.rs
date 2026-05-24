@@ -9,7 +9,7 @@
 //! is the concrete client wired by the binary.
 //!
 //! `transfers_to` is SYNC (mirrors `chain-btc`'s `UtxoChainClient` /
-//! `find_arrival`, which the async `ThorBtcPolicy` already calls into).
+//! `find_arrival`, which the async `ThorUtxoPolicy` already calls into).
 //! Same accepted trade-off: a blocking JSON-RPC call inside the
 //! low-frequency signer path. Uses `reqwest::blocking` rather than
 //! pulling a full async provider through the sync boundary.
