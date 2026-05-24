@@ -19,6 +19,9 @@ tracing.workspace = true
 # (this crate) re-references them so callers can switch chains by passing
 # a `ChainId` rather than re-deriving the constants here.
 xindex-shared.workspace = true
+# U6 per-chain address codecs.
+bech32.workspace = true
+bitcoincash-addr.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

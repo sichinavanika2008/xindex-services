@@ -17,11 +17,16 @@
 //! constants live in [`params`]; per-chain address codecs in U6.
 
 pub mod client;
+pub mod codec;
 pub mod params;
 pub mod types;
 pub mod watcher;
 
 pub use client::{EsploraClient, UtxoChainClient, UtxoError};
+pub use codec::{
+    codec_for_mainnet, BchCodec, BtcCodec, CodecError, DogeCodec, LtcCodec, UtxoAddressCodec,
+    ZecCodec,
+};
 pub use params::{ScriptKind, UtxoParams};
 pub use types::{UtxoEntry, UtxoTxStatus};
 pub use watcher::find_arrival;

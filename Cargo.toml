@@ -50,6 +50,15 @@ bitcoin = { version = "0.32", default-features = false, features = ["std", "secp
 miniscript = { version = "12", default-features = false, features = ["std"] }
 bdk_esplora = { version = "0.20", default-features = false, features = ["blocking", "std"] }
 bdk_wallet = { version = "1", default-features = false, features = ["std"] }
+# Per-chain address codecs (Phase 3.1 U6):
+# - bech32: LTC hand-rolled bech32 with "ltc" HRP. Already transitive
+#   via bitcoin; promoted to an explicit dep so chain-utxo can use it
+#   without the bitcoin re-export.
+# - bitcoincash-addr: BCH CashAddr (`bitcoincash:`-prefixed base32).
+#   Pinned to the v0.5 lineage per plan §"Architecture". Pure-Rust,
+#   MIT-licensed, no native deps.
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
+bitcoincash-addr = "0.5"
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
 xindex-chain-eth = { path = "crates/chain-eth" }
