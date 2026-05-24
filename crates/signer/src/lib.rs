@@ -13,13 +13,17 @@
 //!   before signing. The signer's #1 trust surface; never sign without it.
 
 pub mod crosscheck;
+pub mod remote;
 
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync;
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::Eip712Domain;
 use thiserror::Error;
-use xindex_shared::eip712::{attestation_signing_hash, Attestation};
+use xindex_shared::eip712::{
+    attestation_signing_hash, redemption_attestation_signing_hash, refund_attestation_signing_hash,
+    AsyncLegDeliveryAttestation, AsyncLegRefundAttestation, Attestation,
+};
 
 /// Errors surfaced by signer operations. Concrete enough that callers
 /// can distinguish "wrong key for this signer" from "transport failure"
@@ -56,6 +60,51 @@ pub trait HsmBackend {
     /// Returns [`SignerError::Backend`] if the backend rejects the
     /// signing request (locked HSM, transport failure, etc.).
     fn sign_digest(&self, digest: B256) -> Result<[u8; 65], SignerError>;
+
+    /// Sign a typed mint [`Attestation`]. Default impl computes the
+    /// EIP-712 digest locally and delegates to [`Self::sign_digest`].
+    /// Remote/daemon backends override this to send the typed payload
+    /// to the daemon's `/api/v1/sign/eip712-attestation` endpoint —
+    /// the daemon computes the digest itself (PART 5 / DL-M5-3: the
+    /// daemon never trusts a coordinator-supplied digest).
+    ///
+    /// # Errors
+    /// Forwards any [`SignerError`] from the underlying backend.
+    fn sign_attestation_msg(
+        &self,
+        domain: &Eip712Domain,
+        attestation: &Attestation,
+    ) -> Result<[u8; 65], SignerError> {
+        self.sign_digest(attestation_signing_hash(attestation, domain))
+    }
+
+    /// Sign a typed per-leg [`AsyncLegDeliveryAttestation`] (burn → USDT
+    /// delivery for one leg of a multi-leg redemption). Default impl =
+    /// digest-then-`sign_digest`; remote daemons override.
+    ///
+    /// # Errors
+    /// Forwards any [`SignerError`].
+    fn sign_redemption_attestation_msg(
+        &self,
+        domain: &Eip712Domain,
+        attestation: &AsyncLegDeliveryAttestation,
+    ) -> Result<[u8; 65], SignerError> {
+        self.sign_digest(redemption_attestation_signing_hash(attestation, domain))
+    }
+
+    /// Sign a typed per-leg [`AsyncLegRefundAttestation`] (burn → native
+    /// asset refund for one leg of a multi-leg redemption). Default impl
+    /// = digest-then-`sign_digest`; remote daemons override.
+    ///
+    /// # Errors
+    /// Forwards any [`SignerError`].
+    fn sign_refund_attestation_msg(
+        &self,
+        domain: &Eip712Domain,
+        attestation: &AsyncLegRefundAttestation,
+    ) -> Result<[u8; 65], SignerError> {
+        self.sign_digest(refund_attestation_signing_hash(attestation, domain))
+    }
 }
 
 /// Software-backed [`HsmBackend`] holding a raw secp256k1 private key in
@@ -138,8 +187,10 @@ pub fn sign_attestation<H: HsmBackend>(
     domain: &Eip712Domain,
     attestation: &Attestation,
 ) -> Result<[u8; 65], SignerError> {
-    let digest = attestation_signing_hash(attestation, domain);
-    backend.sign_digest(digest)
+    // Delegates to the trait method so remote/daemon backends can
+    // override to send the typed payload over HTTP. Software backends
+    // keep the digest-then-sign default.
+    backend.sign_attestation_msg(domain, attestation)
 }
 
 /// Aggregates signatures from N backends, returning the
@@ -162,11 +213,76 @@ pub fn aggregate_signatures<H: HsmBackend>(
     Ok(sigs)
 }
 
+/// Sign a per-leg `AsyncLegDeliveryAttestation` (burn → USDT delivery
+/// for one leg). Separate typehash ⇒ a mint signature can never satisfy
+/// `attestRedemption`.
+///
+/// # Errors
+/// Forwards any [`SignerError`] from the backend.
+pub fn sign_redemption_attestation<H: HsmBackend>(
+    backend: &H,
+    domain: &Eip712Domain,
+    attestation: &AsyncLegDeliveryAttestation,
+) -> Result<[u8; 65], SignerError> {
+    backend.sign_redemption_attestation_msg(domain, attestation)
+}
+
+/// Aggregate k-of-n signatures for an `AsyncLegDeliveryAttestation` →
+/// `AttestationOracle.attestRedemption`'s `signatures: bytes[]`.
+///
+/// # Errors
+/// Forwards the first [`SignerError`]; stops on first failure.
+pub fn aggregate_redemption_signatures<H: HsmBackend>(
+    backends: &[&H],
+    domain: &Eip712Domain,
+    attestation: &AsyncLegDeliveryAttestation,
+) -> Result<Vec<Vec<u8>>, SignerError> {
+    let mut sigs = Vec::with_capacity(backends.len());
+    for b in backends {
+        sigs.push(sign_redemption_attestation(*b, domain, attestation)?.to_vec());
+    }
+    Ok(sigs)
+}
+
+/// Sign a per-leg `AsyncLegRefundAttestation` (burn → native asset
+/// refund for one leg). Third separate typehash; mutually exclusive with
+/// the delivery path on-chain (per-leg mutex).
+///
+/// # Errors
+/// Forwards any [`SignerError`] from the backend.
+pub fn sign_refund_attestation<H: HsmBackend>(
+    backend: &H,
+    domain: &Eip712Domain,
+    attestation: &AsyncLegRefundAttestation,
+) -> Result<[u8; 65], SignerError> {
+    backend.sign_refund_attestation_msg(domain, attestation)
+}
+
+/// Aggregate k-of-n signatures for an `AsyncLegRefundAttestation` →
+/// `AttestationOracle.attestRefund`'s `signatures: bytes[]`.
+///
+/// # Errors
+/// Forwards the first [`SignerError`]; stops on first failure.
+pub fn aggregate_refund_signatures<H: HsmBackend>(
+    backends: &[&H],
+    domain: &Eip712Domain,
+    attestation: &AsyncLegRefundAttestation,
+) -> Result<Vec<Vec<u8>>, SignerError> {
+    let mut sigs = Vec::with_capacity(backends.len());
+    for b in backends {
+        sigs.push(sign_refund_attestation(*b, domain, attestation)?.to_vec());
+    }
+    Ok(sigs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::{PrimitiveSignature, U256};
-    use xindex_shared::eip712::{attestation, attestation_oracle_domain};
+    use xindex_shared::eip712::{
+        attestation, attestation_oracle_domain, redemption_attestation,
+        redemption_attestation_signing_hash, refund_attestation, refund_attestation_signing_hash,
+    };
 
     /// Anvil's first deterministic private key (account 0).
     const ANVIL_KEY_0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -220,6 +336,38 @@ mod tests {
         );
     }
 
+    /// `sign_attestation` produces a 65-byte signature that recovers
+    /// back to the signer's own address — closes the mutation-testing
+    /// gap where `Ok([0; 65])` (a zero-signature stub) passed all
+    /// existing tests because length and 65-byte checks don't validate
+    /// signature correctness. Without this test, a bug in the digest
+    /// computation (wrong domain separator, swapped fields) would slip
+    /// through every other unit test.
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test code: panic on bad fixture is fine"
+    )]
+    fn sign_attestation_recovers_to_signer_address() {
+        let s = SoftwareSigner::from_hex(ANVIL_KEY_0).expect("valid Anvil key");
+        let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
+        let a = attestation(
+            B256::repeat_byte(0xcd),
+            U256::from(0u8),
+            U256::from(1_000_000u32),
+        );
+
+        let sig_bytes = sign_attestation(&s, &domain, &a).expect("sign_attestation");
+        let digest = attestation_signing_hash(&a, &domain);
+        let sig = PrimitiveSignature::try_from(sig_bytes.as_slice()).expect("65-byte sig");
+        let recovered = sig.recover_address_from_prehash(&digest).expect("recover");
+        assert_eq!(
+            recovered,
+            s.signer_address(),
+            "sign_attestation output must recover to the signer address"
+        );
+    }
+
     /// `aggregate_signatures` produces N 65-byte payloads in input order.
     /// The on-chain `attest` loop iterates the array and checks each is
     /// 65 bytes (`AttestationOracle.sol:113`); anything else reverts.
@@ -245,6 +393,132 @@ mod tests {
         assert_eq!(sigs.len(), 2);
         for (i, sig) in sigs.iter().enumerate() {
             assert_eq!(sig.len(), 65, "signature {i} must be 65 bytes");
+        }
+    }
+
+    const ANVIL_KEY_1: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+    /// `sign_redemption_attestation` must recover to the signer address
+    /// under the SEPARATE redemption typehash digest — closes the
+    /// mutation gap where `Ok([0;65])`/`Ok([1;65])` passed (length-only
+    /// checks don't validate correctness) and proves the redemption
+    /// digest (domain + typehash + fields) is wired correctly so the
+    /// on-chain `attestRedemption` `_isSigner` lookup will match.
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test code: panic on bad fixture is fine"
+    )]
+    fn sign_redemption_attestation_recovers_to_signer_address() {
+        let s = SoftwareSigner::from_hex(ANVIL_KEY_0).expect("valid Anvil key");
+        let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
+        let a = redemption_attestation(
+            B256::repeat_byte(0xcd),
+            U256::ZERO,
+            B256::repeat_byte(0xa1),
+            U256::from(1_000_000u32),
+        );
+
+        let sig_bytes = sign_redemption_attestation(&s, &domain, &a).expect("sign");
+        let digest = redemption_attestation_signing_hash(&a, &domain);
+        let sig = PrimitiveSignature::try_from(sig_bytes.as_slice()).expect("65-byte sig");
+        let recovered = sig.recover_address_from_prehash(&digest).expect("recover");
+        assert_eq!(recovered, s.signer_address());
+    }
+
+    /// Same closure for the refund leg (third typehash). A delivery
+    /// signature must not satisfy this digest and vice-versa; the
+    /// recovery proves the refund digest is independently correct.
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test code: panic on bad fixture is fine"
+    )]
+    fn sign_refund_attestation_recovers_to_signer_address() {
+        let s = SoftwareSigner::from_hex(ANVIL_KEY_0).expect("valid Anvil key");
+        let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
+        let a = refund_attestation(
+            B256::repeat_byte(0xef),
+            U256::ZERO,
+            B256::repeat_byte(0xa1),
+            U256::from(99_999u32),
+        );
+
+        let sig_bytes = sign_refund_attestation(&s, &domain, &a).expect("sign");
+        let digest = refund_attestation_signing_hash(&a, &domain);
+        let sig = PrimitiveSignature::try_from(sig_bytes.as_slice()).expect("65-byte sig");
+        let recovered = sig.recover_address_from_prehash(&digest).expect("recover");
+        assert_eq!(recovered, s.signer_address());
+
+        // Cross-typehash negative: a redemption signature over the same
+        // ids must NOT recover to the signer under the refund digest.
+        let r = redemption_attestation(
+            B256::repeat_byte(0xef),
+            U256::ZERO,
+            B256::repeat_byte(0xa1),
+            U256::from(99_999u32),
+        );
+        let r_sig = sign_redemption_attestation(&s, &domain, &r).expect("sign");
+        let r_parsed = PrimitiveSignature::try_from(r_sig.as_slice()).expect("65-byte");
+        let r_recovered = r_parsed
+            .recover_address_from_prehash(&digest)
+            .expect("recover");
+        assert_ne!(
+            r_recovered,
+            s.signer_address(),
+            "redemption sig must not verify under the refund digest"
+        );
+    }
+
+    /// `aggregate_redemption_signatures` / `aggregate_refund_signatures`
+    /// produce N order-preserving signatures that each recover to the
+    /// matching signer — closes the `Ok(vec![..])` aggregation mutants
+    /// (empty / single / wrong-content stubs that length checks miss).
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test code: panic on bad fixture is fine"
+    )]
+    fn aggregate_redemption_and_refund_recover_in_order() {
+        let s0 = SoftwareSigner::from_hex(ANVIL_KEY_0).expect("k0");
+        let s1 = SoftwareSigner::from_hex(ANVIL_KEY_1).expect("k1");
+        let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
+        let backends: Vec<&SoftwareSigner> = vec![&s0, &s1];
+
+        let red = redemption_attestation(
+            B256::repeat_byte(0x11),
+            U256::ZERO,
+            B256::repeat_byte(0xa1),
+            U256::from(7u32),
+        );
+        let red_d = redemption_attestation_signing_hash(&red, &domain);
+        let red_sigs = aggregate_redemption_signatures(&backends, &domain, &red).expect("agg red");
+        assert_eq!(red_sigs.len(), 2);
+        for (i, b) in [&s0, &s1].iter().enumerate() {
+            let sig = PrimitiveSignature::try_from(red_sigs[i].as_slice()).expect("65");
+            assert_eq!(
+                sig.recover_address_from_prehash(&red_d).expect("rec"),
+                b.signer_address(),
+                "redemption sig {i} must recover to backend {i} (order preserved)"
+            );
+        }
+
+        let refu = refund_attestation(
+            B256::repeat_byte(0x22),
+            U256::ZERO,
+            B256::repeat_byte(0xa1),
+            U256::from(8u32),
+        );
+        let refu_d = refund_attestation_signing_hash(&refu, &domain);
+        let refu_sigs = aggregate_refund_signatures(&backends, &domain, &refu).expect("agg ref");
+        assert_eq!(refu_sigs.len(), 2);
+        for (i, b) in [&s0, &s1].iter().enumerate() {
+            let sig = PrimitiveSignature::try_from(refu_sigs[i].as_slice()).expect("65");
+            assert_eq!(
+                sig.recover_address_from_prehash(&refu_d).expect("rec"),
+                b.signer_address(),
+                "refund sig {i} must recover to backend {i} (order preserved)"
+            );
         }
     }
 }

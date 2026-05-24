@@ -20,6 +20,13 @@ async-trait = "0.1"
 bitcoin.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# RemoteHsmBackend talks HTTP to the signer-daemon. `HsmBackend` is a
+# sync trait (the on-chain attestation flow is a low-frequency,
+# blocking-friendly path), so we use `reqwest::blocking` here — same
+# pattern as `chain-eth::erc20::RpcErc20LogClient`.
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

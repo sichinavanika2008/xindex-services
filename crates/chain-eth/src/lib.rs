@@ -8,3 +8,8 @@
 //! See workspace plan §15–§16 for the full milestone path.
 
 pub mod bindings;
+pub mod erc20;
+pub mod rpc;
+
+pub use erc20::RpcErc20LogClient;
+pub use rpc::{backoff, is_transient_rpc_error, ConnectAttempt, EndpointError, WsEndpointList};

@@ -13,11 +13,29 @@ workspace = true
 xindex-shared.workspace = true
 xindex-chain-eth.workspace = true
 xindex-chain-btc.workspace = true
+xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
 bitcoin.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+sqlx.workspace = true
+# RemoteMultisigCosigner posts PSBTs over HTTP to the signer-daemon.
+# `MultisigCosigner` is a sync trait, so use `reqwest::blocking`
+# — same pattern as `crates/signer`'s `RemoteHsmBackend`.
+reqwest = { workspace = true, features = ["blocking"] }
+base64 = "0.22"
+
+[dev-dependencies]
+wiremock.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "xindex-redeem"
+path = "src/bin/xindex-redeem.rs"

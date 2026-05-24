@@ -6,10 +6,18 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use reqwest::Client;
 use thiserror::Error;
 
 use crate::types::{InboundAddress, OutboundEntry, Pool, TxResponse};
+
+/// Maximum response body size accepted from `THORNode` (16 MiB). A
+/// well-behaved `THORNode` response is well under 1 MiB; the 16 MiB cap
+/// bounds memory exhaustion if a compromised or malicious upstream
+/// streams a large body. Hits before deserialize, so a hostile JSON
+/// stream can't OOM the daemon under cover of valid syntax.
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Errors surfaced by `THORNode` RPC calls.
 #[derive(Debug, Error)]
@@ -20,6 +28,10 @@ pub enum ThorError {
     /// `THORNode` returned a non-2xx status.
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
+    /// Response body exceeded [`MAX_RESPONSE_BODY_BYTES`]. Fail loud
+    /// rather than silently truncate or OOM.
+    #[error("response too large: > {limit} bytes")]
+    ResponseTooLarge { limit: usize },
     /// Successful response that didn't deserialize.
     #[error("decode error: {0}")]
     Decode(String),
@@ -69,14 +81,15 @@ impl ThorClient {
     }
 
     /// Override the default 10-second request timeout.
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        // Rebuild the client with the new timeout. If construction fails we
-        // fall back to the previous client (caller can verify via a probe call).
-        if let Ok(http) = Client::builder().timeout(timeout).build() {
-            self.http = http;
-        }
-        self
+    ///
+    /// # Errors
+    /// Returns [`ThorError::Transport`] if the underlying reqwest client
+    /// cannot be rebuilt (typically TLS configuration failures). Caller
+    /// must propagate — silent fallback would leave the previous timeout
+    /// in place with no signal.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, ThorError> {
+        self.http = Client::builder().timeout(timeout).build()?;
+        Ok(self)
     }
 
     /// `GET /thorchain/inbound_addresses` — current Asgard vault addresses
@@ -133,16 +146,37 @@ impl ThorClient {
         tracing::debug!(url = %url, "thornode GET");
         let resp = self.http.get(&url).send().await?;
         let status = resp.status();
+        let body = read_body_capped(resp).await?;
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(ThorError::Http {
                 status: status.as_u16(),
                 body,
             });
         }
-        let body = resp.text().await?;
         serde_json::from_str(&body).map_err(|e| ThorError::Decode(e.to_string()))
     }
+}
+
+/// Read the response body into a `String`, refusing anything larger than
+/// [`MAX_RESPONSE_BODY_BYTES`]. Streams chunk-by-chunk so an oversized
+/// body bails before fully buffering. Used by both the success and
+/// error paths so a malicious 503 with a 1 GB body can't OOM us either.
+///
+/// On chunk-read failure, surfaces the underlying [`reqwest::Error`] —
+/// preserves context that the prior `unwrap_or_default()` swallowed.
+async fn read_body_capped(resp: reqwest::Response) -> Result<String, ThorError> {
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
+            return Err(ThorError::ResponseTooLarge {
+                limit: MAX_RESPONSE_BODY_BYTES,
+            });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|e| ThorError::Decode(format!("non-utf8 body: {e}")))
 }
 
 #[cfg(test)]

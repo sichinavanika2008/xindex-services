@@ -36,7 +36,16 @@ pub enum SignError {
     Finalize(String),
     #[error("psbt extraction failed: {0}")]
     Extract(String),
+    /// `OP_RETURN` memo exceeds the 80-byte standard null-data relay
+    /// limit. `THORChain` swap memos (`=:ETH.USDT:0x<40>:<dec>` ≈ 60–70 B)
+    /// fit comfortably; a longer memo would be non-standard and rejected
+    /// by relay policy, so we fail closed before broadcasting.
+    #[error("op_return memo {0} bytes exceeds 80-byte standard limit")]
+    MemoTooLong(usize),
 }
+
+/// Standard-relay maximum for an `OP_RETURN` data push.
+pub const MAX_OP_RETURN_BYTES: usize = 80;
 
 /// One UTXO this multisig holds; passed to [`build_spending_psbt`] as
 /// input descriptors.
@@ -60,17 +69,26 @@ pub struct MultisigUtxo {
 /// UTXO ≈ user's redemption amount; any change goes back to the
 /// multisig).
 ///
+/// `op_return`: optional null-data memo. The burn → USDT reverse flow
+/// passes the `THORChain` swap memo (`=:ETH.USDT:<indexToken>:<minOut>`)
+/// here so the Asgard deposit carries it. Output order is
+/// `[recipient, OP_RETURN?, change?]` — the vault output is `vout[0]`
+/// (`THORChain` matches the inbound by the vault address, reads the memo
+/// from the `OP_RETURN`). Input order is preserved: `vin[0]` is
+/// `inputs[0]`, which the executor guarantees is a multisig UTXO so
+/// `THORChain` resolves any slip-refund back to our multisig.
+///
 /// # Errors
-/// Returns [`SignError::Sighash`] if the underlying transaction
-/// construction rejects the input shape (currently only happens on
-/// version / locktime mismatches; we use the canonical Bitcoin
-/// transaction `Version::TWO`).
+/// [`SignError::MemoTooLong`] if `op_return` exceeds
+/// [`MAX_OP_RETURN_BYTES`]; [`SignError::Sighash`] if transaction
+/// construction rejects the input shape (version / locktime).
 pub fn build_spending_psbt(
     inputs: &[MultisigUtxo],
     recipient: &Address,
     recipient_value: Amount,
     change_to: Option<&Address>,
     change_value: Amount,
+    op_return: Option<&[u8]>,
 ) -> Result<Psbt, SignError> {
     let mut tx_inputs = Vec::with_capacity(inputs.len());
     for utxo in inputs {
@@ -86,6 +104,17 @@ pub fn build_spending_psbt(
         value: recipient_value,
         script_pubkey: recipient.script_pubkey(),
     }];
+    if let Some(memo) = op_return {
+        if memo.len() > MAX_OP_RETURN_BYTES {
+            return Err(SignError::MemoTooLong(memo.len()));
+        }
+        let push = bitcoin::script::PushBytesBuf::try_from(memo.to_vec())
+            .map_err(|_| SignError::MemoTooLong(memo.len()))?;
+        tx_outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(push),
+        });
+    }
     if let Some(change_addr) = change_to {
         if change_value > Amount::ZERO {
             tx_outputs.push(TxOut {
@@ -267,6 +296,7 @@ mod tests {
             Amount::from_sat(950_000),
             None,
             Amount::ZERO,
+            None,
         )
         .expect("build");
 
@@ -300,6 +330,7 @@ mod tests {
             Amount::from_sat(950_000),
             None,
             Amount::ZERO,
+            None,
         )
         .expect("build");
 
@@ -337,6 +368,7 @@ mod tests {
             Amount::from_sat(950_000),
             None,
             Amount::ZERO,
+            None,
         )
         .expect("build");
         assert!(matches!(

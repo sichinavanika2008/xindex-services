@@ -1,0 +1,40 @@
+[package]
+name = "xindex-signer-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xindex-shared.workspace = true
+xindex-multisig.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+async-trait = "0.1"
+sqlx.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# HTTP server + client (axum for the daemon endpoints; reqwest for the
+# outbound call to the locally-fronting Web3Signer instance).
+axum = { workspace = true, features = ["json"] }
+reqwest = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+# Bitcoin PSBT signing path (DL-M5-3 `psbt-input` endpoint).
+bitcoin.workspace = true
+base64 = "0.22"
+
+[dev-dependencies]
+wiremock.workspace = true
+tower = "0.5"
+# End-to-end loopback integration: spin up the real daemon + drive it
+# from the production coordinator clients (`RemoteHsmBackend`,
+# `RemoteMultisigCosigner`).
+xindex-signer.workspace = true
+xindex-executor.workspace = true
+alloy = { workspace = true }

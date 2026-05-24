@@ -1,16 +1,24 @@
 //! EIP-712 typed-data definitions mirroring `AttestationOracle.sol`.
 //!
 //! The on-chain `ATTESTATION_TYPEHASH` constant at
-//! `Xindex/src/AttestationOracle.sol:33` is:
+//! `Xindex/src/AttestationOracle.sol:32-33` is:
 //!
 //! ```solidity
 //! bytes32 public constant ATTESTATION_TYPEHASH =
 //!     keccak256("Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)");
 //! ```
 //!
-//! Off-chain signers MUST use the same string verbatim. The `#[test]`
-//! below asserts byte-equality at compile-test time so a future Solidity
-//! refactor that touches the typehash string fails the Rust suite loudly.
+//! Phase 3.0: the two redemption-side typehashes were generalized to
+//! per-leg shape (one redemption may span N async legs). Each leg's
+//! delivery and refund attestations are signed under a SEPARATE
+//! struct/typehash with `legIndex` + `assetId` fields baked into the
+//! typed-data payload — defeats leg-index/asset-id confusion across
+//! heterogeneous baskets without a runtime `kind` discriminator.
+//!
+//! Off-chain signers MUST use the same strings verbatim. The `#[test]`
+//! suite below asserts byte-equality at compile-test time so a future
+//! Solidity refactor that touches any typehash fails the Rust suite
+//! loudly.
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
@@ -28,7 +36,7 @@ sol! {
 }
 
 /// Verbatim type string used to derive the on-chain typehash. MUST match
-/// `AttestationOracle.sol:33` byte-for-byte. Trailing-newline-free.
+/// `AttestationOracle.sol:32-33` byte-for-byte. Trailing-newline-free.
 pub const ATTESTATION_TYPE_STRING: &[u8] =
     b"Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)";
 
@@ -72,6 +80,124 @@ pub fn attestation_signing_hash(attestation: &Attestation, domain: &Eip712Domain
     attestation.eip712_signing_hash(domain)
 }
 
+/* -------------------------------------------------------------------------- */
+/*       ASYNC-LEG DELIVERY ATTESTATION (burn → USDT, per-leg delivery)       */
+/* -------------------------------------------------------------------------- */
+
+sol! {
+    /// Per-leg redemption delivery attestation. A SEPARATE struct ⇒
+    /// SEPARATE typehash from {Attestation}: a mint signature can never
+    /// verify on the redemption path, with no runtime `kind` discriminator
+    /// to forget. Phase 3.0: the `legIndex` + `assetId` fields bind each
+    /// signature to a specific leg of a specific basket — defeats leg
+    /// confusion across heterogeneous baskets. Mirrors
+    /// `AttestationOracle.ASYNC_LEG_DELIVERY_TYPEHASH`.
+    struct AsyncLegDeliveryAttestation {
+        bytes32 redemptionId;
+        uint256 legIndex;
+        bytes32 assetId;
+        uint256 deliveredAmount;
+    }
+}
+
+/// Verbatim type string. MUST match `AttestationOracle.sol:39-42`.
+pub const ASYNC_LEG_DELIVERY_TYPE_STRING: &[u8] =
+    b"AsyncLegDeliveryAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredAmount)";
+
+/// `keccak256(ASYNC_LEG_DELIVERY_TYPE_STRING)` — equals
+/// `AttestationOracle.ASYNC_LEG_DELIVERY_TYPEHASH` on-chain.
+#[must_use]
+pub fn redemption_attestation_typehash() -> B256 {
+    keccak256(ASYNC_LEG_DELIVERY_TYPE_STRING)
+}
+
+/// Construct an `AsyncLegDeliveryAttestation` from raw fields.
+#[must_use]
+pub fn redemption_attestation(
+    redemption_id: B256,
+    leg_index: U256,
+    asset_id: B256,
+    delivered_amount: U256,
+) -> AsyncLegDeliveryAttestation {
+    AsyncLegDeliveryAttestation {
+        redemptionId: redemption_id,
+        legIndex: leg_index,
+        assetId: asset_id,
+        deliveredAmount: delivered_amount,
+    }
+}
+
+/// EIP-712 signing hash for an `AsyncLegDeliveryAttestation`. Reuses
+/// `attestation_oracle_domain` (the oracle's EIP-712 domain is shared
+/// across all three typehashes); the per-struct typehash provides the
+/// path separation. Equivalent to
+/// `AttestationOracle.redemptionAttestationHash(...)` on-chain.
+#[must_use]
+pub fn redemption_attestation_signing_hash(
+    attestation: &AsyncLegDeliveryAttestation,
+    domain: &Eip712Domain,
+) -> B256 {
+    attestation.eip712_signing_hash(domain)
+}
+
+/* -------------------------------------------------------------------------- */
+/*         ASYNC-LEG REFUND ATTESTATION (burn → USDT, per-leg refund)         */
+/* -------------------------------------------------------------------------- */
+
+sol! {
+    /// Per-leg refund attestation: signers proved `THORChain` returned the
+    /// native asset for THIS leg to our multisig (`REFUND:<inbound_txid>`
+    /// outbound) instead of delivering USDT. A THIRD separate struct /
+    /// typehash; mutually exclusive with {`AsyncLegDeliveryAttestation`}
+    /// at the on-chain queue (per-leg mutex). Mirrors
+    /// `AttestationOracle.ASYNC_LEG_REFUND_TYPEHASH`. The signers attest
+    /// the actual amount refunded (inbound − `THORChain` fee).
+    struct AsyncLegRefundAttestation {
+        bytes32 redemptionId;
+        uint256 legIndex;
+        bytes32 assetId;
+        uint256 refundedAmount;
+    }
+}
+
+/// Verbatim type string. MUST match `AttestationOracle.sol:47-50`.
+pub const ASYNC_LEG_REFUND_TYPE_STRING: &[u8] =
+    b"AsyncLegRefundAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 refundedAmount)";
+
+/// `keccak256(ASYNC_LEG_REFUND_TYPE_STRING)` — equals
+/// `AttestationOracle.ASYNC_LEG_REFUND_TYPEHASH` on-chain.
+#[must_use]
+pub fn refund_attestation_typehash() -> B256 {
+    keccak256(ASYNC_LEG_REFUND_TYPE_STRING)
+}
+
+/// Construct an `AsyncLegRefundAttestation` from raw fields.
+#[must_use]
+pub fn refund_attestation(
+    redemption_id: B256,
+    leg_index: U256,
+    asset_id: B256,
+    refunded_amount: U256,
+) -> AsyncLegRefundAttestation {
+    AsyncLegRefundAttestation {
+        redemptionId: redemption_id,
+        legIndex: leg_index,
+        assetId: asset_id,
+        refundedAmount: refunded_amount,
+    }
+}
+
+/// EIP-712 signing hash for an `AsyncLegRefundAttestation`. Reuses
+/// `attestation_oracle_domain`. Equivalent to
+/// `AttestationOracle.refundAttestationHash(...)` on-chain.
+#[must_use]
+pub fn refund_attestation_signing_hash(
+    attestation: &AsyncLegRefundAttestation,
+    domain: &Eip712Domain,
+) -> B256 {
+    attestation.eip712_signing_hash(domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,8 +210,6 @@ mod tests {
     /// the two paths would silently diverge — this test catches that.
     #[test]
     fn macro_derived_typehash_matches_constant() {
-        // The sol!-generated typehash. SolStruct trait exposes `eip712_root_type`
-        // (the verbatim type string) — keccak256 of it must equal our pinned const.
         let macro_typehash = keccak256(Attestation::eip712_root_type().as_bytes());
         assert_eq!(
             macro_typehash,
@@ -96,13 +220,6 @@ mod tests {
 
     /// Cross-implementation invariant: the typehash this crate computes
     /// MUST exactly match `AttestationOracle.ATTESTATION_TYPEHASH` on-chain.
-    ///
-    /// The pinned value below was captured from
-    /// `cast keccak "Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)"`
-    /// — this is the exact 32-byte digest the Solidity verifier compares
-    /// against when recovering signatures. If a future Solidity refactor
-    /// edits `AttestationOracle.sol:32-33`, this test fails loudly before
-    /// any signer gets deployed with a stale digest.
     #[test]
     fn typehash_matches_solidity_source() {
         // Pinned: keccak256("Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)")
@@ -136,5 +253,61 @@ mod tests {
         assert_eq!(decoded.intentId, a.intentId);
         assert_eq!(decoded.slotIndex, a.slotIndex);
         assert_eq!(decoded.attestedAmount, a.attestedAmount);
+    }
+
+    /// Pinned from
+    /// `cast keccak "AsyncLegDeliveryAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredAmount)"`.
+    /// Source of truth: `Xindex/src/AttestationOracle.sol:39-42`.
+    #[test]
+    fn redemption_typehash_matches_solidity_source() {
+        let pinned = B256::new([
+            0xb9, 0x16, 0x6b, 0x72, 0x86, 0x3f, 0x84, 0x0d, 0x15, 0x97, 0x6d, 0xac, 0x19, 0x65,
+            0xd0, 0xf3, 0x28, 0x42, 0xfa, 0xbb, 0x80, 0x08, 0xff, 0xb2, 0x6f, 0x64, 0x8d, 0xdd,
+            0xef, 0x59, 0x26, 0xce,
+        ]);
+        assert_eq!(
+            redemption_attestation_typehash(),
+            pinned,
+            "Rust typehash drifted from on-chain ASYNC_LEG_DELIVERY_TYPEHASH"
+        );
+        assert_eq!(
+            keccak256(AsyncLegDeliveryAttestation::eip712_root_type().as_bytes()),
+            redemption_attestation_typehash(),
+            "sol! macro-derived delivery typehash drifted"
+        );
+    }
+
+    /// Pinned from
+    /// `cast keccak "AsyncLegRefundAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 refundedAmount)"`.
+    /// Source of truth: `Xindex/src/AttestationOracle.sol:47-50`.
+    #[test]
+    fn refund_typehash_matches_solidity_source() {
+        let pinned = B256::new([
+            0x3b, 0xa6, 0x6f, 0x74, 0x26, 0x5d, 0x64, 0x09, 0x85, 0x23, 0x9e, 0x60, 0xe2, 0x2f,
+            0xd8, 0x92, 0xca, 0x9b, 0x9d, 0x88, 0xbc, 0xdb, 0x19, 0x1e, 0x59, 0x47, 0x97, 0x38,
+            0xe0, 0x9c, 0x41, 0xc6,
+        ]);
+        assert_eq!(
+            refund_attestation_typehash(),
+            pinned,
+            "Rust typehash drifted from on-chain ASYNC_LEG_REFUND_TYPEHASH"
+        );
+        assert_eq!(
+            keccak256(AsyncLegRefundAttestation::eip712_root_type().as_bytes()),
+            refund_attestation_typehash(),
+            "sol! macro-derived refund typehash drifted"
+        );
+    }
+
+    /// The three typehashes MUST be pairwise distinct — the type-level
+    /// mint↔delivery↔refund separation the on-chain design relies on.
+    #[test]
+    fn three_typehashes_pairwise_distinct() {
+        let m = attestation_typehash();
+        let r = redemption_attestation_typehash();
+        let f = refund_attestation_typehash();
+        assert_ne!(m, r, "mint vs delivery typehash collision");
+        assert_ne!(m, f, "mint vs refund typehash collision");
+        assert_ne!(r, f, "delivery vs refund typehash collision");
     }
 }

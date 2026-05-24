@@ -26,7 +26,7 @@ pub enum MultisigError {
 /// A K-of-N P2WSH multisig descriptor. Holds the parsed
 /// `miniscript::Descriptor` so consumers can derive addresses and reuse
 /// the same secp context.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MultisigDescriptor {
     pub descriptor: Descriptor<DescriptorPublicKey>,
     pub threshold: usize,

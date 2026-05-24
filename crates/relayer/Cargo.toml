@@ -12,8 +12,24 @@ workspace = true
 [dependencies]
 xindex-shared.workspace = true
 xindex-chain-eth.workspace = true
+xindex-ops.workspace = true
+alloy.workspace = true
 alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+sqlx.workspace = true
+prometheus.workspace = true
+
+[[bin]]
+name = "xindex-cancel"
+path = "src/bin/xindex-cancel.rs"
+
+[[bin]]
+name = "xindex-finalize-redeem"
+path = "src/bin/xindex-finalize-redeem.rs"

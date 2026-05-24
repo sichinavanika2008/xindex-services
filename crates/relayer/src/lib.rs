@@ -12,6 +12,13 @@
 //! poll catches it. We never authoritatively decide intents — only the
 //! contract's `IntentState` is canonical.
 
+pub mod redemption_store;
+pub mod store;
 pub mod tracker;
 
+pub use redemption_store::{
+    InMemoryRedemptionTracker, RedemptionTrackerError, RedemptionTrackerStore,
+    SqliteRedemptionTracker, StuckDecision, TrackedRedemption,
+};
+pub use store::{InMemoryIntentTracker, IntentTrackerStore, SqliteIntentTracker, TrackerError};
 pub use tracker::{IntentTracker, RelayDecision, TrackedIntent};

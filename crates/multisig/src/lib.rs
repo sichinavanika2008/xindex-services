@@ -34,4 +34,7 @@ pub mod descriptor;
 pub mod psbt;
 
 pub use descriptor::{MultisigDescriptor, MultisigError};
-pub use psbt::{build_spending_psbt, finalize_psbt, sign_psbt_input, MultisigUtxo, SignError};
+pub use psbt::{
+    build_spending_psbt, finalize_psbt, sign_psbt_input, MultisigUtxo, SignError,
+    MAX_OP_RETURN_BYTES,
+};

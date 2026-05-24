@@ -151,12 +151,21 @@ finalize-m2:
 # ── Maintenance ───────────────────────────────────────────────────────────────
 
 # Re-pull vendored ABIs from the Solidity build output.
+#
+# Most contracts are vendored as full Foundry artifacts (abi + bytecode).
+# `IndexToken` is the exception: post-P3-1 (EIP-170 refactor) it delegatecalls
+# the external `AsyncMintLib`, so its artifact contains unlinked bytecode
+# with a `__$..$__` placeholder which alloy's `sol!` macro refuses to parse.
+# The off-chain stack never deploys IndexToken (no `::deploy` use), so we
+# vendor only the `.abi` array for that one contract.
 sync-abi:
     cd {{XINDEX}} && forge build
     cp {{XINDEX}}/out/IntentQueue.sol/IntentQueue.json crates/shared/abi/
-    cp {{XINDEX}}/out/IndexToken.sol/IndexToken.json crates/shared/abi/
+    python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["abi"], open(sys.argv[2],"w"))' \
+        {{XINDEX}}/out/IndexToken.sol/IndexToken.json crates/shared/abi/IndexToken.json
     cp {{XINDEX}}/out/AttestationOracle.sol/AttestationOracle.json crates/shared/abi/
     cp {{XINDEX}}/out/IndexFactory.sol/IndexFactory.json crates/shared/abi/
+    cp {{XINDEX}}/out/ThorchainAdapter.sol/ThorchainAdapter.json crates/shared/abi/
     @echo "ABIs vendored to crates/shared/abi/"
 
 # Strict gate: matches CI exactly. Run before every commit.

@@ -12,16 +12,23 @@ workspace = true
 [dependencies]
 xindex-shared.workspace = true
 xindex-signer = { path = "../signer" }
+xindex-chain-btc.workspace = true
+xindex-chain-thor.workspace = true
 alloy = { workspace = true }
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
+bitcoin.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
+# Blocking JSON-RPC for the sync `Erc20ArrivalClient` (mirrors how
+# chain-btc's Esplora backs the sync `BitcoinChainClient`).
+reqwest = { workspace = true, features = ["blocking"] }
 
 [[bin]]
 name = "xindex-watch"
@@ -30,3 +37,7 @@ path = "src/bin/xindex-watch.rs"
 [[bin]]
 name = "xindex-attest"
 path = "src/bin/xindex-attest.rs"
+
+[[bin]]
+name = "xindex-attest-redeem"
+path = "src/bin/xindex-attest-redeem.rs"

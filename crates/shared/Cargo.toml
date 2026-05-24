@@ -14,3 +14,9 @@ alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# F2 redemption-dispatch store (executor writer / signer reader).
+sqlx.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
