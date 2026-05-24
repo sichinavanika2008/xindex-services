@@ -163,6 +163,133 @@ as the mint-side `now_unix_secs`).
 
 Reproduce: `cargo mutants --package xindex-signer --baseline=skip --timeout 120`
 
+## Phase 3.1 — UTXO custody-chain family (2026-05-24)
+
+Multi-chain expansion of the UTXO custody surface. Five chains: BTC,
+LTC, BCH, DOGE, ZEC. All share `xindex-chain-utxo` (renamed from
+`xindex-chain-btc`) + `xindex-multisig` (now serves both P2WSH SegWit
+and P2SH-legacy templates). 11 commits on `feat/phase-3-1-utxo`.
+
+### P3.1-1: DOGE 40-conf depth (accepted — Bifrost heuristic)
+
+`xindex-shared::chain_registry::ChainId::Doge::conf_depth() == 40`,
+vs. BTC/BCH = 6, LTC = 12, ZEC = 10. DOGE has 1-min blocks + a
+historical reorg vulnerability; the 40-conf depth is the THORChain
+Bifrost (`bifrost/pkg/chainclients/dogecoin`) production heuristic
+ported verbatim. Pinned in unit test
+`conf_depths_match_bifrost_heuristics`.
+
+**Status:** ✅ Accepted as-is. Per-chain key-ceremony rollout (DL-P3-7)
+will reverify under operator sign-off.
+
+### P3.1-2: BCH OP_RETURN 220-byte policy (accepted — relay-policy fact)
+
+`ChainId::Bch::op_return_max() == 220`, vs. 80 for BTC/LTC/DOGE/ZEC.
+BCH raised the OP_RETURN standard-relay limit to 220 bytes in the 2019
+relay-policy bump. THORChain affiliate-fee memos can exceed 80 bytes
+on BCH; the executor must allow up to 220 to avoid non-relay errors.
+The 80-byte default for BTC/LTC/DOGE/ZEC is the unchanged Bitcoin Core
+standard. Pinned in unit test `op_return_max_per_relay_policy`.
+
+**Status:** ✅ Accepted.
+
+### P3.1-3: ZEC t-addr only — z-addr (shielded) explicitly unsupported
+
+`ChainId::Zec` codec encodes the transparent (t-addr P2SH, `t3…`
+prefix) layer only. Shielded (z-addr, Sapling/Orchard) addresses are
+out of scope per DL-P3-7 — supporting them requires a different
+trust + cryptography surface (shielded notes, viewing keys, prover
+performance) that is not in the Phase 3.1 scope.
+
+**Status:** ✅ Accepted; documented in `ZecCodec` module doc + the
+plan's "Out of scope (deferred)" section.
+
+### P3.1-4: Per-chain fee unit (sat/vB vs sat/B) (accepted — chain fact)
+
+`ChainId::*::fee_unit()` returns `PerVbyte` for BTC/LTC (SegWit) and
+`PerByte` for BCH/DOGE/ZEC (no SegWit). Mixing units underpays a
+legacy-chain tx by up to 4× because the SegWit virtual-byte unit is
+witness-discounted. Pinned in `fee_unit_per_segwit_status`. Executor
+fee-derivation today is BTC-only (`derive_fee_sats` reads sat/vB); the
+per-chain wiring of `fee_unit` into the fee derivation lands when the
+non-BTC executor binaries ship (operational rollout per DL-P3-7).
+
+**Status:** ⏳ Plumbing exists; per-chain fee math is operational
+rollout work.
+
+### P3.1-5: H1 / per-leg DispatchRecord backfill default `leg_index = 0`
+
+Phase 3.0 went per-leg on-chain but the Rust mirror was per-rid; a
+multi-leg redemption's second leg's `record_dispatch()` hit
+`INSERT OR IGNORE` and was silently dropped. H1 reshapes the PK to
+`(redemption_id, leg_index)`. Existing in-flight rows are backfilled
+`leg_index = 0` (the current single-async-slot rail's value).
+Backfill is correct because at the time of the migration there is
+exactly one leg per rid in flight.
+
+**Status:** ✅ Fixed in H1; in-memory + SQLite tests cover both
+single-leg + 2-leg non-collision paths.
+
+### P3.1-6: U9 per-chain dispatch column backfill default `chain = 'btc'`
+
+`redemption_dispatch.chain` added in U9 migration
+(`20260524000000_dispatch_multichain.sql`). Existing rows backfill
+`'btc'` — correct under the current BTC-only operational state. Once
+non-BTC executor instances start writing rows, they will tag their
+own chain via the `--chain` CLI arg (U10).
+
+**Status:** ✅ Migration applied + CHECK-constrained to the Phase 3.1
+chain set; tested in `redemption_dispatch.rs`.
+
+### P3.1-7: ZEC codec hand-rolled vs `zcash_address` crate (deviation from plan)
+
+The plan suggested using the ECC `zcash_address` crate for ZEC t-addr
+encoding. The implementation uses a ~10-line hand-roll over
+`bitcoin::base58` + `bitcoin::hashes::sha256d` instead, because
+`zcash_address` pulls in shielded-pool primitives we don't need for
+the transparent t-addr layer. The hand-roll is audit-friendlier — the
+full code path is one file + two helper functions, fully covered by
+the U6 round-trip + bad-version negative tests.
+
+**Status:** ✅ Accepted deviation; documented in `ZecCodec` module
+comment.
+
+### P3.1-8: `RUSTSEC-2023-0071` (rsa via sqlx-mysql; ignored)
+
+`cargo audit` flags the `rsa` 0.9.x Marvin timing sidechannel. Pulled
+transitively via `sqlx-mysql`, which sqlx 0.8 keeps in its lockfile
+entry even with `default-features = false` + sqlite-only features.
+We do not compile the mysql driver — the vulnerable code is not
+reachable from the workspace's binary outputs. No upstream fix
+available.
+
+**Status:** ⏳ Ignored in `deny.toml` + `cargo audit --ignore`.
+Revisit when either sqlx-mysql moves off rsa 0.9 or a patched rsa
+release lands.
+
+### P3.1-9: Per-chain end-to-end PSBT test modules (deferred)
+
+The plan called for 4 per-chain E2E test modules (LTC + BCH + DOGE +
+ZEC). The implementation ships the building blocks (U4 descriptor
+templates, U5 PSBT BIP-143 + legacy sighash, U6 codec round-trips)
+fully unit-tested. The combined per-chain E2E harnesses are deferred
+to a follow-up — they add concentration coverage but no NEW
+security-critical surface beyond the unit tests.
+
+**Status:** ⏳ Deferred. Pre-mainnet (per DL-P3-7) audit + per-chain
+key ceremony will require at least one per-chain mainnet rehearsal,
+which the per-chain E2E test should mirror.
+
+### P3.1-10: 2-chain loopback (BTC + LTC) deferred
+
+The plan called for the `signer-daemon` loopback test to be extended
+to a parametrized 2-chain harness exercising the multi-role HashMap
+routing. The U8 commit ships the multi-role machinery; the
+integration-level 2-chain loopback is deferred to the same follow-up
+as P3.1-9.
+
+**Status:** ⏳ Deferred.
+
 ## When this file gets updated
 
 - New audit pass (internal or external) → add a section
