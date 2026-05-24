@@ -34,8 +34,8 @@ use bitcoin::{Address, Amount, Network};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use xindex_chain_btc::{find_arrival, BitcoinChainClient, BitcoinError};
 use xindex_chain_thor::{ThorClient, ThorError};
+use xindex_chain_utxo::{find_arrival, UtxoChainClient, UtxoError};
 
 /// Errors surfaced by the cross-check.
 #[derive(Debug, Error)]
@@ -43,7 +43,7 @@ pub enum CrossCheckError {
     #[error("`THORChain` RPC error: {0}")]
     Thor(#[from] ThorError),
     #[error("Bitcoin chain error: {0}")]
-    Btc(#[from] BitcoinError),
+    Btc(#[from] UtxoError),
     /// `THORChain` has not finished observing the inbound or has no
     /// matching outbound action yet. The signer should poll again
     /// later, NOT sign.
@@ -105,7 +105,7 @@ impl CrossCheck for PassThroughPolicy {
 /// same address.
 ///
 /// Holds owned clones of both clients; both must outlive the policy.
-pub struct ThorBtcPolicy<C: BitcoinChainClient + Send + Sync> {
+pub struct ThorBtcPolicy<C: UtxoChainClient + Send + Sync> {
     thor: ThorClient,
     btc: C,
     btc_multisig_address: Address,
@@ -119,7 +119,7 @@ pub struct ThorBtcPolicy<C: BitcoinChainClient + Send + Sync> {
     tolerance_sats: u64,
 }
 
-impl<C: BitcoinChainClient + Send + Sync> std::fmt::Debug for ThorBtcPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorBtcPolicy<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ThorBtcPolicy")
             .field("btc_multisig_address", &self.btc_multisig_address)
@@ -129,7 +129,7 @@ impl<C: BitcoinChainClient + Send + Sync> std::fmt::Debug for ThorBtcPolicy<C> {
     }
 }
 
-impl<C: BitcoinChainClient + Send + Sync> ThorBtcPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> ThorBtcPolicy<C> {
     /// Construct a production policy.
     ///
     /// `btc_multisig_address` MUST be parsed for the same network the
@@ -159,7 +159,7 @@ impl<C: BitcoinChainClient + Send + Sync> ThorBtcPolicy<C> {
 }
 
 #[async_trait]
-impl<C: BitcoinChainClient + Send + Sync> CrossCheck for ThorBtcPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorBtcPolicy<C> {
     async fn verify(
         &self,
         thor_inbound_tx_hash: &str,
@@ -267,7 +267,7 @@ pub enum Erc20Error {
 /// actually landed on Ethereum. Trait lives here (not in `chain-eth`)
 /// because `chain-eth` depends on `signer`; the concrete alloy-backed
 /// impl is injected by the `xindex-attest-redeem` binary — exactly the
-/// mint pattern where `BitcoinChainClient` lives in `chain-btc` and the
+/// mint pattern where `UtxoChainClient` lives in `chain-btc` and the
 /// concrete `EsploraClient` is wired by the binary.
 pub trait Erc20ArrivalClient: Send + Sync {
     /// Every `Transfer(_, to, value)` of `token` observed for `to`,
@@ -324,7 +324,7 @@ pub enum RefundCrossCheckError {
     #[error("`THORChain` RPC error: {0}")]
     Thor(#[from] ThorError),
     #[error("Bitcoin chain error: {0}")]
-    Btc(#[from] BitcoinError),
+    Btc(#[from] UtxoError),
     #[error("`THORChain` not yet ready: {reason}")]
     ThorNotReady { reason: String },
     #[error("refund BTC not yet confirmed at multisig: need ≥{need_sats} sats ≥{confs} confs")]
@@ -523,7 +523,7 @@ impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorBtcToUsdtPolicy<E> {
 /// Production refund policy: `THORChain` slip-refunded the BTC to our
 /// multisig (`REFUND:<txid>` outbound) and the UTXO actually returned.
 /// Disambiguated ONLY by the `REFUND:` memo — never by time.
-pub struct ThorBtcRefundPolicy<C: BitcoinChainClient + Send + Sync> {
+pub struct ThorBtcRefundPolicy<C: UtxoChainClient + Send + Sync> {
     thor: ThorClient,
     btc: C,
     btc_multisig_address: Address,
@@ -531,7 +531,7 @@ pub struct ThorBtcRefundPolicy<C: BitcoinChainClient + Send + Sync> {
     tolerance_sats: u64,
 }
 
-impl<C: BitcoinChainClient + Send + Sync> std::fmt::Debug for ThorBtcRefundPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorBtcRefundPolicy<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ThorBtcRefundPolicy")
             .field("btc_multisig_address", &self.btc_multisig_address)
@@ -541,7 +541,7 @@ impl<C: BitcoinChainClient + Send + Sync> std::fmt::Debug for ThorBtcRefundPolic
     }
 }
 
-impl<C: BitcoinChainClient + Send + Sync> ThorBtcRefundPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> ThorBtcRefundPolicy<C> {
     #[must_use]
     pub fn new(
         thor: ThorClient,
@@ -561,7 +561,7 @@ impl<C: BitcoinChainClient + Send + Sync> ThorBtcRefundPolicy<C> {
 }
 
 #[async_trait]
-impl<C: BitcoinChainClient + Send + Sync> RefundCrossCheck for ThorBtcRefundPolicy<C> {
+impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorBtcRefundPolicy<C> {
     async fn verify(&self, btc_txid: &str) -> Result<u64, RefundCrossCheckError> {
         let resp = self.thor.tx_status(btc_txid).await?;
         if resp.observed_tx.status != "done" {
@@ -632,29 +632,29 @@ mod tests {
     use bitcoin::Txid;
     use std::str::FromStr;
     use std::sync::Mutex;
-    use xindex_chain_btc::{BitcoinTxStatus, BitcoinUtxo};
+    use xindex_chain_utxo::{UtxoEntry, UtxoTxStatus};
 
     /// In-memory Bitcoin client for tests.
     #[derive(Debug, Default)]
     struct StubBtc {
-        utxos: Mutex<Vec<BitcoinUtxo>>,
+        utxos: Mutex<Vec<UtxoEntry>>,
     }
-    impl BitcoinChainClient for StubBtc {
-        fn get_address_utxos(&self, _addr: &Address) -> Result<Vec<BitcoinUtxo>, BitcoinError> {
+    impl UtxoChainClient for StubBtc {
+        fn get_address_utxos(&self, _addr: &Address) -> Result<Vec<UtxoEntry>, UtxoError> {
             Ok(self
                 .utxos
                 .lock()
-                .map_err(|e| BitcoinError::Upstream(e.to_string()))?
+                .map_err(|e| UtxoError::Upstream(e.to_string()))?
                 .clone())
         }
-        fn get_tx_status(&self, _txid: &Txid) -> Result<BitcoinTxStatus, BitcoinError> {
-            Err(BitcoinError::Upstream("not used".to_string()))
+        fn get_tx_status(&self, _txid: &Txid) -> Result<UtxoTxStatus, UtxoError> {
+            Err(UtxoError::Upstream("not used".to_string()))
         }
-        fn get_tip_height(&self) -> Result<u32, BitcoinError> {
+        fn get_tip_height(&self) -> Result<u32, UtxoError> {
             Ok(800_000)
         }
-        fn broadcast(&self, _tx: &bitcoin::Transaction) -> Result<Txid, BitcoinError> {
-            Err(BitcoinError::Upstream("not used".to_string()))
+        fn broadcast(&self, _tx: &bitcoin::Transaction) -> Result<Txid, UtxoError> {
+            Err(UtxoError::Upstream("not used".to_string()))
         }
     }
 
@@ -906,7 +906,7 @@ mod tests {
         let txid =
             Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
                 .expect("txid");
-        btc.utxos.lock().expect("lock").push(BitcoinUtxo {
+        btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid,
             vout: 0,
             value: Amount::from_sat(100_000),
@@ -1077,7 +1077,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        btc.utxos.lock().expect("lock").push(BitcoinUtxo {
+        btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid: Txid::from_str(
                 "0000000000000000000000000000000000000000000000000000000000000abc",
             )
@@ -1271,7 +1271,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        btc.utxos.lock().expect("lock").push(BitcoinUtxo {
+        btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid: Txid::from_str(
                 "0000000000000000000000000000000000000000000000000000000000000abc",
             )
@@ -1368,7 +1368,7 @@ mod tests {
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        btc.utxos.lock().expect("lock").push(BitcoinUtxo {
+        btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid: Txid::from_str(
                 "0000000000000000000000000000000000000000000000000000000000000abc",
             )

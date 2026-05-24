@@ -5380,20 +5380,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xindex-chain-btc"
-version = "0.0.1"
-dependencies = [
- "bdk_esplora",
- "bitcoin",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
 name = "xindex-chain-eth"
 version = "0.0.1"
 dependencies = [
@@ -5410,8 +5396,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "xindex-chain-btc",
  "xindex-chain-thor",
+ "xindex-chain-utxo",
  "xindex-shared",
  "xindex-signer",
 ]
@@ -5422,6 +5408,20 @@ version = "0.0.1"
 dependencies = [
  "futures-util",
  "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "xindex-chain-utxo"
+version = "0.0.1"
+dependencies = [
+ "bdk_esplora",
+ "bitcoin",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -5449,9 +5449,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremock",
- "xindex-chain-btc",
  "xindex-chain-eth",
  "xindex-chain-thor",
+ "xindex-chain-utxo",
  "xindex-multisig",
  "xindex-shared",
 ]
@@ -5530,8 +5530,8 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
- "xindex-chain-btc",
  "xindex-chain-thor",
+ "xindex-chain-utxo",
  "xindex-shared",
 ]
 

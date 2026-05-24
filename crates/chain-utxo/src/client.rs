@@ -1,6 +1,6 @@
 //! Bitcoin chain client trait + production HTTP implementation.
 //!
-//! [`BitcoinChainClient`] is the surface the rest of the off-chain stack
+//! [`UtxoChainClient`] is the surface the rest of the off-chain stack
 //! programs against. The production [`EsploraClient`] talks to any
 //! Blockstream-style Esplora HTTP API (signet, mainnet, or a self-hosted
 //! Esplora). Tests inject a fake implementing the same trait — no
@@ -12,7 +12,7 @@ use bdk_esplora::esplora_client::{self, BlockingClient};
 use bitcoin::{Address, Amount, Network, Transaction, Txid};
 use thiserror::Error;
 
-use crate::types::{BitcoinTxStatus, BitcoinUtxo};
+use crate::types::{UtxoEntry, UtxoTxStatus};
 
 /// Default per-request timeout (seconds). Chosen to be generous enough for
 /// the slowest Esplora endpoints (Blockstream's free tier under load) but
@@ -39,7 +39,7 @@ struct UtxoCandidate {
 
 /// Errors surfaced by Bitcoin chain queries.
 #[derive(Debug, Error)]
-pub enum BitcoinError {
+pub enum UtxoError {
     /// Transport / HTTP failure talking to the underlying Esplora server.
     #[error("transport error: {0}")]
     Transport(String),
@@ -62,37 +62,37 @@ pub enum BitcoinError {
 ///   compatible Esplora HTTP server.
 /// - Tests: an in-memory fake (see `crates/chain-btc/tests` and the
 ///   `tests` module of [`crate::watcher`]).
-pub trait BitcoinChainClient {
+pub trait UtxoChainClient {
     /// Confirmed UTXOs currently sitting at `address`.
     ///
     /// # Errors
-    /// [`BitcoinError::Transport`] on network failure,
-    /// [`BitcoinError::AddressNetworkMismatch`] if the address belongs
+    /// [`UtxoError::Transport`] on network failure,
+    /// [`UtxoError::AddressNetworkMismatch`] if the address belongs
     /// to a different network than this client.
-    fn get_address_utxos(&self, address: &Address) -> Result<Vec<BitcoinUtxo>, BitcoinError>;
+    fn get_address_utxos(&self, address: &Address) -> Result<Vec<UtxoEntry>, UtxoError>;
 
     /// Confirmation status of a single transaction.
     ///
     /// # Errors
-    /// As [`BitcoinChainClient::get_address_utxos`].
-    fn get_tx_status(&self, txid: &Txid) -> Result<BitcoinTxStatus, BitcoinError>;
+    /// As [`UtxoChainClient::get_address_utxos`].
+    fn get_tx_status(&self, txid: &Txid) -> Result<UtxoTxStatus, UtxoError>;
 
     /// Current chain tip height.
     ///
     /// # Errors
-    /// [`BitcoinError::Transport`] on network failure.
-    fn get_tip_height(&self) -> Result<u32, BitcoinError>;
+    /// [`UtxoError::Transport`] on network failure.
+    fn get_tip_height(&self) -> Result<u32, UtxoError>;
 
     /// Broadcast a finalized transaction. Used by the executor after the
     /// 3-of-5 multisig signing round completes.
     ///
     /// # Errors
-    /// [`BitcoinError::Upstream`] if the node rejects the broadcast
+    /// [`UtxoError::Upstream`] if the node rejects the broadcast
     /// (mempool conflict, dust-relay, signature failure).
-    fn broadcast(&self, tx: &Transaction) -> Result<Txid, BitcoinError>;
+    fn broadcast(&self, tx: &Transaction) -> Result<Txid, UtxoError>;
 
     /// Live fee rate (sat/vB) sufficient to confirm within
-    /// `target_blocks`. Default impl returns [`BitcoinError::Upstream`]:
+    /// `target_blocks`. Default impl returns [`UtxoError::Upstream`]:
     /// only the production [`EsploraClient`] queries a real fee oracle,
     /// so test fakes keep the caller's configured flat fallback with no
     /// per-fake boilerplate. Closes `KNOWN_FINDINGS` L-R5 (hardcoded
@@ -101,12 +101,12 @@ pub trait BitcoinChainClient {
     /// default on any error.
     ///
     /// # Errors
-    /// [`BitcoinError::Transport`] on network failure;
-    /// [`BitcoinError::Upstream`] if the backend has no fee oracle or
+    /// [`UtxoError::Transport`] on network failure;
+    /// [`UtxoError::Upstream`] if the backend has no fee oracle or
     /// returns no usable estimate.
-    fn estimate_fee_rate_sat_vb(&self, target_blocks: u16) -> Result<f64, BitcoinError> {
+    fn estimate_fee_rate_sat_vb(&self, target_blocks: u16) -> Result<f64, UtxoError> {
         let _ = target_blocks;
-        Err(BitcoinError::Upstream(
+        Err(UtxoError::Upstream(
             "fee estimation unsupported by this client".to_string(),
         ))
     }
@@ -141,7 +141,7 @@ pub fn pick_fee_estimate<S: std::hash::BuildHasher>(
     estimates.iter().min_by_key(|(k, _)| **k).map(|(_, v)| *v)
 }
 
-/// Production [`BitcoinChainClient`] backed by an Esplora-compatible
+/// Production [`UtxoChainClient`] backed by an Esplora-compatible
 /// HTTP server.
 ///
 /// Construct with [`EsploraClient::new`] (mainnet, default 30s timeout),
@@ -218,7 +218,7 @@ impl EsploraClient {
     /// than a placeholder). Used purely for the operator-facing error
     /// message — the routing decision has already failed by the time
     /// we get here.
-    fn require_network(&self, address: &Address) -> Result<(), BitcoinError> {
+    fn require_network(&self, address: &Address) -> Result<(), UtxoError> {
         let unchecked = address.as_unchecked();
         if unchecked.is_valid_for_network(self.network) {
             return Ok(());
@@ -232,7 +232,7 @@ impl EsploraClient {
         .into_iter()
         .find(|n| unchecked.is_valid_for_network(*n))
         .unwrap_or(Network::Bitcoin);
-        Err(BitcoinError::AddressNetworkMismatch {
+        Err(UtxoError::AddressNetworkMismatch {
             expected: self.network,
             actual,
         })
@@ -258,8 +258,8 @@ impl Default for EsploraClient {
     }
 }
 
-impl BitcoinChainClient for EsploraClient {
-    fn get_address_utxos(&self, address: &Address) -> Result<Vec<BitcoinUtxo>, BitcoinError> {
+impl UtxoChainClient for EsploraClient {
+    fn get_address_utxos(&self, address: &Address) -> Result<Vec<UtxoEntry>, UtxoError> {
         self.require_network(address)?;
         let script = address.script_pubkey();
         let tip = self.get_tip_height()?;
@@ -273,7 +273,7 @@ impl BitcoinChainClient for EsploraClient {
             let txs = self
                 .inner
                 .scripthash_txs(script.as_script(), last_seen)
-                .map_err(|e| BitcoinError::Transport(e.to_string()))?;
+                .map_err(|e| UtxoError::Transport(e.to_string()))?;
             if txs.is_empty() {
                 break;
             }
@@ -285,7 +285,7 @@ impl BitcoinChainClient for EsploraClient {
                             vout_idx
                                 .try_into()
                                 .map_err(|e: std::num::TryFromIntError| {
-                                    BitcoinError::Decode(format!("vout index overflow: {e}"))
+                                    UtxoError::Decode(format!("vout index overflow: {e}"))
                                 })?;
                         candidates.push(UtxoCandidate {
                             txid: tx.txid,
@@ -312,12 +312,12 @@ impl BitcoinChainClient for EsploraClient {
             let status = self
                 .inner
                 .get_output_status(&c.txid, u64::from(c.vout))
-                .map_err(|e| BitcoinError::Transport(e.to_string()))?;
+                .map_err(|e| UtxoError::Transport(e.to_string()))?;
             let is_spent = status.is_some_and(|s| s.spent);
             if is_spent {
                 continue;
             }
-            utxos.push(BitcoinUtxo {
+            utxos.push(UtxoEntry {
                 txid: c.txid,
                 vout: c.vout,
                 value: c.value,
@@ -328,13 +328,13 @@ impl BitcoinChainClient for EsploraClient {
         Ok(utxos)
     }
 
-    fn get_tx_status(&self, txid: &Txid) -> Result<BitcoinTxStatus, BitcoinError> {
+    fn get_tx_status(&self, txid: &Txid) -> Result<UtxoTxStatus, UtxoError> {
         let status = self
             .inner
             .get_tx_status(txid)
-            .map_err(|e| BitcoinError::Transport(e.to_string()))?;
+            .map_err(|e| UtxoError::Transport(e.to_string()))?;
         let tip = self.get_tip_height()?;
-        Ok(BitcoinTxStatus {
+        Ok(UtxoTxStatus {
             txid: *txid,
             confirmed: status.confirmed,
             block_height: status.block_height,
@@ -343,26 +343,26 @@ impl BitcoinChainClient for EsploraClient {
         })
     }
 
-    fn get_tip_height(&self) -> Result<u32, BitcoinError> {
+    fn get_tip_height(&self) -> Result<u32, UtxoError> {
         self.inner
             .get_height()
-            .map_err(|e| BitcoinError::Transport(e.to_string()))
+            .map_err(|e| UtxoError::Transport(e.to_string()))
     }
 
-    fn broadcast(&self, tx: &Transaction) -> Result<Txid, BitcoinError> {
+    fn broadcast(&self, tx: &Transaction) -> Result<Txid, UtxoError> {
         self.inner
             .broadcast(tx)
-            .map_err(|e| BitcoinError::Upstream(e.to_string()))?;
+            .map_err(|e| UtxoError::Upstream(e.to_string()))?;
         Ok(tx.compute_txid())
     }
 
-    fn estimate_fee_rate_sat_vb(&self, target_blocks: u16) -> Result<f64, BitcoinError> {
+    fn estimate_fee_rate_sat_vb(&self, target_blocks: u16) -> Result<f64, UtxoError> {
         let estimates = self
             .inner
             .get_fee_estimates()
-            .map_err(|e| BitcoinError::Transport(e.to_string()))?;
+            .map_err(|e| UtxoError::Transport(e.to_string()))?;
         pick_fee_estimate(&estimates, target_blocks)
-            .ok_or_else(|| BitcoinError::Upstream("esplora returned no fee estimates".to_string()))
+            .ok_or_else(|| UtxoError::Upstream("esplora returned no fee estimates".to_string()))
     }
 }
 
@@ -432,25 +432,25 @@ mod fee_estimate_integration_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Minimal `BitcoinChainClient` that overrides ONLY the required
+    /// Minimal `UtxoChainClient` that overrides ONLY the required
     /// methods and inherits the trait default for fee estimation. Lets
     /// us assert the default returns `Err` (kills the `Ok(*)` default-
     /// impl mutants).
     struct DefaultFeeChain;
-    impl BitcoinChainClient for DefaultFeeChain {
-        fn get_address_utxos(&self, _address: &Address) -> Result<Vec<BitcoinUtxo>, BitcoinError> {
+    impl UtxoChainClient for DefaultFeeChain {
+        fn get_address_utxos(&self, _address: &Address) -> Result<Vec<UtxoEntry>, UtxoError> {
             Ok(Vec::new())
         }
-        fn get_tx_status(&self, _txid: &Txid) -> Result<BitcoinTxStatus, BitcoinError> {
+        fn get_tx_status(&self, _txid: &Txid) -> Result<UtxoTxStatus, UtxoError> {
             // Not used by any test in this module; returning Err avoids
             // needing a fabricated `Txid` (and avoids `expect_used`).
-            Err(BitcoinError::Upstream("not used".to_string()))
+            Err(UtxoError::Upstream("not used".to_string()))
         }
-        fn get_tip_height(&self) -> Result<u32, BitcoinError> {
+        fn get_tip_height(&self) -> Result<u32, UtxoError> {
             Ok(0)
         }
-        fn broadcast(&self, _tx: &Transaction) -> Result<Txid, BitcoinError> {
-            Err(BitcoinError::Upstream("not used".to_string()))
+        fn broadcast(&self, _tx: &Transaction) -> Result<Txid, UtxoError> {
+            Err(UtxoError::Upstream("not used".to_string()))
         }
     }
 
@@ -463,7 +463,7 @@ mod fee_estimate_integration_tests {
             .expect_err("default impl must return Err");
         // Surfaces as Upstream so callers can fall back to a flat fee
         // without confusing a transport failure with "no oracle here".
-        assert!(matches!(err, BitcoinError::Upstream(_)));
+        assert!(matches!(err, UtxoError::Upstream(_)));
     }
 
     /// `EsploraClient` integration: mount `/fee-estimates` on a wiremock

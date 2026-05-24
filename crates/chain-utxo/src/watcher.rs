@@ -1,5 +1,5 @@
 //! High-level Bitcoin observation helpers built on the
-//! [`BitcoinChainClient`] trait.
+//! [`UtxoChainClient`] trait.
 //!
 //! The signer's cross-check use case: "did at least `min_amount` worth
 //! of BTC arrive at our multisig with at least `min_confirmations`
@@ -7,8 +7,8 @@
 
 use bitcoin::{Address, Amount};
 
-use crate::client::{BitcoinChainClient, BitcoinError};
-use crate::types::BitcoinUtxo;
+use crate::client::{UtxoChainClient, UtxoError};
+use crate::types::UtxoEntry;
 
 /// Search the address's UTXO set for the first UTXO that satisfies BOTH:
 /// - `value >= min_amount`
@@ -24,13 +24,13 @@ use crate::types::BitcoinUtxo;
 /// expected amount.
 ///
 /// # Errors
-/// Forwards [`BitcoinError`] from the underlying client.
-pub fn find_arrival<C: BitcoinChainClient>(
+/// Forwards [`UtxoError`] from the underlying client.
+pub fn find_arrival<C: UtxoChainClient>(
     client: &C,
     address: &Address,
     min_amount: Amount,
     min_confirmations: u32,
-) -> Result<Option<BitcoinUtxo>, BitcoinError> {
+) -> Result<Option<UtxoEntry>, UtxoError> {
     let utxos = client.get_address_utxos(address)?;
     Ok(utxos
         .into_iter()
@@ -41,31 +41,31 @@ pub fn find_arrival<C: BitcoinChainClient>(
 /// the chain client. Wraps `get_tx_status().confirmations`.
 ///
 /// # Errors
-/// Forwards [`BitcoinError`] from the underlying client.
-pub fn confirmations_for_tx<C: BitcoinChainClient>(
+/// Forwards [`UtxoError`] from the underlying client.
+pub fn confirmations_for_tx<C: UtxoChainClient>(
     client: &C,
     txid: &bitcoin::Txid,
-) -> Result<u32, BitcoinError> {
+) -> Result<u32, UtxoError> {
     client.get_tx_status(txid).map(|s| s.confirmations)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{BitcoinTxStatus, BitcoinUtxo};
+    use crate::types::{UtxoEntry, UtxoTxStatus};
     use bitcoin::{Network, Transaction, Txid};
     use std::str::FromStr;
 
-    /// In-memory fake [`BitcoinChainClient`] for unit tests.
+    /// In-memory fake [`UtxoChainClient`] for unit tests.
     /// Mutating helpers (`set_utxos`, `add_utxo`) seed deterministic state.
     #[derive(Default)]
     struct FakeClient {
-        utxos: std::sync::Mutex<Vec<BitcoinUtxo>>,
+        utxos: std::sync::Mutex<Vec<UtxoEntry>>,
         tip_height: std::sync::Mutex<u32>,
     }
 
     impl FakeClient {
-        fn set_utxos(&self, utxos: Vec<BitcoinUtxo>) {
+        fn set_utxos(&self, utxos: Vec<UtxoEntry>) {
             #[expect(clippy::expect_used, reason = "test code")]
             {
                 *self.utxos.lock().expect("mutex") = utxos;
@@ -73,13 +73,13 @@ mod tests {
         }
     }
 
-    impl BitcoinChainClient for FakeClient {
-        fn get_address_utxos(&self, _address: &Address) -> Result<Vec<BitcoinUtxo>, BitcoinError> {
+    impl UtxoChainClient for FakeClient {
+        fn get_address_utxos(&self, _address: &Address) -> Result<Vec<UtxoEntry>, UtxoError> {
             #[expect(clippy::expect_used, reason = "test code")]
             Ok(self.utxos.lock().expect("mutex").clone())
         }
-        fn get_tx_status(&self, txid: &Txid) -> Result<BitcoinTxStatus, BitcoinError> {
-            Ok(BitcoinTxStatus {
+        fn get_tx_status(&self, txid: &Txid) -> Result<UtxoTxStatus, UtxoError> {
+            Ok(UtxoTxStatus {
                 txid: *txid,
                 confirmed: true,
                 block_height: Some(800_000),
@@ -87,11 +87,11 @@ mod tests {
                 confirmations: 6,
             })
         }
-        fn get_tip_height(&self) -> Result<u32, BitcoinError> {
+        fn get_tip_height(&self) -> Result<u32, UtxoError> {
             #[expect(clippy::expect_used, reason = "test code")]
             Ok(*self.tip_height.lock().expect("mutex"))
         }
-        fn broadcast(&self, _tx: &Transaction) -> Result<Txid, BitcoinError> {
+        fn broadcast(&self, _tx: &Transaction) -> Result<Txid, UtxoError> {
             #[expect(clippy::expect_used, reason = "test code")]
             Ok(
                 Txid::from_str("0000000000000000000000000000000000000000000000000000000000000001")
@@ -110,8 +110,8 @@ mod tests {
     }
 
     #[expect(clippy::expect_used, reason = "test code")]
-    fn dummy_utxo(amount_sat: u64, confirmations: u32) -> BitcoinUtxo {
-        BitcoinUtxo {
+    fn dummy_utxo(amount_sat: u64, confirmations: u32) -> UtxoEntry {
+        UtxoEntry {
             txid: Txid::from_str(
                 "0000000000000000000000000000000000000000000000000000000000000002",
             )

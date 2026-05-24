@@ -54,7 +54,7 @@ bdk_wallet = { version = "1", default-features = false, features = ["std"] }
 xindex-shared = { path = "crates/shared" }
 xindex-chain-eth = { path = "crates/chain-eth" }
 xindex-chain-thor = { path = "crates/chain-thor" }
-xindex-chain-btc = { path = "crates/chain-btc" }
+xindex-chain-utxo = { path = "crates/chain-utxo" }
 xindex-multisig = { path = "crates/multisig" }
 xindex-signer = { path = "crates/signer" }
 xindex-executor = { path = "crates/executor" }

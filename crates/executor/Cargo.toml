@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 xindex-shared.workspace = true
 xindex-chain-eth.workspace = true
-xindex-chain-btc.workspace = true
+xindex-chain-utxo.workspace = true
 xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
 alloy.workspace = true

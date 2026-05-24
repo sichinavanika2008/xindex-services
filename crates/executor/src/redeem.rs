@@ -17,8 +17,8 @@ use bitcoin::{Address, Amount, Network, Transaction, Txid};
 use thiserror::Error;
 use tracing::{debug, info};
 
-use xindex_chain_btc::{BitcoinChainClient, BitcoinError, BitcoinUtxo};
 use xindex_chain_eth::bindings::ThorchainAdapter;
+use xindex_chain_utxo::{UtxoChainClient, UtxoEntry, UtxoError};
 use xindex_multisig::{
     build_spending_psbt, sign_psbt_input, MultisigDescriptor, MultisigUtxo, SignError,
     MAX_OP_RETURN_BYTES,
@@ -48,7 +48,7 @@ pub enum ExecuteError {
     Psbt(#[from] SignError),
     /// Bitcoin chain access failed.
     #[error("bitcoin chain error: {0}")]
-    Chain(#[from] BitcoinError),
+    Chain(#[from] UtxoError),
     /// Insufficient signers configured (< K of K-of-N).
     #[error("threshold {threshold} requires {threshold} keys, got {got}")]
     InsufficientSigners { threshold: usize, got: usize },
@@ -152,7 +152,7 @@ impl std::fmt::Debug for SigningBackend {
 }
 
 #[derive(Debug)]
-pub struct InProcessExecutor<C: BitcoinChainClient> {
+pub struct InProcessExecutor<C: UtxoChainClient> {
     descriptor: MultisigDescriptor,
     backend: SigningBackend,
     chain: C,
@@ -178,7 +178,7 @@ pub trait MultisigCosigner: Send + Sync {
     ) -> Result<(bitcoin::PublicKey, bitcoin::ecdsa::Signature), ExecuteError>;
 }
 
-impl<C: BitcoinChainClient> InProcessExecutor<C> {
+impl<C: UtxoChainClient> InProcessExecutor<C> {
     /// `keys` must contain ≥ `descriptor.threshold` secret keys whose
     /// pubkeys appear in the multisig descriptor.
     ///
@@ -249,8 +249,8 @@ impl<C: BitcoinChainClient> InProcessExecutor<C> {
     }
 
     /// Pick the smallest UTXO that covers `value + fee_sats`.
-    fn select_utxo(utxos: &[BitcoinUtxo], needed: Amount) -> Result<&BitcoinUtxo, ExecuteError> {
-        let mut chosen: Option<&BitcoinUtxo> = None;
+    fn select_utxo(utxos: &[UtxoEntry], needed: Amount) -> Result<&UtxoEntry, ExecuteError> {
+        let mut chosen: Option<&UtxoEntry> = None;
         let mut total_available: u64 = 0;
         for utxo in utxos {
             total_available = total_available.saturating_add(utxo.value.to_sat());
@@ -389,32 +389,32 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FakeBtc {
-        utxos: std::sync::Mutex<Vec<BitcoinUtxo>>,
+        utxos: std::sync::Mutex<Vec<UtxoEntry>>,
         broadcasts: std::sync::Mutex<Vec<Transaction>>,
     }
 
-    impl BitcoinChainClient for FakeBtc {
-        fn get_address_utxos(&self, _addr: &Address) -> Result<Vec<BitcoinUtxo>, BitcoinError> {
+    impl UtxoChainClient for FakeBtc {
+        fn get_address_utxos(&self, _addr: &Address) -> Result<Vec<UtxoEntry>, UtxoError> {
             Ok(self
                 .utxos
                 .lock()
-                .map_err(|e| BitcoinError::Upstream(e.to_string()))?
+                .map_err(|e| UtxoError::Upstream(e.to_string()))?
                 .clone())
         }
         fn get_tx_status(
             &self,
             _txid: &Txid,
-        ) -> Result<xindex_chain_btc::BitcoinTxStatus, BitcoinError> {
-            Err(BitcoinError::Upstream("not used in this test".to_string()))
+        ) -> Result<xindex_chain_utxo::UtxoTxStatus, UtxoError> {
+            Err(UtxoError::Upstream("not used in this test".to_string()))
         }
-        fn get_tip_height(&self) -> Result<u32, BitcoinError> {
+        fn get_tip_height(&self) -> Result<u32, UtxoError> {
             Ok(800_000)
         }
-        fn broadcast(&self, tx: &Transaction) -> Result<Txid, BitcoinError> {
+        fn broadcast(&self, tx: &Transaction) -> Result<Txid, UtxoError> {
             let txid = tx.compute_txid();
             self.broadcasts
                 .lock()
-                .map_err(|e| BitcoinError::Upstream(e.to_string()))?
+                .map_err(|e| UtxoError::Upstream(e.to_string()))?
                 .push(tx.clone());
             Ok(txid)
         }
@@ -545,8 +545,8 @@ mod tests {
     }
 
     #[expect(clippy::expect_used, reason = "test code")]
-    fn utxo(value_sats: u64, vout: u32) -> BitcoinUtxo {
-        BitcoinUtxo {
+    fn utxo(value_sats: u64, vout: u32) -> UtxoEntry {
+        UtxoEntry {
             txid: Txid::from_str(
                 "2222222222222222222222222222222222222222222222222222222222222222",
             )
@@ -601,7 +601,7 @@ mod tests {
         let utxo_txid =
             Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
                 .expect("txid");
-        chain.utxos.lock().expect("lock").push(BitcoinUtxo {
+        chain.utxos.lock().expect("lock").push(UtxoEntry {
             txid: utxo_txid,
             vout: 0,
             value: Amount::from_sat(100_000_000),

@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 xindex-shared.workspace = true
 xindex-signer = { path = "../signer" }
-xindex-chain-btc.workspace = true
+xindex-chain-utxo.workspace = true
 xindex-chain-thor.workspace = true
 alloy = { workspace = true }
 alloy-primitives.workspace = true

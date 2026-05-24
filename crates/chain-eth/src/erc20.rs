@@ -5,10 +5,10 @@
 //! The trait lives in `xindex-signer` (not here) because `chain-eth`
 //! depends on `signer`; this concrete impl satisfies it and is injected
 //! by the `xindex-attest-redeem` binary — exactly the mint pattern
-//! where `BitcoinChainClient` lives in `chain-btc` and `EsploraClient`
+//! where `UtxoChainClient` lives in `chain-btc` and `EsploraClient`
 //! is the concrete client wired by the binary.
 //!
-//! `transfers_to` is SYNC (mirrors `chain-btc`'s `BitcoinChainClient` /
+//! `transfers_to` is SYNC (mirrors `chain-btc`'s `UtxoChainClient` /
 //! `find_arrival`, which the async `ThorBtcPolicy` already calls into).
 //! Same accepted trade-off: a blocking JSON-RPC call inside the
 //! low-frequency signer path. Uses `reqwest::blocking` rather than

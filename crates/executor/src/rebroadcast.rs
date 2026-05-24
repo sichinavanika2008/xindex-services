@@ -46,7 +46,7 @@ use bitcoin::Transaction;
 use thiserror::Error;
 use tokio::time::interval;
 use tracing::{error, info, warn};
-use xindex_chain_btc::{BitcoinChainClient, BitcoinError};
+use xindex_chain_utxo::{UtxoChainClient, UtxoError};
 
 use crate::broadcast_registry::{now_unix_secs, BroadcastRegistry, RegistryError};
 
@@ -105,7 +105,7 @@ pub async fn run_watcher<R, C>(
 ) -> Result<(), WatcherError>
 where
     R: BroadcastRegistry + 'static,
-    C: BitcoinChainClient + Send + Sync + 'static,
+    C: UtxoChainClient + Send + Sync + 'static,
 {
     let mut ticker = interval(cfg.interval);
     // First tick fires immediately; skip it so the watcher doesn't
@@ -131,7 +131,7 @@ where
 async fn tick_once<R, C>(registry: &R, chain: &C, cfg: WatcherConfig) -> Result<(), WatcherError>
 where
     R: BroadcastRegistry,
-    C: BitcoinChainClient,
+    C: UtxoChainClient,
 {
     let pending = registry.list_pending().await?;
     if pending.is_empty() {
@@ -189,7 +189,7 @@ where
                             );
                         }
                     }
-                    Err(BitcoinError::Upstream(msg)) if is_already_known(&msg) => {
+                    Err(UtxoError::Upstream(msg)) if is_already_known(&msg) => {
                         // Node already has the tx — count this as a
                         // successful re-broadcast attempt. Bumping
                         // last_attempt avoids hammering Esplora on
@@ -210,7 +210,7 @@ where
                     }
                 }
             }
-            Err(BitcoinError::Transport(msg)) => {
+            Err(UtxoError::Transport(msg)) => {
                 // RPC-side flake. Don't act on this entry — pretending
                 // the tx is gone when we just can't see it would cause
                 // a spurious re-broadcast loop while Esplora is down.
@@ -242,27 +242,27 @@ mod tests {
     use bitcoin::hashes::Hash;
     use bitcoin::{Amount, BlockHash, Txid};
     use std::sync::Mutex as StdMutex;
-    use xindex_chain_btc::BitcoinTxStatus;
-    use xindex_chain_btc::{BitcoinError, BitcoinUtxo};
+    use xindex_chain_utxo::UtxoTxStatus;
+    use xindex_chain_utxo::{UtxoEntry, UtxoError};
 
-    /// In-memory fake of `BitcoinChainClient`. Each call resolves to a
+    /// In-memory fake of `UtxoChainClient`. Each call resolves to a
     /// scripted response stored in `Vec<...>` so tests can express
     /// "first call says not-confirmed, second call says confirmed."
     #[derive(Default)]
     struct FakeChain {
-        statuses: StdMutex<Vec<Result<BitcoinTxStatus, BitcoinError>>>,
-        broadcast_results: StdMutex<Vec<Result<Txid, BitcoinError>>>,
+        statuses: StdMutex<Vec<Result<UtxoTxStatus, UtxoError>>>,
+        broadcast_results: StdMutex<Vec<Result<Txid, UtxoError>>>,
         broadcasts: StdMutex<Vec<Txid>>,
     }
 
     impl FakeChain {
-        fn push_status(&self, r: Result<BitcoinTxStatus, BitcoinError>) {
+        fn push_status(&self, r: Result<UtxoTxStatus, UtxoError>) {
             self.statuses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(r);
         }
-        fn push_broadcast(&self, r: Result<Txid, BitcoinError>) {
+        fn push_broadcast(&self, r: Result<Txid, UtxoError>) {
             self.broadcast_results
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -276,14 +276,14 @@ mod tests {
         }
     }
 
-    impl BitcoinChainClient for FakeChain {
+    impl UtxoChainClient for FakeChain {
         fn get_address_utxos(
             &self,
             _address: &bitcoin::Address,
-        ) -> Result<Vec<BitcoinUtxo>, BitcoinError> {
+        ) -> Result<Vec<UtxoEntry>, UtxoError> {
             Ok(vec![])
         }
-        fn get_tx_status(&self, _txid: &Txid) -> Result<BitcoinTxStatus, BitcoinError> {
+        fn get_tx_status(&self, _txid: &Txid) -> Result<UtxoTxStatus, UtxoError> {
             self.statuses
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -292,7 +292,7 @@ mod tests {
                     // Default = "not confirmed" so tests that only need
                     // happy-path confirmations don't need to push the
                     // not-confirmed cases explicitly.
-                    Ok(BitcoinTxStatus {
+                    Ok(UtxoTxStatus {
                         txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(
                             [0; 32],
                         )),
@@ -303,10 +303,10 @@ mod tests {
                     })
                 })
         }
-        fn get_tip_height(&self) -> Result<u32, BitcoinError> {
+        fn get_tip_height(&self) -> Result<u32, UtxoError> {
             Ok(800_000)
         }
-        fn broadcast(&self, tx: &bitcoin::Transaction) -> Result<Txid, BitcoinError> {
+        fn broadcast(&self, tx: &bitcoin::Transaction) -> Result<Txid, UtxoError> {
             let txid = tx.compute_txid();
             self.broadcasts
                 .lock()
@@ -366,7 +366,7 @@ mod tests {
         registry.register(entry).await.expect("register");
 
         let chain = FakeChain::default();
-        chain.push_status(Ok(BitcoinTxStatus {
+        chain.push_status(Ok(UtxoTxStatus {
             txid,
             confirmed: true,
             block_height: Some(800_000),
@@ -401,7 +401,7 @@ mod tests {
         registry.register(entry).await.expect("register");
 
         let chain = FakeChain::default();
-        chain.push_status(Ok(BitcoinTxStatus {
+        chain.push_status(Ok(UtxoTxStatus {
             txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0; 32])),
             confirmed: false,
             block_height: None,
@@ -431,7 +431,7 @@ mod tests {
         registry.register(entry).await.expect("register");
 
         let chain = FakeChain::default();
-        chain.push_status(Ok(BitcoinTxStatus {
+        chain.push_status(Ok(UtxoTxStatus {
             txid,
             confirmed: false,
             block_height: None,
@@ -467,14 +467,14 @@ mod tests {
         registry.register(entry).await.expect("register");
 
         let chain = FakeChain::default();
-        chain.push_status(Ok(BitcoinTxStatus {
+        chain.push_status(Ok(UtxoTxStatus {
             txid,
             confirmed: false,
             block_height: None,
             block_hash: None,
             confirmations: 0,
         }));
-        chain.push_broadcast(Err(BitcoinError::Upstream(
+        chain.push_broadcast(Err(UtxoError::Upstream(
             "txn-already-in-mempool".to_string(),
         )));
 
@@ -499,7 +499,7 @@ mod tests {
         registry.register(entry).await.expect("register");
 
         let chain = FakeChain::default();
-        chain.push_status(Err(BitcoinError::Transport("network down".to_string())));
+        chain.push_status(Err(UtxoError::Transport("network down".to_string())));
 
         tick_once(&registry, &chain, WatcherConfig::default())
             .await

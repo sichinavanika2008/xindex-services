@@ -41,9 +41,9 @@ use bitcoin::{Network, PublicKey};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
-use xindex_chain_btc::{BitcoinChainClient, EsploraClient};
 use xindex_chain_eth::bindings::ThorchainAdapter;
 use xindex_chain_thor::ThorClient;
+use xindex_chain_utxo::{EsploraClient, UtxoChainClient};
 use xindex_executor::remote_cosigner::RemoteMultisigCosigner;
 use xindex_executor::{
     decode_redeem_event, now_unix_secs, run_watcher, BroadcastRegistry, InMemoryBroadcastRegistry,

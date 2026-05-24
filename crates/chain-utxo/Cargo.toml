@@ -1,5 +1,5 @@
 [package]
-name = "xindex-chain-btc"
+name = "xindex-chain-utxo"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

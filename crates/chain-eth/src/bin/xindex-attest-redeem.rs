@@ -33,10 +33,10 @@ use bitcoin::Network;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
-use xindex_chain_btc::EsploraClient;
 use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
 use xindex_chain_eth::RpcErc20LogClient;
 use xindex_chain_thor::ThorClient;
+use xindex_chain_utxo::EsploraClient;
 use xindex_shared::eip712::{
     attestation_oracle_domain, redemption_attestation, refund_attestation,
 };

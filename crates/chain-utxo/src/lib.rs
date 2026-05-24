@@ -11,13 +11,13 @@
 //!    that the multisig has signed via PSBT round-trips with the per-key
 //!    `xindex-multisig` daemon.
 //!
-//! The crate exposes a [`BitcoinChainClient`] trait so production code
+//! The crate exposes a [`UtxoChainClient`] trait so production code
 //! (Esplora HTTP) and tests (in-memory fake) share the same surface.
 
 pub mod client;
 pub mod types;
 pub mod watcher;
 
-pub use client::{BitcoinChainClient, BitcoinError, EsploraClient};
-pub use types::{BitcoinTxStatus, BitcoinUtxo};
+pub use client::{EsploraClient, UtxoChainClient, UtxoError};
+pub use types::{UtxoEntry, UtxoTxStatus};
 pub use watcher::find_arrival;

@@ -9,7 +9,7 @@ use bitcoin::{Amount, BlockHash, Txid};
 
 /// A confirmed UTXO at a watched address.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BitcoinUtxo {
+pub struct UtxoEntry {
     pub txid: Txid,
     pub vout: u32,
     pub value: Amount,
@@ -25,7 +25,7 @@ pub struct BitcoinUtxo {
 
 /// Confirmation status of an arbitrary Bitcoin transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BitcoinTxStatus {
+pub struct UtxoTxStatus {
     pub txid: Txid,
     /// `true` once the transaction has been mined into any block.
     /// Re-org awareness is the caller's responsibility — compare
