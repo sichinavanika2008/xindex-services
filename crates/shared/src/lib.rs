@@ -5,6 +5,7 @@
 //! the F2 redemption-dispatch correlation store shared by the executor
 //! (writer) and signer (reader).
 
+pub mod chain_registry;
 pub mod eip712;
 pub mod redemption_dispatch;
 pub mod signer_wire;
