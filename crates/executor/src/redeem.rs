@@ -20,8 +20,8 @@ use tracing::{debug, info};
 use xindex_chain_eth::bindings::ThorchainAdapter;
 use xindex_chain_utxo::{UtxoChainClient, UtxoEntry, UtxoError};
 use xindex_multisig::{
-    build_spending_psbt, sign_psbt_input, MultisigDescriptor, MultisigUtxo, SignError,
-    MAX_OP_RETURN_BYTES,
+    build_spending_psbt, sign_psbt_input, MultisigDescriptor, MultisigUtxo, MultisigUtxoSpend,
+    SignError, MAX_OP_RETURN_BYTES,
 };
 
 /// Errors surfaced during a single redemption execution.
@@ -315,6 +315,11 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             .explicit_script()
             .map_err(|e| ExecuteError::Psbt(SignError::Sighash(e.to_string())))?;
 
+        // BTC today is the only chain wired through the executor, so
+        // every spend is P2WSH (BIP-143). U10 routes per-chain and would
+        // wrap a P2SH-legacy spend with MultisigUtxoSpend::NonWitness
+        // for BCH/DOGE/ZEC (carrying the full prevout tx, fetched via
+        // Esplora's /tx/{txid}/raw endpoint).
         let multisig_utxo = MultisigUtxo {
             outpoint: bitcoin::OutPoint {
                 txid: selected.txid,
@@ -322,7 +327,7 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             },
             value: selected.value,
             script_pubkey: multisig_address.script_pubkey(),
-            witness_script,
+            spend: MultisigUtxoSpend::Witness { witness_script },
         };
         let change_value = selected.value.checked_sub(needed).unwrap_or(Amount::ZERO);
 

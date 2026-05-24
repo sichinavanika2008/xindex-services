@@ -1,21 +1,25 @@
-//! `xindex-multisig` — Bitcoin 3-of-5 P2WSH multisig descriptor + PSBT
-//! coordination primitives.
+//! `xindex-multisig` — 3-of-5 UTXO multisig descriptor + PSBT
+//! coordination primitives for the Phase 3.1 UTXO custody family.
 //!
 //! Used by:
 //! - `xindex-executor` to construct redemption transactions when a user
-//!   calls `IndexToken.burnAsync` and the adapter emits `RedeemDispatched`.
+//!   burns shares and the adapter emits `RedeemDispatched`.
 //! - The N independent signer daemons (M5) that each hold one private
 //!   key in `YubiHSM2` and sign their assigned PSBT input.
 //! - The deploy / key-ceremony tooling that generates the multisig
 //!   descriptor from N pubkeys.
 //!
-//! ## Descriptor shape
+//! ## Descriptor shapes
 //!
-//! `wsh(multi(K, pk_1, pk_2, ..., pk_N))` — a Bitcoin Output Script
-//! Descriptor (BIP 380) for a K-of-N P2WSH multisig. Sorted by pubkey
-//! within the descriptor for deterministic address derivation
-//! (`sortedmulti` would be the alternate; we use `multi` because pubkey
-//! order in our key ceremony is deterministic).
+//! - `wsh(multi(K, pk_1, ..., pk_N))` — P2WSH for `SegWit` chains
+//!   (BTC, LTC). BIP-143 sighash.
+//! - `sh(multi(K, pk_1, ..., pk_N))` — P2SH-legacy for chains without
+//!   `SegWit` (BCH, DOGE, ZEC). Legacy sighash (pre-BIP-143).
+//!
+//! Both built via [`MultisigDescriptor::new_p2wsh`] /
+//! [`MultisigDescriptor::new_p2sh_legacy`]. The descriptor uses `multi`
+//! (vs `sortedmulti`) because pubkey order in our key ceremony is
+//! deterministic.
 //!
 //! ## PSBT lifecycle
 //!
@@ -35,6 +39,6 @@ pub mod psbt;
 
 pub use descriptor::{MultisigDescriptor, MultisigError};
 pub use psbt::{
-    build_spending_psbt, finalize_psbt, sign_psbt_input, MultisigUtxo, SignError,
-    MAX_OP_RETURN_BYTES,
+    build_spending_psbt, finalize_psbt, sign_psbt_input, MultisigUtxo, MultisigUtxoSpend,
+    SignError, MAX_OP_RETURN_BYTES,
 };

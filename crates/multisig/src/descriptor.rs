@@ -254,7 +254,7 @@ mod tests {
         );
     }
 
-    /// U4: `script_pubkey()` for P2WSH yields a 34-byte SegWit-v0 SPK
+    /// U4: `script_pubkey()` for P2WSH yields a 34-byte `SegWit`-v0 SPK
     /// (`OP_0 <0x20> <32-byte sha256>`); for P2SH-legacy it yields a
     /// 23-byte SPK (`OP_HASH160 <0x14> <20-byte hash160> OP_EQUAL`).
     /// Both forms are network-independent — the U6 codec layer wraps
