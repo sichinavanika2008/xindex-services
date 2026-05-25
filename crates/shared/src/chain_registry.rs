@@ -7,16 +7,18 @@
 //! arm in each lookup, add test vectors. The compiler walks every
 //! callsite through every arm — there is no default fallthrough.
 //!
-//! ## Phase 3.1 scope
+//! ## Phase 3.1 + 3.2 scope
 //!
 //! `Btc` / `Ltc` / `Bch` / `Doge` / `Zec` — the UTXO custody family
-//! (`CustodyFamily::Utxo`). EVM / Cosmos / Solana / Substrate families
-//! are Phase 3.2+ and will reuse this enum.
+//! (`CustodyFamily::Utxo`). `Eth` / `Bsc` / `Avax` / `Base` / `Pol` —
+//! the EVM custody family (`CustodyFamily::Evm`), Safe v1.4.1 k-of-n
+//! direct multisig per chain. Cosmos / Solana / Substrate families are
+//! Phase 3.3+ and will reuse this enum.
 
 use std::fmt;
 use std::str::FromStr;
 
-use alloy_primitives::{keccak256, B256};
+use alloy_primitives::{address, keccak256, Address, B256};
 use serde::{Deserialize, Serialize};
 
 /// Per-chain identifier. UTXO family today; other families land in
@@ -38,6 +40,16 @@ pub enum ChainId {
     Doge,
     /// Zcash (transparent t-addr only; z-addr is out of scope).
     Zec,
+    /// Ethereum mainnet.
+    Eth,
+    /// BNB Smart Chain.
+    Bsc,
+    /// Avalanche C-Chain.
+    Avax,
+    /// Base (Coinbase L2).
+    Base,
+    /// Polygon `PoS`.
+    Pol,
 }
 
 impl fmt::Display for ChainId {
@@ -48,6 +60,11 @@ impl fmt::Display for ChainId {
             Self::Bch => "bch",
             Self::Doge => "doge",
             Self::Zec => "zec",
+            Self::Eth => "eth",
+            Self::Bsc => "bsc",
+            Self::Avax => "avax",
+            Self::Base => "base",
+            Self::Pol => "pol",
         })
     }
 }
@@ -75,6 +92,11 @@ impl FromStr for ChainId {
             "bch" => Ok(Self::Bch),
             "doge" => Ok(Self::Doge),
             "zec" => Ok(Self::Zec),
+            "eth" => Ok(Self::Eth),
+            "bsc" => Ok(Self::Bsc),
+            "avax" => Ok(Self::Avax),
+            "base" => Ok(Self::Base),
+            "pol" => Ok(Self::Pol),
             other => Err(ParseChainIdError(other.to_string())),
         }
     }
@@ -86,23 +108,60 @@ impl FromStr for ChainId {
 pub enum CustodyFamily {
     /// UTXO chains: native multisig via descriptor + PSBT.
     Utxo,
-    // Evm, Cosmos, Solana, Substrate — Phase 3.2+.
+    /// EVM chains: Safe v1.4.1 k-of-n smart-contract multisig via
+    /// `execTransaction` (DL-P3-4, DL-P3.2-3).
+    Evm,
+    // Cosmos, Solana, Substrate — Phase 3.3+.
 }
 
-/// Fee-rate unit per chain. `SegWit` chains charge per virtual byte (the
-/// witness-discounted weight unit); legacy / no-segwit chains charge
-/// per raw byte. Mixing them produces a fee that is up to 4× wrong.
+/// Fee-rate unit per chain. UTXO `SegWit` chains charge per virtual byte
+/// (witness-discounted weight unit); UTXO legacy / no-segwit chains
+/// charge per raw byte; EVM chains charge per gas-unit (`gwei`). Mixing
+/// UTXO units produces a fee up to 4× wrong; mixing EVM with UTXO is a
+/// type error caught here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeeUnit {
     /// sat/vB — `SegWit`-bearing chains (BTC, LTC).
     PerVbyte,
     /// sat/B (raw byte) — legacy chains without `SegWit` (BCH, DOGE, ZEC).
     PerByte,
+    /// wei/gas — EVM chains. Translated to / from gwei at the wire.
+    PerGwei,
 }
 
+/// EVM transaction type per chain. Phase 3.2 picks one per chain at
+/// `chain_registry::tx_type`; the executor selects the matching
+/// `alloy` builder (`TxEip1559` vs `TxLegacy`). BSC long resisted
+/// EIP-1559 — its mempool still routes legacy txs by default
+/// (DL-P3.2-4 locked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvmTxType {
+    /// Type-2 EIP-1559 (`max_fee_per_gas` + `max_priority_fee_per_gas`).
+    Eip1559,
+    /// Type-0 legacy (`gas_price`).
+    Legacy,
+}
+
+/// Compile-time `&[ChainId]` of every supported chain. Used by
+/// `from_asset_id` and the test-side full-coverage iteration.
+pub const ALL_CHAINS: &[ChainId] = &[
+    ChainId::Btc,
+    ChainId::Ltc,
+    ChainId::Bch,
+    ChainId::Doge,
+    ChainId::Zec,
+    ChainId::Eth,
+    ChainId::Bsc,
+    ChainId::Avax,
+    ChainId::Base,
+    ChainId::Pol,
+];
+
 impl ChainId {
-    /// `THORChain` asset string, e.g. `"BTC.BTC"`. Used in swap memos
-    /// and as the canonical input to [`Self::asset_id_hash`].
+    /// `THORChain` asset string, e.g. `"BTC.BTC"` / `"ETH.ETH"`. Used
+    /// in swap memos and as the canonical input to [`Self::asset_id_hash`].
+    /// EVM gas-token names per `THORChain` `Bifrost`: `ETH.ETH`,
+    /// `BSC.BNB`, `AVAX.AVAX`, `BASE.ETH`, `POL.MATIC`.
     #[must_use]
     pub const fn thor_asset(self) -> &'static str {
         match self {
@@ -111,68 +170,169 @@ impl ChainId {
             Self::Bch => "BCH.BCH",
             Self::Doge => "DOGE.DOGE",
             Self::Zec => "ZEC.ZEC",
+            Self::Eth => "ETH.ETH",
+            Self::Bsc => "BSC.BNB",
+            Self::Avax => "AVAX.AVAX",
+            Self::Base => "BASE.ETH",
+            Self::Pol => "POL.MATIC",
         }
     }
 
-    /// Custody family. All Phase 3.1 chains are UTXO.
+    /// Custody family. UTXO for Phase 3.1 chains; EVM (Safe v1.4.1
+    /// multisig) for Phase 3.2 chains.
     #[must_use]
     pub const fn custody_family(self) -> CustodyFamily {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => CustodyFamily::Utxo,
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => CustodyFamily::Evm,
         }
     }
 
-    /// Native-unit decimals. All Bitcoin-family chains use 8.
+    /// Native-unit decimals. UTXO family = 8 (sat); EVM family = 18 (wei).
     #[must_use]
     pub const fn decimals(self) -> u8 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 8,
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => 18,
         }
     }
 
-    /// Native-unit scale (`10^decimals`). All 8-decimal chains use
-    /// `100_000_000`.
+    /// Native-unit scale (`10^decimals`) as `u64`. **UTXO-only.** EVM
+    /// chains have `10^18` which overflows `u64`; calling this on an
+    /// EVM chain is a programming error. Use [`Self::scale_u128`] for
+    /// any code that may run on the EVM family.
+    ///
+    /// # Panics
+    /// Panics on `Eth` / `Bsc` / `Avax` / `Base` / `Pol`.
     #[must_use]
+    #[expect(
+        clippy::panic,
+        reason = "intentional fail-loud guard against EVM-callers using a u64 path; \
+                  EVM 10^18 overflows u64. Workspace clippy.panic = deny is correct \
+                  for production code, but this const fn is the exception that names \
+                  itself u64."
+    )]
     pub const fn scale(self) -> u64 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
+                panic!("ChainId::scale() does not fit u64 for the EVM family — use scale_u128()")
+            }
+        }
+    }
+
+    /// Native-unit scale (`10^decimals`) as `u128`. Works for all
+    /// chains (`10^18 < u128::MAX`); the canonical accessor for any
+    /// code that touches both UTXO and EVM families (chain-evm,
+    /// safe-evm, executor).
+    #[must_use]
+    pub const fn scale_u128(self) -> u128 {
+        match self {
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
+                1_000_000_000_000_000_000
+            }
         }
     }
 
     /// Confirmation depth before the signer attests a delivery /
-    /// refund. Per `THORChain` `bifrost/pkg/chainclients/*` heuristics:
-    /// BTC 6, LTC 12 (10-min target ÷ 2.5-min blocks ⇒ 4× BTC's
-    /// timewise; pinned 12 by bifrost), BCH 6 (matches BTC),
-    /// **DOGE 40** (1-min blocks + reorg history), ZEC 10.
+    /// refund. UTXO per `THORChain` Bifrost: BTC 6, LTC 12, BCH 6,
+    /// DOGE 40, ZEC 10. EVM per Bifrost finality models: ETH 12
+    /// (proof-of-stake near-instant finality at 2 epochs ≈ 12.8 min),
+    /// BSC 20 (3-sec blocks, 1-min effective), AVAX 5 (post-Apricot
+    /// rapid finality), BASE 30 (L2 sequencer + ~5-min L1 anchoring),
+    /// POL 64 (heimdall-bor 256-block checkpointing → conservative).
     #[must_use]
+    #[expect(
+        clippy::match_same_arms,
+        reason = "BTC/BCH share 6 confs as a Bifrost coincidence (different consensus); \
+                  LTC/ETH share 12 by coincidence (PoW vs PoS finality). Merging arms \
+                  would imply a shared reason that does not exist."
+    )]
     pub const fn conf_depth(self) -> u32 {
         match self {
             Self::Btc | Self::Bch => 6,
             Self::Ltc => 12,
             Self::Doge => 40,
             Self::Zec => 10,
+            Self::Eth => 12,
+            Self::Bsc => 20,
+            Self::Avax => 5,
+            Self::Base => 30,
+            Self::Pol => 64,
         }
     }
 
-    /// Maximum bytes carryable in an `OP_RETURN` standard-relay output.
-    /// 80 is the Bitcoin Core default; BCH raised the limit to 220 in
-    /// 2019 (`MAY 2019` HF). Affects `THORChain` affiliate-fee memos
-    /// which can exceed 80 on BCH.
+    /// Maximum bytes carryable in an `OP_RETURN` standard-relay output
+    /// (UTXO chains). Always `0` for EVM chains — memos live in
+    /// calldata, not `OP_RETURN`.
     #[must_use]
     pub const fn op_return_max(self) -> usize {
         match self {
             Self::Bch => 220,
             Self::Btc | Self::Ltc | Self::Doge | Self::Zec => 80,
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => 0,
         }
     }
 
-    /// Fee unit per chain. `SegWit` chains use `PerVbyte`; legacy /
-    /// no-segwit chains use `PerByte` (their "vbyte" is just a byte).
+    /// Fee unit per chain. UTXO `SegWit` → `PerVbyte`; UTXO legacy →
+    /// `PerByte`; EVM → `PerGwei`.
     #[must_use]
     pub const fn fee_unit(self) -> FeeUnit {
         match self {
             Self::Btc | Self::Ltc => FeeUnit::PerVbyte,
             Self::Bch | Self::Doge | Self::Zec => FeeUnit::PerByte,
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => FeeUnit::PerGwei,
+        }
+    }
+
+    /// EVM transaction type per chain. UTXO chains return `None`
+    /// (the EVM tx-type concept is meaningless for them). DL-P3.2-4:
+    /// EIP-1559 on ETH/AVAX/BASE/POL; legacy on BSC.
+    #[must_use]
+    pub const fn tx_type(self) -> Option<EvmTxType> {
+        match self {
+            Self::Eth | Self::Avax | Self::Base | Self::Pol => Some(EvmTxType::Eip1559),
+            Self::Bsc => Some(EvmTxType::Legacy),
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => None,
+        }
+    }
+
+    /// EVM chain ID (the `chainId` field used in EIP-155 + EIP-712
+    /// domain separators). UTXO chains return `None`.
+    #[must_use]
+    pub const fn evm_chain_id(self) -> Option<u64> {
+        match self {
+            Self::Eth => Some(1),
+            Self::Bsc => Some(56),
+            Self::Avax => Some(43_114),
+            Self::Base => Some(8_453),
+            Self::Pol => Some(137),
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => None,
+        }
+    }
+
+    /// `THORChain` Router contract address on the chain itself. The
+    /// executor sends Safe `execTransaction` output to this address to
+    /// initiate a swap back to USDT on Ethereum. UTXO chains return
+    /// `None` (their `THORChain` side is an `Asgard` vault address
+    /// served by `ThorchainVaultRegistry`).
+    ///
+    /// **DL-P3.2-5: placeholders pending source citation.** These
+    /// addresses MUST be pinned from a specific `THORChain` docs
+    /// commit before V10 mainnet deploy. Returning `address(0)` here
+    /// ensures any premature mainnet attempt fails loudly (Safe
+    /// `execTransaction` to the zero address would revert at the
+    /// receiver gate). V7 (executor) and V10 (Solidity registration)
+    /// pin the real addresses with source citation; V11
+    /// `KNOWN_FINDINGS` records the pin verification.
+    #[must_use]
+    pub fn thorchain_router_address(self) -> Option<Address> {
+        match self {
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
+                Some(address!("0000000000000000000000000000000000000000"))
+            }
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => None,
         }
     }
 
@@ -189,15 +349,16 @@ impl ChainId {
 
     /// Reverse of [`asset_id_hash`]: lookup the `ChainId` for an
     /// on-chain `legAssetIds[i]` value. Returns `None` if the asset
-    /// hash doesn't match any Phase 3.1 UTXO-family chain.
+    /// hash doesn't match any supported chain. Iterates [`ALL_CHAINS`].
     ///
     /// Used by `xindex-attest-redeem` to route per-leg cross-checks:
     /// `ev.legAssetIds[i]` → `ChainId` → per-chain dispatch lookup +
-    /// Esplora client + `THORChain` chain-query endpoint.
+    /// chain client + `THORChain` chain-query endpoint.
     #[must_use]
     pub fn from_asset_id(asset_id: B256) -> Option<Self> {
-        [Self::Btc, Self::Ltc, Self::Bch, Self::Doge, Self::Zec]
-            .into_iter()
+        ALL_CHAINS
+            .iter()
+            .copied()
             .find(|c| c.asset_id_hash() == asset_id)
     }
 }
@@ -208,7 +369,9 @@ mod tests {
 
     /// Canonical `THORChain` asset strings. Pinned — changing any of
     /// these breaks the on-chain `IndexFactory` constants which hash
-    /// the same UTF-8 bytes.
+    /// the same UTF-8 bytes. EVM gas-token names per Bifrost
+    /// convention (`ETH.ETH`, `BSC.BNB`, `AVAX.AVAX`, `BASE.ETH`,
+    /// `POL.MATIC`).
     #[test]
     fn thor_asset_strings_match_thorchain_convention() {
         assert_eq!(ChainId::Btc.thor_asset(), "BTC.BTC");
@@ -216,6 +379,11 @@ mod tests {
         assert_eq!(ChainId::Bch.thor_asset(), "BCH.BCH");
         assert_eq!(ChainId::Doge.thor_asset(), "DOGE.DOGE");
         assert_eq!(ChainId::Zec.thor_asset(), "ZEC.ZEC");
+        assert_eq!(ChainId::Eth.thor_asset(), "ETH.ETH");
+        assert_eq!(ChainId::Bsc.thor_asset(), "BSC.BNB");
+        assert_eq!(ChainId::Avax.thor_asset(), "AVAX.AVAX");
+        assert_eq!(ChainId::Base.thor_asset(), "BASE.ETH");
+        assert_eq!(ChainId::Pol.thor_asset(), "POL.MATIC");
     }
 
     #[test]
@@ -230,7 +398,61 @@ mod tests {
             assert_eq!(c.custody_family(), CustodyFamily::Utxo);
             assert_eq!(c.decimals(), 8);
             assert_eq!(c.scale(), 100_000_000);
+            assert_eq!(c.scale_u128(), 100_000_000_u128);
+            assert_eq!(c.tx_type(), None);
+            assert_eq!(c.evm_chain_id(), None);
+            assert_eq!(c.thorchain_router_address(), None);
         }
+    }
+
+    #[test]
+    fn all_phase_3_2_chains_are_evm_family_with_18_decimals() {
+        for c in [
+            ChainId::Eth,
+            ChainId::Bsc,
+            ChainId::Avax,
+            ChainId::Base,
+            ChainId::Pol,
+        ] {
+            assert_eq!(c.custody_family(), CustodyFamily::Evm);
+            assert_eq!(c.decimals(), 18);
+            assert_eq!(c.scale_u128(), 1_000_000_000_000_000_000_u128);
+            assert_eq!(c.fee_unit(), FeeUnit::PerGwei);
+            assert_eq!(c.op_return_max(), 0);
+            assert!(c.tx_type().is_some());
+            assert!(c.evm_chain_id().is_some());
+            assert!(c.thorchain_router_address().is_some());
+        }
+    }
+
+    /// Tx-type per DL-P3.2-4: EIP-1559 on ETH/AVAX/BASE/POL; legacy on BSC.
+    #[test]
+    fn tx_type_per_chain_matches_dl_p32_4() {
+        assert_eq!(ChainId::Eth.tx_type(), Some(EvmTxType::Eip1559));
+        assert_eq!(ChainId::Avax.tx_type(), Some(EvmTxType::Eip1559));
+        assert_eq!(ChainId::Base.tx_type(), Some(EvmTxType::Eip1559));
+        assert_eq!(ChainId::Pol.tx_type(), Some(EvmTxType::Eip1559));
+        assert_eq!(ChainId::Bsc.tx_type(), Some(EvmTxType::Legacy));
+    }
+
+    /// EVM chain IDs pinned per EIP-155 mainnet assignments.
+    #[test]
+    fn evm_chain_ids_match_mainnet() {
+        assert_eq!(ChainId::Eth.evm_chain_id(), Some(1));
+        assert_eq!(ChainId::Bsc.evm_chain_id(), Some(56));
+        assert_eq!(ChainId::Avax.evm_chain_id(), Some(43_114));
+        assert_eq!(ChainId::Base.evm_chain_id(), Some(8_453));
+        assert_eq!(ChainId::Pol.evm_chain_id(), Some(137));
+    }
+
+    /// `ChainId::scale()` panics on EVM chains — those callers must
+    /// use `scale_u128`. Pinning the panic so a silent EVM regression
+    /// (`scale()` returning 0 or wrapping `10^18 mod 2^64`) is
+    /// impossible.
+    #[test]
+    #[should_panic(expected = "does not fit u64")]
+    fn scale_u64_panics_on_evm() {
+        let _ = ChainId::Eth.scale();
     }
 
     /// Confirmation depths verbatim from `THORChain` Bifrost.
@@ -244,6 +466,12 @@ mod tests {
         // DOGE 40: 1-min blocks + historical reorg vulnerability.
         assert_eq!(ChainId::Doge.conf_depth(), 40);
         assert_eq!(ChainId::Zec.conf_depth(), 10);
+        // EVM family per Bifrost finality models.
+        assert_eq!(ChainId::Eth.conf_depth(), 12);
+        assert_eq!(ChainId::Bsc.conf_depth(), 20);
+        assert_eq!(ChainId::Avax.conf_depth(), 5);
+        assert_eq!(ChainId::Base.conf_depth(), 30);
+        assert_eq!(ChainId::Pol.conf_depth(), 64);
     }
 
     /// BCH's 2019 post-fork relay policy raised the `OP_RETURN` limit
@@ -275,23 +503,20 @@ mod tests {
     /// chains produce distinct hashes (anti-collision sanity).
     /// Round-trip: `ChainId` ↔ string form (`Display` + `FromStr`).
     /// Used by JSON wire (`PsbtInputSignRequest`), `SQLite` TEXT columns,
-    /// and CLI args. Mixed-case input is normalised to lowercase.
+    /// and CLI args. Mixed-case input is normalised to lowercase. All
+    /// 10 chains round-trip cleanly.
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
     fn display_fromstr_round_trip_and_case_insensitive() {
-        for c in [
-            ChainId::Btc,
-            ChainId::Ltc,
-            ChainId::Bch,
-            ChainId::Doge,
-            ChainId::Zec,
-        ] {
+        for &c in ALL_CHAINS {
             let s = c.to_string();
             let back: ChainId = s.parse().expect("parse");
             assert_eq!(back, c);
         }
         assert_eq!("BTC".parse::<ChainId>().expect("uppercase"), ChainId::Btc);
         assert_eq!("Ltc".parse::<ChainId>().expect("mixed"), ChainId::Ltc);
+        assert_eq!("ETH".parse::<ChainId>().expect("evm upper"), ChainId::Eth);
+        assert_eq!("Base".parse::<ChainId>().expect("evm mixed"), ChainId::Base);
         assert!("ada".parse::<ChainId>().is_err());
     }
 
@@ -306,17 +531,12 @@ mod tests {
     }
 
     /// U10: round-trip `ChainId` → `asset_id_hash` → `ChainId` via
-    /// `from_asset_id`. Bogus hash returns None. Used by
-    /// `xindex-attest-redeem` to route per-leg cross-checks.
+    /// `from_asset_id`. Bogus hash returns `None`. Used by
+    /// `xindex-attest-redeem` to route per-leg cross-checks. All 10
+    /// chains covered.
     #[test]
     fn from_asset_id_round_trip_and_rejects_unknown() {
-        for c in [
-            ChainId::Btc,
-            ChainId::Ltc,
-            ChainId::Bch,
-            ChainId::Doge,
-            ChainId::Zec,
-        ] {
+        for &c in ALL_CHAINS {
             assert_eq!(ChainId::from_asset_id(c.asset_id_hash()), Some(c));
         }
         // Unknown / bogus asset hash → None (not silently mapped to BTC).
@@ -326,27 +546,16 @@ mod tests {
 
     #[test]
     fn asset_id_hash_matches_keccak256_of_thor_asset_bytes() {
-        for c in [
-            ChainId::Btc,
-            ChainId::Ltc,
-            ChainId::Bch,
-            ChainId::Doge,
-            ChainId::Zec,
-        ] {
+        for &c in ALL_CHAINS {
             let expected = keccak256(c.thor_asset().as_bytes());
             assert_eq!(c.asset_id_hash(), expected);
         }
-        // All five hashes are pairwise distinct.
-        let hashes: Vec<B256> = [
-            ChainId::Btc,
-            ChainId::Ltc,
-            ChainId::Bch,
-            ChainId::Doge,
-            ChainId::Zec,
-        ]
-        .into_iter()
-        .map(ChainId::asset_id_hash)
-        .collect();
+        // All 10 hashes are pairwise distinct (no UTXO/EVM collisions).
+        let hashes: Vec<B256> = ALL_CHAINS
+            .iter()
+            .copied()
+            .map(ChainId::asset_id_hash)
+            .collect();
         for (i, a) in hashes.iter().enumerate() {
             for (j, b) in hashes.iter().enumerate() {
                 if i != j {
