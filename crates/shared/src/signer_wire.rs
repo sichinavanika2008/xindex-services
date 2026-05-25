@@ -15,9 +15,9 @@
 //! coordinator both depend on it, so a wire-shape mismatch is a
 //! compile error, never a runtime one.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::chain_registry::ChainId;
+use crate::chain_registry::{ChainId, CustodyFamily};
 
 /// `POST /api/v1/sign/eip712-attestation`
 ///
@@ -107,6 +107,68 @@ pub struct PsbtInputSignRequest {
     pub input_index: u32,
 }
 
+/// `POST /api/v1/sign/evm-safe-tx`
+///
+/// V2 (Phase 3.2): Safe v1.4.1 `execTransaction` digest signing for
+/// the EVM custody family. The daemon:
+///   1. Routes to the per-chain config keyed by `chain_id` (`endpoint_disabled`
+///      if no EVM role is configured for that chain — DL-P3.2-2).
+///   2. RE-COMPUTES the `safeTxHash` from the `safe-evm` crate (V3) using
+///      the caller-supplied Safe address + nonce + ABI inputs, and refuses
+///      the request if the recomputed digest does not match `safe_tx_hash`
+///      — defense-in-depth: never blind-sign.
+///   3. Replay-keys on `(redemption_id_or_safe_addr, chain_id, nonce)`.
+///      `safe_tx_hash` already incorporates `chain_id` via the EIP-712
+///      domain separator, so the tuple is over-keyed by design.
+///   4. Signs the recomputed digest via `HsmDigestSigner::sign_digest` —
+///      the SAME 65-byte ECDSA primitive used by the PSBT-input path.
+///
+/// Returns [`Eip712SignResponse`] — no new response type is needed; the
+/// existing `signature` + `signer_address` fields cover the Safe path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvmSafeTxSignRequest {
+    /// EVM `ChainId`. MUST satisfy
+    /// `chain_id.custody_family() == CustodyFamily::Evm`; the serde
+    /// validator rejects UTXO chain ids at deserialize time with
+    /// [`error_codes::NON_EVM_CHAIN`].
+    #[serde(deserialize_with = "deserialize_evm_chain_id")]
+    pub chain_id: ChainId,
+    /// Safe proxy contract address — `0x`-prefixed 20-byte EIP-55
+    /// checksum hex. Bound into the EIP-712 domain's `verifyingContract`.
+    pub safe_address: String,
+    /// Pre-computed `safeTxHash` digest (the keccak256 of
+    /// `0x1901 || domainSeparator || structHash`), `0x`-prefixed 32-byte
+    /// hex. The daemon recomputes from the Safe ABI inputs and rejects
+    /// mismatches.
+    pub safe_tx_hash: String,
+    /// Safe contract `nonce()` at hash construction time. Decimal
+    /// string (JSON numbers can't represent the full `uint256`, even
+    /// though Safe nonces are practically `u64`).
+    pub nonce: String,
+    /// Caller-supplied fee in wei (DL-P3.2-7: no oracle integration in
+    /// v1; coordinator carries the gas price end-to-end). Decimal
+    /// string.
+    pub fee_wei: String,
+}
+
+/// Serde validator: refuse to deserialize an [`EvmSafeTxSignRequest`]
+/// with a non-EVM `chain_id`. This is a defence-in-depth filter — the
+/// handler also checks `custody_family()` at runtime, but rejecting at
+/// the JSON boundary keeps the type itself an EVM-only carrier.
+fn deserialize_evm_chain_id<'de, D>(deserializer: D) -> Result<ChainId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let chain = ChainId::deserialize(deserializer)?;
+    if chain.custody_family() != CustodyFamily::Evm {
+        return Err(serde::de::Error::custom(format!(
+            "{}: chain '{chain}' is not an EVM custody family chain",
+            error_codes::NON_EVM_CHAIN
+        )));
+    }
+    Ok(chain)
+}
+
 /// Response for the three EIP-712 endpoints.
 ///
 /// `signature` is 65-byte ECDSA `r ‖ s ‖ v` (v ∈ {27,28}) hex-encoded
@@ -192,6 +254,18 @@ pub mod error_codes {
     /// The endpoint is not configured for this daemon's role (e.g.
     /// PSBT request to an EIP-712-only daemon). HTTP 404.
     pub const ENDPOINT_DISABLED: &str = "endpoint_disabled";
+    /// V2 (Phase 3.2): the request's `safe_address` did not parse as a
+    /// 20-byte EIP-55 checksum hex string, or the recomputed
+    /// `safeTxHash` did not match the caller-supplied value. HTTP 422.
+    pub const WRONG_SAFE_ADDRESS: &str = "wrong_safe_address";
+    /// V2 (Phase 3.2): the request's `nonce` did not parse as a
+    /// `uint256` decimal string or is outside the practical `u64`
+    /// range. HTTP 400.
+    pub const NONCE_OUT_OF_RANGE: &str = "nonce_out_of_range";
+    /// V2 (Phase 3.2): the request's `chain_id` belongs to the UTXO
+    /// custody family — the EVM Safe-tx endpoint only accepts EVM
+    /// chains. HTTP 422.
+    pub const NON_EVM_CHAIN: &str = "non_evm_chain";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -306,6 +380,64 @@ mod tests {
         let s = serde_json::to_string(&r).expect("serialize");
         let back: Eip712SignResponse = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, r);
+    }
+
+    /// V2: `EvmSafeTxSignRequest` round-trips JSON for every EVM
+    /// `ChainId` (eth / bsc / avax / base / pol) without losing fields.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn evm_safe_tx_request_round_trip_all_evm_chains() {
+        for chain in [
+            ChainId::Eth,
+            ChainId::Bsc,
+            ChainId::Avax,
+            ChainId::Base,
+            ChainId::Pol,
+        ] {
+            let req = EvmSafeTxSignRequest {
+                chain_id: chain,
+                safe_address: "0x1234567890aBcDef1234567890AbCdEf12345678".to_string(),
+                safe_tx_hash: format!("0x{}", "ab".repeat(32)),
+                nonce: "7".to_string(),
+                fee_wei: "1000000000".to_string(),
+            };
+            let s = serde_json::to_string(&req).expect("serialize");
+            let back: EvmSafeTxSignRequest = serde_json::from_str(&s).expect("deserialize");
+            assert_eq!(back, req);
+        }
+    }
+
+    /// V2: the serde validator rejects every UTXO `ChainId` on the
+    /// `evm-safe-tx` request — defence-in-depth above the runtime
+    /// `custody_family` check in the daemon handler.
+    #[test]
+    fn evm_safe_tx_request_rejects_utxo_chains() {
+        for chain in ["btc", "ltc", "bch", "doge", "zec"] {
+            let json = format!(
+                r#"{{"chain_id":"{chain}","safe_address":"0x0000000000000000000000000000000000000000","safe_tx_hash":"0x{hash}","nonce":"0","fee_wei":"0"}}"#,
+                chain = chain,
+                hash = "00".repeat(32),
+            );
+            let result: Result<EvmSafeTxSignRequest, _> = serde_json::from_str(&json);
+            let err_msg = match result {
+                Ok(req) => format!("expected NON_EVM_CHAIN rejection, got: {req:?}"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err_msg.contains(error_codes::NON_EVM_CHAIN),
+                "must surface the NON_EVM_CHAIN code; chain='{chain}', got: {err_msg}"
+            );
+        }
+    }
+
+    /// V2: unknown chain string is rejected with the generic
+    /// `ChainId` parse error (not the `NON_EVM_CHAIN` code) — sanity
+    /// check that the validator order is `parse → custody-family-check`.
+    #[test]
+    fn evm_safe_tx_request_rejects_unknown_chain() {
+        let json = r#"{"chain_id":"ada","safe_address":"0x0","safe_tx_hash":"0x0","nonce":"0","fee_wei":"0"}"#;
+        let result: Result<EvmSafeTxSignRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 
     #[test]
