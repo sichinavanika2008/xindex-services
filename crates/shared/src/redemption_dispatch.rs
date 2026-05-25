@@ -514,4 +514,52 @@ mod tests {
             "per-leg first-write-wins (sqlite)"
         );
     }
+
+    /// V8 / Phase 3.2: every EVM family chain is admitted by the widened
+    /// CHECK constraint on the sqlite store. Pre-existing UTXO rows still
+    /// insert cleanly (post-migration regression).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_accepts_every_evm_chain_post_v8_migration() {
+        let store = SqliteRedemptionDispatch::connect("sqlite::memory:")
+            .await
+            .expect("connect + migrate");
+        // Pre-existing UTXO regression: btc still records.
+        let utxo_id = b256!("00000000000000000000000000000000000000000000000000000000000000e0");
+        store
+            .record(utxo_id, 0, ChainId::Btc, "btc-txid".into(), 1)
+            .await
+            .expect("btc record");
+        // Each EVM chain records its own row.
+        for (idx, chain) in [
+            ChainId::Eth,
+            ChainId::Bsc,
+            ChainId::Avax,
+            ChainId::Base,
+            ChainId::Pol,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = b256!("00000000000000000000000000000000000000000000000000000000000000e1");
+            let leg = u32::try_from(idx).expect("idx fits u32");
+            store
+                .record(
+                    id,
+                    leg,
+                    chain,
+                    format!("evm-tx-{chain}"),
+                    100 + u64::from(leg),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("record {chain}: {e}"));
+            let got = store
+                .get(&id, leg)
+                .await
+                .expect("get")
+                .expect("recorded row");
+            assert_eq!(got.chain, chain, "{chain} round-trips");
+            assert_eq!(got.inbound_txid, format!("evm-tx-{chain}"));
+        }
+    }
 }
