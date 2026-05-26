@@ -552,7 +552,7 @@ mod tests {
                     100 + u64::from(leg),
                 )
                 .await
-                .unwrap_or_else(|e| panic!("record {chain}: {e}"));
+                .unwrap_or_else(|e| unreachable!("record {chain}: {e}"));
             let got = store
                 .get(&id, leg)
                 .await
