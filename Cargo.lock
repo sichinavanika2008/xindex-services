@@ -5418,6 +5418,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-chain-evm"
+version = "0.0.1"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "alloy-sol-types",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "xindex-chain-eth",
+ "xindex-shared",
+]
+
+[[package]]
 name = "xindex-chain-thor"
 version = "0.0.1"
 dependencies = [

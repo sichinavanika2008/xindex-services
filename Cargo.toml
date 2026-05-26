@@ -62,6 +62,7 @@ bitcoincash-addr = "0.5"
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
 xindex-chain-eth = { path = "crates/chain-eth" }
+xindex-chain-evm = { path = "crates/chain-evm" }
 xindex-chain-thor = { path = "crates/chain-thor" }
 xindex-chain-utxo = { path = "crates/chain-utxo" }
 xindex-multisig = { path = "crates/multisig" }

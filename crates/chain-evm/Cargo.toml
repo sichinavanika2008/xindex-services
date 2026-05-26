@@ -1,0 +1,27 @@
+[package]
+name = "xindex-chain-evm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+xindex-shared.workspace = true
+# Re-uses `WsEndpointList` + `is_transient_rpc_error` from chain-eth.
+# Phase 3.2 extends the multi-RPC helpers across chains rather than
+# duplicating ~300 LOC of fallover code.
+xindex-chain-eth.workspace = true
+alloy = { workspace = true }
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true
