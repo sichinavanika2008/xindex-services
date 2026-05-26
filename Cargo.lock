@@ -5468,11 +5468,13 @@ version = "0.0.1"
 dependencies = [
  "alloy",
  "alloy-primitives",
+ "alloy-sol-types",
  "anyhow",
  "base64",
  "bitcoin",
  "clap",
  "futures-util",
+ "k256",
  "reqwest",
  "serde_json",
  "sqlx",
@@ -5482,9 +5484,11 @@ dependencies = [
  "tracing-subscriber",
  "wiremock",
  "xindex-chain-eth",
+ "xindex-chain-evm",
  "xindex-chain-thor",
  "xindex-chain-utxo",
  "xindex-multisig",
+ "xindex-safe-evm",
  "xindex-shared",
 ]
 

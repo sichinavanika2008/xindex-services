@@ -12,11 +12,14 @@ workspace = true
 [dependencies]
 xindex-shared.workspace = true
 xindex-chain-eth.workspace = true
+xindex-chain-evm.workspace = true
 xindex-chain-utxo.workspace = true
 xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
+xindex-safe-evm.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
 bitcoin.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -35,7 +38,14 @@ base64 = "0.22"
 [dev-dependencies]
 wiremock.workspace = true
 serde_json.workspace = true
+# V7 tests: deterministic k1 signatures so the safe-evm aggregator's
+# recovery cross-check passes against StubCosigner outputs.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 
 [[bin]]
 name = "xindex-redeem"
 path = "src/bin/xindex-redeem.rs"
+
+[[bin]]
+name = "xindex-redeem-evm"
+path = "src/bin/xindex-redeem-evm.rs"

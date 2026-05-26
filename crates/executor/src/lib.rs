@@ -16,6 +16,7 @@
 //! with a `MultisigCosigner` trait carrying signer-daemon RPC calls.
 
 pub mod broadcast_registry;
+pub mod evm_redeem;
 pub mod rebroadcast;
 pub mod redeem;
 pub mod remote_cosigner;
