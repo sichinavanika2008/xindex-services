@@ -136,18 +136,53 @@ pub struct EvmSafeTxSignRequest {
     /// Safe proxy contract address — `0x`-prefixed 20-byte EIP-55
     /// checksum hex. Bound into the EIP-712 domain's `verifyingContract`.
     pub safe_address: String,
-    /// Pre-computed `safeTxHash` digest (the keccak256 of
-    /// `0x1901 || domainSeparator || structHash`), `0x`-prefixed 32-byte
-    /// hex. The daemon recomputes from the Safe ABI inputs and rejects
-    /// mismatches.
-    pub safe_tx_hash: String,
-    /// Safe contract `nonce()` at hash construction time. Decimal
-    /// string (JSON numbers can't represent the full `uint256`, even
-    /// though Safe nonces are practically `u64`).
+
+    // ─── SafeTransaction ABI inputs (V5) ────────────────────────────────
+    // Carried in the wire so the daemon can RE-COMPUTE `safeTxHash` from
+    // the inputs locally and reject mismatch (DL-M5-3 / signer-daemon
+    // never trusts a coordinator-supplied digest).
+    /// `SafeTx.to` — `0x`-prefixed 20-byte address hex.
+    pub to: String,
+    /// `SafeTx.value` — wei, decimal `U256` string.
+    pub value: String,
+    /// `SafeTx.data` — `0x`-prefixed bytes hex (may be empty `0x`).
+    pub data: String,
+    /// `SafeTx.operation` — `0` (Call) or `1` (`DelegateCall`). Phase 3.2
+    /// custody never delegatecalls.
+    pub operation: u8,
+    /// `SafeTx.safeTxGas` — gas budget for the Safe-side call, decimal
+    /// `U256` string. `0` = use full available gas at execution time
+    /// (Safe v1.3+ default).
+    pub safe_tx_gas: String,
+    /// `SafeTx.baseGas` — gas charged for Safe overhead, decimal `U256`
+    /// string. `0` in Phase 3.2 (no Safe-side refund).
+    pub base_gas: String,
+    /// `SafeTx.gasPrice` — Safe-side refund price, decimal `U256`
+    /// string. **Always 0 in Phase 3.2** (DL-P3.2-7: caller supplies
+    /// gas at the tx-broadcast layer, not Safe's refund machinery).
+    pub gas_price: String,
+    /// `SafeTx.gasToken` — refund token, `0x`-prefixed address hex.
+    /// **Always `address(0)` in Phase 3.2** (no Safe-side refund).
+    pub gas_token: String,
+    /// `SafeTx.refundReceiver` — `0x`-prefixed address hex. **Always
+    /// `address(0)` in Phase 3.2** (no refund).
+    pub refund_receiver: String,
+    /// `SafeTx.nonce` — the Safe's monotonic nonce, decimal `U256`
+    /// string (Safe nonces are practically `u64` but the ABI is
+    /// `uint256`).
     pub nonce: String,
+
+    /// Pre-computed `safeTxHash` (coordinator's claim).
+    /// `keccak256(0x1901 || domainSeparator || structHash)`,
+    /// `0x`-prefixed 32-byte hex. The daemon recomputes from the
+    /// ABI inputs above and refuses the request with
+    /// [`error_codes::SAFE_TX_HASH_MISMATCH`] if it diverges.
+    pub safe_tx_hash: String,
+
     /// Caller-supplied fee in wei (DL-P3.2-7: no oracle integration in
     /// v1; coordinator carries the gas price end-to-end). Decimal
-    /// string.
+    /// string. NOT part of the Safe digest — passed through for
+    /// transport convenience; daemon ignores during signing.
     pub fee_wei: String,
 }
 
@@ -266,6 +301,14 @@ pub mod error_codes {
     /// custody family — the EVM Safe-tx endpoint only accepts EVM
     /// chains. HTTP 422.
     pub const NON_EVM_CHAIN: &str = "non_evm_chain";
+    /// V5 (Phase 3.2): the daemon recomputed `safeTxHash` from the
+    /// request's Safe ABI inputs (`to` / `value` / `data` / `operation`
+    /// / `safe_tx_gas` / `base_gas` / `gas_price` / `gas_token` /
+    /// `refund_receiver` / `nonce`) and the result did not match the
+    /// caller-supplied `safe_tx_hash`. Indicates the coordinator
+    /// constructed the hash from different inputs than it claims.
+    /// HTTP 422.
+    pub const SAFE_TX_HASH_MISMATCH: &str = "safe_tx_hash_mismatch";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -397,8 +440,17 @@ mod tests {
             let req = EvmSafeTxSignRequest {
                 chain_id: chain,
                 safe_address: "0x1234567890aBcDef1234567890AbCdEf12345678".to_string(),
-                safe_tx_hash: format!("0x{}", "ab".repeat(32)),
+                to: "0xaabbccddeeff00112233445566778899aabbccdd".to_string(),
+                value: "0".to_string(),
+                data: "0xdeadbeef".to_string(),
+                operation: 0,
+                safe_tx_gas: "0".to_string(),
+                base_gas: "0".to_string(),
+                gas_price: "0".to_string(),
+                gas_token: format!("0x{}", "00".repeat(20)),
+                refund_receiver: format!("0x{}", "00".repeat(20)),
                 nonce: "7".to_string(),
+                safe_tx_hash: format!("0x{}", "ab".repeat(32)),
                 fee_wei: "1000000000".to_string(),
             };
             let s = serde_json::to_string(&req).expect("serialize");
@@ -413,9 +465,10 @@ mod tests {
     #[test]
     fn evm_safe_tx_request_rejects_utxo_chains() {
         for chain in ["btc", "ltc", "bch", "doge", "zec"] {
+            let zero_addr = format!("0x{}", "00".repeat(20));
             let json = format!(
-                r#"{{"chain_id":"{chain}","safe_address":"0x0000000000000000000000000000000000000000","safe_tx_hash":"0x{hash}","nonce":"0","fee_wei":"0"}}"#,
-                chain = chain,
+                r#"{{"chain_id":"{chain}","safe_address":"{a}","to":"{a}","value":"0","data":"0x","operation":0,"safe_tx_gas":"0","base_gas":"0","gas_price":"0","gas_token":"{a}","refund_receiver":"{a}","nonce":"0","safe_tx_hash":"0x{hash}","fee_wei":"0"}}"#,
+                a = zero_addr,
                 hash = "00".repeat(32),
             );
             let result: Result<EvmSafeTxSignRequest, _> = serde_json::from_str(&json);
@@ -435,7 +488,7 @@ mod tests {
     /// check that the validator order is `parse → custody-family-check`.
     #[test]
     fn evm_safe_tx_request_rejects_unknown_chain() {
-        let json = r#"{"chain_id":"ada","safe_address":"0x0","safe_tx_hash":"0x0","nonce":"0","fee_wei":"0"}"#;
+        let json = r#"{"chain_id":"ada","safe_address":"0x0","to":"0x0","value":"0","data":"0x","operation":0,"safe_tx_gas":"0","base_gas":"0","gas_price":"0","gas_token":"0x0","refund_receiver":"0x0","nonce":"0","safe_tx_hash":"0x0","fee_wei":"0"}"#;
         let result: Result<EvmSafeTxSignRequest, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }

@@ -176,6 +176,30 @@ pub trait ReplayStore: Send + Sync {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// V5: Safe v1.4.1 `execTransaction` digest replay check. Keyed by
+    /// `(chain_id, safe_address, nonce)` — Safe nonces are monotonic
+    /// per Safe, so a second-different request at the same nonce is
+    /// a coordinator bug or attack. `payload_hash` is the daemon's
+    /// recomputed `safeTxHash` (32 bytes; same value the HSM signs).
+    fn check_safe_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        safe_address: alloy_primitives::Address,
+        nonce: u64,
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// V5: record a fresh Safe-tx signature.
+    fn record_safe_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        safe_address: alloy_primitives::Address,
+        nonce: u64,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -187,6 +211,8 @@ struct InMemoryInner {
     attestations: HashMap<(B256, U256), SignedRecord>,
     redemptions: HashMap<B256, (RedemptionKind, SignedRecord)>,
     psbt_inputs: HashMap<([u8; 32], u32), SignedRecord>,
+    /// V5: Safe-tx replay key — `(chain_id_str, safe_address_bytes, nonce)`.
+    safe_txs: HashMap<(&'static str, [u8; 20], u64), SignedRecord>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -336,6 +362,50 @@ impl ReplayStore for InMemoryReplayStore {
         } else {
             Err(ReplayError::Decode(
                 "duplicate PSBT-input record (race)".to_string(),
+            ))
+        }
+    }
+
+    async fn check_safe_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        safe_address: alloy_primitives::Address,
+        nonce: u64,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), <[u8; 20]>::from(safe_address), nonce);
+        let g = self.inner.lock().await;
+        Ok(match g.safe_txs.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_safe_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        safe_address: alloy_primitives::Address,
+        nonce: u64,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), <[u8; 20]>::from(safe_address), nonce);
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.safe_txs.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Decode(
+                "duplicate Safe-tx record (race)".to_string(),
             ))
         }
     }
@@ -569,6 +639,82 @@ impl ReplayStore for SqliteReplayStore {
         )
         .bind(input_txid.as_slice())
         .bind(vout)
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn check_safe_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        safe_address: alloy_primitives::Address,
+        nonce: u64,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        // Safe nonces fit in `u64` in any realistic horizon; bind as
+        // `i64` so sqlite can sort the PK column natively.
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "Safe nonce cannot reach i64::MAX in practice"
+        )]
+        let nonce_i = nonce as i64;
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM signed_safe_txs
+             WHERE chain_id = ? AND safe_address = ? AND nonce = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(safe_address.as_slice())
+        .bind(nonce_i)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_safe_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        safe_address: alloy_primitives::Address,
+        nonce: u64,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "Safe nonce cannot reach i64::MAX in practice"
+        )]
+        let nonce_i = nonce as i64;
+        sqlx::query(
+            "INSERT INTO signed_safe_txs
+                (chain_id, safe_address, nonce, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(safe_address.as_slice())
+        .bind(nonce_i)
         .bind(payload_hash.as_slice())
         .bind(&signature)
         .bind(now_unix)

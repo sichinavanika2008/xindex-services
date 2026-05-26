@@ -524,6 +524,7 @@ mod tests {
             replay,
             hsm,
             utxo,
+            evm: std::collections::HashMap::new(),
         };
         let app = Router::new()
             .route(

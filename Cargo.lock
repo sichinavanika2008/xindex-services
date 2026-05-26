@@ -5603,6 +5603,7 @@ dependencies = [
  "wiremock",
  "xindex-executor",
  "xindex-multisig",
+ "xindex-safe-evm",
  "xindex-shared",
  "xindex-signer",
 ]

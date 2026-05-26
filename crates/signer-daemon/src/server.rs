@@ -43,6 +43,7 @@ use std::collections::HashMap;
 
 use xindex_shared::chain_registry::ChainId;
 
+use crate::evm_safe::{handle_evm_safe_tx, EvmSignerConfig};
 use crate::psbt::{handle_psbt_input, UtxoSignerConfig};
 use crate::replay::{CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore};
 use crate::web3signer::{HsmDigestSigner, HsmError};
@@ -86,6 +87,12 @@ pub struct DaemonState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
     /// each chain has its own 3-of-5 ceremony (no cross-chain key
     /// sharing per DL-P3-7).
     pub utxo: HashMap<ChainId, Arc<UtxoSignerConfig>>,
+    /// V5: per-chain EVM Safe-tx signing roles. Empty map = no EVM
+    /// key configured; the `/api/v1/sign/evm-safe-tx` route is then
+    /// not registered. Same dispatch shape as `utxo` — one
+    /// [`EvmSignerConfig`] per chain this daemon is in the Safe
+    /// owner-set of (DL-P3-7: no cross-chain key sharing).
+    pub evm: HashMap<ChainId, Arc<EvmSignerConfig>>,
 }
 
 // Manual `Clone` impl: every field is cheap to clone (`Arc<_>` +
@@ -101,6 +108,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for DaemonSta
             replay: Arc::clone(&self.replay),
             hsm: Arc::clone(&self.hsm),
             utxo: self.utxo.clone(),
+            evm: self.evm.clone(),
         }
     }
 }
@@ -113,6 +121,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             replay,
             hsm,
             utxo: HashMap::new(),
+            evm: HashMap::new(),
         }
     }
 
@@ -122,6 +131,15 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
     #[must_use]
     pub fn with_utxo(mut self, config: UtxoSignerConfig) -> Self {
         self.utxo.insert(config.chain_id, Arc::new(config));
+        self
+    }
+
+    /// V5 builder: attach a per-chain EVM Safe-tx signing role.
+    /// Call once per chain this daemon serves; the chain is taken from
+    /// `config.chain`.
+    #[must_use]
+    pub fn with_evm(mut self, config: EvmSignerConfig) -> Self {
+        self.evm.insert(config.chain, Arc::new(config));
         self
     }
 }
@@ -148,6 +166,9 @@ where
         .route("/api/v1/sign/eip712-refund", post(handle_refund::<S, H>));
     if !state.utxo.is_empty() {
         r = r.route("/api/v1/sign/psbt-input", post(handle_psbt_input::<S, H>));
+    }
+    if !state.evm.is_empty() {
+        r = r.route("/api/v1/sign/evm-safe-tx", post(handle_evm_safe_tx::<S, H>));
     }
     r.with_state(state)
 }
@@ -767,5 +788,277 @@ mod tests {
             format!("{:#x}", state.config.eth_address)
         );
         assert!(v["btc_pubkey"].is_null());
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // V5 — `/api/v1/sign/evm-safe-tx` loopback tests
+    // ────────────────────────────────────────────────────────────────
+
+    mod evm_safe_tx_tests {
+        use super::*;
+        use crate::evm_safe::EvmSignerConfig;
+        use alloy_primitives::Bytes;
+        use xindex_safe_evm::{
+            digest::{safe_tx_hash, SafeTransaction},
+            SafeOperation,
+        };
+        use xindex_shared::signer_wire::EvmSafeTxSignRequest;
+
+        const ETH_SAFE: Address = Address::new([0x11; 20]);
+        const ETH_SIGNER: Address = Address::new([0x21; 20]);
+        const BSC_SAFE: Address = Address::new([0x33; 20]);
+        const BSC_SIGNER: Address = Address::new([0x43; 20]);
+
+        fn evm_state() -> (
+            DaemonState<InMemoryReplayStore, CapturingSigner>,
+            Arc<CapturingSigner>,
+        ) {
+            let replay = Arc::new(InMemoryReplayStore::new());
+            let hsm = Arc::new(CapturingSigner::default());
+            let state = DaemonState::new(cfg(), replay, hsm.clone())
+                .with_evm(EvmSignerConfig {
+                    chain: ChainId::Eth,
+                    safe_address: ETH_SAFE,
+                    my_signer_address: ETH_SIGNER,
+                })
+                .with_evm(EvmSignerConfig {
+                    chain: ChainId::Bsc,
+                    safe_address: BSC_SAFE,
+                    my_signer_address: BSC_SIGNER,
+                });
+            (state, hsm)
+        }
+
+        /// Build a `(SafeTransaction, request_body)` pair where the
+        /// `safe_tx_hash` in the request matches the digest we'd
+        /// recompute server-side.
+        fn build_request(
+            chain: ChainId,
+            safe: Address,
+            nonce: u64,
+            data: &[u8],
+        ) -> (SafeTransaction, EvmSafeTxSignRequest) {
+            let tx = SafeTransaction {
+                to: Address::new([0xa1; 20]),
+                value: U256::ZERO,
+                data: Bytes::from(data.to_vec()),
+                operation: SafeOperation::Call,
+                safe_tx_gas: U256::ZERO,
+                base_gas: U256::ZERO,
+                gas_price: U256::ZERO,
+                gas_token: Address::ZERO,
+                refund_receiver: Address::ZERO,
+                nonce: U256::from(nonce),
+            };
+            #[expect(clippy::expect_used, reason = "test code")]
+            let evm_chain_id = chain.evm_chain_id().expect("evm chain");
+            let h = safe_tx_hash(evm_chain_id, safe, &tx);
+            let req = EvmSafeTxSignRequest {
+                chain_id: chain,
+                safe_address: format!("{safe:#x}"),
+                to: format!("{:#x}", tx.to),
+                value: tx.value.to_string(),
+                data: format!("0x{}", alloy_primitives::hex::encode(&tx.data)),
+                operation: tx.operation as u8,
+                safe_tx_gas: tx.safe_tx_gas.to_string(),
+                base_gas: tx.base_gas.to_string(),
+                gas_price: tx.gas_price.to_string(),
+                gas_token: format!("{:#x}", tx.gas_token),
+                refund_receiver: format!("{:#x}", tx.refund_receiver),
+                nonce: tx.nonce.to_string(),
+                safe_tx_hash: format!("0x{}", alloy_primitives::hex::encode(h)),
+                fee_wei: "0".to_string(),
+            };
+            (tx, req)
+        }
+
+        /// ETH + BSC configured → both sign cleanly, daemon hands the
+        /// HSM the EXACT recomputed digest for each chain.
+        #[tokio::test]
+        async fn signs_for_every_configured_chain() {
+            let (state, hsm) = evm_state();
+            let app = router(state.clone());
+
+            for (chain, safe, signer) in [
+                (ChainId::Eth, ETH_SAFE, ETH_SIGNER),
+                (ChainId::Bsc, BSC_SAFE, BSC_SIGNER),
+            ] {
+                let (tx, req) = build_request(chain, safe, 0, b"hello");
+                let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+                let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+                assert_eq!(status, StatusCode::OK, "{chain:?} status: {body}");
+                assert_eq!(
+                    body["signer_address"].as_str().unwrap_or(""),
+                    format!("{signer:#x}"),
+                    "{chain:?} signer"
+                );
+                // The HSM received the LOCALLY-RECOMPUTED digest, not the
+                // request's `safe_tx_hash` field (defence-in-depth — even
+                // if a coordinator lied about the hash, the daemon would
+                // have signed its own version OR rejected on mismatch).
+                #[expect(clippy::expect_used, reason = "test code")]
+                let evm_chain_id = chain.evm_chain_id().expect("evm chain");
+                let expected_digest = safe_tx_hash(evm_chain_id, safe, &tx);
+                #[expect(clippy::unwrap_used, reason = "test code")]
+                let seen = hsm.seen.lock().unwrap();
+                assert!(seen.iter().any(|(addr, d)| {
+                    *addr == signer && *d == expected_digest
+                }), "expected to see signer={signer:#x} digest={expected_digest} in HSM call history");
+            }
+        }
+
+        /// A chain not in `state.evm` returns 404 `endpoint_disabled`.
+        /// The route IS registered (because ETH+BSC are configured),
+        /// but the per-request lookup fails for AVAX.
+        #[tokio::test]
+        async fn avax_request_returns_endpoint_disabled() {
+            let (state, _hsm) = evm_state();
+            let app = router(state);
+            // Use AVAX's chain_id so the serde validator passes (AVAX
+            // is a valid EVM chain), but the daemon has no AVAX config.
+            let (_, mut req) = build_request(ChainId::Avax, ETH_SAFE, 0, b"");
+            // The hash was computed for AVAX evm_chain_id; safe_address
+            // doesn't matter — endpoint_disabled wins.
+            req.safe_address = format!("{:#x}", Address::new([0xfe; 20]));
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(
+                body["code"].as_str().unwrap_or(""),
+                error_codes::ENDPOINT_DISABLED
+            );
+        }
+
+        /// Wrong `safe_address` (right chain, wrong Safe) → 422 `wrong_safe_address`.
+        #[tokio::test]
+        async fn wrong_safe_address_is_rejected() {
+            let (state, _hsm) = evm_state();
+            let app = router(state);
+            let bogus_safe = Address::new([0xfe; 20]);
+            // Build hash for the BOGUS safe so the hash matches its
+            // ABI inputs — but the daemon's ETH config has ETH_SAFE,
+            // not the bogus one.
+            let (_, req) = build_request(ChainId::Eth, bogus_safe, 0, b"");
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                body["code"].as_str().unwrap_or(""),
+                error_codes::WRONG_SAFE_ADDRESS
+            );
+        }
+
+        /// Tampered `safe_tx_hash` (coordinator's claim ≠ daemon's
+        /// recompute) → 422 `safe_tx_hash_mismatch`. The HSM is NEVER
+        /// invoked.
+        #[tokio::test]
+        async fn mismatched_safe_tx_hash_is_rejected() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            let (_, mut req) = build_request(ChainId::Eth, ETH_SAFE, 0, b"original");
+            // Substitute a hash that doesn't match the rest of the
+            // request. (Use a random-looking but valid 32-byte hex.)
+            req.safe_tx_hash = format!("0x{}", "de".repeat(32));
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                body["code"].as_str().unwrap_or(""),
+                error_codes::SAFE_TX_HASH_MISMATCH
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert!(
+                seen.is_empty(),
+                "HSM must not have been touched on hash mismatch"
+            );
+        }
+
+        /// Identical retry returns the cached signature; HSM is hit
+        /// exactly once across the two requests.
+        #[tokio::test]
+        async fn identical_replay_returns_cached_signature() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            let (_, req) = build_request(ChainId::Eth, ETH_SAFE, 42, b"once");
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (s1, b1) = post_json(&app, "/api/v1/sign/evm-safe-tx", body.clone()).await;
+            let (s2, b2) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(s1, StatusCode::OK);
+            assert_eq!(s2, StatusCode::OK);
+            assert_eq!(b1["signature"], b2["signature"]);
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "HSM hit exactly once across two retries");
+        }
+
+        /// Same (chain, safe, nonce) with a DIFFERENT digest → 409
+        /// `conflict_already_signed_different`. HSM hit only by the
+        /// first request.
+        #[tokio::test]
+        async fn same_nonce_different_payload_is_409() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            let (_, req1) = build_request(ChainId::Eth, ETH_SAFE, 7, b"first");
+            let (_, req2) = build_request(ChainId::Eth, ETH_SAFE, 7, b"different");
+            // Both requests pass the digest-recompute check (each is
+            // internally self-consistent) but their `payload_hash`
+            // differs → conflict.
+            let (s1, _) = post_json(
+                &app,
+                "/api/v1/sign/evm-safe-tx",
+                serde_json::to_value(&req1).unwrap_or(serde_json::Value::Null),
+            )
+            .await;
+            assert_eq!(s1, StatusCode::OK);
+            let (s2, b2) = post_json(
+                &app,
+                "/api/v1/sign/evm-safe-tx",
+                serde_json::to_value(&req2).unwrap_or(serde_json::Value::Null),
+            )
+            .await;
+            assert_eq!(s2, StatusCode::CONFLICT);
+            assert_eq!(
+                b2["code"].as_str().unwrap_or(""),
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+        }
+
+        /// The EVM route is NOT registered when `state.evm` is empty.
+        /// Defends against accidentally serving the endpoint with no
+        /// EVM role configured (e.g., a daemon misconfigured at deploy).
+        #[tokio::test]
+        async fn route_not_registered_when_evm_unconfigured() {
+            let (state, _hsm) = build_state(); // no .with_evm()
+            let app = router(state);
+            let zero_addr = format!("0x{}", "00".repeat(20));
+            // Body content doesn't matter — the route doesn't exist.
+            let body = serde_json::json!({
+                "chain_id": "eth",
+                "safe_address": zero_addr,
+                "to": zero_addr,
+                "value": "0",
+                "data": "0x",
+                "operation": 0,
+                "safe_tx_gas": "0",
+                "base_gas": "0",
+                "gas_price": "0",
+                "gas_token": zero_addr,
+                "refund_receiver": zero_addr,
+                "nonce": "0",
+                "safe_tx_hash": format!("0x{}", "00".repeat(32)),
+                "fee_wei": "0",
+            });
+            let (status, _) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            // axum returns 405 for an unrouted POST since the daemon
+            // doesn't add the path. (Specifically: no route on this
+            // path → 404, but axum's MethodRouter returns 405 if the
+            // path exists for a different method; the daemon doesn't
+            // expose this path at all → 404.)
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
     }
 }
