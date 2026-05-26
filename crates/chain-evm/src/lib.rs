@@ -10,9 +10,9 @@
 //!
 //! [`EvmChainClient`] is the trait every EVM-side consumer programs
 //! against. [`AlloyEvmChainClient`] is the production impl, backed by
-//! `alloy`'s WS provider and the [`xindex_chain_eth::WsEndpointList`]
-//! multi-RPC fallover (lifted from chain-eth so we don't duplicate
-//! 300 LOC of transient-classifier logic).
+//! an `alloy::providers::Provider`. The binary callsite constructs the
+//! provider (typically over WS with multi-RPC fallover via
+//! `chain-eth::WsEndpointList`) and wraps it once.
 //!
 //! ## Per-chain tx-type selection
 //!

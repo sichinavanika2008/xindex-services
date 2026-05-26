@@ -3,8 +3,9 @@
 //! The trait is the abstraction every Phase 3.2 consumer programs
 //! against (V6 cross-check policies, V7 executor). Implementations:
 //!
-//! - Production: [`AlloyEvmChainClient`] backed by `alloy` over WS with
-//!   [`xindex_chain_eth::WsEndpointList`] multi-RPC fallover.
+//! - Production: [`AlloyEvmChainClient`] backed by `alloy` over WS.
+//!   Multi-RPC fallover at construction is the binary's responsibility
+//!   (see chain-eth's `WsEndpointList` for the same-shape pattern).
 //! - Tests: in-memory fakes (one per consumer crate's test fixture).
 //!
 //! ## Type surface
@@ -150,6 +151,10 @@ pub trait EvmChainClient: Send + Sync + 'static {
     /// Tx envelope to build per chain — EIP-1559 except BSC (DL-P3.2-4).
     fn tx_type(&self) -> EvmTxType;
 
+    /// Current chain-tip block number. Used by cross-check policies
+    /// (V6) to compute confirmation depth from a log's `block_number`.
+    fn block_number(&self) -> impl Future<Output = Result<u64, EvmChainError>> + Send;
+
     /// Read the Safe contract's monotonic `nonce()` via `eth_call`.
     /// Returns the value the NEXT successful `execTransaction` will
     /// consume. Callers MUST hold a per-Safe lock (V7's
@@ -242,11 +247,11 @@ pub fn decode_safe_nonce_return(bytes: &[u8]) -> Result<u64, EvmChainError> {
 
 /// Production [`EvmChainClient`] backed by alloy's WS provider.
 ///
-/// Construct via [`AlloyEvmChainClient::connect`], which walks the
-/// [`xindex_chain_eth::WsEndpointList`] in priority order and uses the
-/// first endpoint that responds. The fallover applies at connect time
-/// only; in-flight subscription fallover would require a custom
-/// transport (v2 work — see chain-eth's `rpc.rs` module docs).
+/// The binary callsite constructs an `alloy` provider (typically via
+/// `ProviderBuilder` + WS), wraps it with [`AlloyEvmChainClient::new`],
+/// and shares the result across the executor / cross-check layers.
+/// Multi-RPC fallover at connect time is the binary's concern (see
+/// `chain-eth::WsEndpointList` for the same-shape primitive).
 pub struct AlloyEvmChainClient<P>
 where
     P: alloy::providers::Provider + Send + Sync + 'static,
@@ -323,6 +328,13 @@ where
 
     fn tx_type(&self) -> EvmTxType {
         self.tx_type
+    }
+
+    async fn block_number(&self) -> Result<u64, EvmChainError> {
+        self.provider
+            .get_block_number()
+            .await
+            .map_err(|e| EvmChainError::Rpc(format!("get_block_number: {e}")))
     }
 
     async fn safe_nonce(&self, safe: Address) -> Result<u64, EvmChainError> {

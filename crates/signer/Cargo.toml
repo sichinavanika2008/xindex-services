@@ -13,6 +13,9 @@ workspace = true
 xindex-shared.workspace = true
 xindex-chain-thor.workspace = true
 xindex-chain-utxo.workspace = true
+# V6: EVM cross-check policies use `EvmChainClient` for log scanning
+# (THORChain Router `TransferOut` events) and tip queries.
+xindex-chain-evm.workspace = true
 alloy = { workspace = true }
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true

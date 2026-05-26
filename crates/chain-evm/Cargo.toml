@@ -11,10 +11,6 @@ workspace = true
 
 [dependencies]
 xindex-shared.workspace = true
-# Re-uses `WsEndpointList` + `is_transient_rpc_error` from chain-eth.
-# Phase 3.2 extends the multi-RPC helpers across chains rather than
-# duplicating ~300 LOC of fallover code.
-xindex-chain-eth.workspace = true
 alloy = { workspace = true }
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true

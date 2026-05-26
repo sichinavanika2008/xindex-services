@@ -5428,7 +5428,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "xindex-chain-eth",
  "xindex-shared",
 ]
 
@@ -5576,6 +5575,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "xindex-chain-evm",
  "xindex-chain-thor",
  "xindex-chain-utxo",
  "xindex-shared",
