@@ -41,4 +41,8 @@ tower = "0.5"
 # `RemoteMultisigCosigner`).
 xindex-signer.workspace = true
 xindex-executor.workspace = true
+# V9 e2e: drives `EvmRedeemExecutor` (V7) against three real
+# `signer-daemon` instances over HTTP. Requires the EVM chain trait
+# (V4) + the production cosigner cosigner trait shape (V7).
+xindex-chain-evm.workspace = true
 alloy = { workspace = true }

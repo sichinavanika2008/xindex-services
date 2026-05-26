@@ -5605,6 +5605,7 @@ dependencies = [
  "tower",
  "tracing",
  "wiremock",
+ "xindex-chain-evm",
  "xindex-executor",
  "xindex-multisig",
  "xindex-safe-evm",
