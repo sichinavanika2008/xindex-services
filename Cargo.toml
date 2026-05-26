@@ -65,6 +65,7 @@ xindex-chain-eth = { path = "crates/chain-eth" }
 xindex-chain-thor = { path = "crates/chain-thor" }
 xindex-chain-utxo = { path = "crates/chain-utxo" }
 xindex-multisig = { path = "crates/multisig" }
+xindex-safe-evm = { path = "crates/safe-evm" }
 xindex-signer = { path = "crates/signer" }
 xindex-executor = { path = "crates/executor" }
 xindex-relayer = { path = "crates/relayer" }

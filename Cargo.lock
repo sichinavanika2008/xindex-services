@@ -5520,6 +5520,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-safe-evm"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "k256",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "xindex-shared",
+]
+
+[[package]]
 name = "xindex-shared"
 version = "0.0.1"
 dependencies = [

@@ -1,0 +1,21 @@
+[package]
+name = "xindex-safe-evm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives = { workspace = true, features = ["serde", "k256"] }
+alloy-sol-types.workspace = true
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+serde.workspace = true
+thiserror.workspace = true
+xindex-shared.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
