@@ -309,6 +309,12 @@ pub mod error_codes {
     /// constructed the hash from different inputs than it claims.
     /// HTTP 422.
     pub const SAFE_TX_HASH_MISMATCH: &str = "safe_tx_hash_mismatch";
+    /// Phase-1 hardening (H11): the signature the HSM returned does not
+    /// recover to this daemon's configured `my_signer_address` over the
+    /// recomputed `safeTxHash`. Indicates an HSM key-mapping bug, a
+    /// wrong-key signature, or a corrupted/forged signing response — the
+    /// daemon refuses to record or return it. HTTP 500.
+    pub const SIGNER_RECOVER_MISMATCH: &str = "signer_recover_mismatch";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;

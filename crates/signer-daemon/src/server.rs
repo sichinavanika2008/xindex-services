@@ -805,26 +805,67 @@ mod tests {
         use xindex_shared::signer_wire::EvmSafeTxSignRequest;
 
         const ETH_SAFE: Address = Address::new([0x11; 20]);
-        const ETH_SIGNER: Address = Address::new([0x21; 20]);
         const BSC_SAFE: Address = Address::new([0x33; 20]);
-        const BSC_SIGNER: Address = Address::new([0x43; 20]);
+
+        /// Fixed test key. Its address is the configured signer for both
+        /// chains so the HSM's signatures recover to `my_signer_address`
+        /// — required by the 1.5 recover-verify gate.
+        #[expect(clippy::expect_used, reason = "test code")]
+        fn evm_key() -> alloy::signers::local::PrivateKeySigner {
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+                .parse()
+                .expect("valid test key")
+        }
+
+        fn evm_signer() -> Address {
+            evm_key().address()
+        }
+
+        /// Real-signing HSM mock: signs the digest with [`evm_key`] and
+        /// captures every `(address, digest)` for assertion. Unlike
+        /// [`CapturingSigner`], it returns a recoverable ECDSA signature,
+        /// so the 1.5 recover-verify (handler step 5a) accepts it.
+        #[derive(Debug)]
+        struct RealEvmSigner {
+            seen: Mutex<Vec<(Address, B256)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl HsmDigestSigner for RealEvmSigner {
+            async fn sign_digest(
+                &self,
+                address: Address,
+                digest: B256,
+            ) -> Result<[u8; 65], HsmError> {
+                use alloy::signers::SignerSync;
+                #[expect(clippy::unwrap_used, reason = "test code")]
+                self.seen.lock().unwrap().push((address, digest));
+                let sig = evm_key()
+                    .sign_hash_sync(&digest)
+                    .map_err(|e| HsmError::Decode(format!("test sign: {e}")))?;
+                Ok(sig.as_bytes())
+            }
+        }
 
         fn evm_state() -> (
-            DaemonState<InMemoryReplayStore, CapturingSigner>,
-            Arc<CapturingSigner>,
+            DaemonState<InMemoryReplayStore, RealEvmSigner>,
+            Arc<RealEvmSigner>,
         ) {
             let replay = Arc::new(InMemoryReplayStore::new());
-            let hsm = Arc::new(CapturingSigner::default());
+            let hsm = Arc::new(RealEvmSigner {
+                seen: Mutex::new(Vec::new()),
+            });
+            let signer = evm_signer();
             let state = DaemonState::new(cfg(), replay, hsm.clone())
                 .with_evm(EvmSignerConfig {
                     chain: ChainId::Eth,
                     safe_address: ETH_SAFE,
-                    my_signer_address: ETH_SIGNER,
+                    my_signer_address: signer,
                 })
                 .with_evm(EvmSignerConfig {
                     chain: ChainId::Bsc,
                     safe_address: BSC_SAFE,
-                    my_signer_address: BSC_SIGNER,
+                    my_signer_address: signer,
                 });
             (state, hsm)
         }
@@ -880,8 +921,8 @@ mod tests {
             let app = router(state.clone());
 
             for (chain, safe, signer) in [
-                (ChainId::Eth, ETH_SAFE, ETH_SIGNER),
-                (ChainId::Bsc, BSC_SAFE, BSC_SIGNER),
+                (ChainId::Eth, ETH_SAFE, evm_signer()),
+                (ChainId::Bsc, BSC_SAFE, evm_signer()),
             ] {
                 let (tx, req) = build_request(chain, safe, 0, b"hello");
                 let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
@@ -905,6 +946,34 @@ mod tests {
                     *addr == signer && *d == expected_digest
                 }), "expected to see signer={signer:#x} digest={expected_digest} in HSM call history");
             }
+        }
+
+        /// 1.5 (H11): if the HSM returns a signature that recovers to an
+        /// address OTHER than the configured `my_signer_address`, the
+        /// daemon refuses with 500 `signer_recover_mismatch` and does NOT
+        /// record it. Simulated by configuring a signer that does not
+        /// match the key the (real-signing) HSM mock uses.
+        #[tokio::test]
+        async fn rejects_signature_recovering_to_wrong_signer() {
+            let replay = Arc::new(InMemoryReplayStore::new());
+            let hsm = Arc::new(RealEvmSigner {
+                seen: Mutex::new(Vec::new()),
+            });
+            let wrong_signer = Address::repeat_byte(0x99);
+            let state = DaemonState::new(cfg(), replay, hsm).with_evm(EvmSignerConfig {
+                chain: ChainId::Eth,
+                safe_address: ETH_SAFE,
+                my_signer_address: wrong_signer,
+            });
+            let app = router(state);
+            let (_, req) = build_request(ChainId::Eth, ETH_SAFE, 0, b"x");
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                body["code"].as_str().unwrap_or(""),
+                error_codes::SIGNER_RECOVER_MISMATCH
+            );
         }
 
         /// A chain not in `state.evm` returns 404 `endpoint_disabled`.

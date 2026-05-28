@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, PrimitiveSignature, U256};
 use axum::{extract::State, http::StatusCode, response::Json};
 use xindex_safe_evm::{
     digest::{safe_tx_hash, SafeTransaction},
@@ -331,12 +331,48 @@ where
         CheckOutcome::FirstTime => {}
     }
 
-    // 5. HSM-sign the digest + record.
+    // 5. HSM-sign the digest.
     let sig = state
         .hsm
         .sign_digest(evm_cfg.my_signer_address, recomputed)
         .await
         .map_err(|e| hsm_unavailable(&e))?;
+
+    // 5a. Recover-verify (1.5 / H11). The signature the HSM returned MUST
+    // recover to this daemon's configured signer over the recomputed
+    // digest; otherwise an HSM key-mapping bug, a wrong-key signature, or
+    // a corrupted signing response would be recorded and returned as a
+    // valid owner signature. We only READ the signature here (no byte
+    // reconstruction), so there is no signature-format risk; low-S
+    // normalization (1.13) is deferred — see KNOWN_FINDINGS.
+    let recovered = PrimitiveSignature::try_from(sig.as_slice())
+        .map_err(|e| {
+            err(
+                error_codes::SIGNER_RECOVER_MISMATCH,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("HSM signature did not parse as a 65-byte ECDSA signature: {e}"),
+            )
+        })?
+        .recover_address_from_prehash(&recomputed)
+        .map_err(|e| {
+            err(
+                error_codes::SIGNER_RECOVER_MISMATCH,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("HSM signature did not recover to an address: {e}"),
+            )
+        })?;
+    if recovered != evm_cfg.my_signer_address {
+        return Err(err(
+            error_codes::SIGNER_RECOVER_MISMATCH,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "HSM signature recovered to {recovered:#x}, expected configured signer {:#x}",
+                evm_cfg.my_signer_address
+            ),
+        ));
+    }
+
+    // 5b. Record + return.
     state
         .replay
         .record_safe_tx(

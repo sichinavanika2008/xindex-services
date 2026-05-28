@@ -316,6 +316,18 @@ deployment + signer-set composition procedure.
 | P3.2-14 | Info | ⏳ Deferred | **Cancel-stuck escrow formal review (carry-over from 2026-05-25 red-team).** Same SD-B class applies to EVM legs — a halted Safe (signer-party compromise + threshold not reached) leaves a redemption permanently pending. Mirror of the BTC SD-B runbook needed for Phase 3.2 chains; formal/symbolic review of the cancel-stuck escrow path covers both families. Tracked in next-steps memory as a mainnet gate. |
 | P3.2-15 | Info | 📝 Operational | **Solidity registration ceremony is config-only.** V10 ships zero Solidity contract code changes (DL-P3.2-1 — adapter is chain-generic). Per-chain mainnet deploy is a separate operational step: (1) deploy Safe ceremony per `safe-key-ceremony.md`; (2) operator runs `forge script DeployPhase32Adapters --rpc-url <chain>` with `SAFE_ADDRESS_<CHAIN>` env; (3) operator flips `factory.setAdapterAllowed(newAdapter, true)` only after independent verification of step (1)'s signer-set disclosure. |
 
+## 2026-05-27 red-team — Phase-1 signer-daemon hardening (2026-05-28)
+
+Continuation of the 15-agent red-team sprint (Solidity Phase-1 + most of
+Phase-2 landed on the `Xindex` repo). The Rust signer-daemon Phase-1
+items:
+
+| ID | Severity | Status | Note |
+|---|---|---|---|
+| 1.5 (H11) | **High** | ✅ Closed in code | **Recover-verify on the HSM EIP-712 signature.** `handle_evm_safe_tx` now recovers the signer address from the HSM's returned 65-byte signature over the recomputed `safeTxHash` and refuses (`signer_recover_mismatch`, 500) unless it equals the configured `my_signer_address`. Catches an HSM key-mapping bug, a wrong-key signature, or a corrupted signing response BEFORE it is recorded or returned as a valid owner signature. `crates/signer-daemon/src/evm_safe.rs` step 5a; new `error_codes::SIGNER_RECOVER_MISMATCH`. Test: `server::tests::evm_safe_tx_tests::rejects_signature_recovering_to_wrong_signer`. The `evm_safe_tx_tests` HSM mock was upgraded from a fixed-bytes stub (`CapturingSigner`) to a real ECDSA signer (`RealEvmSigner`) whose key's address is the configured signer, so its signatures recover. |
+| 1.13 | Medium | ⏳ Deferred | **Low-S normalization on the HSM signature.** `Web3Signer` / alloy `PrivateKeySigner` already emit canonical low-S (EIP-2), so this is defense-in-depth. Deferred because a correct implementation must reconstruct the 65-byte `r‖s‖v` with the exact `v` convention (0/1 vs 27/28) the Safe expects, and a wrong normalization would corrupt an otherwise-valid signature (net-negative) — not worth shipping without verifying the convention against a live Web3Signer + Safe `checkSignatures`. The 1.5 recover-verify already rejects a signature that fails to parse/recover. |
+| 1.14 | Low | ⏳ Deferred | **Refuse `PassThroughPolicy` at signer-daemon startup.** No implementation site exists: `signer-daemon` is a library crate with no binary `main`, and `PassThroughPolicy` (`crates/signer/src/crosscheck.rs`) is not wired into any production startup path — it is a dev/test-only `CrossCheck` that already `warn!`s on every call. The "startup gate" has no home until the daemon gets a binary entrypoint that selects the policy from config; implement it there (compile-time feature-gate, or a runtime refuse-on-`PassThrough` in that main). |
+
 ## When this file gets updated
 
 - New audit pass (internal or external) → add a section
