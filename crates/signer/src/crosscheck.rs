@@ -2182,8 +2182,7 @@ pub mod evm {
                         let in_range = filter.from_block.is_none_or(|f| l.block_number >= f)
                             && filter.to_block.is_none_or(|t| l.block_number <= t);
                         let addr_ok = filter.address.is_none_or(|a| l.address == a);
-                        let topic0_ok =
-                            filter.topic0.is_none_or(|t| l.topics.first() == Some(&t));
+                        let topic0_ok = filter.topic0.is_none_or(|t| l.topics.first() == Some(&t));
                         let topic_filters_ok =
                             filter.topics_1_3.iter().enumerate().all(|(i, opt)| {
                                 opt.is_none_or(|want| l.topics.get(i + 1) == Some(&want))

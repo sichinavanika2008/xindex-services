@@ -279,8 +279,8 @@ async fn main() -> Result<()> {
             signer_addresses.len()
         ));
     }
-    let amount_wei = U256::from_str_radix(&args.amount_wei, 10)
-        .context("--amount-wei: bad decimal")?;
+    let amount_wei =
+        U256::from_str_radix(&args.amount_wei, 10).context("--amount-wei: bad decimal")?;
 
     // Build alloy provider against the destination chain. `.boxed()`
     // erases the concrete `Http<Client>` transport to `BoxTransport`
