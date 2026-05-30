@@ -433,6 +433,10 @@ pub mod error_codes {
     /// Phase 3.3: the request's `account_address` did not match this
     /// daemon's configured Cosmos multisig account. HTTP 422.
     pub const WRONG_COSMOS_ACCOUNT: &str = "wrong_cosmos_account";
+    /// Phase 3.3: the request's `cosmos_chain_id` did not match the
+    /// consensus chain-id pinned in this daemon's config. Blocks replay of
+    /// a custody-move signature onto another Cosmos chain. HTTP 422.
+    pub const WRONG_COSMOS_CHAIN_ID: &str = "wrong_cosmos_chain_id";
     /// Phase 3.3: the daemon recomputed the amino `StdSignDoc` sign-bytes
     /// hash from the request's semantic fields (`cosmos_chain_id` /
     /// `account_number` / `sequence` / `to_address` / `amount` / `denom`

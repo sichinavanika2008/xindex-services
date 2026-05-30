@@ -10,15 +10,17 @@
 //!    not auto-normalize like the EVM path tolerates via the recovery
 //!    bit). [`to_cosmos_compact_low_s`] normalizes the HSM's `(r, s)` to
 //!    low-S, and [`verify`] refuses a high-S signature outright.
-//! 3. **Aggregation is positional.** k members' 64-byte sigs are placed
-//!    into a `MultiSignature` in ascending member-index order, paired
-//!    with a `CompactBitArray` marking which members signed
-//!    ([`aggregate`]).
+//! 3. **Aggregation is positional + verified.** k members' 64-byte sigs
+//!    are placed into a `MultiSignature` in ascending member-index order,
+//!    paired with a `CompactBitArray` marking which members signed. The
+//!    public entrypoint ([`aggregate_verified`]) verifies every partial
+//!    against the descriptor's member pubkeys before encoding.
 
 use k256::ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{Signature, VerifyingKey};
 
 use crate::proto;
+use crate::CosmosMultisig;
 
 /// Normalize an HSM-produced `(r, s)` ECDSA signature to low-S form and
 /// return the 64-byte compact `r ‖ s` Cosmos expects. Drops any recovery
@@ -86,10 +88,52 @@ pub struct AggregatedMultisig {
     pub signed_count: usize,
 }
 
-/// Aggregate ≥ `threshold` member signatures into the `CompactBitArray` +
-/// `MultiSignature` proto messages. Signatures are emitted in ascending
-/// member-index order (the Cosmos multisig invariant); the bitarray marks
-/// each signing member's position.
+/// Verify each partial against the multisig descriptor, then aggregate.
+///
+/// This is the **only** public way to assemble an aggregate: every
+/// `MemberSig` is checked to be a valid low-S signature of `prehash` by the
+/// member pubkey at its claimed `member_index` (`sigs::verify`). A foreign
+/// signature, a wrong-index placement, a high-S value, or the same partial
+/// replicated under two indices therefore fails here — the bitarray can
+/// never claim a position the corresponding member did not actually sign.
+/// `total_members` and `threshold` are taken from `descriptor`, so the
+/// emitted `CompactBitArray` width and threshold can never diverge from the
+/// frozen account the address was derived from.
+///
+/// # Errors
+/// - [`SigError::IndexOutOfRange`] if a `member_index >= descriptor.member_count()`.
+/// - [`SigError::HighS`] / [`SigError::Malformed`] / [`SigError::Verify`] /
+///   [`SigError::BadPubkey`] if any partial fails verification.
+/// - any error from the inner positional encode
+///   ([`SigError::EmptyInput`], [`SigError::DuplicateMemberIndex`],
+///   [`SigError::BelowThreshold`]).
+pub fn aggregate_verified(
+    descriptor: &CosmosMultisig,
+    prehash: &[u8; 32],
+    parts: &[MemberSig],
+) -> Result<AggregatedMultisig, SigError> {
+    let total = descriptor.member_count();
+    let pubkeys = descriptor.member_pubkeys();
+    for p in parts {
+        let pk = pubkeys
+            .get(p.member_index)
+            .ok_or(SigError::IndexOutOfRange {
+                index: p.member_index,
+                total,
+            })?;
+        verify(pk, prehash, &p.sig64)?;
+    }
+    aggregate(total, descriptor.threshold(), parts)
+}
+
+/// Positional encoder: aggregate ≥ `threshold` member signatures into the
+/// `CompactBitArray` + `MultiSignature` proto messages. Signatures are
+/// emitted in ascending member-index order (the Cosmos multisig
+/// invariant); the bitarray marks each signing member's position.
+///
+/// Internal: this primitive does NOT verify the partials. Callers must go
+/// through [`aggregate_verified`], which binds every partial to the
+/// descriptor's member pubkeys + sign-bytes first.
 ///
 /// # Errors
 /// - [`SigError::NoMembers`] if `total_members == 0`.
@@ -97,7 +141,7 @@ pub struct AggregatedMultisig {
 /// - [`SigError::DuplicateMemberIndex`] if a member index appears twice.
 /// - [`SigError::IndexOutOfRange`] if any index `>= total_members`.
 /// - [`SigError::BelowThreshold`] if fewer than `threshold` sigs.
-pub fn aggregate(
+pub(crate) fn aggregate(
     total_members: usize,
     threshold: u32,
     parts: &[MemberSig],
@@ -377,5 +421,71 @@ mod tests {
             aggregate(5, 1, &oor).unwrap_err(),
             SigError::IndexOutOfRange { index: 5, total: 5 }
         );
+    }
+
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn member_key(seed: u8) -> (SigningKey, [u8; 33]) {
+        let sk = SigningKey::from_slice(&[seed; 32]).expect("key");
+        let ep = sk.verifying_key().to_encoded_point(true);
+        let mut pk = [0u8; 33];
+        pk.copy_from_slice(ep.as_bytes());
+        (sk, pk)
+    }
+
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn member_sig(sk: &SigningKey, member_index: usize, digest: &[u8; 32]) -> MemberSig {
+        let sig: Signature = sk.sign_prehash(digest).expect("sign");
+        let mut sb = [0u8; 64];
+        sb.copy_from_slice(sig.to_bytes().as_ref());
+        let (mut r, mut s) = ([0u8; 32], [0u8; 32]);
+        r.copy_from_slice(&sb[..32]);
+        s.copy_from_slice(&sb[32..]);
+        MemberSig {
+            member_index,
+            sig64: to_cosmos_compact_low_s(&r, &s).expect("low-s"),
+        }
+    }
+
+    /// `aggregate_verified` accepts 3 valid partials over the shared digest
+    /// and produces the same bitarray as the positional encoder.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn aggregate_verified_accepts_valid_partials() {
+        let keys: Vec<(SigningKey, [u8; 33])> = (1u8..=5).map(member_key).collect();
+        let pubkeys: Vec<[u8; 33]> = keys.iter().map(|(_, pk)| *pk).collect();
+        let ms = CosmosMultisig::new(3, pubkeys, "cosmos").expect("descriptor");
+        let digest = [0x11u8; 32];
+        let parts = [
+            member_sig(&keys[0].0, 0, &digest),
+            member_sig(&keys[2].0, 2, &digest),
+            member_sig(&keys[4].0, 4, &digest),
+        ];
+        let agg = aggregate_verified(&ms, &digest, &parts).expect("aggregate");
+        assert_eq!(agg.signed_count, 3);
+        // bits 0,2,4 over 5 members → identical to the positional encoder.
+        assert_eq!(agg.compact_bitarray, vec![0x08, 0x05, 0x12, 0x01, 0xA8]);
+    }
+
+    /// A partial placed at the wrong member index (member 0's signature
+    /// claimed as member 1's) fails verification — the bitarray cannot mark
+    /// a position the member did not actually sign.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn aggregate_verified_rejects_misplaced_partial() {
+        let keys: Vec<(SigningKey, [u8; 33])> = (1u8..=5).map(member_key).collect();
+        let pubkeys: Vec<[u8; 33]> = keys.iter().map(|(_, pk)| *pk).collect();
+        let ms = CosmosMultisig::new(3, pubkeys, "cosmos").expect("descriptor");
+        let digest = [0x11u8; 32];
+        let misplaced = MemberSig {
+            member_index: 1,
+            sig64: member_sig(&keys[0].0, 0, &digest).sig64,
+        };
+        let parts = [
+            member_sig(&keys[0].0, 0, &digest),
+            misplaced,
+            member_sig(&keys[4].0, 4, &digest),
+        ];
+        let err = aggregate_verified(&ms, &digest, &parts).expect_err("must reject");
+        assert!(matches!(err, SigError::Verify(_)), "got {err:?}");
     }
 }

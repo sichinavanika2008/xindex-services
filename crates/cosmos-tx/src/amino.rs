@@ -132,10 +132,26 @@ impl CosmosSendSignDoc<'_> {
 
     /// Canonical amino `StdSignDoc` JSON bytes.
     ///
+    /// Validates that every numeric field is canonical decimal first: the
+    /// daemon recomputes the digest over the SAME strings it received, so a
+    /// non-canonical value (e.g. `"07"`, `"01000000"`) would pass the
+    /// daemon's self-check yet produce sign-bytes that diverge from what a
+    /// validator reconstructs from the canonical decimal — a released
+    /// signature that is invalid on-chain (stuck funds). Rejecting here
+    /// makes non-canonical input impossible to sign from any caller.
+    ///
     /// # Errors
-    /// [`AminoError::Json`] if serialization fails (cannot happen for the
-    /// all-`&str` shape, but the `serde_json` API is fallible).
+    /// - [`AminoError::NonCanonicalDecimal`] if `account_number`,
+    ///   `fee_amount`, `gas`, `amount`, or `sequence` is not canonical
+    ///   decimal (non-empty, ASCII digits, no leading zero unless `"0"`).
+    /// - [`AminoError::Json`] if serialization fails (cannot happen for the
+    ///   all-`&str` shape, but the `serde_json` API is fallible).
     pub fn canonical_json(&self, sequence: &str) -> Result<Vec<u8>, AminoError> {
+        check_canonical_decimal("account_number", self.account_number)?;
+        check_canonical_decimal("fee_amount", self.fee_amount)?;
+        check_canonical_decimal("gas", self.gas)?;
+        check_canonical_decimal("amount", self.amount)?;
+        check_canonical_decimal("sequence", sequence)?;
         let mut doc = self.to_doc();
         doc.sequence = sequence;
         serde_json::to_vec(&doc).map_err(|e| AminoError::Json(e.to_string()))
@@ -152,9 +168,39 @@ impl CosmosSendSignDoc<'_> {
     }
 }
 
+/// `true` iff `s` is a canonical Cosmos decimal string: non-empty, only
+/// ASCII digits, and no leading zero unless the value is exactly `"0"`.
+/// Cosmos amino encodes `sdk.Int`/`uint64` as this canonical decimal; a
+/// validator reconstructs the sign-bytes from it.
+fn is_canonical_decimal(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && (s.len() == 1 || s.as_bytes()[0] != b'0')
+}
+
+fn check_canonical_decimal(field: &'static str, value: &str) -> Result<(), AminoError> {
+    if is_canonical_decimal(value) {
+        Ok(())
+    } else {
+        Err(AminoError::NonCanonicalDecimal {
+            field,
+            value: value.to_string(),
+        })
+    }
+}
+
 /// Errors from amino sign-doc construction.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AminoError {
+    /// A numeric field was not canonical decimal (would yield sign-bytes
+    /// the network rejects).
+    #[error("non-canonical decimal in field {field}: {value:?}")]
+    NonCanonicalDecimal {
+        /// Which sign-doc field was malformed.
+        field: &'static str,
+        /// The offending value.
+        value: String,
+    },
     /// `serde_json` serialization failed.
     #[error("amino json serialization failed: {0}")]
     Json(String),
@@ -206,6 +252,47 @@ mod tests {
         let s = String::from_utf8(json).expect("utf8");
         assert!(s.contains("0xabc:0/1/0"), "slash must be literal: {s}");
         assert!(!s.contains("\\/"), "slash must not be escaped: {s}");
+    }
+
+    /// A non-canonical sequence (leading zero) is rejected — it would
+    /// hash differently from the canonical `"7"` a validator reconstructs.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test code")]
+    fn rejects_non_canonical_sequence() {
+        let err = sample().canonical_json("07").unwrap_err();
+        assert_eq!(
+            err,
+            AminoError::NonCanonicalDecimal {
+                field: "sequence",
+                value: "07".to_string(),
+            }
+        );
+    }
+
+    /// A non-canonical amount (leading zero) is rejected at the numeric
+    /// field, before any signature can be produced over it.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test code")]
+    fn rejects_non_canonical_amount() {
+        let mut doc = sample();
+        doc.amount = "01000000";
+        let err = doc.canonical_json("7").unwrap_err();
+        assert_eq!(
+            err,
+            AminoError::NonCanonicalDecimal {
+                field: "amount",
+                value: "01000000".to_string(),
+            }
+        );
+    }
+
+    /// `"0"` is canonical (a zero `account_number` / sequence is valid).
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn zero_is_canonical() {
+        let mut doc = sample();
+        doc.account_number = "0";
+        doc.canonical_json("0").expect("zero is canonical");
     }
 
     /// The sign-bytes digest is SHA-256 of the canonical JSON, and is

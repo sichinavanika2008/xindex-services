@@ -95,6 +95,17 @@ impl CosmosMultisig {
                 }
             }
         }
+        // Each member key must be a valid compressed secp256k1 point. A
+        // ceremony input error (uncompressed key truncated to 33 bytes, a
+        // 0x04 lead byte, an off-curve x) is otherwise silently baked into
+        // a deterministic-but-unspendable account address. This matches
+        // the verifying path (`sigs::verify` parses every pubkey via
+        // `VerifyingKey::from_sec1_bytes`).
+        for (i, pk) in member_pubkeys.iter().enumerate() {
+            if k256::ecdsa::VerifyingKey::from_sec1_bytes(pk).is_err() {
+                return Err(CosmosMultisigError::InvalidMemberPubkey(i));
+            }
+        }
         Ok(Self {
             threshold,
             member_pubkeys,
@@ -165,6 +176,9 @@ pub enum CosmosMultisigError {
     /// Two members share the same pubkey (positions `.0` and `.1`).
     #[error("duplicate member pubkey at positions {0} and {1}")]
     DuplicateMember(usize, usize),
+    /// A member pubkey is not a valid compressed secp256k1 point (position).
+    #[error("member pubkey at position {0} is not a valid compressed secp256k1 point")]
+    InvalidMemberPubkey(usize),
     /// bech32 address derivation failed.
     #[error("address derivation failed: {0}")]
     Address(String),
@@ -173,11 +187,17 @@ pub enum CosmosMultisigError {
 #[cfg(test)]
 mod descriptor_tests {
     use super::*;
+    use k256::ecdsa::SigningKey;
 
+    /// A real compressed secp256k1 pubkey from a `byte`-seeded key, so the
+    /// pubkey-validity check in `new` accepts it. Distinct `byte` → distinct
+    /// key; equal `byte` → equal key (used to exercise duplicate detection).
+    #[expect(clippy::expect_used, reason = "test code")]
     fn pk(byte: u8) -> [u8; 33] {
+        let sk = SigningKey::from_slice(&[byte; 32]).expect("seed is a valid scalar");
+        let ep = sk.verifying_key().to_encoded_point(true);
         let mut k = [0u8; 33];
-        k[0] = 0x02; // valid compressed-point prefix
-        k[32] = byte;
+        k.copy_from_slice(ep.as_bytes());
         k
     }
 
@@ -226,5 +246,17 @@ mod descriptor_tests {
     fn descriptor_rejects_duplicate_members() {
         let err = CosmosMultisig::new(1, vec![pk(1), pk(1)], "cosmos").unwrap_err();
         assert_eq!(err, CosmosMultisigError::DuplicateMember(0, 1));
+    }
+
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "test code")]
+    fn descriptor_rejects_invalid_member_pubkey() {
+        // 0x04 lead byte (uncompressed prefix) is not a valid compressed
+        // point; a ceremony typo of this shape must be rejected, not baked
+        // into an unspendable address.
+        let mut bad = [0u8; 33];
+        bad[0] = 0x04;
+        let err = CosmosMultisig::new(1, vec![pk(1), bad], "cosmos").unwrap_err();
+        assert_eq!(err, CosmosMultisigError::InvalidMemberPubkey(1));
     }
 }

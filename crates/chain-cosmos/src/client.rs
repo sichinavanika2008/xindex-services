@@ -10,10 +10,18 @@
 //! the integration surface deferred to rehearsal (DL-P3.3-8).
 
 use std::future::Future;
+use std::time::Duration;
 
 use serde_json::Value;
 use thiserror::Error;
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
+
+/// Per-request timeout. A stalled or black-holed RPC must not wedge the
+/// signer cross-check / executor (which await these calls inline) — matches
+/// the `chain-utxo` Esplora client posture.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Connection-establishment timeout (shorter than the per-request budget).
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Account number + sequence for a Cosmos account. Both are bound into
 /// the amino sign-bytes; `sequence` is the monotonic replay coordinate.
@@ -312,6 +320,8 @@ impl ReqwestCosmosChainClient {
             return Err(CosmosChainError::NotCosmosChain(chain));
         }
         let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .build()
             .map_err(|e| CosmosChainError::Rpc(e.to_string()))?;
         Ok(Self {

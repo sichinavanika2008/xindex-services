@@ -40,6 +40,13 @@ use crate::web3signer::{HsmDigestSigner, HsmError};
 pub struct CosmosSignerConfig {
     /// Which Cosmos chain this config serves.
     pub chain: ChainId,
+    /// The consensus chain-id this daemon will sign for (e.g.
+    /// `"cosmoshub-4"`), pinned at deploy from the key ceremony. The
+    /// chain-id is bound into the amino sign-bytes; a request whose
+    /// `cosmos_chain_id` differs is refused, so a signature authorized for
+    /// this network can never be replayed onto a different Cosmos chain the
+    /// same secp256k1 key controls (mirrors the EVM handler's chain pin).
+    pub cosmos_chain_id: String,
     /// The bech32 `LegacyAminoPubKey` multisig account address this daemon
     /// signs for. A request whose `account_address` differs is refused.
     pub account_address: String,
@@ -117,6 +124,7 @@ fn hsm_unavailable(e: &HsmError) -> (StatusCode, Json<ErrorBody>) {
 /// # Errors
 /// Returns `(StatusCode, Json<ErrorBody>)` with a stable error code:
 /// `endpoint_disabled` (404), `wrong_cosmos_account` (422),
+/// `wrong_cosmos_chain_id` (422),
 /// `sign_doc_mismatch` (422), `bad_request` (400),
 /// `conflict_already_signed_different` (409), `hsm_unavailable` (503),
 /// `signer_recover_mismatch` (500 — HSM sig fails to verify under the
@@ -158,6 +166,21 @@ where
         ));
     }
 
+    // 2b. Consensus chain-id must match the pinned config. The chain-id is
+    // bound into the sign-bytes; without this pin a signature authorized
+    // for this network could be replayed onto another Cosmos chain the same
+    // key controls (the sign-doc hash would still recompute consistently).
+    if req.cosmos_chain_id != cfg.cosmos_chain_id {
+        return Err(err(
+            error_codes::WRONG_COSMOS_CHAIN_ID,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "cosmos_chain_id mismatch: configured {}, request {}",
+                cfg.cosmos_chain_id, req.cosmos_chain_id
+            ),
+        ));
+    }
+
     // 3. Recompute the amino sign-bytes hash and compare to the claim.
     let doc = CosmosSendSignDoc {
         account_number: &req.account_number,
@@ -170,10 +193,12 @@ where
         amount: &req.amount,
         denom: &req.denom,
     };
+    // A non-canonical numeric field (caught here) is malformed client
+    // input, not a server fault — return BAD_REQUEST.
     let recomputed = doc.sign_bytes_sha256(&req.sequence).map_err(|e| {
         err(
             error_codes::BAD_REQUEST,
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_REQUEST,
             format!("amino sign-bytes: {e}"),
         )
     })?;
@@ -379,6 +404,7 @@ mod tests {
         )
         .with_cosmos(CosmosSignerConfig {
             chain: ChainId::Gaia,
+            cosmos_chain_id: "cosmoshub-4".to_string(),
             account_address: ACCOUNT.to_string(),
             my_signer_address: signer,
             my_member_pubkey: pubkey,
@@ -412,6 +438,21 @@ mod tests {
             .expect_err("err");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.code, error_codes::WRONG_COSMOS_ACCOUNT);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn rejects_wrong_cosmos_chain_id() {
+        let (sk, signer, pubkey) = key_identity();
+        let st = state(pubkey, signer, sk);
+        // A request for a different Cosmos network the same key controls.
+        let mut req = sample_request(expected_digest());
+        req.cosmos_chain_id = "theta-testnet-001".to_string();
+        let (status, body) = handle_cosmos_tx(State(st), Json(req))
+            .await
+            .expect_err("err");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.code, error_codes::WRONG_COSMOS_CHAIN_ID);
     }
 
     #[tokio::test]

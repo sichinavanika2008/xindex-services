@@ -380,9 +380,23 @@ async fn run(args: Args) -> Result<()> {
         let Some(leg_chain) = xindex_shared::chain_registry::ChainId::from_asset_id(asset_id)
         else {
             warn!(redemption_id = %rid, %asset_id,
-                  "leg asset_id does not match any known UTXO chain; skipping (runbook)");
+                  "leg asset_id does not match any known chain; skipping (runbook)");
             return;
         };
+        // `from_asset_id` now resolves EVM (Phase 3.2) and Cosmos (Phase
+        // 3.3) assets too, so a "known" chain no longer implies this
+        // UTXO-only attest path can service it: the delivery/refund
+        // cross-checks here are BTC/UTXO-specific (ThorUtxo* policies). Gate
+        // on custody family — a non-UTXO leg is skipped (a runbook alert)
+        // until its own attest path lands (Cosmos: C6/C7) rather than being
+        // mis-routed into the UTXO cross-check.
+        if leg_chain.custody_family() != xindex_shared::chain_registry::CustodyFamily::Utxo {
+            warn!(redemption_id = %rid, chain = ?leg_chain,
+                  family = ?leg_chain.custody_family(),
+                  "leg chain is not UTXO-family; xindex-attest-redeem services \
+                   only UTXO legs — skipping (runbook)");
+            return;
+        }
         info!(redemption_id = %rid, chain = ?leg_chain,
               "leg routed by asset_id");
 
