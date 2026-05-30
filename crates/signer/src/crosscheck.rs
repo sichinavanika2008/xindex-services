@@ -2464,3 +2464,624 @@ pub mod evm {
         }
     }
 }
+
+/// C6: Phase 3.3 Cosmos custody cross-check policies. Symmetric to the
+/// UTXO (`ThorUtxoToUsdtPolicy` / `ThorUtxoRefundPolicy`) and EVM ([`evm`])
+/// families, for the Cosmos custody family (GAIA / ATOM) where the
+/// destination custody is a LegacyAminoPubKey k-of-n multisig.
+///
+/// ## Why it mirrors the UTXO side, not the EVM side
+///
+/// A Cosmos delivery/refund is a NATIVE bank transfer — no Router contract,
+/// no event-bearing token — so (unlike EVM, which scans the THORChain
+/// Router's TransferOut log) the observation is a `transfer` event on the
+/// destination address, exactly like scanning a Bitcoin multisig for an
+/// arriving UTXO. The redemption DELIVERY leg is identical across all
+/// families (USDT lands on Ethereum), so the delivery policy reuses the
+/// shared `Erc20ArrivalClient`; only the refund leg is Cosmos-specific.
+///
+/// ## Refund binds to the Asgard vault (DL-P3.3)
+///
+/// A refund is uatom returning to our multisig. Because our multisig bech32
+/// address is public, a recipient+amount match alone is forgeable by anyone
+/// who pays it; the refund policy additionally requires the on-chain
+/// `transfer.sender` to equal the live THORChain GAIA Asgard vault (resolved
+/// via `/thorchain/inbound_addresses`), and refuses to attest while GAIA
+/// trading is halted.
+#[expect(
+    clippy::doc_markdown,
+    reason = "THORChain / GAIA / ATOM / Asgard / RPC identifiers recur \
+              throughout this module's docs; per-identifier backticks add \
+              noise without aiding parsing"
+)]
+pub mod cosmos {
+    use super::{
+        confirm_erc20_arrival, within, Erc20ArrivalClient, RedemptionCrossCheck,
+        RedemptionCrossCheckError, RefundCrossCheck, RefundCrossCheckError,
+    };
+    use alloy_primitives::Address as EthAddress;
+    use async_trait::async_trait;
+    use tracing::{info, warn};
+    use xindex_chain_cosmos::{CosmosChainClient, CosmosChainError};
+    use xindex_chain_thor::ThorClient;
+
+    /// THORChain reports every asset in 1e8; native uatom is 1e6 (GAIA), so
+    /// a refund's THORChain amount is divided by 100 to compare with the
+    /// on-chain uatom value (the R-T2 analogue — see KNOWN_FINDINGS).
+    const THOR_TO_ATOM_SCALE: u128 = 100;
+    /// THORChain 1e8 vs on-chain USDT 1e6 — the delivery leg lands USDT on
+    /// Ethereum, identical to the UTXO/EVM delivery.
+    const THOR_TO_USDT_SCALE: u128 = 100;
+    /// THORChain chain label for Cosmos Hub.
+    const GAIA_CHAIN: &str = "GAIA";
+    /// THORChain asset for native ATOM.
+    const GAIA_ASSET: &str = "GAIA.ATOM";
+    /// Native micro-denom for ATOM.
+    const UATOM_DENOM: &str = "uatom";
+
+    /// Production delivery policy: THORChain swapped ATOM→USDT and the USDT
+    /// actually landed at the IndexToken on Ethereum. Two independent
+    /// observations, mirroring `ThorUtxoToUsdtPolicy`; only the refund
+    /// mutual-exclusion guard is Cosmos-specific (GAIA, not BTC).
+    pub struct ThorCosmosToUsdtPolicy<E: Erc20ArrivalClient> {
+        thor: ThorClient,
+        erc20: E,
+        usdt_token: EthAddress,
+        min_confirmations: u32,
+        tolerance_1e6: u128,
+    }
+
+    impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorCosmosToUsdtPolicy<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ThorCosmosToUsdtPolicy")
+                .field("usdt_token", &self.usdt_token)
+                .field("min_confirmations", &self.min_confirmations)
+                .field("tolerance_1e6", &self.tolerance_1e6)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<E: Erc20ArrivalClient> ThorCosmosToUsdtPolicy<E> {
+        #[must_use]
+        pub fn new(
+            thor: ThorClient,
+            erc20: E,
+            usdt_token: EthAddress,
+            min_confirmations: u32,
+            tolerance_1e6: u128,
+        ) -> Self {
+            Self {
+                thor,
+                erc20,
+                usdt_token,
+                min_confirmations,
+                tolerance_1e6,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorCosmosToUsdtPolicy<E> {
+        async fn verify(
+            &self,
+            cosmos_inbound_hash: &str,
+            index_token: EthAddress,
+        ) -> Result<u128, RedemptionCrossCheckError> {
+            let resp = self.thor.tx_status(cosmos_inbound_hash).await?;
+            if resp.observed_tx.status != "done" {
+                return Err(RedemptionCrossCheckError::ThorNotReady {
+                    reason: format!("observed_tx.status = {}", resp.observed_tx.status),
+                });
+            }
+            // Mutual-exclusion: a GAIA REFUND outbound means this is the
+            // refund path, never attest a delivery.
+            if resp
+                .actions
+                .iter()
+                .any(|a| a.chain == GAIA_CHAIN && a.memo.to_uppercase().starts_with("REFUND:"))
+            {
+                return Err(RedemptionCrossCheckError::RefundedInstead);
+            }
+            let want = format!("{index_token:#x}").to_lowercase();
+            let action = resp
+                .actions
+                .iter()
+                .find(|a| {
+                    a.chain == "ETH"
+                        && a.coin.asset.to_uppercase().starts_with("ETH.USDT")
+                        && a.to_address.to_lowercase() == want
+                })
+                .ok_or_else(|| RedemptionCrossCheckError::ThorNotReady {
+                    reason: "no ETH.USDT outbound to the IndexToken yet".to_string(),
+                })?;
+            let thor_1e8: u128 = action.coin.amount.parse().map_err(|e| {
+                RedemptionCrossCheckError::ThorNotReady {
+                    reason: format!("non-integer outbound amount '{}': {e}", action.coin.amount),
+                }
+            })?;
+            let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
+            let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
+            let arrival = confirm_erc20_arrival(
+                &self.erc20,
+                self.usdt_token,
+                index_token,
+                floor,
+                self.min_confirmations,
+            )?
+            .ok_or(RedemptionCrossCheckError::UsdtNotReady {
+                need_1e6: thor_1e6,
+                confs: self.min_confirmations,
+            })?;
+            if !within(thor_1e6, arrival.value, self.tolerance_1e6) {
+                return Err(RedemptionCrossCheckError::AmountMismatch {
+                    thor_1e6,
+                    onchain_1e6: arrival.value,
+                });
+            }
+            info!(
+                cosmos_inbound_hash,
+                onchain_usdt_1e6 = arrival.value,
+                "cosmos redemption cross-check OK"
+            );
+            // Attest the ON-CHAIN observed value (what the IndexToken's USDT
+            // balance actually grew by), not THORChain's figure.
+            Ok(arrival.value)
+        }
+    }
+
+    /// Production refund policy: THORChain slip-refunded ATOM to our
+    /// multisig (`REFUND:<hash>` GAIA outbound) and the uatom actually
+    /// returned FROM the live Asgard vault. Disambiguated from a delivery
+    /// ONLY by the USDT-outbound mutual exclusion + the `REFUND:` memo —
+    /// never by time.
+    pub struct ThorCosmosRefundPolicy<C: CosmosChainClient> {
+        thor: ThorClient,
+        cosmos: C,
+        multisig_address: String,
+        min_confirmations: u32,
+        tolerance_uatom: u128,
+        lookback_blocks: u64,
+    }
+
+    impl<C: CosmosChainClient> std::fmt::Debug for ThorCosmosRefundPolicy<C> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ThorCosmosRefundPolicy")
+                .field("multisig_address", &self.multisig_address)
+                .field("min_confirmations", &self.min_confirmations)
+                .field("tolerance_uatom", &self.tolerance_uatom)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<C: CosmosChainClient> ThorCosmosRefundPolicy<C> {
+        #[must_use]
+        pub fn new(
+            thor: ThorClient,
+            cosmos: C,
+            multisig_address: String,
+            min_confirmations: u32,
+            tolerance_uatom: u128,
+            lookback_blocks: u64,
+        ) -> Self {
+            Self {
+                thor,
+                cosmos,
+                multisig_address,
+                min_confirmations,
+                tolerance_uatom,
+                lookback_blocks,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<C: CosmosChainClient> RefundCrossCheck for ThorCosmosRefundPolicy<C> {
+        async fn verify(&self, cosmos_inbound_hash: &str) -> Result<u64, RefundCrossCheckError> {
+            let resp = self.thor.tx_status(cosmos_inbound_hash).await?;
+            if resp.observed_tx.status != "done" {
+                return Err(RefundCrossCheckError::ThorNotReady {
+                    reason: format!("observed_tx.status = {}", resp.observed_tx.status),
+                });
+            }
+            // Mutual-exclusion: a USDT delivery means use the delivery path.
+            if resp
+                .actions
+                .iter()
+                .any(|a| a.chain == "ETH" && a.coin.asset.to_uppercase().starts_with("ETH.USDT"))
+            {
+                return Err(RefundCrossCheckError::DeliveredInstead);
+            }
+            let action = resp
+                .actions
+                .iter()
+                .find(|a| {
+                    a.chain == GAIA_CHAIN
+                        && a.to_address == self.multisig_address
+                        && a.memo.to_uppercase().starts_with("REFUND:")
+                        && a.coin.asset.to_uppercase() == GAIA_ASSET
+                })
+                .ok_or_else(|| RefundCrossCheckError::ThorNotReady {
+                    reason: "no GAIA REFUND outbound to our multisig yet".to_string(),
+                })?;
+            let thor_1e8: u128 = action.coin.amount.parse().map_err(|e| {
+                RefundCrossCheckError::ThorNotReady {
+                    reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
+                }
+            })?;
+            let thor_uatom = thor_1e8 / THOR_TO_ATOM_SCALE;
+
+            // Resolve the live Asgard vault — the refund MUST originate
+            // there (sender binding). Refuse while GAIA trading is halted.
+            let vault = self
+                .thor
+                .vault_for_chain(GAIA_CHAIN)
+                .await?
+                .ok_or_else(|| RefundCrossCheckError::ThorNotReady {
+                    reason: "no GAIA inbound address from THORChain".to_string(),
+                })?;
+            if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+                return Err(RefundCrossCheckError::ThorNotReady {
+                    reason: "GAIA trading halted on THORChain".to_string(),
+                });
+            }
+
+            let floor = thor_uatom.saturating_sub(self.tolerance_uatom);
+            let observed = find_cosmos_arrival(
+                &self.cosmos,
+                &self.multisig_address,
+                &vault.address,
+                UATOM_DENOM,
+                floor,
+                self.min_confirmations,
+                self.lookback_blocks,
+            )
+            .await
+            .map_err(|e| RefundCrossCheckError::ThorNotReady {
+                reason: format!("cosmos arrival lookup failed: {e}"),
+            })?
+            .ok_or(RefundCrossCheckError::BtcNotReady {
+                // Variant is family-shared and smallest-unit; "sats" naming
+                // is historical (a v2 rename), the value is uatom here.
+                need_sats: u64::try_from(thor_uatom).unwrap_or(u64::MAX),
+                confs: self.min_confirmations,
+            })?;
+            if observed.abs_diff(thor_uatom) > self.tolerance_uatom {
+                return Err(RefundCrossCheckError::AmountMismatch {
+                    thor_sats: u64::try_from(thor_uatom).unwrap_or(u64::MAX),
+                    utxo_sats: u64::try_from(observed).unwrap_or(u64::MAX),
+                });
+            }
+            warn!(
+                cosmos_inbound_hash,
+                refund_uatom = observed,
+                asgard = %vault.address,
+                "cosmos refund cross-check OK"
+            );
+            Ok(u64::try_from(observed).unwrap_or(u64::MAX))
+        }
+    }
+
+    /// First `transfer` to `multisig` with `sender == expected_sender`,
+    /// `denom == expected_denom`, `amount >= min_value`, and at least
+    /// `min_confs` inclusion depth at the chain tip. `None` = not yet
+    /// observed (the signer polls again, never attests).
+    async fn find_cosmos_arrival<C: CosmosChainClient>(
+        cosmos: &C,
+        multisig: &str,
+        expected_sender: &str,
+        expected_denom: &str,
+        min_value: u128,
+        min_confs: u32,
+        lookback_blocks: u64,
+    ) -> Result<Option<u128>, CosmosChainError> {
+        let tip = cosmos.latest_height().await?;
+        let min_height = tip.saturating_sub(lookback_blocks);
+        let transfers = cosmos.transfers_to(multisig, min_height).await?;
+        for t in transfers {
+            let confs = tip.saturating_sub(t.height).saturating_add(1);
+            if t.sender == expected_sender
+                && t.denom == expected_denom
+                && t.amount >= min_value
+                && confs >= u64::from(min_confs)
+            {
+                return Ok(Some(t.amount));
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{Erc20Arrival, Erc20Error, Erc20ArrivalClient};
+        use super::{
+            RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
+            RefundCrossCheckError, ThorCosmosRefundPolicy, ThorCosmosToUsdtPolicy,
+        };
+        use alloy_primitives::Address as EthAddress;
+        use std::future::ready;
+        use xindex_chain_cosmos::{
+            CosmosAccount, CosmosBroadcastOutcome, CosmosChainClient, CosmosChainError,
+            CosmosTransfer,
+        };
+        use xindex_chain_thor::ThorClient;
+        use xindex_shared::chain_registry::ChainId;
+
+        const INDEX_TOKEN: EthAddress = EthAddress::new([0x11; 20]);
+        const USDT: EthAddress = EthAddress::new([0x22; 20]);
+        const MULTISIG: &str = "cosmos1vault0multisig";
+        const ASGARD: &str = "cosmos1asgard0vault";
+
+        /// In-memory ERC20 arrival backend.
+        #[derive(Default)]
+        struct StubErc20 {
+            arrivals: Vec<Erc20Arrival>,
+        }
+        impl Erc20ArrivalClient for StubErc20 {
+            fn transfers_to(
+                &self,
+                _token: EthAddress,
+                _to: EthAddress,
+            ) -> Result<Vec<Erc20Arrival>, Erc20Error> {
+                Ok(self.arrivals.clone())
+            }
+        }
+
+        /// In-memory Cosmos client. `ready(..)` (not `async fn`) keeps the
+        /// stubs free of `clippy::unused_async`.
+        struct StubCosmos {
+            tip: u64,
+            transfers: Vec<CosmosTransfer>,
+        }
+        impl CosmosChainClient for StubCosmos {
+            fn chain(&self) -> ChainId {
+                ChainId::Gaia
+            }
+            #[expect(
+                clippy::unnecessary_literal_bound,
+                reason = "test stub returns a fixed consensus chain-id"
+            )]
+            fn cosmos_chain_id(&self) -> &str {
+                "cosmoshub-4"
+            }
+            fn account(
+                &self,
+                _address: &str,
+            ) -> impl std::future::Future<Output = Result<CosmosAccount, CosmosChainError>> + Send
+            {
+                ready(Ok(CosmosAccount {
+                    account_number: 1,
+                    sequence: 0,
+                }))
+            }
+            fn latest_height(
+                &self,
+            ) -> impl std::future::Future<Output = Result<u64, CosmosChainError>> + Send {
+                ready(Ok(self.tip))
+            }
+            fn transfers_to(
+                &self,
+                _recipient: &str,
+                min_height: u64,
+            ) -> impl std::future::Future<Output = Result<Vec<CosmosTransfer>, CosmosChainError>> + Send
+            {
+                let v: Vec<CosmosTransfer> = self
+                    .transfers
+                    .iter()
+                    .filter(|t| t.height >= min_height)
+                    .cloned()
+                    .collect();
+                ready(Ok(v))
+            }
+            fn broadcast_tx_sync(
+                &self,
+                _tx_raw: &[u8],
+            ) -> impl std::future::Future<Output = Result<CosmosBroadcastOutcome, CosmosChainError>> + Send
+            {
+                ready(Err(CosmosChainError::Rpc("not used in tests".to_string())))
+            }
+        }
+
+        fn transfer(sender: &str, amount: u128, denom: &str, height: u64) -> CosmosTransfer {
+            CosmosTransfer {
+                height,
+                txhash: "GAIATX".to_string(),
+                sender: sender.to_string(),
+                recipient: MULTISIG.to_string(),
+                amount,
+                denom: denom.to_string(),
+            }
+        }
+
+        /// Mock `GET /thorchain/tx/{hash}` with the given actions JSON.
+        async fn mount_tx(server: &wiremock::MockServer, hash: &str, actions: serde_json::Value) {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/thorchain/tx/{hash}")))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "observed_tx": {
+                            "tx": { "id": hash, "chain": "GAIA", "from_address": "cosmos1user",
+                                    "to_address": ASGARD, "coins": [], "memo": "" },
+                            "status": "done"
+                        },
+                        "actions": actions
+                    })),
+                )
+                .mount(server)
+                .await;
+        }
+
+        /// Mock `GET /thorchain/inbound_addresses` returning a GAIA vault.
+        async fn mount_inbound(server: &wiremock::MockServer, halted: bool) {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/thorchain/inbound_addresses"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                        "chain": "GAIA", "pub_key": "thorpub1addwnpepq", "address": ASGARD,
+                        "halted": halted
+                    }])),
+                )
+                .mount(server)
+                .await;
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_ok_when_uatom_returns_from_asgard() {
+            let server = wiremock::MockServer::start().await;
+            // 5 ATOM refund: THORChain 1e8 = 500_000_000 → 5_000_000 uatom.
+            mount_tx(
+                &server,
+                "gaia-in",
+                serde_json::json!([{ "chain": "GAIA", "to_address": MULTISIG,
+                    "coin": {"asset": "GAIA.ATOM", "amount": "500000000"},
+                    "memo": "REFUND:gaia-in", "max_gas": [] }]),
+            )
+            .await;
+            mount_inbound(&server, false).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let cosmos = StubCosmos {
+                tip: 100,
+                transfers: vec![transfer(ASGARD, 5_000_000, "uatom", 100)],
+            };
+            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let out = policy.verify("gaia-in").await.expect("refund ok");
+            assert_eq!(out, 5_000_000);
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_rejects_wrong_sender() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(
+                &server,
+                "gaia-in",
+                serde_json::json!([{ "chain": "GAIA", "to_address": MULTISIG,
+                    "coin": {"asset": "GAIA.ATOM", "amount": "500000000"},
+                    "memo": "REFUND:gaia-in", "max_gas": [] }]),
+            )
+            .await;
+            mount_inbound(&server, false).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            // The uatom arrives, exact amount — but NOT from the Asgard vault.
+            let cosmos = StubCosmos {
+                tip: 100,
+                transfers: vec![transfer("cosmos1attacker", 5_000_000, "uatom", 100)],
+            };
+            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let err = policy.verify("gaia-in").await.expect_err("must reject");
+            assert!(matches!(err, RefundCrossCheckError::BtcNotReady { .. }), "got {err:?}");
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_rejects_when_gaia_halted() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(
+                &server,
+                "gaia-in",
+                serde_json::json!([{ "chain": "GAIA", "to_address": MULTISIG,
+                    "coin": {"asset": "GAIA.ATOM", "amount": "500000000"},
+                    "memo": "REFUND:gaia-in", "max_gas": [] }]),
+            )
+            .await;
+            mount_inbound(&server, true).await; // halted
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let cosmos = StubCosmos {
+                tip: 100,
+                transfers: vec![transfer(ASGARD, 5_000_000, "uatom", 100)],
+            };
+            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let err = policy.verify("gaia-in").await.expect_err("must reject");
+            assert!(matches!(err, RefundCrossCheckError::ThorNotReady { .. }), "got {err:?}");
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_delivered_instead_when_usdt_outbound_present() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(
+                &server,
+                "gaia-in",
+                serde_json::json!([{ "chain": "ETH", "to_address": "0xindex",
+                    "coin": {"asset": "ETH.USDT-0XDAC", "amount": "100000000"},
+                    "memo": "OUT:gaia-in", "max_gas": [] }]),
+            )
+            .await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let cosmos = StubCosmos { tip: 100, transfers: vec![] };
+            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let err = policy.verify("gaia-in").await.expect_err("must reject");
+            assert!(matches!(err, RefundCrossCheckError::DeliveredInstead), "got {err:?}");
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn delivery_ok_when_usdt_lands_on_eth() {
+            let server = wiremock::MockServer::start().await;
+            let want = format!("{INDEX_TOKEN:#x}");
+            mount_tx(
+                &server,
+                "gaia-in",
+                serde_json::json!([{ "chain": "ETH", "to_address": want,
+                    "coin": {"asset": "ETH.USDT-0XDAC", "amount": "100000000"},
+                    "memo": "OUT:gaia-in", "max_gas": [] }]),
+            )
+            .await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            // 1e8 / 100 = 1e6 USDT, and the same lands on-chain.
+            let erc20 = StubErc20 {
+                arrivals: vec![Erc20Arrival { value: 1_000_000, confirmations: 5 }],
+            };
+            let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
+            let out = policy.verify("gaia-in", INDEX_TOKEN).await.expect("delivery ok");
+            assert_eq!(out, 1_000_000);
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn delivery_refunded_instead_when_gaia_refund_present() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(
+                &server,
+                "gaia-in",
+                serde_json::json!([{ "chain": "GAIA", "to_address": MULTISIG,
+                    "coin": {"asset": "GAIA.ATOM", "amount": "500000000"},
+                    "memo": "REFUND:gaia-in", "max_gas": [] }]),
+            )
+            .await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let policy = ThorCosmosToUsdtPolicy::new(thor, StubErc20::default(), USDT, 3, 0);
+            let err = policy
+                .verify("gaia-in", INDEX_TOKEN)
+                .await
+                .expect_err("must reject");
+            assert!(matches!(err, RedemptionCrossCheckError::RefundedInstead), "got {err:?}");
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn delivery_amount_mismatch_when_onchain_differs() {
+            let server = wiremock::MockServer::start().await;
+            let want = format!("{INDEX_TOKEN:#x}");
+            mount_tx(
+                &server,
+                "gaia-in",
+                serde_json::json!([{ "chain": "ETH", "to_address": want,
+                    "coin": {"asset": "ETH.USDT-0XDAC", "amount": "100000000"},
+                    "memo": "OUT:gaia-in", "max_gas": [] }]),
+            )
+            .await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            // THORChain says 1e6; on-chain shows more, tolerance 0 → mismatch.
+            let erc20 = StubErc20 {
+                arrivals: vec![Erc20Arrival { value: 1_100_000, confirmations: 5 }],
+            };
+            let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
+            let err = policy
+                .verify("gaia-in", INDEX_TOKEN)
+                .await
+                .expect_err("must reject");
+            assert!(matches!(err, RedemptionCrossCheckError::AmountMismatch { .. }), "got {err:?}");
+        }
+    }
+}

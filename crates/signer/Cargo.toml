@@ -16,6 +16,9 @@ xindex-chain-utxo.workspace = true
 # V6: EVM cross-check policies use `EvmChainClient` for log scanning
 # (THORChain Router `TransferOut` events) and tip queries.
 xindex-chain-evm.workspace = true
+# C6: Cosmos cross-check policies use `CosmosChainClient` for native
+# bank-transfer observation (refund: uatom back to our multisig).
+xindex-chain-cosmos.workspace = true
 alloy = { workspace = true }
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true

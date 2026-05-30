@@ -42,6 +42,11 @@ pub struct CosmosTransfer {
     pub height: u64,
     /// Tx hash (uppercase hex, Tendermint convention).
     pub txhash: String,
+    /// bech32 sender (the `transfer` event's `sender` attribute). The
+    /// cross-check binds a delivery/refund to its expected origin (e.g.
+    /// the `THORChain` Asgard vault) — a recipient+amount match alone is
+    /// forgeable by anyone who pays our public multisig address.
+    pub sender: String,
     /// bech32 recipient.
     pub recipient: String,
     /// Amount in the coin's micro-unit.
@@ -234,11 +239,12 @@ pub fn parse_transfers(
             let Some(attrs) = ev.get("attributes").and_then(Value::as_array) else {
                 continue;
             };
-            let (mut recipient, mut amount) = (None, None);
+            let (mut recipient, mut amount, mut sender) = (None, None, None);
             for at in attrs {
                 match at.get("key").and_then(Value::as_str) {
                     Some("recipient") => recipient = at.get("value").and_then(Value::as_str),
                     Some("amount") => amount = at.get("value").and_then(Value::as_str),
+                    Some("sender") => sender = at.get("value").and_then(Value::as_str),
                     _ => {}
                 }
             }
@@ -246,11 +252,13 @@ pub fn parse_transfers(
                 continue;
             }
             let Some(amount) = amount else { continue };
+            let sender = sender.unwrap_or_default().to_string();
             for coin in amount.split(',') {
                 let (value, denom) = parse_coin_amount(coin)?;
                 out.push(CosmosTransfer {
                     height,
                     txhash: txhash.clone(),
+                    sender: sender.clone(),
                     recipient: want_recipient.to_string(),
                     amount: value,
                     denom,
@@ -491,6 +499,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].height, 100);
         assert_eq!(got[0].txhash, "AAAA");
+        assert_eq!(got[0].sender, "cosmos1thor");
         assert_eq!(got[0].amount, 5_000_000);
         assert_eq!(got[0].denom, "uatom");
         // min_height filters out the height-100 hit.

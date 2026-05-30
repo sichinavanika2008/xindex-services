@@ -5605,6 +5605,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+ "xindex-chain-cosmos",
  "xindex-chain-evm",
  "xindex-chain-thor",
  "xindex-chain-utxo",
