@@ -562,4 +562,32 @@ mod tests {
             assert_eq!(got.inbound_txid, format!("evm-tx-{chain}"));
         }
     }
+
+    /// C8 / Phase 3.3: the Cosmos family chain (gaia) is admitted by the
+    /// widened CHECK constraint; pre-existing UTXO + EVM rows still insert.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_accepts_gaia_post_v9_migration() {
+        let store = SqliteRedemptionDispatch::connect("sqlite::memory:")
+            .await
+            .expect("connect + migrate");
+        // Regression: a UTXO + an EVM chain still record post-migration.
+        let id = b256!("00000000000000000000000000000000000000000000000000000000000000e2");
+        store
+            .record(id, 0, ChainId::Btc, "btc-txid".into(), 1)
+            .await
+            .expect("btc record");
+        store
+            .record(id, 1, ChainId::Eth, "eth-txid".into(), 2)
+            .await
+            .expect("eth record");
+        // The Cosmos chain records its own leg.
+        store
+            .record(id, 2, ChainId::Gaia, "gaia-txhash".into(), 3)
+            .await
+            .expect("gaia record");
+        let got = store.get(&id, 2).await.expect("get").expect("recorded row");
+        assert_eq!(got.chain, ChainId::Gaia);
+        assert_eq!(got.inbound_txid, "gaia-txhash");
+    }
 }
