@@ -7,13 +7,15 @@
 //! arm in each lookup, add test vectors. The compiler walks every
 //! callsite through every arm — there is no default fallthrough.
 //!
-//! ## Phase 3.1 + 3.2 scope
+//! ## Phase 3.1 + 3.2 + 3.3 scope
 //!
 //! `Btc` / `Ltc` / `Bch` / `Doge` / `Zec` — the UTXO custody family
 //! (`CustodyFamily::Utxo`). `Eth` / `Bsc` / `Avax` / `Base` / `Pol` —
 //! the EVM custody family (`CustodyFamily::Evm`), Safe v1.4.1 k-of-n
-//! direct multisig per chain. Cosmos / Solana / Substrate families are
-//! Phase 3.3+ and will reuse this enum.
+//! direct multisig per chain. `Gaia` — the Cosmos custody family
+//! (`CustodyFamily::Cosmos`), `LegacyAminoPubKey` k-of-n multisig
+//! (`GAIA.ATOM`). Solana / Substrate families are Phase 3.4+ and will
+//! reuse this enum.
 
 use std::fmt;
 use std::str::FromStr;
@@ -50,6 +52,8 @@ pub enum ChainId {
     Base,
     /// Polygon `PoS`.
     Pol,
+    /// Cosmos Hub (GAIA / ATOM). Cosmos custody family.
+    Gaia,
 }
 
 impl fmt::Display for ChainId {
@@ -65,6 +69,7 @@ impl fmt::Display for ChainId {
             Self::Avax => "avax",
             Self::Base => "base",
             Self::Pol => "pol",
+            Self::Gaia => "gaia",
         })
     }
 }
@@ -97,6 +102,7 @@ impl FromStr for ChainId {
             "avax" => Ok(Self::Avax),
             "base" => Ok(Self::Base),
             "pol" => Ok(Self::Pol),
+            "gaia" => Ok(Self::Gaia),
             other => Err(ParseChainIdError(other.to_string())),
         }
     }
@@ -111,7 +117,10 @@ pub enum CustodyFamily {
     /// EVM chains: Safe v1.4.1 k-of-n smart-contract multisig via
     /// `execTransaction` (DL-P3-4, DL-P3.2-3).
     Evm,
-    // Cosmos, Solana, Substrate — Phase 3.3+.
+    /// Cosmos-SDK chains: native `LegacyAminoPubKey` k-of-n multisig
+    /// account, amino-JSON signing (DL-P3.3-2/3/4).
+    Cosmos,
+    // Solana, Substrate — Phase 3.4+.
 }
 
 /// Fee-rate unit per chain. UTXO `SegWit` chains charge per virtual byte
@@ -127,6 +136,10 @@ pub enum FeeUnit {
     PerByte,
     /// wei/gas — EVM chains. Translated to / from gwei at the wire.
     PerGwei,
+    /// `uatom`/gas — Cosmos-SDK chains. Fee = `gas_limit × gas_price`
+    /// denominated in the native micro-unit (`uatom` for GAIA); distinct
+    /// from `PerGwei` (different base unit, no gwei translation).
+    PerCosmosGas,
 }
 
 /// EVM transaction type per chain. Phase 3.2 picks one per chain at
@@ -155,6 +168,7 @@ pub const ALL_CHAINS: &[ChainId] = &[
     ChainId::Avax,
     ChainId::Base,
     ChainId::Pol,
+    ChainId::Gaia,
 ];
 
 impl ChainId {
@@ -175,32 +189,38 @@ impl ChainId {
             Self::Avax => "AVAX.AVAX",
             Self::Base => "BASE.ETH",
             Self::Pol => "POL.MATIC",
+            Self::Gaia => "GAIA.ATOM",
         }
     }
 
     /// Custody family. UTXO for Phase 3.1 chains; EVM (Safe v1.4.1
-    /// multisig) for Phase 3.2 chains.
+    /// multisig) for Phase 3.2 chains; Cosmos (`LegacyAminoPubKey`
+    /// multisig) for Phase 3.3 chains.
     #[must_use]
     pub const fn custody_family(self) -> CustodyFamily {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => CustodyFamily::Utxo,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => CustodyFamily::Evm,
+            Self::Gaia => CustodyFamily::Cosmos,
         }
     }
 
-    /// Native-unit decimals. UTXO family = 8 (sat); EVM family = 18 (wei).
+    /// Native-unit decimals. UTXO family = 8 (sat); EVM family = 18 (wei);
+    /// Cosmos GAIA = 6 (`uatom`).
     #[must_use]
     pub const fn decimals(self) -> u8 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 8,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => 18,
+            Self::Gaia => 6,
         }
     }
 
-    /// Native-unit scale (`10^decimals`) as `u64`. **UTXO-only.** EVM
-    /// chains have `10^18` which overflows `u64`; calling this on an
-    /// EVM chain is a programming error. Use [`Self::scale_u128`] for
-    /// any code that may run on the EVM family.
+    /// Native-unit scale (`10^decimals`) as `u64`. **Non-EVM only**
+    /// (UTXO `10^8`, Cosmos GAIA `10^6`). EVM chains have `10^18` which
+    /// overflows `u64`; calling this on an EVM chain is a programming
+    /// error. Use [`Self::scale_u128`] for any code that may run on the
+    /// EVM family.
     ///
     /// # Panics
     /// Panics on `Eth` / `Bsc` / `Avax` / `Base` / `Pol`.
@@ -215,6 +235,7 @@ impl ChainId {
     pub const fn scale(self) -> u64 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
+            Self::Gaia => 1_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 panic!("ChainId::scale() does not fit u64 for the EVM family — use scale_u128()")
             }
@@ -229,6 +250,7 @@ impl ChainId {
     pub const fn scale_u128(self) -> u128 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
+            Self::Gaia => 1_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 1_000_000_000_000_000_000
             }
@@ -242,6 +264,9 @@ impl ChainId {
     /// BSC 20 (3-sec blocks, 1-min effective), AVAX 5 (post-Apricot
     /// rapid finality), BASE 30 (L2 sequencer + ~5-min L1 anchoring),
     /// POL 64 (heimdall-bor 256-block checkpointing → conservative).
+    /// GAIA 1 — Tendermint instant finality (a committed block is final
+    /// under <1/3 Byzantine); 1 = read the including block after commit
+    /// (Bifrost reads tip-1 to dodge the block-results race).
     #[must_use]
     #[expect(
         clippy::match_same_arms,
@@ -260,41 +285,44 @@ impl ChainId {
             Self::Avax => 5,
             Self::Base => 30,
             Self::Pol => 64,
+            Self::Gaia => 1,
         }
     }
 
     /// Maximum bytes carryable in an `OP_RETURN` standard-relay output
-    /// (UTXO chains). Always `0` for EVM chains — memos live in
-    /// calldata, not `OP_RETURN`.
+    /// (UTXO chains). `0` for EVM chains (memos live in calldata) and
+    /// Cosmos chains (the `THORChain` memo lives in the tx `memo` field,
+    /// ≤250 bytes, enforced by the Cosmos tx builder — not here).
     #[must_use]
     pub const fn op_return_max(self) -> usize {
         match self {
             Self::Bch => 220,
             Self::Btc | Self::Ltc | Self::Doge | Self::Zec => 80,
-            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => 0,
+            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol | Self::Gaia => 0,
         }
     }
 
     /// Fee unit per chain. UTXO `SegWit` → `PerVbyte`; UTXO legacy →
-    /// `PerByte`; EVM → `PerGwei`.
+    /// `PerByte`; EVM → `PerGwei`; Cosmos → `PerCosmosGas`.
     #[must_use]
     pub const fn fee_unit(self) -> FeeUnit {
         match self {
             Self::Btc | Self::Ltc => FeeUnit::PerVbyte,
             Self::Bch | Self::Doge | Self::Zec => FeeUnit::PerByte,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => FeeUnit::PerGwei,
+            Self::Gaia => FeeUnit::PerCosmosGas,
         }
     }
 
-    /// EVM transaction type per chain. UTXO chains return `None`
-    /// (the EVM tx-type concept is meaningless for them). DL-P3.2-4:
-    /// EIP-1559 on ETH/AVAX/BASE/POL; legacy on BSC.
+    /// EVM transaction type per chain. UTXO and Cosmos chains return
+    /// `None` (the EVM tx-type concept is meaningless for them).
+    /// DL-P3.2-4: EIP-1559 on ETH/AVAX/BASE/POL; legacy on BSC.
     #[must_use]
     pub const fn tx_type(self) -> Option<EvmTxType> {
         match self {
             Self::Eth | Self::Avax | Self::Base | Self::Pol => Some(EvmTxType::Eip1559),
             Self::Bsc => Some(EvmTxType::Legacy),
-            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => None,
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia => None,
         }
     }
 
@@ -308,15 +336,15 @@ impl ChainId {
             Self::Avax => Some(43_114),
             Self::Base => Some(8_453),
             Self::Pol => Some(137),
-            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => None,
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia => None,
         }
     }
 
     /// `THORChain` Router contract address on the chain itself. The
     /// executor sends Safe `execTransaction` output to this address to
-    /// initiate a swap back to USDT on Ethereum. UTXO chains return
-    /// `None` (their `THORChain` side is an `Asgard` vault address
-    /// served by `ThorchainVaultRegistry`).
+    /// initiate a swap back to USDT on Ethereum. UTXO and Cosmos chains
+    /// return `None` (their `THORChain` side is an `Asgard` vault /
+    /// account address served by `ThorchainVaultRegistry`).
     ///
     /// **DL-P3.2-5: placeholders pending source citation.** These
     /// addresses MUST be pinned from a specific `THORChain` docs
@@ -332,7 +360,7 @@ impl ChainId {
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 Some(address!("0000000000000000000000000000000000000000"))
             }
-            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => None,
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia => None,
         }
     }
 
@@ -384,6 +412,7 @@ mod tests {
         assert_eq!(ChainId::Avax.thor_asset(), "AVAX.AVAX");
         assert_eq!(ChainId::Base.thor_asset(), "BASE.ETH");
         assert_eq!(ChainId::Pol.thor_asset(), "POL.MATIC");
+        assert_eq!(ChainId::Gaia.thor_asset(), "GAIA.ATOM");
     }
 
     #[test]
@@ -423,6 +452,24 @@ mod tests {
             assert!(c.evm_chain_id().is_some());
             assert!(c.thorchain_router_address().is_some());
         }
+    }
+
+    /// Phase 3.3 Cosmos family: GAIA = ATOM, 6-dec (`uatom`), instant
+    /// finality, memo in tx field (no `OP_RETURN`), `PerCosmosGas` fee
+    /// unit, no EVM tx-type / chain-id / router. `scale()` fits u64 (10^6).
+    #[test]
+    fn all_phase_3_3_chains_are_cosmos_family_with_6_decimals() {
+        // Single-chain family today (NOBLE follow-on adds a second row).
+        let c = ChainId::Gaia;
+        assert_eq!(c.custody_family(), CustodyFamily::Cosmos);
+        assert_eq!(c.decimals(), 6);
+        assert_eq!(c.scale(), 1_000_000);
+        assert_eq!(c.scale_u128(), 1_000_000_u128);
+        assert_eq!(c.fee_unit(), FeeUnit::PerCosmosGas);
+        assert_eq!(c.op_return_max(), 0);
+        assert_eq!(c.tx_type(), None);
+        assert_eq!(c.evm_chain_id(), None);
+        assert_eq!(c.thorchain_router_address(), None);
     }
 
     /// Tx-type per DL-P3.2-4: EIP-1559 on ETH/AVAX/BASE/POL; legacy on BSC.
@@ -472,6 +519,8 @@ mod tests {
         assert_eq!(ChainId::Avax.conf_depth(), 5);
         assert_eq!(ChainId::Base.conf_depth(), 30);
         assert_eq!(ChainId::Pol.conf_depth(), 64);
+        // GAIA 1: Tendermint instant finality.
+        assert_eq!(ChainId::Gaia.conf_depth(), 1);
     }
 
     /// BCH's 2019 post-fork relay policy raised the `OP_RETURN` limit
@@ -484,6 +533,8 @@ mod tests {
         assert_eq!(ChainId::Bch.op_return_max(), 220);
         assert_eq!(ChainId::Doge.op_return_max(), 80);
         assert_eq!(ChainId::Zec.op_return_max(), 80);
+        // GAIA: memo lives in the tx memo field, not OP_RETURN.
+        assert_eq!(ChainId::Gaia.op_return_max(), 0);
     }
 
     /// Fee unit per `SegWit` availability. BCH/DOGE/ZEC have no
@@ -496,6 +547,7 @@ mod tests {
         assert_eq!(ChainId::Bch.fee_unit(), FeeUnit::PerByte);
         assert_eq!(ChainId::Doge.fee_unit(), FeeUnit::PerByte);
         assert_eq!(ChainId::Zec.fee_unit(), FeeUnit::PerByte);
+        assert_eq!(ChainId::Gaia.fee_unit(), FeeUnit::PerCosmosGas);
     }
 
     /// `asset_id_hash` is `keccak256(thor_asset.as_bytes())`. Both
@@ -504,7 +556,7 @@ mod tests {
     /// Round-trip: `ChainId` ↔ string form (`Display` + `FromStr`).
     /// Used by JSON wire (`PsbtInputSignRequest`), `SQLite` TEXT columns,
     /// and CLI args. Mixed-case input is normalised to lowercase. All
-    /// 10 chains round-trip cleanly.
+    /// 11 chains round-trip cleanly.
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
     fn display_fromstr_round_trip_and_case_insensitive() {
@@ -517,6 +569,10 @@ mod tests {
         assert_eq!("Ltc".parse::<ChainId>().expect("mixed"), ChainId::Ltc);
         assert_eq!("ETH".parse::<ChainId>().expect("evm upper"), ChainId::Eth);
         assert_eq!("Base".parse::<ChainId>().expect("evm mixed"), ChainId::Base);
+        assert_eq!(
+            "GAIA".parse::<ChainId>().expect("cosmos upper"),
+            ChainId::Gaia
+        );
         assert!("ada".parse::<ChainId>().is_err());
     }
 
@@ -532,7 +588,7 @@ mod tests {
 
     /// U10: round-trip `ChainId` → `asset_id_hash` → `ChainId` via
     /// `from_asset_id`. Bogus hash returns `None`. Used by
-    /// `xindex-attest-redeem` to route per-leg cross-checks. All 10
+    /// `xindex-attest-redeem` to route per-leg cross-checks. All 11
     /// chains covered.
     #[test]
     fn from_asset_id_round_trip_and_rejects_unknown() {
@@ -550,7 +606,7 @@ mod tests {
             let expected = keccak256(c.thor_asset().as_bytes());
             assert_eq!(c.asset_id_hash(), expected);
         }
-        // All 10 hashes are pairwise distinct (no UTXO/EVM collisions).
+        // All 11 hashes are pairwise distinct (no UTXO/EVM/Cosmos collisions).
         let hashes: Vec<B256> = ALL_CHAINS
             .iter()
             .copied()
