@@ -1,0 +1,19 @@
+[package]
+name = "xindex-cosmos-tx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+sha2.workspace = true
+bech32 = { workspace = true, default-features = false, features = ["alloc"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+xindex-shared.workspace = true

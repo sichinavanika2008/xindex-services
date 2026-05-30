@@ -59,8 +59,14 @@ bdk_wallet = { version = "1", default-features = false, features = ["std"] }
 #   MIT-licensed, no native deps.
 bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 bitcoincash-addr = "0.5"
+# Cosmos stack (cosmos-tx, Phase 3.3). Hand-rolled — no cosmrs/prost. The
+# pure crate needs SHA-256 for the amino StdSignDoc sign-bytes and the
+# LegacyAminoPubKey multisig-address derivation; secp256k1 (verify +
+# low-S) reuses k256 as the safe-evm crate does.
+sha2 = "0.10"
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
+xindex-cosmos-tx = { path = "crates/cosmos-tx" }
 xindex-chain-eth = { path = "crates/chain-eth" }
 xindex-chain-evm = { path = "crates/chain-evm" }
 xindex-chain-thor = { path = "crates/chain-thor" }
