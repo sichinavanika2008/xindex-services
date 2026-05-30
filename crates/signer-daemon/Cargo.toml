@@ -52,3 +52,8 @@ xindex-executor.workspace = true
 # (V4) + the production cosigner cosigner trait shape (V7).
 xindex-chain-evm.workspace = true
 alloy = { workspace = true }
+# C9 e2e: drives `CosmosRedeemExecutor` (C7) against three real daemons.
+# Needs the Cosmos chain trait (C4) for the stub client + the multisig
+# descriptor (C3) to derive the account address.
+xindex-chain-cosmos.workspace = true
+xindex-cosmos-tx.workspace = true

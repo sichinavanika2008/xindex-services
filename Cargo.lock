@@ -5635,6 +5635,7 @@ dependencies = [
  "tower",
  "tracing",
  "wiremock",
+ "xindex-chain-cosmos",
  "xindex-chain-evm",
  "xindex-cosmos-tx",
  "xindex-executor",
