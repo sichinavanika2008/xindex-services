@@ -204,6 +204,101 @@ where
     Ok(chain)
 }
 
+/// `POST /api/v1/sign/cosmos-tx`
+///
+/// (Phase 3.3): Cosmos-SDK `LegacyAminoPubKey` k-of-n multisig partial-
+/// signature endpoint for the Cosmos custody family (GAIA / ATOM). The
+/// daemon:
+///   1. Routes to the per-chain config keyed by `chain_id`
+///      (`endpoint_disabled` if no Cosmos role is configured).
+///   2. Verifies `account_address` matches the daemon's configured
+///      multisig account ([`error_codes::WRONG_COSMOS_ACCOUNT`]).
+///   3. RE-COMPUTES the `SIGN_MODE_LEGACY_AMINO_JSON` `StdSignDoc`
+///      sign-bytes hash from the semantic fields below (via the
+///      `cosmos-tx` crate) and refuses if it does not match
+///      `sign_doc_hash` ([`error_codes::SIGN_DOC_MISMATCH`]) — the
+///      daemon never blind-signs a coordinator-supplied digest
+///      (DL-M5-3).
+///   4. Replay-keys on `(chain_id, account_address, sequence)` — the
+///      `sequence` is the Cosmos monotonic-nonce analogue and is bound
+///      into the sign-bytes.
+///   5. Signs the recomputed 32-byte sign-bytes hash with its single
+///      secp256k1 key, enforces low-S, and returns a 64-byte `r ‖ s`
+///      signature + the member pubkey.
+///
+/// Amino-JSON (not `SIGN_MODE_DIRECT`) is mandatory for the multisig:
+/// the amino `StdSignDoc` excludes the signer-set / bitarray, so each
+/// member signs the identical sign-bytes independently (DL-P3.3-3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CosmosTxSignRequest {
+    /// Cosmos `ChainId`. MUST satisfy
+    /// `chain_id.custody_family() == CustodyFamily::Cosmos`; the serde
+    /// validator rejects non-Cosmos ids at deserialize time with
+    /// [`error_codes::NON_COSMOS_CHAIN`].
+    #[serde(deserialize_with = "deserialize_cosmos_chain_id")]
+    pub chain_id: ChainId,
+    /// The `LegacyAminoPubKey` multisig account address (bech32, e.g.
+    /// `cosmos1…`). This is the `MsgSend.from_address` AND the daemon's
+    /// configured custody account — mismatch →
+    /// [`error_codes::WRONG_COSMOS_ACCOUNT`].
+    pub account_address: String,
+    /// Cosmos consensus chain-id string bound in the sign-bytes (e.g.
+    /// `"cosmoshub-4"`). Distinct from the `chain_id` enum, whose wire
+    /// form is `THORChain`'s `"gaia"`.
+    pub cosmos_chain_id: String,
+    /// `account_number` of the multisig account (decimal `u64` string).
+    /// Bound in the amino sign-bytes (fixed per account at first
+    /// funding).
+    pub account_number: String,
+    /// `sequence` of the multisig account (decimal `u64` string). The
+    /// monotonic replay coordinate — the daemon refuses to re-sign a
+    /// different payload at the same `(chain, account, sequence)`.
+    pub sequence: String,
+
+    // ─── MsgSend (single send, single coin — THORChain Cosmos rail) ─────
+    /// `MsgSend.to_address` — bech32 recipient (the `THORChain` Asgard
+    /// inbound account for a redeem leg).
+    pub to_address: String,
+    /// Send amount in the native micro-unit (decimal string; `uatom`).
+    pub amount: String,
+    /// Send + fee denom (`"uatom"` for GAIA — the gas asset on the
+    /// `THORChain` Cosmos rail).
+    pub denom: String,
+
+    // ─── Fee ────────────────────────────────────────────────────────────
+    /// Fee amount in `denom` micro-units (decimal string).
+    pub fee_amount: String,
+    /// Gas limit (decimal `u64` string).
+    pub gas_limit: String,
+
+    /// `THORChain` memo carried in the tx `memo` field (≤250 bytes).
+    pub memo: String,
+
+    /// Pre-computed amino `StdSignDoc` sign-bytes hash (coordinator's
+    /// claim): `SHA-256(canonical_amino_json)`, `0x`-prefixed 32-byte
+    /// hex. The daemon recomputes from the semantic fields above and
+    /// refuses with [`error_codes::SIGN_DOC_MISMATCH`] on divergence.
+    pub sign_doc_hash: String,
+}
+
+/// Serde validator: refuse to deserialize a [`CosmosTxSignRequest`]
+/// with a non-Cosmos `chain_id`. Defence-in-depth — the handler also
+/// checks `custody_family()` at runtime, but rejecting at the JSON
+/// boundary keeps the type a Cosmos-only carrier.
+fn deserialize_cosmos_chain_id<'de, D>(deserializer: D) -> Result<ChainId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let chain = ChainId::deserialize(deserializer)?;
+    if chain.custody_family() != CustodyFamily::Cosmos {
+        return Err(serde::de::Error::custom(format!(
+            "{}: chain '{chain}' is not a Cosmos custody family chain",
+            error_codes::NON_COSMOS_CHAIN
+        )));
+    }
+    Ok(chain)
+}
+
 /// Response for the three EIP-712 endpoints.
 ///
 /// `signature` is 65-byte ECDSA `r ‖ s ‖ v` (v ∈ {27,28}) hex-encoded
@@ -230,6 +325,23 @@ pub struct PsbtSignResponse {
     /// `0x`-prefixed 33-byte compressed secp256k1 pubkey.
     pub pubkey: String,
     /// Hex DER+sighash signature (no `0x` prefix to mirror Bitcoin tooling).
+    pub signature: String,
+}
+
+/// Response for `cosmos-tx` signing (Phase 3.3).
+///
+/// Cosmos secp256k1 signatures are 64-byte compact `r ‖ s` (low-S
+/// normalized, **no recovery byte**) — distinct from the EVM 65-byte
+/// `r ‖ s ‖ v` and the Bitcoin DER+sighash encodings. `pubkey` is the
+/// 33-byte compressed signing pubkey so the coordinator can place this
+/// member's partial signature at the correct `CompactBitArray` position
+/// in the aggregated `MultiSignature`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CosmosSignResponse {
+    /// `0x`-prefixed 33-byte compressed secp256k1 pubkey.
+    pub pubkey: String,
+    /// `0x`-prefixed 64-byte (128-hex) compact `r ‖ s` signature, low-S
+    /// normalized.
     pub signature: String,
 }
 
@@ -315,6 +427,18 @@ pub mod error_codes {
     /// wrong-key signature, or a corrupted/forged signing response — the
     /// daemon refuses to record or return it. HTTP 500.
     pub const SIGNER_RECOVER_MISMATCH: &str = "signer_recover_mismatch";
+    /// Phase 3.3: the request's `chain_id` is not a Cosmos custody-family
+    /// chain — the `cosmos-tx` endpoint only accepts Cosmos chains. HTTP 422.
+    pub const NON_COSMOS_CHAIN: &str = "non_cosmos_chain";
+    /// Phase 3.3: the request's `account_address` did not match this
+    /// daemon's configured Cosmos multisig account. HTTP 422.
+    pub const WRONG_COSMOS_ACCOUNT: &str = "wrong_cosmos_account";
+    /// Phase 3.3: the daemon recomputed the amino `StdSignDoc` sign-bytes
+    /// hash from the request's semantic fields (`cosmos_chain_id` /
+    /// `account_number` / `sequence` / `to_address` / `amount` / `denom`
+    /// / `fee_amount` / `gas_limit` / `memo`) and the result did not
+    /// match the caller-supplied `sign_doc_hash`. HTTP 422.
+    pub const SIGN_DOC_MISMATCH: &str = "sign_doc_mismatch";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -509,5 +633,67 @@ mod tests {
         let s = serde_json::to_string(&e).expect("serialize");
         let back: ErrorBody = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, e);
+    }
+
+    /// C2: `CosmosTxSignRequest` round-trips JSON for every Cosmos
+    /// `ChainId` (gaia today) without losing fields.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn cosmos_tx_request_round_trip_all_cosmos_chains() {
+        // Single-chain family today (NOBLE follow-on adds a second row).
+        let req = CosmosTxSignRequest {
+            chain_id: ChainId::Gaia,
+            account_address: "cosmos1vault0account0address0000000000000000".to_string(),
+            cosmos_chain_id: "cosmoshub-4".to_string(),
+            account_number: "12345".to_string(),
+            sequence: "7".to_string(),
+            to_address: "cosmos1asgard0inbound0account00000000000000000".to_string(),
+            amount: "1000000".to_string(),
+            denom: "uatom".to_string(),
+            fee_amount: "5000".to_string(),
+            gas_limit: "200000".to_string(),
+            memo: "=:ETH.USDT:0xabc:0/1/0".to_string(),
+            sign_doc_hash: format!("0x{}", "ab".repeat(32)),
+        };
+        let s = serde_json::to_string(&req).expect("serialize");
+        let back: CosmosTxSignRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, req);
+        assert!(s.contains("\"chain_id\":\"gaia\""));
+    }
+
+    /// C2: the serde validator rejects non-Cosmos `ChainId`s (UTXO + EVM)
+    /// on the `cosmos-tx` request — defence-in-depth above the runtime
+    /// `custody_family` check in the daemon handler.
+    #[test]
+    fn cosmos_tx_request_rejects_non_cosmos_chains() {
+        for chain in [
+            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol",
+        ] {
+            let json = format!(
+                r#"{{"chain_id":"{chain}","account_address":"cosmos1x","cosmos_chain_id":"cosmoshub-4","account_number":"0","sequence":"0","to_address":"cosmos1y","amount":"1","denom":"uatom","fee_amount":"0","gas_limit":"200000","memo":"","sign_doc_hash":"0x{hash}"}}"#,
+                hash = "00".repeat(32),
+            );
+            let result: Result<CosmosTxSignRequest, _> = serde_json::from_str(&json);
+            let err_msg = match result {
+                Ok(req) => format!("expected NON_COSMOS_CHAIN rejection, got: {req:?}"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err_msg.contains(error_codes::NON_COSMOS_CHAIN),
+                "must surface the NON_COSMOS_CHAIN code; chain='{chain}', got: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn cosmos_sign_response_json_round_trip() {
+        let r = CosmosSignResponse {
+            pubkey: format!("0x{}", "02".repeat(33)),
+            signature: format!("0x{}", "cd".repeat(64)),
+        };
+        let s = serde_json::to_string(&r).expect("serialize");
+        let back: CosmosSignResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, r);
     }
 }
