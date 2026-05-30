@@ -39,6 +39,7 @@ pub mod addr;
 pub mod amino;
 mod proto;
 pub mod sigs;
+pub mod tx;
 
 /// A Cosmos-SDK `LegacyAminoPubKey` k-of-n multisig configuration.
 ///

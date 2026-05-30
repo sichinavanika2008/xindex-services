@@ -32,7 +32,7 @@ fn encode_secp256k1_pubkey(compressed: &[u8; 33]) -> Vec<u8> {
 }
 
 /// proto-encode `google.protobuf.Any { type_url: string = 1, value: bytes = 2 }`.
-fn encode_any(type_url: &str, value: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_any(type_url: &str, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     proto::put_len_delim(1, type_url.as_bytes(), &mut out);
     proto::put_len_delim(2, value, &mut out);
@@ -40,8 +40,9 @@ fn encode_any(type_url: &str, value: &[u8]) -> Vec<u8> {
 }
 
 /// proto-encode `cosmos.crypto.multisig.LegacyAminoPubKey
-/// { threshold: uint32 = 1, public_keys: repeated Any = 2 }`.
-fn encode_legacy_amino_pubkey(threshold: u32, members: &[[u8; 33]]) -> Vec<u8> {
+/// { threshold: uint32 = 1, public_keys: repeated Any = 2 }`. Reused by
+/// [`crate::tx`] for the `SignerInfo.public_key` `Any`.
+pub(crate) fn encode_legacy_amino_pubkey(threshold: u32, members: &[[u8; 33]]) -> Vec<u8> {
     let mut out = Vec::new();
     // threshold >= 1 always, so it is always present (proto3 would omit 0).
     proto::put_varint_field(1, u64::from(threshold), &mut out);

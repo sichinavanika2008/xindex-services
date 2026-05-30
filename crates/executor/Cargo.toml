@@ -17,6 +17,10 @@ xindex-chain-utxo.workspace = true
 xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
 xindex-safe-evm.workspace = true
+# C7: Cosmos redeem leg — builds the MsgSend sign-doc + TxRaw and reads
+# account/sequence from the Cosmos chain.
+xindex-chain-cosmos.workspace = true
+xindex-cosmos-tx.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
@@ -49,3 +53,7 @@ path = "src/bin/xindex-redeem.rs"
 [[bin]]
 name = "xindex-redeem-evm"
 path = "src/bin/xindex-redeem-evm.rs"
+
+[[bin]]
+name = "xindex-redeem-cosmos"
+path = "src/bin/xindex-redeem-cosmos.rs"
