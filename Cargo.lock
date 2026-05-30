@@ -5395,6 +5395,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-chain-cosmos"
+version = "0.0.1"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "xindex-shared",
+]
+
+[[package]]
 name = "xindex-chain-eth"
 version = "0.0.1"
 dependencies = [
