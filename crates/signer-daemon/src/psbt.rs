@@ -525,6 +525,7 @@ mod tests {
             hsm,
             utxo,
             evm: std::collections::HashMap::new(),
+            cosmos: std::collections::HashMap::new(),
         };
         let app = Router::new()
             .route(

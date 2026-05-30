@@ -25,6 +25,7 @@
 //! Coordinators hold ZERO key material; their failure mode is "lose a
 //! coordinator host" not "leak a signing key" (DL-M5-1).
 
+pub mod cosmos_tx;
 pub mod evm_safe;
 pub mod psbt;
 pub mod replay;

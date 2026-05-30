@@ -43,6 +43,7 @@ use std::collections::HashMap;
 
 use xindex_shared::chain_registry::ChainId;
 
+use crate::cosmos_tx::{handle_cosmos_tx, CosmosSignerConfig};
 use crate::evm_safe::{handle_evm_safe_tx, EvmSignerConfig};
 use crate::psbt::{handle_psbt_input, UtxoSignerConfig};
 use crate::replay::{CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore};
@@ -93,6 +94,11 @@ pub struct DaemonState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
     /// [`EvmSignerConfig`] per chain this daemon is in the Safe
     /// owner-set of (DL-P3-7: no cross-chain key sharing).
     pub evm: HashMap<ChainId, Arc<EvmSignerConfig>>,
+    /// C5: per-chain Cosmos `LegacyAminoPubKey` multisig signing roles.
+    /// Empty map = no Cosmos key configured; the `/api/v1/sign/cosmos-tx`
+    /// route is then not registered. One [`CosmosSignerConfig`] per Cosmos
+    /// chain this daemon is a multisig member of (DL-P3-7).
+    pub cosmos: HashMap<ChainId, Arc<CosmosSignerConfig>>,
 }
 
 // Manual `Clone` impl: every field is cheap to clone (`Arc<_>` +
@@ -109,6 +115,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for DaemonSta
             hsm: Arc::clone(&self.hsm),
             utxo: self.utxo.clone(),
             evm: self.evm.clone(),
+            cosmos: self.cosmos.clone(),
         }
     }
 }
@@ -122,6 +129,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             hsm,
             utxo: HashMap::new(),
             evm: HashMap::new(),
+            cosmos: HashMap::new(),
         }
     }
 
@@ -140,6 +148,13 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
     #[must_use]
     pub fn with_evm(mut self, config: EvmSignerConfig) -> Self {
         self.evm.insert(config.chain, Arc::new(config));
+        self
+    }
+
+    /// C5 builder: attach a per-chain Cosmos multisig signing role.
+    #[must_use]
+    pub fn with_cosmos(mut self, config: CosmosSignerConfig) -> Self {
+        self.cosmos.insert(config.chain, Arc::new(config));
         self
     }
 }
@@ -169,6 +184,9 @@ where
     }
     if !state.evm.is_empty() {
         r = r.route("/api/v1/sign/evm-safe-tx", post(handle_evm_safe_tx::<S, H>));
+    }
+    if !state.cosmos.is_empty() {
+        r = r.route("/api/v1/sign/cosmos-tx", post(handle_cosmos_tx::<S, H>));
     }
     r.with_state(state)
 }

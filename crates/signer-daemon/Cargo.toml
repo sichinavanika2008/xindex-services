@@ -16,6 +16,9 @@ xindex-multisig.workspace = true
 # blind-signs a coordinator-supplied hash — it rebuilds from the ABI
 # inputs and rejects mismatches.
 xindex-safe-evm.workspace = true
+# C5 (Phase 3.3): Cosmos amino sign-bytes recompute + secp256k1 verify +
+# low-S normalization. Same never-blind-sign discipline as safe-evm.
+xindex-cosmos-tx.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 async-trait = "0.1"
@@ -36,6 +39,9 @@ base64 = "0.22"
 [dev-dependencies]
 wiremock.workspace = true
 tower = "0.5"
+# C5 cosmos-tx handler tests: a k256 HSM stub that returns a recoverable
+# 65-byte sig the handler normalizes + verifies against the member pubkey.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 # End-to-end loopback integration: spin up the real daemon + drive it
 # from the production coordinator clients (`RemoteHsmBackend`,
 # `RemoteMultisigCosigner`).
