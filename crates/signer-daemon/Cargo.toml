@@ -60,3 +60,7 @@ alloy = { workspace = true }
 # descriptor (C3) to derive the account address.
 xindex-chain-cosmos.workspace = true
 xindex-cosmos-tx.workspace = true
+# C9 e2e (Phase 4.4): drives `XrpRedeemExecutor` (C7) against three real
+# daemons. Needs the XRP chain trait (C4) for the stub client; xrp-tx (C3)
+# is already a non-dev dep for the handler.
+xindex-chain-xrp.workspace = true

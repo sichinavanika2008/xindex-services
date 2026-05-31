@@ -5662,6 +5662,7 @@ dependencies = [
  "wiremock",
  "xindex-chain-cosmos",
  "xindex-chain-evm",
+ "xindex-chain-xrp",
  "xindex-cosmos-tx",
  "xindex-executor",
  "xindex-multisig",
