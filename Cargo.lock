@@ -5665,6 +5665,7 @@ dependencies = [
  "xindex-safe-evm",
  "xindex-shared",
  "xindex-signer",
+ "xindex-xrp-tx",
 ]
 
 [[package]]

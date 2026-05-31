@@ -48,6 +48,7 @@ use crate::evm_safe::{handle_evm_safe_tx, EvmSignerConfig};
 use crate::psbt::{handle_psbt_input, UtxoSignerConfig};
 use crate::replay::{CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore};
 use crate::web3signer::{HsmDigestSigner, HsmError};
+use crate::xrp_tx::{handle_xrp_tx, XrpSignerConfig};
 
 /// Static daemon configuration. Loaded once at startup; never mutated.
 #[derive(Debug, Clone)]
@@ -99,6 +100,11 @@ pub struct DaemonState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
     /// route is then not registered. One [`CosmosSignerConfig`] per Cosmos
     /// chain this daemon is a multisig member of (DL-P3-7).
     pub cosmos: HashMap<ChainId, Arc<CosmosSignerConfig>>,
+    /// C5 (Phase 4.4): per-chain XRP `SignerList` multisig signing roles.
+    /// Empty map = no XRP key configured; the `/api/v1/sign/xrp-tx` route
+    /// is then not registered. One [`XrpSignerConfig`] per XRP chain this
+    /// daemon is a `SignerList` member of (DL-P3-7).
+    pub xrp: HashMap<ChainId, Arc<XrpSignerConfig>>,
 }
 
 // Manual `Clone` impl: every field is cheap to clone (`Arc<_>` +
@@ -116,6 +122,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for DaemonSta
             utxo: self.utxo.clone(),
             evm: self.evm.clone(),
             cosmos: self.cosmos.clone(),
+            xrp: self.xrp.clone(),
         }
     }
 }
@@ -130,6 +137,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             utxo: HashMap::new(),
             evm: HashMap::new(),
             cosmos: HashMap::new(),
+            xrp: HashMap::new(),
         }
     }
 
@@ -155,6 +163,13 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
     #[must_use]
     pub fn with_cosmos(mut self, config: CosmosSignerConfig) -> Self {
         self.cosmos.insert(config.chain, Arc::new(config));
+        self
+    }
+
+    /// C5 (Phase 4.4) builder: attach a per-chain XRP multisig signing role.
+    #[must_use]
+    pub fn with_xrp(mut self, config: XrpSignerConfig) -> Self {
+        self.xrp.insert(config.chain, Arc::new(config));
         self
     }
 }
@@ -187,6 +202,9 @@ where
     }
     if !state.cosmos.is_empty() {
         r = r.route("/api/v1/sign/cosmos-tx", post(handle_cosmos_tx::<S, H>));
+    }
+    if !state.xrp.is_empty() {
+        r = r.route("/api/v1/sign/xrp-tx", post(handle_xrp_tx::<S, H>));
     }
     r.with_state(state)
 }

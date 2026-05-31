@@ -224,6 +224,32 @@ pub trait ReplayStore: Send + Sync {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// C5 (Phase 4.4): pre-flight an XRP multi-signing partial-signature.
+    /// Keyed by `(chain_id, account_address, sequence)` — the XRPL
+    /// `Sequence` is monotonic per account. `payload_hash` is THIS
+    /// daemon's recomputed per-signer digest
+    /// (`SHA512Half(SMT\0 ‖ body ‖ my_account_id)`), so a retry at the
+    /// same sequence with a different body (e.g. a later
+    /// `LastLedgerSequence`) is a `Conflict`.
+    fn check_xrp_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        account_address: String,
+        sequence: u64,
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// C5 (Phase 4.4): record a fresh XRP multi-signing partial-signature.
+    fn record_xrp_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        account_address: String,
+        sequence: u64,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -239,6 +265,8 @@ struct InMemoryInner {
     safe_txs: HashMap<(&'static str, [u8; 20], u64), SignedRecord>,
     /// C5: Cosmos sign-doc replay key — `(chain_id_str, account_bech32, sequence)`.
     cosmos_txs: HashMap<(&'static str, String, u64), SignedRecord>,
+    /// C5 (Phase 4.4): XRP body replay key — `(chain_id_str, r_address, sequence)`.
+    xrp_txs: HashMap<(&'static str, String, u64), SignedRecord>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -476,6 +504,50 @@ impl ReplayStore for InMemoryReplayStore {
         } else {
             Err(ReplayError::Decode(
                 "duplicate Cosmos-tx record (race)".to_string(),
+            ))
+        }
+    }
+
+    async fn check_xrp_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        account_address: String,
+        sequence: u64,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), account_address, sequence);
+        let g = self.inner.lock().await;
+        Ok(match g.xrp_txs.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_xrp_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        account_address: String,
+        sequence: u64,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), account_address, sequence);
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.xrp_txs.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Decode(
+                "duplicate XRP-tx record (race)".to_string(),
             ))
         }
     }
@@ -853,6 +925,80 @@ impl ReplayStore for SqliteReplayStore {
         let seq_i = sequence as i64;
         sqlx::query(
             "INSERT INTO signed_cosmos_txs
+                (chain_id, account_address, sequence, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(&account_address)
+        .bind(seq_i)
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn check_xrp_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        account_address: String,
+        sequence: u64,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "XRPL sequence is u32; cannot reach i64::MAX"
+        )]
+        let seq_i = sequence as i64;
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM signed_xrp_txs
+             WHERE chain_id = ? AND account_address = ? AND sequence = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(&account_address)
+        .bind(seq_i)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_xrp_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        account_address: String,
+        sequence: u64,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "XRPL sequence is u32; cannot reach i64::MAX"
+        )]
+        let seq_i = sequence as i64;
+        sqlx::query(
+            "INSERT INTO signed_xrp_txs
                 (chain_id, account_address, sequence, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?, ?)",
         )

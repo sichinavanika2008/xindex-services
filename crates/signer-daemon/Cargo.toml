@@ -19,6 +19,9 @@ xindex-safe-evm.workspace = true
 # C5 (Phase 3.3): Cosmos amino sign-bytes recompute + secp256k1 verify +
 # low-S normalization. Same never-blind-sign discipline as safe-evm.
 xindex-cosmos-tx.workspace = true
+# C5 (Phase 4.4): XRP STObject body recompute + per-signer SMT-blob digest
+# + DER low-S verify. Same never-blind-sign discipline.
+xindex-xrp-tx.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 async-trait = "0.1"

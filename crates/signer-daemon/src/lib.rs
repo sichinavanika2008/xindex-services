@@ -31,3 +31,4 @@ pub mod psbt;
 pub mod replay;
 pub mod server;
 pub mod web3signer;
+pub mod xrp_tx;
