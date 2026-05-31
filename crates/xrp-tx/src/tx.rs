@@ -29,6 +29,10 @@ pub enum TxError {
     /// maximum (918,744 bytes). Indicates a malformed input.
     #[error("variable-length field too long")]
     FieldTooLong,
+    /// An `Amount` / `Fee` exceeded the XRP supply cap (1e17 drops) and
+    /// would corrupt the `Amount` type-flag bits. Rejected, not encoded.
+    #[error("amount out of range: {0} drops > 1e17")]
+    AmountOutOfRange(u64),
 }
 
 /// The semantic inputs to a custody `Payment`. Amounts are in drops.
@@ -93,16 +97,23 @@ fn payment_fields(
     signers: Option<&[VerifiedSigner]>,
 ) -> Result<Vec<Field>, TxError> {
     let pubkey = vl_payload(signing_pubkey).ok_or(TxError::FieldTooLong)?;
+    let amount =
+        amount_payload(body.amount_drops).ok_or(TxError::AmountOutOfRange(body.amount_drops))?;
+    let fee = amount_payload(body.fee_drops).ok_or(TxError::AmountOutOfRange(body.fee_drops))?;
     let mut fields = vec![
         Field::new(T_UINT16, F_TRANSACTION_TYPE, u16_payload(TX_PAYMENT)),
         Field::new(T_UINT32, F_SEQUENCE, u32_payload(body.sequence)),
-        Field::new(T_AMOUNT, F_AMOUNT, amount_payload(body.amount_drops)),
-        Field::new(T_AMOUNT, F_FEE, amount_payload(body.fee_drops)),
+        Field::new(T_AMOUNT, F_AMOUNT, amount),
+        Field::new(T_AMOUNT, F_FEE, fee),
         Field::new(T_BLOB, F_SIGNING_PUBKEY, pubkey),
         Field::new(T_ACCOUNT, F_ACCOUNT, account_payload(&body.account)),
         Field::new(T_ACCOUNT, F_DESTINATION, account_payload(&body.destination)),
-        memos_field(&body.memo)?,
     ];
+    // Omit the `Memos` field entirely when the memo is empty (rippled /
+    // thornode emit no Memos array, not an empty one).
+    if !body.memo.is_empty() {
+        fields.push(memos_field(&body.memo)?);
+    }
     if let Some(nid) = body.network_id {
         fields.push(Field::new(T_UINT32, F_NETWORK_ID, u32_payload(nid)));
     }
@@ -213,6 +224,7 @@ pub fn serialize_signer_list_set(
             array_element(T_OBJECT, F_SIGNER_ENTRY, inner)
         })
         .collect();
+    let fee = amount_payload(fee_drops).ok_or(TxError::AmountOutOfRange(fee_drops))?;
     let mut fields = vec![
         Field::new(
             T_UINT16,
@@ -221,7 +233,7 @@ pub fn serialize_signer_list_set(
         ),
         Field::new(T_UINT32, F_SEQUENCE, u32_payload(sequence)),
         Field::new(T_UINT32, F_SIGNER_QUORUM, u32_payload(quorum)),
-        Field::new(T_AMOUNT, F_FEE, amount_payload(fee_drops)),
+        Field::new(T_AMOUNT, F_FEE, fee),
         Field::new(T_BLOB, F_SIGNING_PUBKEY, pubkey),
         Field::new(T_ACCOUNT, F_ACCOUNT, account_payload(account)),
         Field::new(T_ARRAY, F_SIGNER_ENTRIES, array_payload(&elements)),

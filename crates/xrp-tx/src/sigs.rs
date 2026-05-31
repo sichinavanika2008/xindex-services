@@ -173,6 +173,35 @@ mod tests {
         assert!(verify_der(&pk, &[0x43u8; 32], &der).is_err());
     }
 
+    /// C10 red-team regression: `verify_der` rejects NON-canonical DER
+    /// re-encodings of an otherwise-valid signature — a trailing byte,
+    /// a long-form SEQUENCE length, and a non-minimal `r` INTEGER all
+    /// fail (strict DER closes the malleability vector). Confirmed by the
+    /// red-team's experimental probe.
+    #[test]
+    fn der_rejects_noncanonical_reencodings() {
+        let (sk, pk) = key(7);
+        let digest = [0x42u8; 32];
+        let der = sign(&sk, &digest);
+        // Canonical is accepted.
+        assert_eq!(verify_der(&pk, &digest, &der), Ok(()));
+        // Trailing byte after the SEQUENCE → BadDer.
+        let mut trailing = der.clone();
+        trailing.push(0x00);
+        assert_eq!(verify_der(&pk, &digest, &trailing), Err(SigError::BadDer));
+        // Long-form SEQUENCE length (0x30 0x81 LEN …) → BadDer.
+        let mut longform = vec![der[0], 0x81, der[1]];
+        longform.extend_from_slice(&der[2..]);
+        assert_eq!(verify_der(&pk, &digest, &longform), Err(SigError::BadDer));
+        // Non-minimal r INTEGER: inject a redundant leading 0x00 into r.
+        // Layout: 0x30 len 0x02 rlen <r> 0x02 slen <s>.
+        let rlen = usize::from(der[3]);
+        let mut nonmin = vec![der[0], der[1] + 1, 0x02, der[3] + 1, 0x00];
+        nonmin.extend_from_slice(&der[4..4 + rlen]); // original r body
+        nonmin.extend_from_slice(&der[4 + rlen..]); // 0x02 slen <s>
+        assert_eq!(verify_der(&pk, &digest, &nonmin), Err(SigError::BadDer));
+    }
+
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
     fn high_s_signature_is_rejected() {

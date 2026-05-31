@@ -64,6 +64,12 @@ pub(crate) const TX_SIGNER_LIST_SET: u16 = 12;
 /// (issued currency) and bit `0x20…` (MPT) stay 0 for XRP.
 pub(crate) const AMOUNT_POSITIVE: u64 = 0x4000_0000_0000_0000;
 
+/// Total XRP supply in drops (1e17). No valid native-XRP amount exceeds
+/// this; a larger value (≥ 2^57) is well below the type-flag bits
+/// (61/62/63), so this bound conservatively guarantees the drops never
+/// collide with the `AMOUNT_POSITIVE` / issued-currency / MPT flags.
+pub(crate) const MAX_XRP_DROPS: u64 = 100_000_000_000_000_000;
+
 /// One serialized field: its sort key `(type_code, field_code)` and the
 /// already-encoded payload (NOT including the field-id header).
 #[derive(Debug, Clone)]
@@ -139,9 +145,14 @@ pub(crate) fn u32_payload(v: u32) -> Vec<u8> {
 }
 
 /// A native-XRP `Amount` payload: `(drops | POSITIVE)` big-endian, fixed
-/// 8 bytes, no VL prefix.
-pub(crate) fn amount_payload(drops: u64) -> Vec<u8> {
-    (drops | AMOUNT_POSITIVE).to_be_bytes().to_vec()
+/// 8 bytes, no VL prefix. Returns `None` if `drops` exceeds
+/// [`MAX_XRP_DROPS`] — a value that high would corrupt the type-flag bits
+/// (silently encoding an issued-currency / MPT amount).
+pub(crate) fn amount_payload(drops: u64) -> Option<Vec<u8>> {
+    if drops > MAX_XRP_DROPS {
+        return None;
+    }
+    Some((drops | AMOUNT_POSITIVE).to_be_bytes().to_vec())
 }
 
 /// A `Blob` (VL) payload: length prefix ‖ data. A 33-byte pubkey or a
@@ -226,13 +237,16 @@ mod tests {
         // 1,000,000 drops → 0x40000000000F4240 (spec §3 worked example).
         assert_eq!(
             amount_payload(1_000_000),
-            vec![0x40, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x42, 0x40]
+            Some(vec![0x40, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x42, 0x40])
         );
-        // 24,528,352 drops → 0x400000000176... wait 0x4000000001 7645E0.
+        // 24,528,352 drops → 0x4000000001 7645E0.
         assert_eq!(
             amount_payload(24_528_352),
-            vec![0x40, 0x00, 0x00, 0x00, 0x01, 0x76, 0x45, 0xE0]
+            Some(vec![0x40, 0x00, 0x00, 0x00, 0x01, 0x76, 0x45, 0xE0])
         );
+        // The supply cap encodes; one drop above it is rejected.
+        assert!(amount_payload(MAX_XRP_DROPS).is_some());
+        assert_eq!(amount_payload(MAX_XRP_DROPS + 1), None);
     }
 
     #[test]
@@ -251,10 +265,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn serialize_fields_sorts_by_type_then_field() {
         // Out-of-order insert; expect (1,2) < (2,4) < (6,1) by (type,field).
         let out = serialize_fields(vec![
-            Field::new(T_AMOUNT, F_AMOUNT, amount_payload(1)),
+            Field::new(T_AMOUNT, F_AMOUNT, amount_payload(1).expect("in range")),
             Field::new(T_UINT16, F_TRANSACTION_TYPE, u16_payload(0)),
             Field::new(T_UINT32, F_SEQUENCE, u32_payload(7)),
         ]);

@@ -57,7 +57,8 @@ use xindex_chain_xrp::{XrpChainClient, XrpChainError};
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
 use xindex_shared::signer_wire::XrpTxSignRequest;
 use xindex_xrp_tx::addr::decode_classic_address;
-use xindex_xrp_tx::sigs::{aggregate_verified, PartialSig, SigError};
+use xindex_xrp_tx::signing::multisign_digest;
+use xindex_xrp_tx::sigs::{aggregate_verified, verify_der, PartialSig, SigError};
 use xindex_xrp_tx::tx::{build_signed_multisig_tx, serialize_for_multisign, PaymentBody, TxError};
 use xindex_xrp_tx::XrpMultisig;
 
@@ -311,7 +312,7 @@ impl<C: XrpChainClient> XrpRedeemExecutor<C> {
             signing_blob: format!("0x{}", alloy_primitives::hex::encode(&body)),
         };
 
-        let parts = self.collect_signatures(&req).await?;
+        let parts = self.collect_signatures(&req, &body).await?;
         // Per-signer verify + AccountID-sorted Signers.
         let signers = aggregate_verified(&self.config.multisig, &body, &parts)?;
         let tx_blob = build_signed_multisig_tx(&body_inputs, &signers)?;
@@ -327,13 +328,16 @@ impl<C: XrpChainClient> XrpRedeemExecutor<C> {
         })
     }
 
-    /// Round-robin cosigners until the summed member weight reaches the
-    /// quorum. A cosigner whose pinned pubkey is not a member is skipped
-    /// (counted as a failure); [`aggregate_verified`] re-checks every
-    /// partial against its own digest.
+    /// Round-robin cosigners until the summed member weight of VALID
+    /// partials reaches the quorum. Each partial is verified against its
+    /// own per-signer digest AS IT IS COLLECTED — a cosigner that returns
+    /// a malformed/garbage signature is skipped and the next cosigner is
+    /// tried, so one bad daemon among the first-k cannot DoS the leg.
+    /// [`aggregate_verified`] re-checks (defence-in-depth) + sorts.
     async fn collect_signatures(
         &self,
         req: &XrpTxSignRequest,
+        body: &[u8],
     ) -> Result<Vec<PartialSig>, XrpRedeemError> {
         let quorum = self.config.multisig.quorum();
         let mut parts: Vec<PartialSig> = Vec::new();
@@ -350,6 +354,16 @@ impl<C: XrpChainClient> XrpRedeemExecutor<C> {
             };
             match cosigner.sign_xrp_tx(req).await {
                 Ok(der) => {
+                    // Verify the partial against ITS OWN digest before it
+                    // counts toward the quorum.
+                    let digest = multisign_digest(body, &member.account_id);
+                    if let Err(e) = verify_der(&pubkey, &digest, &der) {
+                        errors.push(XrpRedeemError::Cosigner {
+                            pubkey: hex33(&pubkey),
+                            message: format!("returned an invalid signature: {e}"),
+                        });
+                        continue;
+                    }
                     weight += u32::from(member.weight);
                     parts.push(PartialSig { pubkey, der });
                 }
@@ -506,6 +520,24 @@ mod tests {
         }
     }
 
+    /// A malicious/buggy cosigner that returns a well-formed-but-WRONG DER
+    /// signature (valid DER, but does not verify against the digest).
+    struct GarbageCosigner {
+        pubkey: [u8; 33],
+    }
+    impl XrpCosigner for GarbageCosigner {
+        fn member_pubkey(&self) -> [u8; 33] {
+            self.pubkey
+        }
+        fn sign_xrp_tx<'a>(&'a self, _req: &'a XrpTxSignRequest) -> SignXrpFuture<'a> {
+            // DER SEQUENCE { INTEGER 1, INTEGER 1 } — parses, low-S, but
+            // will not verify against any real digest.
+            Box::pin(ready(Ok(vec![
+                0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01,
+            ])))
+        }
+    }
+
     fn descriptor_and_keys(n: u8, k: u32) -> (XrpMultisig, Vec<(SigningKey, [u8; 33])>) {
         let keys: Vec<(SigningKey, [u8; 33])> = (1..=n).map(member).collect();
         #[expect(clippy::expect_used, reason = "test code")]
@@ -572,6 +604,43 @@ mod tests {
         let hex = alloy_primitives::hex::encode(&outcome.tx_blob);
         assert!(hex.contains("f3e0"), "Signers array must be present");
         assert_eq!(outcome.dispatch_id, task().dispatch_id);
+    }
+
+    /// C10 hardening: a cosigner returning a garbage signature is skipped
+    /// (verified-as-collected); the leg still succeeds using the remaining
+    /// honest cosigners. One bad daemon cannot DoS the leg.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn build_leg_skips_garbage_partial_and_succeeds() {
+        let (ms, keys) = descriptor_and_keys(5, 3);
+        let cfg = config(ms);
+        // member0 returns garbage; members 1,2,3 are honest → weight 3.
+        let cosigners: Vec<Box<dyn XrpCosigner>> = vec![
+            Box::new(GarbageCosigner { pubkey: keys[0].1 }),
+            Box::new(SigningCosigner {
+                sk: keys[1].0.clone(),
+                pubkey: keys[1].1,
+            }),
+            Box::new(SigningCosigner {
+                sk: keys[2].0.clone(),
+                pubkey: keys[2].1,
+            }),
+            Box::new(SigningCosigner {
+                sk: keys[3].0.clone(),
+                pubkey: keys[3].1,
+            }),
+        ];
+        let xrp = Arc::new(StubXrp {
+            sequence: 7,
+            tip: 9_000_000,
+        });
+        let exec = XrpRedeemExecutor::new(cfg, xrp, cosigners, Arc::new(XrpLockTable::new()))
+            .expect("exec");
+        let outcome = exec
+            .build_leg(&task())
+            .await
+            .expect("leg succeeds despite garbage");
+        assert!(!outcome.tx_blob.is_empty());
     }
 
     #[tokio::test]
