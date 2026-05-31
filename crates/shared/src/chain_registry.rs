@@ -7,14 +7,16 @@
 //! arm in each lookup, add test vectors. The compiler walks every
 //! callsite through every arm — there is no default fallthrough.
 //!
-//! ## Phase 3.1 + 3.2 + 3.3 scope
+//! ## Phase 3.1 + 3.2 + 3.3 + 4.4 scope
 //!
 //! `Btc` / `Ltc` / `Bch` / `Doge` / `Zec` — the UTXO custody family
 //! (`CustodyFamily::Utxo`). `Eth` / `Bsc` / `Avax` / `Base` / `Pol` —
 //! the EVM custody family (`CustodyFamily::Evm`), Safe v1.4.1 k-of-n
 //! direct multisig per chain. `Gaia` — the Cosmos custody family
 //! (`CustodyFamily::Cosmos`), `LegacyAminoPubKey` k-of-n multisig
-//! (`GAIA.ATOM`). Solana / Substrate families are Phase 3.4+ and will
+//! (`GAIA.ATOM`). `Xrp` — the XRP custody family
+//! (`CustodyFamily::Xrp`), native `SignerList` k-of-n multisig
+//! (`XRP.XRP`). Solana / Substrate families are Phase 3.4+ and will
 //! reuse this enum.
 
 use std::fmt;
@@ -54,6 +56,9 @@ pub enum ChainId {
     Pol,
     /// Cosmos Hub (GAIA / ATOM). Cosmos custody family.
     Gaia,
+    /// XRP Ledger (XRP). XRP custody family — native `SignerList`
+    /// k-of-n multisig.
+    Xrp,
 }
 
 impl fmt::Display for ChainId {
@@ -70,6 +75,7 @@ impl fmt::Display for ChainId {
             Self::Base => "base",
             Self::Pol => "pol",
             Self::Gaia => "gaia",
+            Self::Xrp => "xrp",
         })
     }
 }
@@ -103,6 +109,7 @@ impl FromStr for ChainId {
             "base" => Ok(Self::Base),
             "pol" => Ok(Self::Pol),
             "gaia" => Ok(Self::Gaia),
+            "xrp" => Ok(Self::Xrp),
             other => Err(ParseChainIdError(other.to_string())),
         }
     }
@@ -120,6 +127,11 @@ pub enum CustodyFamily {
     /// Cosmos-SDK chains: native `LegacyAminoPubKey` k-of-n multisig
     /// account, amino-JSON signing (DL-P3.3-2/3/4).
     Cosmos,
+    /// XRP Ledger: native `SignerList` k-of-n multisig account, `STObject`
+    /// binary signing. Each signer signs a per-signer multi-signing blob
+    /// (`SMT\0 ‖ tx ‖ own-AccountID`) — distinct from Cosmos where all
+    /// members sign identical sign-bytes (DL-P4.4-*).
+    Xrp,
     // Solana, Substrate — Phase 3.4+.
 }
 
@@ -140,6 +152,11 @@ pub enum FeeUnit {
     /// denominated in the native micro-unit (`uatom` for GAIA); distinct
     /// from `PerGwei` (different base unit, no gwei translation).
     PerCosmosGas,
+    /// drops (flat) — XRP. The XRPL transaction cost is a flat fee in
+    /// drops set by the network reference fee, NOT a per-size or per-gas
+    /// rate; for a multi-signed tx it is `base_fee × (1 + signer_count)`.
+    /// Distinct from every rate-based unit.
+    FlatXrpDrops,
 }
 
 /// EVM transaction type per chain. Phase 3.2 picks one per chain at
@@ -169,6 +186,7 @@ pub const ALL_CHAINS: &[ChainId] = &[
     ChainId::Base,
     ChainId::Pol,
     ChainId::Gaia,
+    ChainId::Xrp,
 ];
 
 impl ChainId {
@@ -190,29 +208,32 @@ impl ChainId {
             Self::Base => "BASE.ETH",
             Self::Pol => "POL.MATIC",
             Self::Gaia => "GAIA.ATOM",
+            Self::Xrp => "XRP.XRP",
         }
     }
 
     /// Custody family. UTXO for Phase 3.1 chains; EVM (Safe v1.4.1
     /// multisig) for Phase 3.2 chains; Cosmos (`LegacyAminoPubKey`
-    /// multisig) for Phase 3.3 chains.
+    /// multisig) for Phase 3.3 chains; XRP (native `SignerList`
+    /// multisig) for Phase 4.4.
     #[must_use]
     pub const fn custody_family(self) -> CustodyFamily {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => CustodyFamily::Utxo,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => CustodyFamily::Evm,
             Self::Gaia => CustodyFamily::Cosmos,
+            Self::Xrp => CustodyFamily::Xrp,
         }
     }
 
     /// Native-unit decimals. UTXO family = 8 (sat); EVM family = 18 (wei);
-    /// Cosmos GAIA = 6 (`uatom`).
+    /// Cosmos GAIA = 6 (`uatom`); XRP = 6 (drops, 1 XRP = 10^6 drops).
     #[must_use]
     pub const fn decimals(self) -> u8 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 8,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => 18,
-            Self::Gaia => 6,
+            Self::Gaia | Self::Xrp => 6,
         }
     }
 
@@ -235,7 +256,7 @@ impl ChainId {
     pub const fn scale(self) -> u64 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
-            Self::Gaia => 1_000_000,
+            Self::Gaia | Self::Xrp => 1_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 panic!("ChainId::scale() does not fit u64 for the EVM family — use scale_u128()")
             }
@@ -250,7 +271,7 @@ impl ChainId {
     pub const fn scale_u128(self) -> u128 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
-            Self::Gaia => 1_000_000,
+            Self::Gaia | Self::Xrp => 1_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 1_000_000_000_000_000_000
             }
@@ -267,11 +288,16 @@ impl ChainId {
     /// GAIA 1 — Tendermint instant finality (a committed block is final
     /// under <1/3 Byzantine); 1 = read the including block after commit
     /// (Bifrost reads tip-1 to dodge the block-results race).
+    /// XRP 1 — XRPL gives deterministic finality on validated ledgers
+    /// (`THORChain` Bifrost waits 0); 1 = require one validated ledger on
+    /// top of the including ledger, the same conservative margin as GAIA.
+    /// The `chain-xrp` client MUST only count txs from validated ledgers.
     #[must_use]
     #[expect(
         clippy::match_same_arms,
         reason = "BTC/BCH share 6 confs as a Bifrost coincidence (different consensus); \
-                  LTC/ETH share 12 by coincidence (PoW vs PoS finality). Merging arms \
+                  LTC/ETH share 12 by coincidence (PoW vs PoS finality); GAIA/XRP share 1 \
+                  by coincidence (Tendermint vs XRPL-consensus finality). Merging arms \
                   would imply a shared reason that does not exist."
     )]
     pub const fn conf_depth(self) -> u32 {
@@ -286,24 +312,33 @@ impl ChainId {
             Self::Base => 30,
             Self::Pol => 64,
             Self::Gaia => 1,
+            Self::Xrp => 1,
         }
     }
 
     /// Maximum bytes carryable in an `OP_RETURN` standard-relay output
-    /// (UTXO chains). `0` for EVM chains (memos live in calldata) and
+    /// (UTXO chains). `0` for EVM chains (memos live in calldata),
     /// Cosmos chains (the `THORChain` memo lives in the tx `memo` field,
-    /// ≤250 bytes, enforced by the Cosmos tx builder — not here).
+    /// ≤250 bytes, enforced by the Cosmos tx builder — not here), and XRP
+    /// (the memo lives in the `Memos` array, hex-encoded `MemoData`).
     #[must_use]
     pub const fn op_return_max(self) -> usize {
         match self {
             Self::Bch => 220,
             Self::Btc | Self::Ltc | Self::Doge | Self::Zec => 80,
-            Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol | Self::Gaia => 0,
+            Self::Eth
+            | Self::Bsc
+            | Self::Avax
+            | Self::Base
+            | Self::Pol
+            | Self::Gaia
+            | Self::Xrp => 0,
         }
     }
 
     /// Fee unit per chain. UTXO `SegWit` → `PerVbyte`; UTXO legacy →
-    /// `PerByte`; EVM → `PerGwei`; Cosmos → `PerCosmosGas`.
+    /// `PerByte`; EVM → `PerGwei`; Cosmos → `PerCosmosGas`; XRP →
+    /// `FlatXrpDrops`.
     #[must_use]
     pub const fn fee_unit(self) -> FeeUnit {
         match self {
@@ -311,6 +346,7 @@ impl ChainId {
             Self::Bch | Self::Doge | Self::Zec => FeeUnit::PerByte,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => FeeUnit::PerGwei,
             Self::Gaia => FeeUnit::PerCosmosGas,
+            Self::Xrp => FeeUnit::FlatXrpDrops,
         }
     }
 
@@ -322,7 +358,9 @@ impl ChainId {
         match self {
             Self::Eth | Self::Avax | Self::Base | Self::Pol => Some(EvmTxType::Eip1559),
             Self::Bsc => Some(EvmTxType::Legacy),
-            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia => None,
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia | Self::Xrp => {
+                None
+            }
         }
     }
 
@@ -336,14 +374,16 @@ impl ChainId {
             Self::Avax => Some(43_114),
             Self::Base => Some(8_453),
             Self::Pol => Some(137),
-            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia => None,
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia | Self::Xrp => {
+                None
+            }
         }
     }
 
     /// `THORChain` Router contract address on the chain itself. The
     /// executor sends Safe `execTransaction` output to this address to
-    /// initiate a swap back to USDT on Ethereum. UTXO and Cosmos chains
-    /// return `None` (their `THORChain` side is an `Asgard` vault /
+    /// initiate a swap back to USDT on Ethereum. UTXO, Cosmos, and XRP
+    /// chains return `None` (their `THORChain` side is an `Asgard` vault /
     /// account address served by `ThorchainVaultRegistry`).
     ///
     /// **DL-P3.2-5: placeholders pending source citation.** These
@@ -360,7 +400,9 @@ impl ChainId {
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 Some(address!("0000000000000000000000000000000000000000"))
             }
-            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia => None,
+            Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec | Self::Gaia | Self::Xrp => {
+                None
+            }
         }
     }
 
@@ -413,6 +455,7 @@ mod tests {
         assert_eq!(ChainId::Base.thor_asset(), "BASE.ETH");
         assert_eq!(ChainId::Pol.thor_asset(), "POL.MATIC");
         assert_eq!(ChainId::Gaia.thor_asset(), "GAIA.ATOM");
+        assert_eq!(ChainId::Xrp.thor_asset(), "XRP.XRP");
     }
 
     #[test]
@@ -472,6 +515,25 @@ mod tests {
         assert_eq!(c.thorchain_router_address(), None);
     }
 
+    /// Phase 4.4 XRP family: XRP = XRP.XRP, 6-dec (drops), deterministic
+    /// finality (conf 1), memo in the `Memos` array (no `OP_RETURN`),
+    /// `FlatXrpDrops` fee unit, no EVM tx-type / chain-id / router.
+    /// `scale()` fits u64 (10^6).
+    #[test]
+    fn xrp_is_xrp_family_with_6_decimals() {
+        let c = ChainId::Xrp;
+        assert_eq!(c.custody_family(), CustodyFamily::Xrp);
+        assert_eq!(c.decimals(), 6);
+        assert_eq!(c.scale(), 1_000_000);
+        assert_eq!(c.scale_u128(), 1_000_000_u128);
+        assert_eq!(c.conf_depth(), 1);
+        assert_eq!(c.fee_unit(), FeeUnit::FlatXrpDrops);
+        assert_eq!(c.op_return_max(), 0);
+        assert_eq!(c.tx_type(), None);
+        assert_eq!(c.evm_chain_id(), None);
+        assert_eq!(c.thorchain_router_address(), None);
+    }
+
     /// Tx-type per DL-P3.2-4: EIP-1559 on ETH/AVAX/BASE/POL; legacy on BSC.
     #[test]
     fn tx_type_per_chain_matches_dl_p32_4() {
@@ -521,6 +583,8 @@ mod tests {
         assert_eq!(ChainId::Pol.conf_depth(), 64);
         // GAIA 1: Tendermint instant finality.
         assert_eq!(ChainId::Gaia.conf_depth(), 1);
+        // XRP 1: deterministic finality on validated ledgers.
+        assert_eq!(ChainId::Xrp.conf_depth(), 1);
     }
 
     /// BCH's 2019 post-fork relay policy raised the `OP_RETURN` limit
@@ -535,6 +599,8 @@ mod tests {
         assert_eq!(ChainId::Zec.op_return_max(), 80);
         // GAIA: memo lives in the tx memo field, not OP_RETURN.
         assert_eq!(ChainId::Gaia.op_return_max(), 0);
+        // XRP: memo lives in the Memos array, not OP_RETURN.
+        assert_eq!(ChainId::Xrp.op_return_max(), 0);
     }
 
     /// Fee unit per `SegWit` availability. BCH/DOGE/ZEC have no
@@ -548,6 +614,7 @@ mod tests {
         assert_eq!(ChainId::Doge.fee_unit(), FeeUnit::PerByte);
         assert_eq!(ChainId::Zec.fee_unit(), FeeUnit::PerByte);
         assert_eq!(ChainId::Gaia.fee_unit(), FeeUnit::PerCosmosGas);
+        assert_eq!(ChainId::Xrp.fee_unit(), FeeUnit::FlatXrpDrops);
     }
 
     /// `asset_id_hash` is `keccak256(thor_asset.as_bytes())`. Both
@@ -556,7 +623,7 @@ mod tests {
     /// Round-trip: `ChainId` ↔ string form (`Display` + `FromStr`).
     /// Used by JSON wire (`PsbtInputSignRequest`), `SQLite` TEXT columns,
     /// and CLI args. Mixed-case input is normalised to lowercase. All
-    /// 11 chains round-trip cleanly.
+    /// 12 chains round-trip cleanly.
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
     fn display_fromstr_round_trip_and_case_insensitive() {
@@ -573,6 +640,7 @@ mod tests {
             "GAIA".parse::<ChainId>().expect("cosmos upper"),
             ChainId::Gaia
         );
+        assert_eq!("XRP".parse::<ChainId>().expect("xrp upper"), ChainId::Xrp);
         assert!("ada".parse::<ChainId>().is_err());
     }
 
@@ -588,7 +656,7 @@ mod tests {
 
     /// U10: round-trip `ChainId` → `asset_id_hash` → `ChainId` via
     /// `from_asset_id`. Bogus hash returns `None`. Used by
-    /// `xindex-attest-redeem` to route per-leg cross-checks. All 11
+    /// `xindex-attest-redeem` to route per-leg cross-checks. All 12
     /// chains covered.
     #[test]
     fn from_asset_id_round_trip_and_rejects_unknown() {
@@ -606,7 +674,7 @@ mod tests {
             let expected = keccak256(c.thor_asset().as_bytes());
             assert_eq!(c.asset_id_hash(), expected);
         }
-        // All 11 hashes are pairwise distinct (no UTXO/EVM/Cosmos collisions).
+        // All 12 hashes are pairwise distinct (no UTXO/EVM/Cosmos/XRP collisions).
         let hashes: Vec<B256> = ALL_CHAINS
             .iter()
             .copied()
