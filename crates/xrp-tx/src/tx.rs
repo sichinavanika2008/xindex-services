@@ -138,7 +138,8 @@ fn payment_fields(
 /// # Errors
 ///
 /// Returns [`TxError::FieldTooLong`] if the memo exceeds the XRPL
-/// variable-length maximum.
+/// variable-length maximum, or [`TxError::AmountOutOfRange`] if the
+/// amount / fee exceeds the XRP supply cap.
 pub fn serialize_for_multisign(body: &PaymentBody) -> Result<Vec<u8>, TxError> {
     Ok(serialize_fields(payment_fields(body, &[], None)?))
 }
@@ -150,7 +151,8 @@ pub fn serialize_for_multisign(body: &PaymentBody) -> Result<Vec<u8>, TxError> {
 /// # Errors
 ///
 /// Returns [`TxError::FieldTooLong`] if the memo or any signer's pubkey /
-/// signature exceeds the XRPL variable-length maximum.
+/// signature exceeds the XRPL variable-length maximum, or
+/// [`TxError::AmountOutOfRange`] if the amount / fee exceeds the supply cap.
 pub fn build_signed_multisig_tx(
     body: &PaymentBody,
     signers: &[VerifiedSigner],
@@ -165,7 +167,8 @@ pub fn build_signed_multisig_tx(
 /// # Errors
 ///
 /// Returns [`TxError::FieldTooLong`] if the memo exceeds the XRPL
-/// variable-length maximum.
+/// variable-length maximum, or [`TxError::AmountOutOfRange`] if the
+/// amount / fee exceeds the XRP supply cap.
 pub fn serialize_single_sign(
     body: &PaymentBody,
     signing_pubkey: &[u8; 33],
@@ -195,7 +198,8 @@ pub struct SignerEntry {
 /// # Errors
 ///
 /// Returns [`TxError::FieldTooLong`] if the signing pubkey exceeds the
-/// XRPL variable-length maximum.
+/// XRPL variable-length maximum, or [`TxError::AmountOutOfRange`] if the
+/// fee exceeds the XRP supply cap.
 #[expect(
     clippy::too_many_arguments,
     reason = "ceremony-only serializer; the 8 params are the distinct XRPL SignerListSet \
@@ -380,6 +384,36 @@ mod tests {
         );
         // Top-level SigningPubKey empty.
         assert!(hex.contains("7300"));
+    }
+
+    /// C10 red-team (LOW-2): an empty memo OMITS the `Memos` field
+    /// entirely (no `0xf9` field-id) — rippled / thornode emit no array,
+    /// not an empty one. A non-empty memo includes it. Pins the byte-match
+    /// gate (P4.4-1) against a future regression.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn empty_memo_omits_memos_field() {
+        let mut body = PaymentBody {
+            account: [0x11; 20],
+            destination: [0x22; 20],
+            amount_drops: 1_000_000,
+            fee_drops: 60,
+            sequence: 5,
+            last_ledger_sequence: None,
+            network_id: None,
+            memo: Vec::new(),
+        };
+        let empty = hexs(&serialize_for_multisign(&body).expect("empty memo"));
+        assert!(
+            !empty.contains("f9"),
+            "empty memo must omit the Memos field"
+        );
+        body.memo = b"m".to_vec();
+        let present = hexs(&serialize_for_multisign(&body).expect("with memo"));
+        assert!(
+            present.contains("f9ea"),
+            "non-empty memo must include Memos"
+        );
     }
 
     #[test]
