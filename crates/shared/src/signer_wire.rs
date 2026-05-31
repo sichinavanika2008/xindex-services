@@ -299,6 +299,103 @@ where
     Ok(chain)
 }
 
+/// `POST /api/v1/sign/xrp-tx`
+///
+/// (Phase 4.4): XRP Ledger native `SignerList` k-of-n multisign partial-
+/// signature endpoint for the XRP custody family (XRP / XRP.XRP). The
+/// daemon:
+///   1. Routes to the per-chain config keyed by `chain_id`
+///      (`endpoint_disabled` if no XRP role is configured).
+///   2. Verifies `account_address` matches the daemon's configured
+///      multisig account ([`error_codes::WRONG_XRP_ACCOUNT`]).
+///   3. RE-SERIALIZES the canonical `STObject` Payment body (with an
+///      EMPTY `SigningPubKey`, no `TxnSignature`, no `Signers`) from the
+///      semantic fields below (via the `xrp-tx` crate) and refuses if it
+///      does not match `signing_blob`
+///      ([`error_codes::XRP_TX_MISMATCH`]) — the daemon never blind-signs
+///      a coordinator-supplied body (DL-M5-3).
+///   4. Computes ITS OWN per-signer multi-signing blob locally:
+///      `SHA512Half(0x534D5400 ‖ body ‖ my_account_id)`, where
+///      `my_account_id` is derived from the daemon's configured member
+///      pubkey — never transmitted.
+///   5. Replay-keys on `(chain_id, account_address, sequence)` — the
+///      `sequence` is the XRPL account-nonce and is bound into the body.
+///   6. Signs the recomputed 32-byte blob with its single secp256k1 key,
+///      enforces low-S, DER-encodes, verifies the signature against its
+///      configured member pubkey, and returns the DER signature + pubkey.
+///
+/// Divergence from Cosmos (DL-P4.4-2): XRPL multisign has each member
+/// sign a DIFFERENT message — the body is shared but the trailing
+/// `my_account_id` suffix differs per signer. So the wire carries the
+/// SHARED body (`signing_blob`), NOT a per-signer hash; each daemon
+/// appends its own `AccountID`. `SigningPubKey` is empty in the signing
+/// body and in the final assembled tx (the master key is disabled via
+/// `SignerListSet` + `asfDisableMaster` during the key ceremony).
+///
+/// XRPL mainnet has no `NetworkID` in the signed body, so (unlike Cosmos
+/// `cosmos_chain_id`) there is no consensus-chain-id field. A test
+/// network with `NetworkID ≥ 1024` would need it pinned analogously.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct XrpTxSignRequest {
+    /// XRP `ChainId`. MUST satisfy
+    /// `chain_id.custody_family() == CustodyFamily::Xrp`; the serde
+    /// validator rejects non-XRP ids at deserialize time with
+    /// [`error_codes::NON_XRP_CHAIN`].
+    #[serde(deserialize_with = "deserialize_xrp_chain_id")]
+    pub chain_id: ChainId,
+    /// The `SignerList` multisig account (classic r-address, e.g.
+    /// `r…`). This is the `Payment.Account` AND the daemon's configured
+    /// custody account — mismatch → [`error_codes::WRONG_XRP_ACCOUNT`].
+    pub account_address: String,
+    /// `Payment.Destination` — classic r-address recipient (the
+    /// `THORChain` Asgard inbound account for a redeem leg).
+    pub destination: String,
+    /// `Payment.Amount` in drops (decimal `u64` string; 1 XRP = 10^6
+    /// drops). No `tfPartialPayment` flag is ever set on a custody send.
+    pub amount_drops: String,
+    /// `Payment.Fee` in drops (decimal `u64` string). For a multi-signed
+    /// tx this is `base_fee × (1 + signer_count)`.
+    pub fee_drops: String,
+    /// `Payment.Sequence` of the multisig account (decimal `u32` string).
+    /// The monotonic replay coordinate — the daemon refuses to re-sign a
+    /// different body at the same `(chain, account, sequence)`.
+    pub sequence: String,
+    /// `Payment.LastLedgerSequence` (decimal `u32` string) — the tx
+    /// expiry. Bound into the body, so a retry at the same `sequence`
+    /// with a different deadline yields a different body and is refused
+    /// as a conflict (the executor must keep one deadline per sequence).
+    pub last_ledger_sequence: String,
+    /// `THORChain` memo (raw bytes as a UTF-8 string); the `xrp-tx`
+    /// builder hex-encodes it into a single `Memos[0].MemoData` field.
+    pub memo: String,
+    /// The SHARED canonical `STObject` Payment body (empty
+    /// `SigningPubKey`, no `TxnSignature`, no `Signers`) the coordinator
+    /// claims — `0x`-prefixed hex. The daemon re-serializes from the
+    /// semantic fields above and refuses with
+    /// [`error_codes::XRP_TX_MISMATCH`] on divergence; it then derives
+    /// its own per-signer signing blob by appending its configured
+    /// `AccountID`. NOT a digest, and NOT per-signer.
+    pub signing_blob: String,
+}
+
+/// Serde validator: refuse to deserialize an [`XrpTxSignRequest`] with a
+/// non-XRP `chain_id`. Defence-in-depth — the handler also checks
+/// `custody_family()` at runtime, but rejecting at the JSON boundary
+/// keeps the type an XRP-only carrier.
+fn deserialize_xrp_chain_id<'de, D>(deserializer: D) -> Result<ChainId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let chain = ChainId::deserialize(deserializer)?;
+    if chain.custody_family() != CustodyFamily::Xrp {
+        return Err(serde::de::Error::custom(format!(
+            "{}: chain '{chain}' is not an XRP custody family chain",
+            error_codes::NON_XRP_CHAIN
+        )));
+    }
+    Ok(chain)
+}
+
 /// Response for the three EIP-712 endpoints.
 ///
 /// `signature` is 65-byte ECDSA `r ‖ s ‖ v` (v ∈ {27,28}) hex-encoded
@@ -342,6 +439,25 @@ pub struct CosmosSignResponse {
     pub pubkey: String,
     /// `0x`-prefixed 64-byte (128-hex) compact `r ‖ s` signature, low-S
     /// normalized.
+    pub signature: String,
+}
+
+/// Response for `xrp-tx` signing (Phase 4.4).
+///
+/// XRPL secp256k1 signatures are **DER-encoded** (ASN.1
+/// `SEQUENCE { INTEGER r, INTEGER s }`), low-S normalized — distinct
+/// from the Cosmos 64-byte compact `r ‖ s`, the EVM 65-byte `r ‖ s ‖ v`,
+/// and the Bitcoin DER+sighash encodings (XRPL `TxnSignature` carries no
+/// sighash byte). `pubkey` is the 33-byte compressed signing pubkey so
+/// the coordinator can derive this member's `AccountID`, place the
+/// partial signature into the correct `Signer` entry, and sort the
+/// `Signers` array by `AccountID` ascending.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct XrpSignResponse {
+    /// `0x`-prefixed 33-byte compressed secp256k1 pubkey.
+    pub pubkey: String,
+    /// Hex DER-encoded ECDSA signature, low-S normalized (no `0x` prefix,
+    /// mirrors the XRPL `TxnSignature` hex convention).
     pub signature: String,
 }
 
@@ -443,6 +559,18 @@ pub mod error_codes {
     /// / `fee_amount` / `gas_limit` / `memo`) and the result did not
     /// match the caller-supplied `sign_doc_hash`. HTTP 422.
     pub const SIGN_DOC_MISMATCH: &str = "sign_doc_mismatch";
+    /// Phase 4.4: the request's `chain_id` is not an XRP custody-family
+    /// chain — the `xrp-tx` endpoint only accepts XRP chains. HTTP 422.
+    pub const NON_XRP_CHAIN: &str = "non_xrp_chain";
+    /// Phase 4.4: the request's `account_address` did not match this
+    /// daemon's configured XRP `SignerList` multisig account. HTTP 422.
+    pub const WRONG_XRP_ACCOUNT: &str = "wrong_xrp_account";
+    /// Phase 4.4: the daemon re-serialized the canonical `STObject`
+    /// Payment body (empty `SigningPubKey`) from the request's semantic
+    /// fields (`destination` / `amount_drops` / `fee_drops` / `sequence`
+    /// / `last_ledger_sequence` / `memo`) and the result did not match
+    /// the caller-supplied `signing_blob`. HTTP 422.
+    pub const XRP_TX_MISMATCH: &str = "xrp_tx_mismatch";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -698,6 +826,66 @@ mod tests {
         };
         let s = serde_json::to_string(&r).expect("serialize");
         let back: CosmosSignResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, r);
+    }
+
+    /// C2: `XrpTxSignRequest` round-trips JSON for every XRP `ChainId`
+    /// (xrp today) without losing fields.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn xrp_tx_request_round_trip_all_xrp_chains() {
+        // Single-chain family today.
+        let req = XrpTxSignRequest {
+            chain_id: ChainId::Xrp,
+            account_address: "rXindexVaultMultisigAccount000000000".to_string(),
+            destination: "rThorchainAsgardInbound00000000000000".to_string(),
+            amount_drops: "1000000".to_string(),
+            fee_drops: "30".to_string(),
+            sequence: "7".to_string(),
+            last_ledger_sequence: "9000007".to_string(),
+            memo: "=:ETH.USDT:0xabc:0/1/0".to_string(),
+            signing_blob: format!("0x{}", "ab".repeat(80)),
+        };
+        let s = serde_json::to_string(&req).expect("serialize");
+        let back: XrpTxSignRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, req);
+        assert!(s.contains("\"chain_id\":\"xrp\""));
+    }
+
+    /// C2: the serde validator rejects non-XRP `ChainId`s (UTXO + EVM +
+    /// Cosmos) on the `xrp-tx` request — defence-in-depth above the
+    /// runtime `custody_family` check in the daemon handler.
+    #[test]
+    fn xrp_tx_request_rejects_non_xrp_chains() {
+        for chain in [
+            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "gaia",
+        ] {
+            let json = format!(
+                r#"{{"chain_id":"{chain}","account_address":"rX","destination":"rY","amount_drops":"1","fee_drops":"30","sequence":"0","last_ledger_sequence":"0","memo":"","signing_blob":"0x{blob}"}}"#,
+                blob = "00".repeat(80),
+            );
+            let result: Result<XrpTxSignRequest, _> = serde_json::from_str(&json);
+            let err_msg = match result {
+                Ok(req) => format!("expected NON_XRP_CHAIN rejection, got: {req:?}"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err_msg.contains(error_codes::NON_XRP_CHAIN),
+                "must surface the NON_XRP_CHAIN code; chain='{chain}', got: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn xrp_sign_response_json_round_trip() {
+        let r = XrpSignResponse {
+            pubkey: format!("0x{}", "02".repeat(33)),
+            // DER sigs are variable length (~70-72 bytes); use a plausible hex.
+            signature: "3045022100abcd0220ef01".to_string(),
+        };
+        let s = serde_json::to_string(&r).expect("serialize");
+        let back: XrpSignResponse = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, r);
     }
 }
