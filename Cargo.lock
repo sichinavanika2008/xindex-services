@@ -5633,6 +5633,7 @@ dependencies = [
  "xindex-chain-evm",
  "xindex-chain-thor",
  "xindex-chain-utxo",
+ "xindex-chain-xrp",
  "xindex-shared",
 ]
 

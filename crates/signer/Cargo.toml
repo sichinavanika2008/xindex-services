@@ -19,6 +19,9 @@ xindex-chain-evm.workspace = true
 # C6: Cosmos cross-check policies use `CosmosChainClient` for native
 # bank-transfer observation (refund: uatom back to our multisig).
 xindex-chain-cosmos.workspace = true
+# C6 (Phase 4.4): XRP cross-check policies use `XrpChainClient` for native
+# Payment observation (refund: XRP back to our multisig, delivered_amount).
+xindex-chain-xrp.workspace = true
 alloy = { workspace = true }
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true

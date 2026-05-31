@@ -3120,3 +3120,566 @@ pub mod cosmos {
         }
     }
 }
+
+/// C6 (Phase 4.4): XRP redemption + refund cross-check policies.
+///
+/// Direct mirror of [`cosmos`]: two independent observations
+/// (THORChain + on-chain), the delivery/refund mutual-exclusion via the
+/// `REFUND:` memo, and live-Asgard-vault sender binding. The XRP-specific
+/// item is `delivered_amount`: the on-chain refund value comes from
+/// [`xindex_chain_xrp::XrpTransfer::delivered_drops`], which the
+/// `chain-xrp` parser sources from `meta.delivered_amount` (never
+/// `Amount`) — so a `tfPartialPayment` cannot make a 1-drop delivery
+/// count as full value.
+#[expect(
+    clippy::doc_markdown,
+    reason = "THORChain / XRP / Asgard / RPC identifiers recur throughout \
+              this module's docs; per-identifier backticks add noise without \
+              aiding parsing"
+)]
+pub mod xrp {
+    use super::{
+        confirm_erc20_arrival, within, Erc20ArrivalClient, RedemptionCrossCheck,
+        RedemptionCrossCheckError, RefundCrossCheck, RefundCrossCheckError,
+    };
+    use alloy_primitives::Address as EthAddress;
+    use async_trait::async_trait;
+    use tracing::{info, warn};
+    use xindex_chain_thor::ThorClient;
+    use xindex_chain_xrp::{XrpChainClient, XrpChainError};
+
+    /// THORChain reports every asset in 1e8; native XRP is 1e6 (drops), so
+    /// a refund's THORChain amount is divided by 100 to compare with the
+    /// on-chain drops value (same scale as ATOM).
+    const THOR_TO_XRP_SCALE: u128 = 100;
+    /// THORChain 1e8 vs on-chain USDT 1e6 — the delivery leg lands USDT on
+    /// Ethereum, identical to the UTXO/EVM/Cosmos delivery.
+    const THOR_TO_USDT_SCALE: u128 = 100;
+    /// THORChain chain label for the XRP Ledger.
+    const XRP_CHAIN: &str = "XRP";
+    /// THORChain asset for native XRP.
+    const XRP_ASSET: &str = "XRP.XRP";
+
+    /// Production delivery policy: THORChain swapped XRP→USDT and the USDT
+    /// actually landed at the `IndexToken` on Ethereum. Two independent
+    /// observations, mirroring `ThorCosmosToUsdtPolicy`; only the refund
+    /// mutual-exclusion guard is XRP-specific.
+    pub struct ThorXrpToUsdtPolicy<E: Erc20ArrivalClient> {
+        thor: ThorClient,
+        erc20: E,
+        usdt_token: EthAddress,
+        min_confirmations: u32,
+        tolerance_1e6: u128,
+    }
+
+    impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorXrpToUsdtPolicy<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ThorXrpToUsdtPolicy")
+                .field("usdt_token", &self.usdt_token)
+                .field("min_confirmations", &self.min_confirmations)
+                .field("tolerance_1e6", &self.tolerance_1e6)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<E: Erc20ArrivalClient> ThorXrpToUsdtPolicy<E> {
+        #[must_use]
+        pub fn new(
+            thor: ThorClient,
+            erc20: E,
+            usdt_token: EthAddress,
+            min_confirmations: u32,
+            tolerance_1e6: u128,
+        ) -> Self {
+            Self {
+                thor,
+                erc20,
+                usdt_token,
+                min_confirmations,
+                tolerance_1e6,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorXrpToUsdtPolicy<E> {
+        async fn verify(
+            &self,
+            xrp_inbound_hash: &str,
+            index_token: EthAddress,
+        ) -> Result<u128, RedemptionCrossCheckError> {
+            let resp = self.thor.tx_status(xrp_inbound_hash).await?;
+            if resp.observed_tx.status != "done" {
+                return Err(RedemptionCrossCheckError::ThorNotReady {
+                    reason: format!("observed_tx.status = {}", resp.observed_tx.status),
+                });
+            }
+            // Mutual-exclusion: an XRP REFUND outbound means this is the
+            // refund path, never attest a delivery.
+            if resp
+                .actions
+                .iter()
+                .any(|a| a.chain == XRP_CHAIN && a.memo.to_uppercase().starts_with("REFUND:"))
+            {
+                return Err(RedemptionCrossCheckError::RefundedInstead);
+            }
+            let want = format!("{index_token:#x}").to_lowercase();
+            let action = resp
+                .actions
+                .iter()
+                .find(|a| {
+                    a.chain == "ETH"
+                        && a.coin.asset.to_uppercase().starts_with("ETH.USDT")
+                        && a.to_address.to_lowercase() == want
+                })
+                .ok_or_else(|| RedemptionCrossCheckError::ThorNotReady {
+                    reason: "no ETH.USDT outbound to the IndexToken yet".to_string(),
+                })?;
+            let thor_1e8: u128 = action.coin.amount.parse().map_err(|e| {
+                RedemptionCrossCheckError::ThorNotReady {
+                    reason: format!("non-integer outbound amount '{}': {e}", action.coin.amount),
+                }
+            })?;
+            let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
+            let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
+            let arrival = confirm_erc20_arrival(
+                &self.erc20,
+                self.usdt_token,
+                index_token,
+                floor,
+                self.min_confirmations,
+            )?
+            .ok_or(RedemptionCrossCheckError::UsdtNotReady {
+                need_1e6: thor_1e6,
+                confs: self.min_confirmations,
+            })?;
+            if !within(thor_1e6, arrival.value, self.tolerance_1e6) {
+                return Err(RedemptionCrossCheckError::AmountMismatch {
+                    thor_1e6,
+                    onchain_1e6: arrival.value,
+                });
+            }
+            info!(
+                xrp_inbound_hash,
+                onchain_usdt_1e6 = arrival.value,
+                "xrp redemption cross-check OK"
+            );
+            // Attest the ON-CHAIN observed value, not THORChain's figure.
+            Ok(arrival.value)
+        }
+    }
+
+    /// Production refund policy: THORChain slip-refunded XRP to our
+    /// multisig (`REFUND:<hash>` XRP outbound) and the drops actually
+    /// returned FROM the live Asgard vault. Disambiguated from a delivery
+    /// ONLY by the USDT-outbound mutual exclusion + the `REFUND:` memo —
+    /// never by time. The on-chain value is `delivered_amount`, not
+    /// `Amount` (partial-payment defence).
+    pub struct ThorXrpRefundPolicy<C: XrpChainClient> {
+        thor: ThorClient,
+        xrp: C,
+        multisig_address: String,
+        min_confirmations: u32,
+        tolerance_drops: u128,
+        lookback_ledgers: u64,
+    }
+
+    impl<C: XrpChainClient> std::fmt::Debug for ThorXrpRefundPolicy<C> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ThorXrpRefundPolicy")
+                .field("multisig_address", &self.multisig_address)
+                .field("min_confirmations", &self.min_confirmations)
+                .field("tolerance_drops", &self.tolerance_drops)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<C: XrpChainClient> ThorXrpRefundPolicy<C> {
+        #[must_use]
+        pub fn new(
+            thor: ThorClient,
+            xrp: C,
+            multisig_address: String,
+            min_confirmations: u32,
+            tolerance_drops: u128,
+            lookback_ledgers: u64,
+        ) -> Self {
+            Self {
+                thor,
+                xrp,
+                multisig_address,
+                min_confirmations,
+                tolerance_drops,
+                lookback_ledgers,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl<C: XrpChainClient> RefundCrossCheck for ThorXrpRefundPolicy<C> {
+        async fn verify(&self, xrp_inbound_hash: &str) -> Result<u64, RefundCrossCheckError> {
+            let resp = self.thor.tx_status(xrp_inbound_hash).await?;
+            if resp.observed_tx.status != "done" {
+                return Err(RefundCrossCheckError::ThorNotReady {
+                    reason: format!("observed_tx.status = {}", resp.observed_tx.status),
+                });
+            }
+            // Mutual-exclusion: a USDT delivery means use the delivery path.
+            if resp
+                .actions
+                .iter()
+                .any(|a| a.chain == "ETH" && a.coin.asset.to_uppercase().starts_with("ETH.USDT"))
+            {
+                return Err(RefundCrossCheckError::DeliveredInstead);
+            }
+            let action = resp
+                .actions
+                .iter()
+                .find(|a| {
+                    a.chain == XRP_CHAIN
+                        && a.to_address == self.multisig_address
+                        && a.memo.to_uppercase().starts_with("REFUND:")
+                        && a.coin.asset.to_uppercase() == XRP_ASSET
+                })
+                .ok_or_else(|| RefundCrossCheckError::ThorNotReady {
+                    reason: "no XRP REFUND outbound to our multisig yet".to_string(),
+                })?;
+            let thor_1e8: u128 =
+                action
+                    .coin
+                    .amount
+                    .parse()
+                    .map_err(|e| RefundCrossCheckError::ThorNotReady {
+                        reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
+                    })?;
+            let thor_drops = thor_1e8 / THOR_TO_XRP_SCALE;
+
+            // Resolve the live Asgard vault — the refund MUST originate
+            // there (sender binding). Refuse while XRP trading is halted.
+            let vault = self.thor.vault_for_chain(XRP_CHAIN).await?.ok_or_else(|| {
+                RefundCrossCheckError::ThorNotReady {
+                    reason: "no XRP inbound address from THORChain".to_string(),
+                }
+            })?;
+            if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+                return Err(RefundCrossCheckError::ThorNotReady {
+                    reason: "XRP trading halted on THORChain".to_string(),
+                });
+            }
+
+            let floor = thor_drops.saturating_sub(self.tolerance_drops);
+            let observed = find_xrp_arrival(
+                &self.xrp,
+                &self.multisig_address,
+                &vault.address,
+                floor,
+                self.min_confirmations,
+                self.lookback_ledgers,
+            )
+            .await
+            .map_err(|e| RefundCrossCheckError::ThorNotReady {
+                reason: format!("xrp arrival lookup failed: {e}"),
+            })?
+            .ok_or(RefundCrossCheckError::BtcNotReady {
+                // Variant is family-shared smallest-unit; "sats" naming is
+                // historical (a v2 rename), the value is drops here.
+                need_sats: u64::try_from(thor_drops).unwrap_or(u64::MAX),
+                confs: self.min_confirmations,
+            })?;
+            if observed.abs_diff(thor_drops) > self.tolerance_drops {
+                return Err(RefundCrossCheckError::AmountMismatch {
+                    thor_sats: u64::try_from(thor_drops).unwrap_or(u64::MAX),
+                    utxo_sats: u64::try_from(observed).unwrap_or(u64::MAX),
+                });
+            }
+            warn!(
+                xrp_inbound_hash,
+                refund_drops = observed,
+                asgard = %vault.address,
+                "xrp refund cross-check OK"
+            );
+            Ok(u64::try_from(observed).unwrap_or(u64::MAX))
+        }
+    }
+
+    /// First validated `Payment` to `multisig` with
+    /// `sender == expected_sender`, `delivered_drops >= min_value`, and at
+    /// least `min_confs` inclusion depth at the validated tip. `None` =
+    /// not yet observed (the signer polls again, never attests). The value
+    /// is `delivered_amount` (the `chain-xrp` parser never reads `Amount`).
+    async fn find_xrp_arrival<C: XrpChainClient>(
+        xrp: &C,
+        multisig: &str,
+        expected_sender: &str,
+        min_value: u128,
+        min_confs: u32,
+        lookback_ledgers: u64,
+    ) -> Result<Option<u128>, XrpChainError> {
+        let tip = xrp.latest_validated_ledger().await?;
+        let min_ledger = tip.saturating_sub(lookback_ledgers);
+        let transfers = xrp.transfers_to(multisig, min_ledger).await?;
+        for t in transfers {
+            let confs = tip.saturating_sub(t.ledger_index).saturating_add(1);
+            if t.sender == expected_sender
+                && t.delivered_drops >= min_value
+                && confs >= u64::from(min_confs)
+            {
+                return Ok(Some(t.delivered_drops));
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{Erc20Arrival, Erc20ArrivalClient, Erc20Error};
+        use super::{
+            RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
+            RefundCrossCheckError, ThorXrpRefundPolicy, ThorXrpToUsdtPolicy,
+        };
+        use alloy_primitives::Address as EthAddress;
+        use std::future::ready;
+        use xindex_chain_thor::ThorClient;
+        use xindex_chain_xrp::{
+            XrpAccount, XrpChainClient, XrpChainError, XrpSubmitOutcome, XrpTransfer,
+        };
+        use xindex_shared::chain_registry::ChainId;
+
+        const INDEX_TOKEN: EthAddress = EthAddress::new([0x11; 20]);
+        const USDT: EthAddress = EthAddress::new([0x22; 20]);
+        const MULTISIG: &str = "rVaultMultisig00000000000000000000";
+        const ASGARD: &str = "rAsgardVault000000000000000000000";
+
+        #[derive(Default)]
+        struct StubErc20 {
+            arrivals: Vec<Erc20Arrival>,
+        }
+        impl Erc20ArrivalClient for StubErc20 {
+            fn transfers_to(
+                &self,
+                _token: EthAddress,
+                _to: EthAddress,
+            ) -> Result<Vec<Erc20Arrival>, Erc20Error> {
+                Ok(self.arrivals.clone())
+            }
+        }
+
+        struct StubXrp {
+            tip: u64,
+            transfers: Vec<XrpTransfer>,
+        }
+        impl XrpChainClient for StubXrp {
+            fn chain(&self) -> ChainId {
+                ChainId::Xrp
+            }
+            fn account_info(
+                &self,
+                _address: &str,
+            ) -> impl std::future::Future<Output = Result<XrpAccount, XrpChainError>> + Send
+            {
+                ready(Ok(XrpAccount { sequence: 0 }))
+            }
+            fn ledger_current(
+                &self,
+            ) -> impl std::future::Future<Output = Result<u64, XrpChainError>> + Send {
+                ready(Ok(self.tip))
+            }
+            fn latest_validated_ledger(
+                &self,
+            ) -> impl std::future::Future<Output = Result<u64, XrpChainError>> + Send {
+                ready(Ok(self.tip))
+            }
+            fn transfers_to(
+                &self,
+                _destination: &str,
+                min_ledger: u64,
+            ) -> impl std::future::Future<Output = Result<Vec<XrpTransfer>, XrpChainError>> + Send
+            {
+                let v: Vec<XrpTransfer> = self
+                    .transfers
+                    .iter()
+                    .filter(|t| t.ledger_index >= min_ledger)
+                    .cloned()
+                    .collect();
+                ready(Ok(v))
+            }
+            fn submit_tx_blob(
+                &self,
+                _tx_blob: &[u8],
+            ) -> impl std::future::Future<Output = Result<XrpSubmitOutcome, XrpChainError>> + Send
+            {
+                ready(Err(XrpChainError::Rpc("not used in tests".to_string())))
+            }
+        }
+
+        fn transfer(sender: &str, drops: u128, ledger: u64) -> XrpTransfer {
+            XrpTransfer {
+                ledger_index: ledger,
+                txhash: "XRPTX".to_string(),
+                sender: sender.to_string(),
+                destination: MULTISIG.to_string(),
+                delivered_drops: drops,
+            }
+        }
+
+        async fn mount_tx(server: &wiremock::MockServer, hash: &str, actions: serde_json::Value) {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!("/thorchain/tx/{hash}")))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "observed_tx": {
+                            "tx": { "id": hash, "chain": "XRP", "from_address": "rUser",
+                                    "to_address": ASGARD, "coins": [], "memo": "" },
+                            "status": "done"
+                        },
+                        "actions": actions
+                    }),
+                ))
+                .mount(server)
+                .await;
+        }
+
+        async fn mount_inbound(server: &wiremock::MockServer, halted: bool) {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/thorchain/inbound_addresses"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([{
+                        "chain": "XRP", "pub_key": "thorpub1addwnpepq", "address": ASGARD,
+                        "halted": halted
+                    }]),
+                ))
+                .mount(server)
+                .await;
+        }
+
+        fn refund_action() -> serde_json::Value {
+            // 5 XRP refund: THORChain 1e8 = 500_000_000 → 5_000_000 drops.
+            serde_json::json!([{ "chain": "XRP", "to_address": MULTISIG,
+                "coin": {"asset": "XRP.XRP", "amount": "500000000"},
+                "memo": "REFUND:xrp-in", "max_gas": [] }])
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_ok_when_drops_return_from_asgard() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(&server, "xrp-in", refund_action()).await;
+            mount_inbound(&server, false).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let xrp = StubXrp {
+                tip: 100,
+                transfers: vec![transfer(ASGARD, 5_000_000, 100)],
+            };
+            let policy = ThorXrpRefundPolicy::new(thor, xrp, MULTISIG.to_string(), 1, 0, 1000);
+            let out = policy.verify("xrp-in").await.expect("refund ok");
+            assert_eq!(out, 5_000_000);
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_rejects_wrong_sender() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(&server, "xrp-in", refund_action()).await;
+            mount_inbound(&server, false).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            // Exact drops arrive — but NOT from the Asgard vault.
+            let xrp = StubXrp {
+                tip: 100,
+                transfers: vec![transfer("rAttacker00000000000000000000000", 5_000_000, 100)],
+            };
+            let policy = ThorXrpRefundPolicy::new(thor, xrp, MULTISIG.to_string(), 1, 0, 1000);
+            let err = policy.verify("xrp-in").await.expect_err("must reject");
+            assert!(
+                matches!(err, RefundCrossCheckError::BtcNotReady { .. }),
+                "got {err:?}"
+            );
+        }
+
+        /// SECURITY: a `tfPartialPayment` that delivered only 1 drop (the
+        /// `delivered_drops` the parser surfaced) does NOT meet the 5 XRP
+        /// floor — even though a THORChain `Amount` of 5 XRP was claimed.
+        /// The cross-check refuses (the partial-payment defence end-to-end).
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_rejects_partial_payment_under_floor() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(&server, "xrp-in", refund_action()).await;
+            mount_inbound(&server, false).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            // From the right vault, but only 1 drop actually delivered.
+            let xrp = StubXrp {
+                tip: 100,
+                transfers: vec![transfer(ASGARD, 1, 100)],
+            };
+            let policy = ThorXrpRefundPolicy::new(thor, xrp, MULTISIG.to_string(), 1, 0, 1000);
+            let err = policy.verify("xrp-in").await.expect_err("must reject");
+            assert!(
+                matches!(err, RefundCrossCheckError::BtcNotReady { .. }),
+                "got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn refund_rejects_when_xrp_halted() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(&server, "xrp-in", refund_action()).await;
+            mount_inbound(&server, true).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let xrp = StubXrp {
+                tip: 100,
+                transfers: vec![transfer(ASGARD, 5_000_000, 100)],
+            };
+            let policy = ThorXrpRefundPolicy::new(thor, xrp, MULTISIG.to_string(), 1, 0, 1000);
+            let err = policy.verify("xrp-in").await.expect_err("must reject");
+            assert!(
+                matches!(err, RefundCrossCheckError::ThorNotReady { .. }),
+                "got {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn delivery_ok_when_usdt_lands() {
+            let server = wiremock::MockServer::start().await;
+            let want = format!("{INDEX_TOKEN:#x}").to_lowercase();
+            mount_tx(
+                &server,
+                "xrp-in",
+                serde_json::json!([{ "chain": "ETH", "to_address": want,
+                    "coin": {"asset": "ETH.USDT", "amount": "70000000"}, "memo": "", "max_gas": [] }]),
+            )
+            .await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let erc20 = StubErc20 {
+                arrivals: vec![Erc20Arrival {
+                    value: 700_000,
+                    confirmations: 5,
+                }],
+            };
+            let policy = ThorXrpToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
+            let out = policy
+                .verify("xrp-in", INDEX_TOKEN)
+                .await
+                .expect("delivery ok");
+            assert_eq!(out, 700_000);
+        }
+
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn delivery_rejects_when_refunded_instead() {
+            let server = wiremock::MockServer::start().await;
+            mount_tx(&server, "xrp-in", refund_action()).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let policy = ThorXrpToUsdtPolicy::new(thor, StubErc20::default(), USDT, 3, 0);
+            let err = policy
+                .verify("xrp-in", INDEX_TOKEN)
+                .await
+                .expect_err("must reject");
+            assert!(
+                matches!(err, RedemptionCrossCheckError::RefundedInstead),
+                "got {err:?}"
+            );
+        }
+    }
+}
