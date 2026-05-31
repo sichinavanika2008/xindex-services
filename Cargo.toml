@@ -76,6 +76,7 @@ xindex-xrp-tx = { path = "crates/xrp-tx" }
 xindex-chain-eth = { path = "crates/chain-eth" }
 xindex-chain-evm = { path = "crates/chain-evm" }
 xindex-chain-cosmos = { path = "crates/chain-cosmos" }
+xindex-chain-xrp = { path = "crates/chain-xrp" }
 xindex-chain-thor = { path = "crates/chain-thor" }
 xindex-chain-utxo = { path = "crates/chain-utxo" }
 xindex-multisig = { path = "crates/multisig" }
