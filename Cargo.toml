@@ -64,9 +64,15 @@ bitcoincash-addr = "0.5"
 # LegacyAminoPubKey multisig-address derivation; secp256k1 (verify +
 # low-S) reuses k256 as the safe-evm crate does.
 sha2 = "0.10"
+# XRP stack (xrp-tx, Phase 4.4). Hand-rolled STObject codec — no
+# xrpl-rust/bs58. XRPL AccountIDs are RIPEMD160(SHA256(pubkey)); the
+# signing digest is SHA512Half (SHA-512 then first 32 bytes). digest 0.10
+# matches sha2 0.10. secp256k1 (DER + low-S) reuses k256.
+ripemd = "0.1"
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
 xindex-cosmos-tx = { path = "crates/cosmos-tx" }
+xindex-xrp-tx = { path = "crates/xrp-tx" }
 xindex-chain-eth = { path = "crates/chain-eth" }
 xindex-chain-evm = { path = "crates/chain-evm" }
 xindex-chain-cosmos = { path = "crates/chain-cosmos" }
