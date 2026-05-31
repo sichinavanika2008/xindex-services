@@ -590,4 +590,33 @@ mod tests {
         assert_eq!(got.chain, ChainId::Gaia);
         assert_eq!(got.inbound_txid, "gaia-txhash");
     }
+
+    /// C8 / Phase 4.4: the XRP family chain (xrp) is admitted by the
+    /// widened CHECK constraint; pre-existing UTXO + EVM + Cosmos rows
+    /// still insert.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_accepts_xrp_post_v10_migration() {
+        let store = SqliteRedemptionDispatch::connect("sqlite::memory:")
+            .await
+            .expect("connect + migrate");
+        let id = b256!("00000000000000000000000000000000000000000000000000000000000000e3");
+        // Regression: UTXO + EVM + Cosmos still record post-migration.
+        store
+            .record(id, 0, ChainId::Btc, "btc-txid".into(), 1)
+            .await
+            .expect("btc record");
+        store
+            .record(id, 1, ChainId::Gaia, "gaia-txhash".into(), 2)
+            .await
+            .expect("gaia record");
+        // The XRP chain records its own leg.
+        store
+            .record(id, 2, ChainId::Xrp, "xrp-txhash".into(), 3)
+            .await
+            .expect("xrp record");
+        let got = store.get(&id, 2).await.expect("get").expect("recorded row");
+        assert_eq!(got.chain, ChainId::Xrp);
+        assert_eq!(got.inbound_txid, "xrp-txhash");
+    }
 }
