@@ -32,8 +32,8 @@ use tracing::info;
 use xindex_chain_cosmos::{CosmosChainClient, ReqwestCosmosChainClient};
 use xindex_cosmos_tx::CosmosMultisig;
 use xindex_executor::cosmos_redeem::{
-    CosmosCosigner, CosmosRedeemConfig, CosmosRedeemExecutor, CosmosRedeemTask, CosmosLockTable,
-    SignCosmosFuture, CosmosRedeemError,
+    CosmosCosigner, CosmosLockTable, CosmosRedeemConfig, CosmosRedeemError, CosmosRedeemExecutor,
+    CosmosRedeemTask, SignCosmosFuture,
 };
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{CosmosSignResponse, CosmosTxSignRequest};
@@ -115,10 +115,12 @@ fn parse_pubkey33(field: &str, hex: &str) -> Result<[u8; 33]> {
     let stripped = hex.strip_prefix("0x").unwrap_or(hex);
     let bytes =
         alloy_primitives::hex::decode(stripped).with_context(|| format!("{field}: bad hex"))?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("{field}: expected 33-byte compressed pubkey, got {}", bytes.len()))
+    bytes.as_slice().try_into().map_err(|_| {
+        anyhow!(
+            "{field}: expected 33-byte compressed pubkey, got {}",
+            bytes.len()
+        )
+    })
 }
 
 fn parse_csv_pubkeys(field: &str, csv: &str) -> Result<Vec<[u8; 33]>> {
@@ -189,6 +191,11 @@ impl CosmosCosigner for RemoteCosmosCosigner {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "rustfmt 1.9.0 line-wrapping expanded this CLI driver past the 100-line \
+              lint (106); logic unchanged, splitting it would not aid readability"
+)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -253,8 +260,13 @@ async fn main() -> Result<()> {
         gas_limit: args.gas_limit,
         vault: args.vault,
     };
-    let executor = CosmosRedeemExecutor::new(cfg, cosmos.clone(), cosigners, Arc::new(CosmosLockTable::new()))
-        .map_err(|e| anyhow!("executor construct: {e}"))?;
+    let executor = CosmosRedeemExecutor::new(
+        cfg,
+        cosmos.clone(),
+        cosigners,
+        Arc::new(CosmosLockTable::new()),
+    )
+    .map_err(|e| anyhow!("executor construct: {e}"))?;
 
     let leg = CosmosRedeemTask {
         dispatch_id: alloy_primitives::B256::ZERO,
@@ -269,10 +281,16 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow!("build_leg: {e}"))?;
 
-    println!("sign_doc_hash: 0x{}", alloy_primitives::hex::encode(outcome.sign_doc_hash));
+    println!(
+        "sign_doc_hash: 0x{}",
+        alloy_primitives::hex::encode(outcome.sign_doc_hash)
+    );
     println!("sequence: {}", outcome.sequence);
     println!("account: {}", outcome.account_address);
-    println!("tx_raw: 0x{}", alloy_primitives::hex::encode(&outcome.tx_raw));
+    println!(
+        "tx_raw: 0x{}",
+        alloy_primitives::hex::encode(&outcome.tx_raw)
+    );
 
     if args.broadcast {
         let result = cosmos
@@ -282,7 +300,11 @@ async fn main() -> Result<()> {
         println!("broadcast_code: {}", result.code);
         println!("broadcast_txhash: {}", result.txhash);
         if !result.accepted() {
-            return Err(anyhow!("CheckTx rejected (code {}): {}", result.code, result.log));
+            return Err(anyhow!(
+                "CheckTx rejected (code {}): {}",
+                result.code,
+                result.log
+            ));
         }
         info!(txhash = %result.txhash, "broadcast accepted to mempool");
     } else {

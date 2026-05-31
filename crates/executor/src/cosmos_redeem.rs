@@ -563,8 +563,9 @@ mod tests {
             account_number: 42,
             sequence: 7,
         });
-        let exec = CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
-            .expect("exec");
+        let exec =
+            CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
+                .expect("exec");
         let outcome = exec.build_leg(&task()).await.expect("leg");
         assert_eq!(outcome.sequence, 7);
         assert_eq!(outcome.chain, ChainId::Gaia);
@@ -593,8 +594,9 @@ mod tests {
             account_number: 1,
             sequence: 0,
         });
-        let exec = CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
-            .expect("exec");
+        let exec =
+            CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
+                .expect("exec");
         let mut t = task();
         t.chain = ChainId::Btc;
         let err = exec.build_leg(&t).await.expect_err("reject");
@@ -619,8 +621,9 @@ mod tests {
             account_number: 1,
             sequence: 0,
         });
-        let exec = CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
-            .expect("exec");
+        let exec =
+            CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
+                .expect("exec");
         let err = exec.build_leg(&task()).await.expect_err("reject");
         assert!(matches!(
             err,
@@ -641,8 +644,9 @@ mod tests {
             account_number: 1,
             sequence: 0,
         });
-        let err = CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
-            .expect_err("construct");
+        let err =
+            CosmosRedeemExecutor::new(cfg, cosmos, cosigners, Arc::new(CosmosLockTable::new()))
+                .expect_err("construct");
         assert!(matches!(
             err,
             CosmosRedeemError::InsufficientCosigners { got: 1, need: 3 }

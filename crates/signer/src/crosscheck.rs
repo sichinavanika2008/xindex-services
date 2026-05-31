@@ -2703,11 +2703,14 @@ pub mod cosmos {
                 .ok_or_else(|| RefundCrossCheckError::ThorNotReady {
                     reason: "no GAIA REFUND outbound to our multisig yet".to_string(),
                 })?;
-            let thor_1e8: u128 = action.coin.amount.parse().map_err(|e| {
-                RefundCrossCheckError::ThorNotReady {
-                    reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
-                }
-            })?;
+            let thor_1e8: u128 =
+                action
+                    .coin
+                    .amount
+                    .parse()
+                    .map_err(|e| RefundCrossCheckError::ThorNotReady {
+                        reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
+                    })?;
             let thor_uatom = thor_1e8 / THOR_TO_ATOM_SCALE;
 
             // Resolve the live Asgard vault — the refund MUST originate
@@ -2792,7 +2795,7 @@ pub mod cosmos {
 
     #[cfg(test)]
     mod tests {
-        use super::super::{Erc20Arrival, Erc20Error, Erc20ArrivalClient};
+        use super::super::{Erc20Arrival, Erc20ArrivalClient, Erc20Error};
         use super::{
             RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
             RefundCrossCheckError, ThorCosmosRefundPolicy, ThorCosmosToUsdtPolicy,
@@ -2855,7 +2858,8 @@ pub mod cosmos {
             }
             fn latest_height(
                 &self,
-            ) -> impl std::future::Future<Output = Result<u64, CosmosChainError>> + Send {
+            ) -> impl std::future::Future<Output = Result<u64, CosmosChainError>> + Send
+            {
                 ready(Ok(self.tip))
             }
             fn transfers_to(
@@ -2896,16 +2900,16 @@ pub mod cosmos {
         async fn mount_tx(server: &wiremock::MockServer, hash: &str, actions: serde_json::Value) {
             wiremock::Mock::given(wiremock::matchers::method("GET"))
                 .and(wiremock::matchers::path(format!("/thorchain/tx/{hash}")))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
                         "observed_tx": {
                             "tx": { "id": hash, "chain": "GAIA", "from_address": "cosmos1user",
                                     "to_address": ASGARD, "coins": [], "memo": "" },
                             "status": "done"
                         },
                         "actions": actions
-                    })),
-                )
+                    }),
+                ))
                 .mount(server)
                 .await;
         }
@@ -2914,12 +2918,12 @@ pub mod cosmos {
         async fn mount_inbound(server: &wiremock::MockServer, halted: bool) {
             wiremock::Mock::given(wiremock::matchers::method("GET"))
                 .and(wiremock::matchers::path("/thorchain/inbound_addresses"))
-                .respond_with(
-                    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([{
                         "chain": "GAIA", "pub_key": "thorpub1addwnpepq", "address": ASGARD,
                         "halted": halted
-                    }])),
-                )
+                    }]),
+                ))
                 .mount(server)
                 .await;
         }
@@ -2943,7 +2947,8 @@ pub mod cosmos {
                 tip: 100,
                 transfers: vec![transfer(ASGARD, 5_000_000, "uatom", 100)],
             };
-            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let policy =
+                ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
             let out = policy.verify("gaia-in").await.expect("refund ok");
             assert_eq!(out, 5_000_000);
         }
@@ -2967,9 +2972,13 @@ pub mod cosmos {
                 tip: 100,
                 transfers: vec![transfer("cosmos1attacker", 5_000_000, "uatom", 100)],
             };
-            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let policy =
+                ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
             let err = policy.verify("gaia-in").await.expect_err("must reject");
-            assert!(matches!(err, RefundCrossCheckError::BtcNotReady { .. }), "got {err:?}");
+            assert!(
+                matches!(err, RefundCrossCheckError::BtcNotReady { .. }),
+                "got {err:?}"
+            );
         }
 
         #[tokio::test]
@@ -2990,9 +2999,13 @@ pub mod cosmos {
                 tip: 100,
                 transfers: vec![transfer(ASGARD, 5_000_000, "uatom", 100)],
             };
-            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let policy =
+                ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
             let err = policy.verify("gaia-in").await.expect_err("must reject");
-            assert!(matches!(err, RefundCrossCheckError::ThorNotReady { .. }), "got {err:?}");
+            assert!(
+                matches!(err, RefundCrossCheckError::ThorNotReady { .. }),
+                "got {err:?}"
+            );
         }
 
         #[tokio::test]
@@ -3008,10 +3021,17 @@ pub mod cosmos {
             )
             .await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-            let cosmos = StubCosmos { tip: 100, transfers: vec![] };
-            let policy = ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
+            let cosmos = StubCosmos {
+                tip: 100,
+                transfers: vec![],
+            };
+            let policy =
+                ThorCosmosRefundPolicy::new(thor, cosmos, MULTISIG.to_string(), 1, 0, 1000);
             let err = policy.verify("gaia-in").await.expect_err("must reject");
-            assert!(matches!(err, RefundCrossCheckError::DeliveredInstead), "got {err:?}");
+            assert!(
+                matches!(err, RefundCrossCheckError::DeliveredInstead),
+                "got {err:?}"
+            );
         }
 
         #[tokio::test]
@@ -3030,10 +3050,16 @@ pub mod cosmos {
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             // 1e8 / 100 = 1e6 USDT, and the same lands on-chain.
             let erc20 = StubErc20 {
-                arrivals: vec![Erc20Arrival { value: 1_000_000, confirmations: 5 }],
+                arrivals: vec![Erc20Arrival {
+                    value: 1_000_000,
+                    confirmations: 5,
+                }],
             };
             let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
-            let out = policy.verify("gaia-in", INDEX_TOKEN).await.expect("delivery ok");
+            let out = policy
+                .verify("gaia-in", INDEX_TOKEN)
+                .await
+                .expect("delivery ok");
             assert_eq!(out, 1_000_000);
         }
 
@@ -3055,7 +3081,10 @@ pub mod cosmos {
                 .verify("gaia-in", INDEX_TOKEN)
                 .await
                 .expect_err("must reject");
-            assert!(matches!(err, RedemptionCrossCheckError::RefundedInstead), "got {err:?}");
+            assert!(
+                matches!(err, RedemptionCrossCheckError::RefundedInstead),
+                "got {err:?}"
+            );
         }
 
         #[tokio::test]
@@ -3074,14 +3103,20 @@ pub mod cosmos {
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             // THORChain says 1e6; on-chain shows more, tolerance 0 → mismatch.
             let erc20 = StubErc20 {
-                arrivals: vec![Erc20Arrival { value: 1_100_000, confirmations: 5 }],
+                arrivals: vec![Erc20Arrival {
+                    value: 1_100_000,
+                    confirmations: 5,
+                }],
             };
             let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
             let err = policy
                 .verify("gaia-in", INDEX_TOKEN)
                 .await
                 .expect_err("must reject");
-            assert!(matches!(err, RedemptionCrossCheckError::AmountMismatch { .. }), "got {err:?}");
+            assert!(
+                matches!(err, RedemptionCrossCheckError::AmountMismatch { .. }),
+                "got {err:?}"
+            );
         }
     }
 }

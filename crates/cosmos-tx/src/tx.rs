@@ -355,9 +355,9 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
     fn tx_raw_three_fields_carry_body_authinfo_signature() {
+        use crate::sigs::{aggregate_verified, to_cosmos_compact_low_s, MemberSig};
         use k256::ecdsa::signature::hazmat::PrehashSigner;
         use k256::ecdsa::{Signature, SigningKey};
-        use crate::sigs::{aggregate_verified, to_cosmos_compact_low_s, MemberSig};
 
         // Real 2-of-3 over a digest.
         let keys: Vec<(SigningKey, [u8; 33])> = (1u8..=3)
@@ -369,9 +369,8 @@ mod tests {
                 (sk, pk)
             })
             .collect();
-        let descriptor =
-            CosmosMultisig::new(2, keys.iter().map(|(_, pk)| *pk).collect(), "cosmos")
-                .expect("descriptor");
+        let descriptor = CosmosMultisig::new(2, keys.iter().map(|(_, pk)| *pk).collect(), "cosmos")
+            .expect("descriptor");
         let digest = [0x42u8; 32];
         let part = |i: usize| {
             let sig: Signature = keys[i].0.sign_prehash(&digest).expect("sign");
@@ -412,7 +411,10 @@ mod tests {
         assert_eq!(end, raw.len(), "no trailing fields after signatures[0]");
 
         // body carries the memo; signature == the aggregate's MultiSignature.
-        assert!(body.windows(5).any(|w| w == b"=:ETH"), "memo embedded in body");
+        assert!(
+            body.windows(5).any(|w| w == b"=:ETH"),
+            "memo embedded in body"
+        );
         assert_eq!(sig, agg.multi_signature.as_slice());
         // auth_info embeds the sequence varint (field 3 of the SignerInfo).
         let mut found_seq = false;

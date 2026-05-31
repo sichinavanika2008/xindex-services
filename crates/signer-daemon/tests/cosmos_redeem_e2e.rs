@@ -83,7 +83,11 @@ impl HsmDigestSigner for SoftHsm {
             let mut g = self.invocations.lock().unwrap();
             *g += 1;
         }
-        assert_eq!(address, self.eth.address(), "HSM requested for wrong address");
+        assert_eq!(
+            address,
+            self.eth.address(),
+            "HSM requested for wrong address"
+        );
         use alloy::signers::SignerSync;
         let sig = self
             .eth
@@ -227,14 +231,20 @@ impl CosmosCosigner for RemoteCosmosCosigner {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(err(format!("HTTP {status}: {text}")));
             }
-            let parsed: CosmosSignResponse = resp.json().await.map_err(|e| err(format!("decode: {e}")))?;
+            let parsed: CosmosSignResponse =
+                resp.json().await.map_err(|e| err(format!("decode: {e}")))?;
             let ret_hex = parsed.pubkey.strip_prefix("0x").unwrap_or(&parsed.pubkey);
-            let ret = alloy_primitives::hex::decode(ret_hex).map_err(|e| err(format!("pubkey hex: {e}")))?;
+            let ret = alloy_primitives::hex::decode(ret_hex)
+                .map_err(|e| err(format!("pubkey hex: {e}")))?;
             if ret.as_slice() != pinned.as_slice() {
                 return Err(err(format!("daemon returned wrong pubkey: 0x{ret_hex}")));
             }
-            let sig_hex = parsed.signature.strip_prefix("0x").unwrap_or(&parsed.signature);
-            let sig = alloy_primitives::hex::decode(sig_hex).map_err(|e| err(format!("sig hex: {e}")))?;
+            let sig_hex = parsed
+                .signature
+                .strip_prefix("0x")
+                .unwrap_or(&parsed.signature);
+            let sig =
+                alloy_primitives::hex::decode(sig_hex).map_err(|e| err(format!("sig hex: {e}")))?;
             let arr: [u8; 64] = sig
                 .as_slice()
                 .try_into()
@@ -252,7 +262,11 @@ const KEY_C: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804c
 
 async fn build_3_of_3_environment() -> (CosmosRedeemExecutor<StubCosmos>, Vec<Arc<SoftHsm>>) {
     // Ordered member set → descriptor → account address.
-    let members = vec![member_pubkey(KEY_A), member_pubkey(KEY_B), member_pubkey(KEY_C)];
+    let members = vec![
+        member_pubkey(KEY_A),
+        member_pubkey(KEY_B),
+        member_pubkey(KEY_C),
+    ];
     let multisig = CosmosMultisig::new(3, members, "cosmos").expect("descriptor");
     let account = multisig.account_address().expect("address");
 
@@ -327,7 +341,11 @@ async fn cosmos_redeem_e2e_3_of_3_collects_sigs_via_real_daemons() {
     assert_eq!(outcome.tx_raw[0], 0x0a);
 
     for (i, hsm) in hsms.iter().enumerate() {
-        assert_eq!(*hsm.invocations.lock().unwrap(), 1, "daemon {i} HSM invocations");
+        assert_eq!(
+            *hsm.invocations.lock().unwrap(),
+            1,
+            "daemon {i} HSM invocations"
+        );
     }
 }
 
@@ -338,7 +356,10 @@ async fn cosmos_redeem_e2e_idempotent_replay_does_not_re_hit_hsm() {
     let out1 = executor.build_leg(&t).await.expect("first");
     let out2 = executor.build_leg(&t).await.expect("replay");
     assert_eq!(out1.sign_doc_hash, out2.sign_doc_hash);
-    assert_eq!(out1.tx_raw, out2.tx_raw, "idempotent replay → identical TxRaw");
+    assert_eq!(
+        out1.tx_raw, out2.tx_raw,
+        "idempotent replay → identical TxRaw"
+    );
     for (i, hsm) in hsms.iter().enumerate() {
         assert_eq!(
             *hsm.invocations.lock().unwrap(),
@@ -351,7 +372,10 @@ async fn cosmos_redeem_e2e_idempotent_replay_does_not_re_hit_hsm() {
 #[tokio::test]
 async fn cosmos_redeem_e2e_same_sequence_different_memo_is_409_at_every_daemon() {
     let (executor, _hsms) = build_3_of_3_environment().await;
-    executor.build_leg(&task("=:ETH.USDT:0x1:1", 1)).await.expect("first ok");
+    executor
+        .build_leg(&task("=:ETH.USDT:0x1:1", 1))
+        .await
+        .expect("first ok");
     // Same sequence (StubCosmos fixed at 7) + different memo → different
     // digest → 409 conflict at each daemon → InsufficientCosigners.
     let err = executor
@@ -359,7 +383,10 @@ async fn cosmos_redeem_e2e_same_sequence_different_memo_is_409_at_every_daemon()
         .await
         .expect_err("conflict");
     assert!(
-        matches!(err, CosmosRedeemError::InsufficientCosigners { got: 0, need: 3 }),
+        matches!(
+            err,
+            CosmosRedeemError::InsufficientCosigners { got: 0, need: 3 }
+        ),
         "expected InsufficientCosigners (got=0), got {err:?}"
     );
 }
