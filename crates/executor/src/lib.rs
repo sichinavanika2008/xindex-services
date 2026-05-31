@@ -21,6 +21,7 @@ pub mod evm_redeem;
 pub mod rebroadcast;
 pub mod redeem;
 pub mod remote_cosigner;
+pub mod xrp_redeem;
 
 pub use broadcast_registry::{
     now_unix_secs, BroadcastRegistry, BroadcastStatus, InMemoryBroadcastRegistry, PendingBroadcast,

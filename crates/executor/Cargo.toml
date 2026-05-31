@@ -21,6 +21,10 @@ xindex-safe-evm.workspace = true
 # account/sequence from the Cosmos chain.
 xindex-chain-cosmos.workspace = true
 xindex-cosmos-tx.workspace = true
+# C7 (Phase 4.4): XRP redeem leg — builds the Payment STObject body +
+# multisigned tx-blob and reads Sequence/ledger from the XRP chain.
+xindex-chain-xrp.workspace = true
+xindex-xrp-tx.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
@@ -57,3 +61,7 @@ path = "src/bin/xindex-redeem-evm.rs"
 [[bin]]
 name = "xindex-redeem-cosmos"
 path = "src/bin/xindex-redeem-cosmos.rs"
+
+[[bin]]
+name = "xindex-redeem-xrp"
+path = "src/bin/xindex-redeem-xrp.rs"
