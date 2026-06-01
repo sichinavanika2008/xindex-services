@@ -156,8 +156,12 @@ pub enum AggregateError {
 ///
 /// `pub` so executors can verify each cosigner's partial AS IT IS
 /// COLLECTED (verify-as-collected), rather than only in the bulk
-/// [`aggregate_signatures`] — a Byzantine cosigner then cannot DoS a
+/// [`aggregate_signatures`] — a Byzantine cosigner then cannot `DoS` a
 /// leg an honest majority could complete (audit M1).
+///
+/// # Errors
+/// [`AggregateError::NonCanonicalV`] if `sig.v` is not 27 or 28;
+/// [`AggregateError::Recovery`] if `(r, s)` recover no point.
 pub fn recover_signer(digest: B256, sig: &EcdsaSig) -> Result<Address, AggregateError> {
     use alloy_primitives::PrimitiveSignature;
     // EOA convention: v ∈ {27, 28} ⇒ y_parity ∈ {false, true}.

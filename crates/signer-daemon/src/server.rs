@@ -380,10 +380,11 @@ fn hash_attestation_payload(intent_id: B256, slot_index: U256, attested_amount: 
 
 /// Per-leg replay-key payload hash. The replay DB keys redemptions on
 /// `(redemption_id, leg_index)` (audit H2) and applies a delivery-XOR-
-/// refund mutex WITHIN each leg. This hash binds `leg_index` + `asset_id`
-/// + amount, so re-signing the SAME leg with a different amount is a
-/// Conflict, while different legs of one redemption are independent slots
-/// (matching the on-chain `IntentQueue::_legForUpdate` per-leg mutex).
+/// refund mutex WITHIN each leg. This hash binds the `leg_index`,
+/// `asset_id`, and amount, so re-signing the SAME leg with a different
+/// amount is a `Conflict`, while different legs of one redemption are
+/// independent slots (matching the on-chain `IntentQueue::_legForUpdate`
+/// per-leg mutex).
 fn hash_leg_payload(
     redemption_id: B256,
     leg_index: U256,

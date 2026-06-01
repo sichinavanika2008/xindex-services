@@ -150,8 +150,8 @@ pub trait ReplayStore: Send + Sync {
     /// Keyed by `(redemption_id, leg_index)` (audit H2) — mirrors the
     /// on-chain per-leg mutex (`IntentQueue::_legForUpdate`). Each leg of
     /// a redemption is an independent delivery-XOR-refund slot; keying on
-    /// `redemption_id` alone would falsely flag leg ≥ 1 as a Conflict /
-    /// MutexViolation against leg 0.
+    /// `redemption_id` alone would falsely flag leg ≥ 1 as a `Conflict` /
+    /// `MutexViolation` against leg 0.
     fn check_redemption(
         &self,
         redemption_id: B256,
@@ -1105,6 +1105,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test code: one cohesive per-leg redemption replay lifecycle (H2)"
+    )]
     async fn run_redemption_lifecycle<S: ReplayStore>(store: &S) {
         #[expect(clippy::expect_used, reason = "test code")]
         {

@@ -406,7 +406,7 @@ impl<E: EvmChainClient> EvmRedeemExecutor<E> {
                         errors.push(EvmRedeemError::Aggregate(AggregateError::SignerMismatch {
                             declared: signer,
                             recovered: rec,
-                        }))
+                        }));
                     }
                     Err(e) => errors.push(EvmRedeemError::Aggregate(e)),
                 },
