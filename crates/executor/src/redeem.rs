@@ -353,6 +353,7 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             Some(&multisig_address),
             change_value,
             Some(&task.memo),
+            UtxoParams::for_chain(ChainId::Btc).op_return_max,
         )?;
 
         // Collect K partial signatures. LocalKeys path uses the

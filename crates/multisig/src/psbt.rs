@@ -36,16 +36,40 @@ pub enum SignError {
     Finalize(String),
     #[error("psbt extraction failed: {0}")]
     Extract(String),
-    /// `OP_RETURN` memo exceeds the 80-byte standard null-data relay
-    /// limit. `THORChain` swap memos (`=:ETH.USDT:0x<40>:<dec>` ≈ 60–70 B)
-    /// fit comfortably; a longer memo would be non-standard and rejected
-    /// by relay policy, so we fail closed before broadcasting.
-    #[error("op_return memo {0} bytes exceeds 80-byte standard limit")]
+    /// `OP_RETURN` memo exceeds the per-chain null-data relay limit
+    /// (`UtxoParams::op_return_max`: 80 for BTC/LTC/DOGE/ZEC, 220 for
+    /// BCH). `THORChain` swap memos (`=:ETH.USDT:0x<40>:<dec>` ≈ 60–70 B)
+    /// fit comfortably; a longer memo is non-standard, so we fail closed
+    /// before broadcasting.
+    #[error("op_return memo {0} bytes exceeds the per-chain OP_RETURN limit")]
     MemoTooLong(usize),
+    /// The legacy sighash flavor (BCH `SIGHASH_FORKID` / ZEC BLAKE2b) is
+    /// not yet implemented (the executor is BTC/Witness-only). Fail closed
+    /// at PSBT-build time rather than emit a network-rejected pre-BIP-143
+    /// `0x01` sighash for BCH/ZEC (audit L1); the algorithms land with U10.
+    #[error("unsupported legacy sighash flavor: {0:?}")]
+    UnsupportedSighash(SighashFlavor),
 }
 
-/// Standard-relay maximum for an `OP_RETURN` data push.
+/// Standard-relay maximum for an `OP_RETURN` data push (BTC/LTC/DOGE/ZEC;
+/// BCH allows 220 — pass the per-chain value to [`build_spending_psbt`]).
 pub const MAX_OP_RETURN_BYTES: usize = 80;
+
+/// Sighash algorithm for a legacy (non-`SegWit`) spend. Pre-BIP-143
+/// `legacy_signature_hash` (`LegacyBtc`) is correct only for DOGE; BCH
+/// needs the BIP-143-style preimage with `SIGHASH_FORKID` (`0x41`) and
+/// ZEC the Sapling BLAKE2b sighash with a consensus-branch-id. Those are
+/// NOT implemented yet — [`build_spending_psbt`] rejects them rather than
+/// silently producing a network-rejected sighash (audit L1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SighashFlavor {
+    /// Pre-BIP-143 legacy sighash (DOGE; the only legacy flavor wired).
+    LegacyBtc,
+    /// BCH: BIP-143 preimage with `SIGHASH_FORKID`. Unimplemented (U10).
+    BchForkId,
+    /// ZEC: Sapling BLAKE2b sighash + consensus-branch-id. Unimplemented (U10).
+    ZcashBlake2b,
+}
 
 /// Per-UTXO spend metadata: either a `SegWit` `witness_script` (BIP-143
 /// sighash) or a legacy `redeem_script` + full prevout transaction
@@ -75,6 +99,9 @@ pub enum MultisigUtxoSpend {
         /// `multi(K, pk_1, ..., pk_N)`. Hashes (ripemd160(sha256(·)))
         /// to the SPK's 20-byte program.
         redeem_script: ScriptBuf,
+        /// Which legacy sighash algorithm this chain requires (audit L1).
+        /// Only `LegacyBtc` (DOGE) is implemented; BCH/ZEC fail closed.
+        sighash_flavor: SighashFlavor,
     },
 }
 
@@ -109,10 +136,15 @@ pub struct MultisigUtxo {
 /// `inputs[0]`, which the executor guarantees is a multisig UTXO so
 /// `THORChain` resolves any slip-refund back to our multisig.
 ///
+/// `max_op_return` is the per-chain `OP_RETURN` byte cap
+/// (`UtxoParams::op_return_max`); pass [`MAX_OP_RETURN_BYTES`] (80) for
+/// BTC. Audit L3 — the cap is no longer hard-coded.
+///
 /// # Errors
-/// [`SignError::MemoTooLong`] if `op_return` exceeds
-/// [`MAX_OP_RETURN_BYTES`]; [`SignError::Sighash`] if transaction
-/// construction rejects the input shape (version / locktime).
+/// [`SignError::MemoTooLong`] if `op_return` exceeds `max_op_return`;
+/// [`SignError::UnsupportedSighash`] for a BCH/ZEC legacy spend;
+/// [`SignError::Sighash`] if transaction construction rejects the input
+/// shape (version / locktime).
 pub fn build_spending_psbt(
     inputs: &[MultisigUtxo],
     recipient: &Address,
@@ -120,6 +152,7 @@ pub fn build_spending_psbt(
     change_to: Option<&Address>,
     change_value: Amount,
     op_return: Option<&[u8]>,
+    max_op_return: usize,
 ) -> Result<Psbt, SignError> {
     let mut tx_inputs = Vec::with_capacity(inputs.len());
     for utxo in inputs {
@@ -136,7 +169,7 @@ pub fn build_spending_psbt(
         script_pubkey: recipient.script_pubkey(),
     }];
     if let Some(memo) = op_return {
-        if memo.len() > MAX_OP_RETURN_BYTES {
+        if memo.len() > max_op_return {
             return Err(SignError::MemoTooLong(memo.len()));
         }
         let push = bitcoin::script::PushBytesBuf::try_from(memo.to_vec())
@@ -191,7 +224,15 @@ pub fn build_spending_psbt(
             MultisigUtxoSpend::NonWitness {
                 prevout_tx,
                 redeem_script,
+                sighash_flavor,
             } => {
+                // Fail closed for the unimplemented BCH/ZEC legacy sighash
+                // flavors (audit L1) — a built PSBT would otherwise be
+                // signed with a pre-BIP-143 `0x01` sighash the network
+                // rejects (BCH FORKID / ZEC BLAKE2b).
+                if *sighash_flavor != SighashFlavor::LegacyBtc {
+                    return Err(SignError::UnsupportedSighash(*sighash_flavor));
+                }
                 input_slot.non_witness_utxo = Some(prevout_tx.clone());
                 input_slot.redeem_script = Some(redeem_script.clone());
             }
@@ -366,6 +407,7 @@ mod tests {
             None,
             Amount::ZERO,
             None,
+            MAX_OP_RETURN_BYTES,
         )
         .expect("build");
 
@@ -400,6 +442,7 @@ mod tests {
             None,
             Amount::ZERO,
             None,
+            MAX_OP_RETURN_BYTES,
         )
         .expect("build");
 
@@ -438,6 +481,7 @@ mod tests {
             None,
             Amount::ZERO,
             None,
+            MAX_OP_RETURN_BYTES,
         )
         .expect("build");
         assert!(matches!(
@@ -474,6 +518,101 @@ mod tests {
                 script_pubkey: spk.clone(),
             }],
         }
+    }
+
+    /// Audit L1: a NonWitness spend with an unimplemented sighash flavor
+    /// (BCH `SIGHASH_FORKID` / ZEC BLAKE2b) is rejected at PSBT-build time
+    /// — never produces a network-rejected pre-BIP-143 sighash.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn nonwitness_unimplemented_flavor_is_rejected() {
+        let secp = Secp256k1::new();
+        let sks: Vec<SecretKey> = (0..5)
+            .map(|_| SecretKey::new(&mut rand::thread_rng()))
+            .collect();
+        let pks: Vec<PublicKey> = sks
+            .iter()
+            .map(|sk| PublicKey::new(sk.public_key(&secp)))
+            .collect();
+        let desc = MultisigDescriptor::new_p2sh_legacy(3, &pks).expect("descriptor");
+        let spk = desc.script_pubkey().expect("spk");
+        let derived = desc.descriptor.at_derivation_index(0).expect("derive");
+        let redeem_script = derived.explicit_script().expect("redeem script");
+        let value = Amount::from_sat(1_000_000);
+        let prevout_tx = synthetic_prevout(&spk, value);
+        let recipient = Address::from_str("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+            .expect("addr")
+            .require_network(Network::Bitcoin)
+            .expect("network");
+        for flavor in [SighashFlavor::BchForkId, SighashFlavor::ZcashBlake2b] {
+            let utxo = MultisigUtxo {
+                outpoint: OutPoint {
+                    txid: prevout_tx.compute_txid(),
+                    vout: 0,
+                },
+                value,
+                script_pubkey: spk.clone(),
+                spend: MultisigUtxoSpend::NonWitness {
+                    prevout_tx: prevout_tx.clone(),
+                    redeem_script: redeem_script.clone(),
+                    sighash_flavor: flavor,
+                },
+            };
+            let err = build_spending_psbt(
+                &[utxo],
+                &recipient,
+                Amount::from_sat(950_000),
+                None,
+                Amount::ZERO,
+                None,
+                MAX_OP_RETURN_BYTES,
+            )
+            .expect_err("BCH/ZEC flavor must be rejected at build time");
+            assert!(matches!(err, SignError::UnsupportedSighash(f) if f == flavor));
+        }
+    }
+
+    /// Audit L3: the `OP_RETURN` cap is per-chain — an 81-byte memo is
+    /// rejected at the BTC limit (80) but accepted at the BCH limit (220).
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn op_return_limit_is_per_chain() {
+        let (desc, _) = random_descriptor(3, 5);
+        let address = desc.address(Network::Bitcoin).expect("addr");
+        let derived = desc.descriptor.at_derivation_index(0).expect("derive");
+        let witness_script = derived.explicit_script().expect("script");
+        let utxo = MultisigUtxo {
+            outpoint: dummy_outpoint(),
+            value: Amount::from_sat(1_000_000),
+            script_pubkey: address.script_pubkey(),
+            spend: MultisigUtxoSpend::Witness { witness_script },
+        };
+        let recipient = Address::from_str("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+            .expect("addr")
+            .require_network(Network::Bitcoin)
+            .expect("network");
+        let memo = vec![0u8; 81];
+        let err = build_spending_psbt(
+            std::slice::from_ref(&utxo),
+            &recipient,
+            Amount::from_sat(950_000),
+            None,
+            Amount::ZERO,
+            Some(&memo),
+            80,
+        )
+        .expect_err("81 > 80 (BTC) must reject");
+        assert!(matches!(err, SignError::MemoTooLong(81)));
+        build_spending_psbt(
+            std::slice::from_ref(&utxo),
+            &recipient,
+            Amount::from_sat(950_000),
+            None,
+            Amount::ZERO,
+            Some(&memo),
+            220,
+        )
+        .expect("81 <= 220 (BCH) must build");
     }
 
     /// U5: P2SH-legacy end-to-end round-trip — build a P2SH-legacy
@@ -516,6 +655,7 @@ mod tests {
             spend: MultisigUtxoSpend::NonWitness {
                 prevout_tx,
                 redeem_script,
+                sighash_flavor: SighashFlavor::LegacyBtc,
             },
         };
 
@@ -533,6 +673,7 @@ mod tests {
             None,
             Amount::ZERO,
             None,
+            MAX_OP_RETURN_BYTES,
         )
         .expect("build");
 
