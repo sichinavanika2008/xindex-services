@@ -271,15 +271,17 @@ fn parse_pubkeys(spec: &str) -> Result<Vec<PublicKey>> {
 /// Parse a comma-separated list of hex-encoded 32-byte secret keys.
 fn parse_secret_keys(spec: &str) -> Result<Vec<SecretKey>> {
     spec.split(',')
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             let trimmed = s.trim();
             let stripped = trimmed.strip_prefix("0x").unwrap_or(trimmed);
             let bytes = alloy_primitives::hex::decode(stripped)
-                .with_context(|| format!("invalid secret-key hex: {trimmed}"))?;
+                .with_context(|| format!("secret key #{i}: invalid hex"))?;
             if bytes.len() != 32 {
-                anyhow::bail!("secret key must be 32 bytes, got {}", bytes.len());
+                anyhow::bail!("secret key #{i}: must be 32 bytes, got {}", bytes.len());
             }
-            SecretKey::from_slice(&bytes).with_context(|| format!("invalid secret key: {trimmed}"))
+            SecretKey::from_slice(&bytes)
+                .with_context(|| format!("secret key #{i}: not a valid secp256k1 scalar"))
         })
         .collect()
 }

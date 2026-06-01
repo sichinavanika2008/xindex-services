@@ -139,8 +139,9 @@ struct Args {
     #[arg(long, env = "BTC_MULTISIG_ADDRESS")]
     btc_multisig_address: Option<String>,
 
-    /// Min ETH confirmations for the USDT arrival. Default 6.
-    #[arg(long, env = "ETH_MIN_CONFIRMATIONS", default_value_t = 6)]
+    /// Min ETH confirmations for the USDT arrival. Default 12 (the ETH
+    /// `conf_depth`); a lower override is rejected at startup (audit M9/I12).
+    #[arg(long, env = "ETH_MIN_CONFIRMATIONS", default_value_t = 12)]
     eth_min_confirmations: u32,
 
     /// Min BTC confirmations for a refund UTXO. Default 6.

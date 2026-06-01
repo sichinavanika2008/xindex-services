@@ -196,8 +196,9 @@ pub fn parse_account(body: &str) -> Result<CosmosAccount, CosmosChainError> {
 /// coin. Only `min_height`-and-above results are returned.
 ///
 /// # Errors
-/// [`CosmosChainError::Decode`] if the response is not the expected shape
-/// or a matched coin amount is malformed.
+/// [`CosmosChainError::Decode`] if the response is not the expected shape.
+/// A single malformed coin segment is skipped, not propagated, so one bad
+/// transfer cannot discard every valid transfer in the response.
 pub fn parse_transfers(
     body: &str,
     want_recipient: &str,
@@ -254,7 +255,9 @@ pub fn parse_transfers(
             let Some(amount) = amount else { continue };
             let sender = sender.unwrap_or_default().to_string();
             for coin in amount.split(',') {
-                let (value, denom) = parse_coin_amount(coin)?;
+                let Ok((value, denom)) = parse_coin_amount(coin) else {
+                    continue;
+                };
                 out.push(CosmosTransfer {
                     height,
                     txhash: txhash.clone(),
@@ -282,8 +285,11 @@ pub fn parse_broadcast(body: &str) -> Result<CosmosBroadcastOutcome, CosmosChain
     let code = r
         .get("code")
         .and_then(Value::as_u64)
-        .and_then(|c| u32::try_from(c).ok())
-        .unwrap_or(0);
+        .ok_or_else(|| CosmosChainError::Decode("missing or non-numeric result.code".into()))
+        .and_then(|c| {
+            u32::try_from(c)
+                .map_err(|_| CosmosChainError::Decode("result.code out of u32 range".into()))
+        })?;
     Ok(CosmosBroadcastOutcome {
         code,
         txhash: r

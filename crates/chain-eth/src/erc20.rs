@@ -107,7 +107,8 @@ fn decode_transfer_log(log: &serde_json::Value, tip: u64) -> Result<Erc20Arrival
         .and_then(|b| b.as_str())
         .ok_or_else(|| Erc20Error::Rpc("log missing blockNumber".into()))?;
     let block = parse_hex_u64(block)?;
-    let confirmations = u32::try_from(tip.saturating_sub(block) + 1).unwrap_or(u32::MAX);
+    let confirmations =
+        u32::try_from(tip.saturating_sub(block).saturating_add(1)).unwrap_or(u32::MAX);
     Ok(Erc20Arrival {
         value,
         confirmations,

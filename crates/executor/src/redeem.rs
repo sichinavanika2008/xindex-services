@@ -18,11 +18,12 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use xindex_chain_eth::bindings::ThorchainAdapter;
-use xindex_chain_utxo::{UtxoChainClient, UtxoEntry, UtxoError};
+use xindex_chain_utxo::{UtxoChainClient, UtxoEntry, UtxoError, UtxoParams};
 use xindex_multisig::{
     build_spending_psbt, sign_psbt_input, MultisigDescriptor, MultisigUtxo, MultisigUtxoSpend,
     SignError, MAX_OP_RETURN_BYTES,
 };
+use xindex_shared::chain_registry::ChainId;
 
 /// Errors surfaced during a single redemption execution.
 #[derive(Debug, Error)]
@@ -329,7 +330,19 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             script_pubkey: multisig_address.script_pubkey(),
             spend: MultisigUtxoSpend::Witness { witness_script },
         };
-        let change_value = selected.value.checked_sub(needed).unwrap_or(Amount::ZERO);
+        // Fold a sub-dust residue into the fee rather than emit a
+        // non-relayable dust change output (audit L2). `dust_sats` (546,
+        // a conservative lower bound for the ~330-sat P2WSH dust limit) is
+        // the per-chain threshold; below it, drop the change and let the
+        // residue become extra fee. Gives the previously-dead `dust_sats`
+        // field a consumer.
+        let dust = Amount::from_sat(UtxoParams::for_chain(ChainId::Btc).dust_sats);
+        let raw_change = selected.value.checked_sub(needed).unwrap_or(Amount::ZERO);
+        let change_value = if raw_change >= dust {
+            raw_change
+        } else {
+            Amount::ZERO
+        };
 
         // Outputs: [Asgard vault, OP_RETURN(memo), change→multisig].
         // Single input ⇒ vin[0] is the multisig UTXO (refund-to-sender).
