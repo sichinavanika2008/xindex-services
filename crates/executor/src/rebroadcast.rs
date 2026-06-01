@@ -16,13 +16,14 @@
 //!   node that dropped it back into propagation. Bump
 //!   `last_attempt_unix_secs`.
 //!
-//! - **Reorg orphan**: a tx that WAS confirmed but isn't anymore (the
-//!   block containing it got reorged out) gets re-broadcast on the same
-//!   stuck-timeout path. Detected because `confirmed=false` after
-//!   previously being `confirmed=true` — registry doesn't track the
-//!   previous state, so we just re-broadcast unconditionally when the
-//!   stuck-timeout has passed since `last_attempt`. Bitcoin no-ops if
-//!   the tx is still in the chain.
+//! - **Shallow reorg** (depth < `min_confirmations`): the entry is still
+//!   `Pending` (it never reached `mark_confirmed`), so the stuck-timeout
+//!   path re-broadcasts it; Bitcoin no-ops if the tx is still in a block.
+//!   NOTE (audit M8): a DEEP reorg of an already-`Confirmed` entry is NOT
+//!   detected — `mark_confirmed` is one-way and `list_pending` no longer
+//!   returns it. That orphan is operator-recoverable (the tx usually
+//!   re-confirms from mempool); block-hash re-validation + a `mark_pending`
+//!   transition is a documented follow-on, not implemented here.
 //!
 //! - **Anything else (RPC error, still in mempool, still confirming)**:
 //!   leave for the next tick. Don't re-broadcast without evidence the
@@ -73,10 +74,11 @@ pub struct WatcherConfig {
     /// — far longer than normal mempool retention, short enough that a
     /// dropped tx doesn't sit unaddressed all day.
     pub stuck_timeout: Duration,
-    /// Confirmation depth at which we consider the broadcast settled
-    /// and stop polling. 3 matches the cross-check policy our signers
-    /// use; 6 would be more conservative but slower to clear the
-    /// pending set.
+    /// Confirmation depth at which we consider the broadcast settled and
+    /// stop polling. Defaults to BTC `conf_depth` (6) — the protocol's
+    /// finality bar (audit M8/M9). The prior default of 3 declared
+    /// settlement three blocks BELOW finality; the signer cross-check
+    /// policy uses 6 (`BTC_MIN_CONFIRMATIONS`), not 3.
     pub min_confirmations: u32,
 }
 
@@ -85,7 +87,7 @@ impl Default for WatcherConfig {
         Self {
             interval: Duration::from_secs(60),
             stuck_timeout: Duration::from_secs(3600),
-            min_confirmations: 3,
+            min_confirmations: 6,
         }
     }
 }

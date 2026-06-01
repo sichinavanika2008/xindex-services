@@ -204,7 +204,7 @@ struct Args {
     /// Confirmation depth at which a broadcast is considered settled
     /// (the watcher stops polling and marks it confirmed). Default 3,
     /// matching the cross-check policy in `xindex-attest`.
-    #[arg(long, env = "REBROADCAST_MIN_CONFIRMATIONS", default_value_t = 3)]
+    #[arg(long, env = "REBROADCAST_MIN_CONFIRMATIONS", default_value_t = 6)]
     rebroadcast_min_confirmations: u32,
 }
 

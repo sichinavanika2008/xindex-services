@@ -413,6 +413,49 @@ ceremony.
 | P4.4-17 | Low | ❌ Accepted | **`MAX_SIGNERS == 32` assumes the `ExpandedSignerList` amendment; no standard 8-entry cap.** A standard (non-expanded) XRPL `SignerList` / `Signers` array caps at **8**; `XrpMultisig::new` rejects only `> 32`, and the assembly path does not bound the effective signer count. Not attacker-reachable — the assembled count is fixed by operator deploy-time `--member-pubkeys` + `--quorum`, no redeem-task input influences it, and a misconfigured >8-signer blob fails CLOSED at broadcast (`temMALFORMED`), never mis-sending funds. Our 3-of-5 model is well under 8. The rippled byte-match (P4.4-1) + the key ceremony pin the real on-chain `SignerList`; an explicit configurable cap (8 standard / 32 expanded) is a documented follow-on. Red-team C10 LOW-1. |
 | P4.4-18 | Info | ❌ Accepted | **`transfers_to` refund observation is single-page (no `marker` pagination).** `ReqwestXrpChainClient::transfers_to` (`crates/chain-xrp/src/client.rs`) issues one `account_tx` (`forward:true`, `limit:100`, `ledger_index_min = tip - lookback`) and `parse_account_tx` never follows `result.marker`. On a high-traffic XRP custody account, a THORChain refund `Payment` landing after >100 in-window inbound txs falls on page 2+ → `find_xrp_arrival` returns `None` indefinitely → the signer never attests. FAIL-CLOSED: the value is sourced from `meta.delivered_amount` (P4.4-4) and bound to the live Asgard `sender`, so no false attestation / no fund loss — a bounded stuck-redemption (liveness) risk only, mirroring the Cosmos twin P3.3-15. v1 mitigation: low-volume custody + an operator alert when a redemption is stuck > N ledgers. A `marker`-loop in `transfers_to` (mirroring the M-R9 Esplora pagination pattern) is a documented follow-on; revisit at scale / signet rehearsal. Audit 2026-06-01 I1. |
 
+## 2026-06-01 deep Rust audit — 36 confirmed findings
+
+65-agent workflow (tool battery → 22 crate×vuln-class auditors → adversarial
+verify → report) over `feat/phase-4-4-xrp`. Confirmed: 2 High, 9 Medium, 14
+Low, 12 Info; 4 refuted. **No live fund-loss path** — every cross-chain custody
+path fails closed; failures are liveness / availability / defense-in-depth.
+**H1 was the only finding live on today's BTC mainnet rail.** Remediation landed
+on `feat/rust-audit-2026-06-01`.
+
+| ID | Sev | Status | Note |
+|---|---|---|---|
+| H1 | High | ✅ Fixed in code | **Reserve-before-broadcast.** `BroadcastRegistry::reserve` writes a 'reserved' write-ahead row before the irreversible BTC broadcast; `register` promotes it. Migration adds the status. Closes the H-R1 double-pay ordering. Tests: `*_reserve_dedups_then_register_promotes`. |
+| H2 / L9 / I7 / I8 | High | ✅ Fixed in code | **Per-leg replay key.** Redemption replay store keyed on `(redemption_id, leg_index)` (trait + InMemory + SQLite + migration), mirroring the on-chain per-leg mutex. Fixes the latent multi-leg brick + the inverted M5/I7 comments. Test: multi-leg `run_redemption_lifecycle`. |
+| M1 / L11 | Med | ✅ Fixed in code | **Verify-as-collected** in EVM + Cosmos `collect_signatures` (mirrors XRP C10). A Byzantine cosigner can't DoS a leg. |
+| M6 | Med | ✅ Fixed in code | **Recover-verify** added to the 3 EIP-712 daemon handlers (attestation/delivery/refund) — extends the 1.5/H11 backstop. |
+| M7 | Med | ✅ Fixed in code | `parse_secret_keys` no longer echoes raw secret-key hex (CWE-532); index-only errors. |
+| M8 | Med | ✅ Partial / ⏳ | Rebroadcast `min_confirmations` default 3→6 (= BTC `conf_depth`); false "3 matches the policy" comment corrected. **Deferred:** deep-reorg `mark_pending` + block-hash re-validation + `list_confirmed` (operator-recoverable today). |
+| M9 / I11 | Med | ✅ Partial / ⏳ | BTC rebroadcast/attest defaults aligned to `conf_depth`. **Deferred:** wire `conf_depth()` into the attest binary's PER-LEG depth (DOGE 40, ZEC 10 — latent, multi-chain mainnet-gated) + a hard floor rejecting under-confirmation. |
+| I2 | Info | ✅ Fixed in code | P3.3-2 corrected — THORChain's gaia client signs `SIGN_MODE_DIRECT`; gaiad (not THORChain) is the amino byte-match ground truth. |
+| I4 | Info | ✅ Fixed in code | `SafeLockTable` comment corrected — the lock spans `nonce-read → build`, submit is outside it. |
+| L2 | Low | ✅ Fixed in code | Sub-dust BTC change folded into the fee (gives `UtxoParams::dust_sats` a consumer). |
+| L4 | Low | ✅ Fixed in code | A malformed coin in a Cosmos `tx_search` transfer is skipped, not propagated. |
+| L6 | Low | ✅ Fixed in code | `decode_router_transfer_out` re-asserts `to == safe` client-side. |
+| L14 | Low | ✅ Fixed in code | `cargo deny` ⊉ `cargo audit` claim corrected (verified on deny 0.19.4: `lru` absent from deny's feature-resolved graph); `cargo audit` is the authoritative gate; added valid `unmaintained = "all"` (report's `unsound` key was removed in deny 0.18). |
+| I1 | Info | ❌ Accepted | **P4.4-18** added — XRP `transfers_to` single-page (fail-closed liveness, mirrors P3.3-15). |
+| I6 | Info | ✅ Fixed in code | `erc20` confirmations `saturating_add(1)`. |
+| I9 | Info | ✅ Fixed in code | `parse_broadcast` strictly decodes `result.code` (no fail-open default-0). |
+| I12 | Info | ✅ Fixed in code | ETH redemption-attestation default confirmations 6→12. |
+| M3 | Med | ❌ Accepted | Account redeem binaries' in-process lock is NOT a cross-invocation double-pay defense (`build_leg` reads nonce/sequence fresh). Acceptance text on P3.2-13 / P3.3-13 / P4.4-11 amended; mainnet REQUIRES a persistent dispatch-dedup guard keyed on the real `dispatch_id` (DL-P3-7 per-family gate). |
+| M2 | Med | ⏳ Deferred (mainnet gate) | **BTC daemon PSBT handler does not veto outputs.** Add `expected_destination_spk` / `expected_amount_sats` / `expected_memo` to `PsbtInputSignRequest` + a `PSBT_OUTPUTS_MISMATCH` output-set check before any HSM call; strong form pins the live Asgard vault SPK. Capped Medium: the live-vault destination binding is absent in ALL four signing handlers (consistency gap, not BTC-only default loss), and BTC is mainnet-gated (DL-P3-7). I3 (witness_utxo `script_pubkey` bind) is the input-side complement — fold in together. |
+| M4 / L7 | Med | ⏳ Deferred (mainnet gate) | **UTXO refund/mint cross-check lacks live-Asgard sender binding** (P3.3-9 not back-ported to UTXO). Needs a new `tx_input_addresses` RPC (Esplora vin prevout) + an `expected_sender` param on `find_arrival`. Over-credit is BOUNDED (genuine BTC in our own multisig, `tolerance` default 0) — not theft, requires a compromised THORChain run-set + BTC mainnet. Mirrors P3.3-9's accepted rationale; re-mocks ~10 UTXO policy tests — land with L8. |
+| L8 / L12 | Low | ⏳ Deferred | **UTXO + EVM refund/mint policies omit the THORChain halt/trading-paused gate** (Cosmos/XRP have it). Defense-in-depth: the attestation remains TRUE during a halt (an independent confirmed UTXO is still required); the halt flag is an operator-incident signal, not attacker-controlled. Adds a `vault_for_chain` call to `verify()` → re-mocks ~12 UTXO/EVM policy tests; land with M4. |
+| L5 | Low | ⏳ Deferred | **EVM native-delivery cross-check never binds the delivered asset.** Latent — `ThorEvmPolicy` / `find_router_transfer_out` have NO production caller; becomes Medium when a V7 EVM attest binary wires them. Decode `data[0..32]` asset + add `thor_native_asset` gate then. |
+| L13 | Low | ⏳ Deferred | **`xindex-finalize-redeem` doesn't observe `RedemptionStuckCancelled`** → orphaned tracker row re-fires a false SD-B alert. Observation-only (cancel settles correctly on-chain). Needs an ABI re-sync (`just sync-abi`, a cross-repo `forge build`) to expose the event, then subscribe + add a `mark_resolved` arm. |
+| L10 | Low | ⏳ Deferred | **Replay check→sign→record TOCTOU** returns 400/500 to the race-loser instead of the idempotent cached sig. PK already guarantees exactly one row + deterministic ECDSA → no double-sign; only a transient false-negative a retry resolves. Add `ReplayError::Duplicate` + idempotent recovery in the 6 handlers. |
+| L1 | Low | ⏳ Deferred | **Legacy P2SH sighash branch is pre-BIP-143** (wrong for BCH FORKID / ZEC BLAKE2b). Unreachable today (executor hardcodes Witness spends; daemon accepts only P2WSH; BTC-only mainnet). Add a fail-loud `SighashFlavor` discriminant; implement BCH/ZEC algos with U10. |
+| L3 | Low | ⏳ Deferred | **OP_RETURN capped at 80 bytes** ignores BCH's 220. Unreachable today (BTC-only, ~74-byte memo). Thread `op_return_max` per chain with U10. |
+| I3 | Info | ⏳ Deferred | PSBT handler doesn't bind `witness_utxo.script_pubkey` to the descriptor. Not fund-loss (BIP-143 commits the value). Fold into M2. |
+| I5 | Info | ⏳ Deferred | ERC20/Router decoders trust the node-side `address` filter, never re-assert `log.address == token` client-side. Info (node-trust); thread `expected_token` through both decoders. |
+| **Refuted (4)** | — | — | Amino memo HTML-escape (the contract-built memo provably can't contain `<>&`); BTC PSBT low-S (k256 `verify_ecdsa` rejects high-S, fails closed before record — I10 is the same); UTXO `min_confirmations==0` lower bound (operator-config-only, no production binary sets 0). |
+
+Full report: `~/.claude/projects/-Users-imac-Movies-Xindex/audit-rust-report.md`.
+
 ## When this file gets updated
 
 - New audit pass (internal or external) → add a section
