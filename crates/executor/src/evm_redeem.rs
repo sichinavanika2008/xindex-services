@@ -152,8 +152,12 @@ pub trait EvmCosigner: Send + Sync {
 /// Per-Safe in-process lock table. The Safe's `nonce()` is monotonic;
 /// two concurrent legs that both read nonce N and build a tx will
 /// collide (only one can succeed; the other reverts with `Safe::
-/// InvalidNonce`). This table serialises `safe_nonce → build → submit`
-/// per `(chain, safe)`.
+/// InvalidNonce`). This table serialises `safe_nonce → build` per
+/// `(chain, safe)`; the guard drops when `build_leg` returns, so the
+/// SUBMIT happens OUTSIDE the lock (it is the binary's job). Cross-leg
+/// double-spend safety therefore rests on the signer-daemon replay store
+/// keyed `(chain, safe_address, nonce)` plus on-chain nonce monotonicity,
+/// not on this in-process lock.
 ///
 /// Plan §V7 specifies a SQLite advisory lock; in-process Mutex
 /// suffices for the single-process executor design (DL-P3.2-6: separate

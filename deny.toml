@@ -7,6 +7,14 @@ all-features = false
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
+# Surface unmaintained advisories across the WHOLE graph (incl. transitive),
+# not just workspace-direct deps (audit 2026-06-01 L14). NOTE: cargo-deny 0.18
+# removed the `vulnerability`/`unsound`/`notice` severity keys — every
+# non-ignored advisory on deny's *feature-resolved* graph is already an error.
+# deny is NOT a superset of `cargo audit`: a crate reachable only via a
+# non-default feature (e.g. `lru`/`rsa`) is absent here but present in
+# `cargo audit`'s full Cargo.lock scan, which is the authoritative gate.
+unmaintained = "all"
 ignore = [
     # `paste` is no longer maintained but is pulled in transitively via alloy
     # for compile-time macro expansion only. No runtime exposure; revisit when
