@@ -52,7 +52,7 @@ use xindex_chain_evm::{build_safe_exec_tx_request, EvmChainClient, EvmChainError
 use xindex_safe_evm::{
     digest::{safe_tx_hash, SafeTransaction},
     exec::build_exec_transaction_calldata,
-    sigs::{aggregate_signatures, AggregateError, EcdsaSig, SignedBy},
+    sigs::{aggregate_signatures, recover_signer, AggregateError, EcdsaSig, SignedBy},
     SafeOperation,
 };
 use xindex_shared::chain_registry::ChainId;
@@ -392,7 +392,24 @@ impl<E: EvmChainClient> EvmRedeemExecutor<E> {
                 )
                 .await
             {
-                Ok(sig) => parts.push(SignedBy { signer, sig }),
+                // Verify-as-collected (audit M1): recover each partial
+                // and confirm it signs to the declared owner BEFORE it
+                // counts toward threshold. A Byzantine daemon (1 of 5,
+                // within the BFT tolerance) that returns a well-formed
+                // sig recovering to garbage is skipped, and an honest
+                // cosigner further down config order is tried instead —
+                // it can no longer DoS a leg the honest majority could
+                // complete. The bulk aggregate stays as belt-and-braces.
+                Ok(sig) => match recover_signer(digest, &sig) {
+                    Ok(rec) if rec == signer => parts.push(SignedBy { signer, sig }),
+                    Ok(rec) => {
+                        errors.push(EvmRedeemError::Aggregate(AggregateError::SignerMismatch {
+                            declared: signer,
+                            recovered: rec,
+                        }))
+                    }
+                    Err(e) => errors.push(EvmRedeemError::Aggregate(e)),
+                },
                 Err(e) => errors.push(e),
             }
         }
@@ -777,19 +794,20 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn build_leg_rejects_signer_not_in_owner_set() {
-        let valid = Address::new([0x01; 20]);
+        // `valid` is in the owner set and returns a REAL recovering sig, so
+        // verify-as-collected (audit M1) counts it. `bogus` is NOT in the
+        // owner set → skipped before signing. One valid partial, threshold
+        // 2 → InsufficientCosigners. (Pre-M1 the first cosigner could pass
+        // an unverified garbage sig; that no longer counts.)
+        let (valid, _) = k1_sign(B256::ZERO, 0x01);
         let bogus = Address::new([0xff; 20]);
         let cfg = cfg_with_owners(vec![valid, Address::new([0x02; 20])]);
         let evm = Arc::new(StubEvm::new(cfg.chain, 0));
         let cosigners: Vec<Box<dyn EvmCosigner>> = vec![
-            Box::new(StubCosigner::ok_with_sig(
-                valid,
-                EcdsaSig {
-                    r: B256::ZERO,
-                    s: B256::ZERO,
-                    v: 27,
-                },
-            )),
+            Box::new(K1Cosigner {
+                key_byte: 0x01,
+                signer: valid,
+            }),
             Box::new(StubCosigner::ok_with_sig(
                 bogus,
                 EcdsaSig {

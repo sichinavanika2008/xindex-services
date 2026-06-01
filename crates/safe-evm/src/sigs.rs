@@ -153,7 +153,12 @@ pub enum AggregateError {
 /// Recover the 20-byte signer address from `(digest, sig)`. Uses
 /// `alloy_primitives::PrimitiveSignature::recover_address_from_prehash`
 /// for the secp256k1 + keccak256 surface.
-fn recover_signer(digest: B256, sig: &EcdsaSig) -> Result<Address, AggregateError> {
+///
+/// `pub` so executors can verify each cosigner's partial AS IT IS
+/// COLLECTED (verify-as-collected), rather than only in the bulk
+/// [`aggregate_signatures`] — a Byzantine cosigner then cannot DoS a
+/// leg an honest majority could complete (audit M1).
+pub fn recover_signer(digest: B256, sig: &EcdsaSig) -> Result<Address, AggregateError> {
     use alloy_primitives::PrimitiveSignature;
     // EOA convention: v ∈ {27, 28} ⇒ y_parity ∈ {false, true}.
     let parity = match sig.v {

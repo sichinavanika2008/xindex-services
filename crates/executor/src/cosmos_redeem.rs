@@ -45,7 +45,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use xindex_chain_cosmos::{CosmosChainClient, CosmosChainError};
 use xindex_cosmos_tx::amino::{AminoError, CosmosSendSignDoc};
-use xindex_cosmos_tx::sigs::{aggregate_verified, MemberSig, SigError};
+use xindex_cosmos_tx::sigs::{aggregate_verified, verify, MemberSig, SigError};
 use xindex_cosmos_tx::tx::{build_tx_raw, CosmosTxParams};
 use xindex_cosmos_tx::CosmosMultisig;
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
@@ -295,7 +295,7 @@ impl<C: CosmosChainClient> CosmosRedeemExecutor<C> {
             sign_doc_hash: format!("0x{}", alloy_primitives::hex::encode(digest)),
         };
 
-        let parts = self.collect_signatures(&req).await?;
+        let parts = self.collect_signatures(&req, &digest).await?;
         let agg = aggregate_verified(&self.config.multisig, &digest, &parts)?;
 
         let params = CosmosTxParams {
@@ -327,6 +327,7 @@ impl<C: CosmosChainClient> CosmosRedeemExecutor<C> {
     async fn collect_signatures(
         &self,
         req: &CosmosTxSignRequest,
+        digest: &[u8; 32],
     ) -> Result<Vec<MemberSig>, CosmosRedeemError> {
         let need = self.config.multisig.threshold() as usize;
         let mut parts: Vec<MemberSig> = Vec::with_capacity(need);
@@ -341,10 +342,25 @@ impl<C: CosmosChainClient> CosmosRedeemExecutor<C> {
                 continue;
             };
             match cosigner.sign_cosmos_tx(req).await {
-                Ok(sig64) => parts.push(MemberSig {
-                    member_index,
-                    sig64,
-                }),
+                Ok(sig64) => {
+                    // Verify-as-collected (audit M1): a partial that does
+                    // not verify against this member's pubkey + the shared
+                    // amino digest is skipped (not counted toward
+                    // threshold), so a Byzantine cosigner cannot DoS a leg
+                    // the honest majority could complete. aggregate_verified
+                    // re-checks every partial as belt-and-braces.
+                    if let Err(e) = verify(&pubkey, digest, &sig64) {
+                        errors.push(CosmosRedeemError::Cosigner {
+                            pubkey: hex33(&pubkey),
+                            message: format!("returned an invalid signature: {e}"),
+                        });
+                        continue;
+                    }
+                    parts.push(MemberSig {
+                        member_index,
+                        sig64,
+                    });
+                }
                 Err(e) => errors.push(e),
             }
         }

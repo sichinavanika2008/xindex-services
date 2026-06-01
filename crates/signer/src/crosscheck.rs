@@ -1562,7 +1562,7 @@ pub mod evm {
         };
         let logs = client.eth_get_logs(filter).await?;
         for log in logs {
-            if let Some(decoded) = decode_router_transfer_out(&log, tip) {
+            if let Some(decoded) = decode_router_transfer_out(&log, safe, tip) {
                 if decoded.value_wei >= min_value_wei && decoded.confirmations >= min_confs {
                     return Ok(Some(decoded));
                 }
@@ -1620,12 +1620,22 @@ pub mod evm {
     /// event: `(address asset, uint256 amount, string memo)`. We only
     /// extract `amount` here — `asset` and `memo` are not needed for
     /// the cross-check (the policy validates amount + recipient).
-    fn decode_router_transfer_out(log: &EvmLogEntry, tip: u64) -> Option<RouterTransferOut> {
+    fn decode_router_transfer_out(
+        log: &EvmLogEntry,
+        expected_to: EthAddress,
+        tip: u64,
+    ) -> Option<RouterTransferOut> {
         // `topic[2]` = to (indexed).
         let to_topic = *log.topics.get(2)?;
         let mut to_bytes = [0u8; 20];
         to_bytes.copy_from_slice(&to_topic.as_slice()[12..]);
         let to = EthAddress::from(to_bytes);
+        // Client-side recipient re-assert (audit L6): the node-side topic
+        // filter already binds `to`, but a non-compliant RPC could ignore
+        // it; mirror decode_erc20_transfer's defensive check.
+        if to != expected_to {
+            return None;
+        }
         // `data` ABI: address (32) ‖ uint256 (32) ‖ offset (32) ‖
         //             length (32) ‖ memo-bytes (padded).
         // We only need the amount at offset 32..64.
