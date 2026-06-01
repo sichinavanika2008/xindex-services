@@ -647,6 +647,27 @@ where
             amount_sats = %task.amount,
             "executing reverse BTC→Asgard deposit"
         );
+
+        // Write-ahead reserve BEFORE the irreversible broadcast (audit
+        // H1): the idempotency row must exist before we broadcast, so a
+        // crash or a transient register error afterwards can no longer
+        // leave NO row and let a `--from-block` replay select a fresh
+        // UTXO and broadcast a SECOND valid Asgard deposit for one burn.
+        // Skip on a pre-existing reservation (replay); fail-safe-skip on
+        // error (never broadcast without a persisted reservation).
+        match registry.reserve(&task.dispatch_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(dispatch_id = %task.dispatch_id,
+                      "dispatch already reserved; skipping (reserve-before-broadcast)");
+                return;
+            }
+            Err(e) => {
+                error!(dispatch_id = %task.dispatch_id, error = %e,
+                       "reserve failed; skipping for safety (no broadcast)");
+                return;
+            }
+        }
         match executor.execute_capturing_tx(&task, &asgard) {
             Ok((txid, tx)) => {
                 info!(redemption_id = %task.redemption_id, %txid, "BTC→Asgard broadcast");

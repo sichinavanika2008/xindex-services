@@ -49,6 +49,13 @@ use tokio::sync::Mutex;
 /// `'failed'`); the SQL CHECK constraint pins the allowed values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastStatus {
+    /// Write-ahead reservation claimed BEFORE the irreversible broadcast
+    /// (audit H1). Excluded from `list_pending` (the watcher never
+    /// re-broadcasts a placeholder); `register` promotes it to `Pending`
+    /// once the real tx is broadcast. A row stuck in `Reserved` (crash
+    /// between reserve and broadcast) is surfaced to the operator, never
+    /// silently re-broadcast.
+    Reserved,
     /// Transaction broadcast; awaiting confirmations.
     Pending,
     /// Transaction confirmed at least `MIN_CONFIRMATIONS` deep.
@@ -102,6 +109,19 @@ pub trait BroadcastRegistry: Send + Sync {
         entry: PendingBroadcast,
     ) -> impl std::future::Future<Output = Result<(), RegistryError>> + Send;
 
+    /// Write-ahead reservation keyed by `intent_id`, claimed BEFORE the
+    /// irreversible broadcast (audit H1). Returns `true` if this call
+    /// created the reservation, `false` if one already exists (a replay
+    /// or concurrent attempt) — the caller MUST skip the broadcast on
+    /// `false`. Closes the H-R1 double-pay ordering: a crash or transient
+    /// `register` error between broadcast and record can no longer leave
+    /// NO row, so a `--from-block` replay can't pick a fresh UTXO and
+    /// broadcast a second valid Asgard deposit for one burn.
+    fn reserve(
+        &self,
+        intent_id: &B256,
+    ) -> impl std::future::Future<Output = Result<bool, RegistryError>> + Send;
+
     /// All currently-pending broadcasts the watcher should poll. Ordered
     /// by `broadcast_at_unix_secs` ASC so older entries get attention
     /// first.
@@ -142,6 +162,22 @@ pub trait BroadcastRegistry: Send + Sync {
     ) -> impl std::future::Future<Output = Result<bool, RegistryError>> + Send;
 }
 
+/// Placeholder row for a write-ahead [`BroadcastRegistry::reserve`]
+/// (audit H1). Carries no real broadcast data — `register` overwrites it
+/// once the tx is sent. Status is `Reserved`, so `list_pending` never
+/// surfaces it for re-broadcast.
+fn reserved_placeholder(intent_id: B256) -> PendingBroadcast {
+    PendingBroadcast {
+        intent_id,
+        txid: Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0u8; 32])),
+        tx_bytes: Vec::new(),
+        recipient_addr: String::new(),
+        amount_sats: 0,
+        broadcast_at_unix_secs: 0,
+        last_attempt_unix_secs: 0,
+    }
+}
+
 /// In-memory store. Loses state on restart; for tests + dev only.
 #[derive(Debug, Default)]
 pub struct InMemoryBroadcastRegistry {
@@ -168,6 +204,18 @@ impl BroadcastRegistry for InMemoryBroadcastRegistry {
             .entries
             .insert(entry.intent_id, (entry, BroadcastStatus::Pending));
         Ok(())
+    }
+
+    async fn reserve(&self, intent_id: &B256) -> Result<bool, RegistryError> {
+        let mut g = self.inner.lock().await;
+        if g.entries.contains_key(intent_id) {
+            return Ok(false);
+        }
+        g.entries.insert(
+            *intent_id,
+            (reserved_placeholder(*intent_id), BroadcastStatus::Reserved),
+        );
+        Ok(true)
     }
 
     async fn list_pending(&self) -> Result<Vec<PendingBroadcast>, RegistryError> {
@@ -278,6 +326,9 @@ impl BroadcastRegistry for SqliteBroadcastRegistry {
             ON CONFLICT(intent_id) DO UPDATE SET
                 txid = excluded.txid,
                 tx_bytes = excluded.tx_bytes,
+                recipient_addr = excluded.recipient_addr,
+                amount_sats = excluded.amount_sats,
+                broadcast_at_unix_secs = excluded.broadcast_at_unix_secs,
                 last_attempt_unix_secs = excluded.last_attempt_unix_secs,
                 status = 'pending'
             ",
@@ -292,6 +343,28 @@ impl BroadcastRegistry for SqliteBroadcastRegistry {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn reserve(&self, intent_id: &B256) -> Result<bool, RegistryError> {
+        // Insert a 'reserved' placeholder BEFORE the irreversible
+        // broadcast (audit H1). ON CONFLICT DO NOTHING makes this an
+        // atomic claim — rows_affected() == 0 means a row already exists
+        // (replay / concurrent attempt) and the caller must NOT broadcast.
+        let zero_txid = [0u8; 32];
+        let res = sqlx::query(
+            r"
+            INSERT INTO broadcasts
+                (intent_id, txid, tx_bytes, recipient_addr, amount_sats,
+                 broadcast_at_unix_secs, last_attempt_unix_secs, status)
+            VALUES (?, ?, X'', '', 0, 0, 0, 'reserved')
+            ON CONFLICT(intent_id) DO NOTHING
+            ",
+        )
+        .bind(intent_id.as_slice())
+        .bind(&zero_txid[..])
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn list_pending(&self) -> Result<Vec<PendingBroadcast>, RegistryError> {
@@ -538,6 +611,51 @@ mod tests {
         assert!(!r.has_record(&id_absent).await.expect("has"));
         r.mark_confirmed(&id_present).await.expect("confirm");
         assert!(r.has_record(&id_present).await.expect("post-confirm"));
+    }
+
+    /// Audit H1: reserve-before-broadcast. A reservation dedups a replay
+    /// (the second reserve is a no-op) and is excluded from the watcher's
+    /// pending list until `register` promotes it with the real tx.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn in_memory_reserve_dedups_then_register_promotes() {
+        let r = InMemoryBroadcastRegistry::new();
+        let id = b256!("00000000000000000000000000000000000000000000000000000000000000c1");
+        assert!(r.reserve(&id).await.expect("reserve"));
+        assert!(!r.reserve(&id).await.expect("second reserve is a no-op"));
+        assert!(r.has_record(&id).await.expect("has"));
+        assert_eq!(
+            r.pending_count().await.expect("count"),
+            0,
+            "a reserved row is not pending"
+        );
+        r.register(entry(id, 100)).await.expect("register");
+        assert_eq!(r.pending_count().await.expect("count"), 1);
+        let pending = r.list_pending().await.expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tx_bytes, vec![0x01, 0x02, 0x03, 0x04]);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_reserve_dedups_then_register_promotes() {
+        let r = SqliteBroadcastRegistry::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        let id = b256!("00000000000000000000000000000000000000000000000000000000000000c2");
+        assert!(r.reserve(&id).await.expect("reserve"));
+        assert!(!r.reserve(&id).await.expect("second reserve is a no-op"));
+        assert!(r.has_record(&id).await.expect("has"));
+        assert_eq!(r.pending_count().await.expect("count"), 0);
+        // register promotes the reserved placeholder and fills the real
+        // recipient/amount (the upsert covers all columns, not just txid).
+        r.register(entry(id, 100)).await.expect("register");
+        assert_eq!(r.pending_count().await.expect("count"), 1);
+        let pending = r.list_pending().await.expect("list");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].txid, entry(id, 100).txid);
+        assert_eq!(pending[0].recipient_addr, "bc1qfaketestaddr");
+        assert_eq!(pending[0].amount_sats, 100_000);
     }
 
     #[tokio::test]
