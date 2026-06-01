@@ -77,8 +77,10 @@ pub enum CheckOutcome {
 }
 
 /// Distinguishes delivery vs refund on the burn side. The
-/// `signed_redemptions` table holds at most one row per redemption id;
-/// the daemon-level mutex (DL-M5-3) is enforced by the PK + this `kind`.
+/// `signed_redemptions` table holds at most one row per
+/// `(redemption_id, leg_index)` (audit H2); the per-leg
+/// delivery-XOR-refund mutex (DL-M5-3) is enforced by the composite PK +
+/// this `kind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedemptionKind {
     /// Burn → USDT delivery attestation.
@@ -145,9 +147,15 @@ pub trait ReplayStore: Send + Sync {
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 
+    /// Keyed by `(redemption_id, leg_index)` (audit H2) — mirrors the
+    /// on-chain per-leg mutex (`IntentQueue::_legForUpdate`). Each leg of
+    /// a redemption is an independent delivery-XOR-refund slot; keying on
+    /// `redemption_id` alone would falsely flag leg ≥ 1 as a Conflict /
+    /// MutexViolation against leg 0.
     fn check_redemption(
         &self,
         redemption_id: B256,
+        leg_index: u32,
         kind: RedemptionKind,
         payload_hash: [u8; 32],
     ) -> impl std::future::Future<Output = Result<RedemptionCheckOutcome, ReplayError>> + Send;
@@ -155,6 +163,7 @@ pub trait ReplayStore: Send + Sync {
     fn record_redemption(
         &self,
         redemption_id: B256,
+        leg_index: u32,
         kind: RedemptionKind,
         payload_hash: [u8; 32],
         signature: Vec<u8>,
@@ -259,7 +268,7 @@ pub trait ReplayStore: Send + Sync {
 #[derive(Debug, Default)]
 struct InMemoryInner {
     attestations: HashMap<(B256, U256), SignedRecord>,
-    redemptions: HashMap<B256, (RedemptionKind, SignedRecord)>,
+    redemptions: HashMap<(B256, u32), (RedemptionKind, SignedRecord)>,
     psbt_inputs: HashMap<([u8; 32], u32), SignedRecord>,
     /// V5: Safe-tx replay key — `(chain_id_str, safe_address_bytes, nonce)`.
     safe_txs: HashMap<(&'static str, [u8; 20], u64), SignedRecord>,
@@ -330,11 +339,12 @@ impl ReplayStore for InMemoryReplayStore {
     async fn check_redemption(
         &self,
         redemption_id: B256,
+        leg_index: u32,
         kind: RedemptionKind,
         payload_hash: [u8; 32],
     ) -> Result<RedemptionCheckOutcome, ReplayError> {
         let g = self.inner.lock().await;
-        Ok(match g.redemptions.get(&redemption_id) {
+        Ok(match g.redemptions.get(&(redemption_id, leg_index)) {
             None => RedemptionCheckOutcome::FirstTime,
             Some((prev_kind, rec)) if *prev_kind != kind => {
                 RedemptionCheckOutcome::MutexViolation {
@@ -355,13 +365,16 @@ impl ReplayStore for InMemoryReplayStore {
     async fn record_redemption(
         &self,
         redemption_id: B256,
+        leg_index: u32,
         kind: RedemptionKind,
         payload_hash: [u8; 32],
         signature: Vec<u8>,
         now_unix: i64,
     ) -> Result<(), ReplayError> {
         let mut g = self.inner.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(e) = g.redemptions.entry(redemption_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) =
+            g.redemptions.entry((redemption_id, leg_index))
+        {
             e.insert((
                 kind,
                 SignedRecord {
@@ -657,14 +670,16 @@ impl ReplayStore for SqliteReplayStore {
     async fn check_redemption(
         &self,
         redemption_id: B256,
+        leg_index: u32,
         kind: RedemptionKind,
         payload_hash: [u8; 32],
     ) -> Result<RedemptionCheckOutcome, ReplayError> {
         let row: Option<(String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
             "SELECT kind, payload_hash, signature, signed_at_unix
-             FROM signed_redemptions WHERE redemption_id = ?",
+             FROM signed_redemptions WHERE redemption_id = ? AND leg_index = ?",
         )
         .bind(redemption_id.as_slice())
+        .bind(i64::from(leg_index))
         .fetch_optional(&self.pool)
         .await?;
         Ok(match row {
@@ -708,6 +723,7 @@ impl ReplayStore for SqliteReplayStore {
     async fn record_redemption(
         &self,
         redemption_id: B256,
+        leg_index: u32,
         kind: RedemptionKind,
         payload_hash: [u8; 32],
         signature: Vec<u8>,
@@ -715,10 +731,11 @@ impl ReplayStore for SqliteReplayStore {
     ) -> Result<(), ReplayError> {
         sqlx::query(
             "INSERT INTO signed_redemptions
-                (redemption_id, kind, payload_hash, signature, signed_at_unix)
-             VALUES (?, ?, ?, ?, ?)",
+                (redemption_id, leg_index, kind, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(redemption_id.as_slice())
+        .bind(i64::from(leg_index))
         .bind(kind.as_str())
         .bind(payload_hash.as_slice())
         .bind(&signature)
@@ -1091,10 +1108,10 @@ mod tests {
     async fn run_redemption_lifecycle<S: ReplayStore>(store: &S) {
         #[expect(clippy::expect_used, reason = "test code")]
         {
-            // First time delivery.
+            // First time delivery on leg 0.
             assert_eq!(
                 store
-                    .check_redemption(id1(), RedemptionKind::Delivery, hash_a())
+                    .check_redemption(id1(), 0, RedemptionKind::Delivery, hash_a())
                     .await
                     .expect("check"),
                 RedemptionCheckOutcome::FirstTime
@@ -1102,6 +1119,7 @@ mod tests {
             store
                 .record_redemption(
                     id1(),
+                    0,
                     RedemptionKind::Delivery,
                     hash_a(),
                     vec![7, 7, 7],
@@ -1109,23 +1127,23 @@ mod tests {
                 )
                 .await
                 .expect("record");
-            // Same id + same kind + same payload → idempotent.
+            // Same id + leg + kind + payload → idempotent.
             let out = store
-                .check_redemption(id1(), RedemptionKind::Delivery, hash_a())
+                .check_redemption(id1(), 0, RedemptionKind::Delivery, hash_a())
                 .await
                 .expect("check");
             assert!(
                 matches!(out, RedemptionCheckOutcome::Idempotent(rec) if rec.signature == vec![7,7,7])
             );
-            // Same id + same kind + DIFFERENT payload → regular conflict.
+            // Same id + leg + kind + DIFFERENT payload → regular conflict.
             let out = store
-                .check_redemption(id1(), RedemptionKind::Delivery, hash_b())
+                .check_redemption(id1(), 0, RedemptionKind::Delivery, hash_b())
                 .await
                 .expect("check");
             assert!(matches!(out, RedemptionCheckOutcome::Conflict { .. }));
-            // Same id + DIFFERENT kind (refund after delivery) → mutex violation.
+            // Same id + leg + DIFFERENT kind (refund after delivery) → mutex.
             let out = store
-                .check_redemption(id1(), RedemptionKind::Refund, hash_a())
+                .check_redemption(id1(), 0, RedemptionKind::Refund, hash_a())
                 .await
                 .expect("check");
             assert!(matches!(
@@ -1135,21 +1153,71 @@ mod tests {
                     ..
                 }
             ));
+
+            // Audit H2: a DIFFERENT leg of the SAME redemption is an
+            // independent slot. Leg 1 MUST be FirstTime for both a
+            // delivery (different payload than leg 0) and a refund — NOT
+            // falsely flagged as a Conflict / MutexViolation against leg
+            // 0. (Pre-H2, keyed on redemption_id alone, both were 409.)
+            assert_eq!(
+                store
+                    .check_redemption(id1(), 1, RedemptionKind::Delivery, hash_b())
+                    .await
+                    .expect("leg1 delivery"),
+                RedemptionCheckOutcome::FirstTime
+            );
+            assert_eq!(
+                store
+                    .check_redemption(id1(), 1, RedemptionKind::Refund, hash_a())
+                    .await
+                    .expect("leg1 refund"),
+                RedemptionCheckOutcome::FirstTime
+            );
+            store
+                .record_redemption(
+                    id1(),
+                    1,
+                    RedemptionKind::Delivery,
+                    hash_b(),
+                    vec![8, 8, 8],
+                    150,
+                )
+                .await
+                .expect("record leg1");
+            // Within leg 1, the per-leg mutex still applies.
+            let out = store
+                .check_redemption(id1(), 1, RedemptionKind::Refund, hash_a())
+                .await
+                .expect("check");
+            assert!(matches!(
+                out,
+                RedemptionCheckOutcome::MutexViolation {
+                    previous_kind: RedemptionKind::Delivery,
+                    ..
+                }
+            ));
+            // Leg 0 is untouched by leg 1's record (still idempotent).
+            let out = store
+                .check_redemption(id1(), 0, RedemptionKind::Delivery, hash_a())
+                .await
+                .expect("check");
+            assert!(matches!(out, RedemptionCheckOutcome::Idempotent(_)));
+
             // Different redemption → independent FirstTime.
             assert_eq!(
                 store
-                    .check_redemption(id2(), RedemptionKind::Refund, hash_a())
+                    .check_redemption(id2(), 0, RedemptionKind::Refund, hash_a())
                     .await
                     .expect("check"),
                 RedemptionCheckOutcome::FirstTime
             );
             // Record refund on id2; check mutex from the other direction.
             store
-                .record_redemption(id2(), RedemptionKind::Refund, hash_a(), vec![1], 200)
+                .record_redemption(id2(), 0, RedemptionKind::Refund, hash_a(), vec![1], 200)
                 .await
                 .expect("record");
             let out = store
-                .check_redemption(id2(), RedemptionKind::Delivery, hash_a())
+                .check_redemption(id2(), 0, RedemptionKind::Delivery, hash_a())
                 .await
                 .expect("check");
             assert!(matches!(
@@ -1159,9 +1227,9 @@ mod tests {
                     ..
                 }
             ));
-            // Second record on same id errors (race-safety net).
+            // Second record on same (id, leg) errors (race-safety net).
             assert!(store
-                .record_redemption(id1(), RedemptionKind::Delivery, hash_a(), vec![], 300)
+                .record_redemption(id1(), 0, RedemptionKind::Delivery, hash_a(), vec![], 300)
                 .await
                 .is_err());
         }

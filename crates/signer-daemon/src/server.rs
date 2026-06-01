@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, PrimitiveSignature, B256, U256};
 use alloy_sol_types::Eip712Domain;
 use axum::{
     extract::State,
@@ -286,6 +286,53 @@ fn hsm_unavailable(e: &HsmError) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+fn internal(code: &str, message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody {
+            code: code.to_string(),
+            message: message.into(),
+        }),
+    )
+}
+
+/// Recover-verify the HSM signature against the configured signer key
+/// (audit M6 — extends the 1.5/H11 evm-safe backstop to all three
+/// EIP-712 paths: attestation, redemption-delivery, refund). Catches an
+/// HSM key-mapping bug, a wrong-key signature, or a corrupted signing
+/// response BEFORE it is recorded or returned as a valid attestation.
+/// Read-only on the signature bytes (no reconstruction), so there is no
+/// signature-format risk; low-S normalization (1.13) stays deferred.
+fn recover_verify_signer(
+    sig: &[u8; 65],
+    digest: B256,
+    expected: Address,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let recovered = PrimitiveSignature::try_from(&sig[..])
+        .map_err(|e| {
+            internal(
+                error_codes::SIGNER_RECOVER_MISMATCH,
+                format!("HSM signature did not parse as a 65-byte ECDSA signature: {e}"),
+            )
+        })?
+        .recover_address_from_prehash(&digest)
+        .map_err(|e| {
+            internal(
+                error_codes::SIGNER_RECOVER_MISMATCH,
+                format!("HSM signature did not recover to an address: {e}"),
+            )
+        })?;
+    if recovered != expected {
+        return Err(internal(
+            error_codes::SIGNER_RECOVER_MISMATCH,
+            format!(
+                "HSM signature recovered to {recovered:#x}, expected configured signer {expected:#x}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_b256(hex_str: &str, field: &str) -> Result<B256, (StatusCode, Json<ErrorBody>)> {
     let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = alloy_primitives::hex::decode(stripped)
@@ -331,11 +378,12 @@ fn hash_attestation_payload(intent_id: B256, slot_index: U256, attested_amount: 
     alloy_primitives::keccak256(buf).into()
 }
 
-/// Phase 3.0: per-leg replay-key hash. The replay DB's mutex per
-/// `(redemption_id, kind)` plus the payload hash now covers per-leg
-/// distinctness — two attestations for different legs of the same
-/// redemption hash differently (different `leg_index` + `asset_id`)
-/// and so are not falsely flagged as a conflict.
+/// Per-leg replay-key payload hash. The replay DB keys redemptions on
+/// `(redemption_id, leg_index)` (audit H2) and applies a delivery-XOR-
+/// refund mutex WITHIN each leg. This hash binds `leg_index` + `asset_id`
+/// + amount, so re-signing the SAME leg with a different amount is a
+/// Conflict, while different legs of one redemption are independent slots
+/// (matching the on-chain `IntentQueue::_legForUpdate` per-leg mutex).
 fn hash_leg_payload(
     redemption_id: B256,
     leg_index: U256,
@@ -400,6 +448,7 @@ where
         .sign_digest(state.config.eth_address, digest)
         .await
         .map_err(|e| hsm_unavailable(&e))?;
+    recover_verify_signer(&sig, digest, state.config.eth_address)?;
     state
         .replay
         .record_attestation(
@@ -430,10 +479,13 @@ where
     // delivery attestation for the same leg with a different amount is
     // a Conflict, never re-signed.
     let payload_hash = hash_leg_payload(redemption_id, leg_index, asset_id, delivered_amount);
+    let leg = u32::try_from(leg_index)
+        .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
 
     handle_redemption_common(
         &state,
         redemption_id,
+        leg,
         RedemptionKind::Delivery,
         payload_hash,
         || {
@@ -457,10 +509,13 @@ where
     let asset_id = parse_b256(&req.asset_id, "asset_id")?;
     let refunded_amount = parse_u256(&req.refunded_amount, "refunded_amount")?;
     let payload_hash = hash_leg_payload(redemption_id, leg_index, asset_id, refunded_amount);
+    let leg = u32::try_from(leg_index)
+        .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
 
     handle_redemption_common(
         &state,
         redemption_id,
+        leg,
         RedemptionKind::Refund,
         payload_hash,
         || {
@@ -476,6 +531,7 @@ where
 async fn handle_redemption_common<S, H, F>(
     state: &DaemonState<S, H>,
     redemption_id: B256,
+    leg_index: u32,
     kind: RedemptionKind,
     payload_hash: [u8; 32],
     compute_digest: F,
@@ -487,7 +543,7 @@ where
 {
     let outcome = state
         .replay
-        .check_redemption(redemption_id, kind, payload_hash)
+        .check_redemption(redemption_id, leg_index, kind, payload_hash)
         .await
         .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
     match outcome {
@@ -520,10 +576,12 @@ where
         .sign_digest(state.config.eth_address, digest)
         .await
         .map_err(|e| hsm_unavailable(&e))?;
+    recover_verify_signer(&sig, digest, state.config.eth_address)?;
     state
         .replay
         .record_redemption(
             redemption_id,
+            leg_index,
             kind,
             payload_hash,
             sig.to_vec(),
@@ -551,27 +609,35 @@ mod tests {
     use std::sync::Mutex;
     use tower::ServiceExt;
 
-    /// Captures every digest the daemon asks to be signed so tests can
-    /// assert the daemon hands the HSM the correct EIP-712 hash — the
-    /// single most important correctness property.
+    /// Fixed test key whose address is the configured `eth_address`, so
+    /// the daemon's recover-verify backstop (audit M6) accepts the HSM
+    /// mock's signatures.
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn test_key() -> alloy::signers::local::PrivateKeySigner {
+        "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+            .parse()
+            .expect("valid test key")
+    }
+
+    /// Real-signing HSM mock: signs the digest with [`test_key`] so the
+    /// recover-verify accepts it, and captures every `(address, digest)`
+    /// so tests can assert the daemon hands the HSM the correct EIP-712
+    /// hash — the single most important correctness property.
     #[derive(Debug, Default)]
     struct CapturingSigner {
         seen: Mutex<Vec<(Address, B256)>>,
-        // Deterministic stub: returns the digest bytes followed by
-        // a fixed v byte (27), so the test signature differs per
-        // digest. NOT a real ECDSA signature — never used on-chain.
     }
 
     #[async_trait::async_trait]
     impl HsmDigestSigner for CapturingSigner {
         async fn sign_digest(&self, address: Address, digest: B256) -> Result<[u8; 65], HsmError> {
+            use alloy::signers::SignerSync;
             #[expect(clippy::unwrap_used, reason = "test code")]
             self.seen.lock().unwrap().push((address, digest));
-            let mut sig = [0u8; 65];
-            sig[..32].copy_from_slice(digest.as_slice());
-            sig[32..64].copy_from_slice(digest.as_slice());
-            sig[64] = 27;
-            Ok(sig)
+            let sig = test_key()
+                .sign_hash_sync(&digest)
+                .map_err(|e| HsmError::Decode(format!("test sign: {e}")))?;
+            Ok(sig.as_bytes())
         }
     }
 
@@ -579,7 +645,7 @@ mod tests {
         DaemonConfig {
             chain_id: 31337,
             verifying_contract: Address::repeat_byte(0xab),
-            eth_address: Address::repeat_byte(0xcd),
+            eth_address: test_key().address(),
         }
     }
 

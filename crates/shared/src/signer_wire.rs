@@ -38,12 +38,13 @@ pub struct AttestationSignRequest {
 
 /// `POST /api/v1/sign/eip712-redemption-delivery`
 ///
-/// Burn-leg delivery attestation. Mirrors
 /// Per-leg delivery attestation. Mirrors
 /// `AttestationOracle.ASYNC_LEG_DELIVERY_TYPEHASH`. The daemon's replay
-/// DB is keyed by `(redemption_id, leg_index, "delivery")` — re-signing
-/// a different `delivered_amount` under the same (redemption, leg) is a
-/// `Conflict` error, never reaches the HSM.
+/// DB is keyed by `(redemption_id, leg_index)` with a delivery-XOR-refund
+/// mutex per leg (audit H2) — re-signing a different `delivered_amount`
+/// under the same `(redemption_id, leg_index)` is a `Conflict`, and a
+/// refund after a delivery on the same leg is a `MutexViolation`; neither
+/// reaches the HSM.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RedemptionDeliverySignRequest {
     /// `bytes32` redemption id, hex.
