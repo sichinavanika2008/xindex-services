@@ -5520,6 +5520,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-chain-solana"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "xindex-shared",
+ "xindex-solana-tx",
+]
+
+[[package]]
 name = "xindex-chain-thor"
 version = "0.0.1"
 dependencies = [
