@@ -48,16 +48,18 @@ pub struct MultisigAccount {
 
 /// Squads `Proposal` lifecycle state. `None` means the account does not
 /// exist yet (the proposal has not been created).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposalState {
     /// The proposal account does not exist.
     None,
     /// `Draft`.
     Draft,
-    /// `Active`, with the current approval count (`< threshold`).
+    /// `Active`, carrying the members that have approved so far (the
+    /// executor picks an un-approved member for the next approval, which
+    /// is restart-safe — a member never double-approves).
     Active {
-        /// Distinct members that have approved so far.
-        approved: u32,
+        /// The distinct members that have approved.
+        approved: Vec<Pubkey>,
     },
     /// `Rejected`.
     Rejected,
@@ -74,13 +76,13 @@ pub enum ProposalState {
 impl ProposalState {
     /// `true` iff the proposal has reached threshold and can be executed.
     #[must_use]
-    pub fn is_approved(self) -> bool {
+    pub fn is_approved(&self) -> bool {
         matches!(self, Self::Approved)
     }
 
     /// `true` iff the vault transfer has already executed.
     #[must_use]
-    pub fn is_executed(self) -> bool {
+    pub fn is_executed(&self) -> bool {
         matches!(self, Self::Executed)
     }
 }
@@ -352,12 +354,24 @@ fn decode_proposal_state(data: &[u8]) -> Result<ProposalState, SolanaChainError>
     match variant {
         0 => Ok(ProposalState::Draft),
         1 => {
-            // approved Vec length follows the status enum (+1 variant byte
-            // +payload timestamp) and the bump (+1).
+            // The approved Vec follows the status enum (+1 variant byte
+            // +payload timestamp) and the bump (+1): a 4-byte LE length
+            // then that many 32-byte member pubkeys.
             let approved_off = PROP_STATUS_OFF + 1 + payload + 1;
-            Ok(ProposalState::Active {
-                approved: read_u32_le(data, approved_off)?,
-            })
+            let count = usize::try_from(read_u32_le(data, approved_off)?).unwrap_or(0);
+            let mut approved = Vec::with_capacity(count.min(64));
+            let mut off = approved_off + 4;
+            for _ in 0..count {
+                let slice = data.get(off..off + 32).ok_or_else(|| {
+                    SolanaChainError::Decode("approved pubkey out of range".into())
+                })?;
+                let arr: [u8; 32] = slice
+                    .try_into()
+                    .map_err(|_| SolanaChainError::Decode("approved slice".into()))?;
+                approved.push(Pubkey::new(arr));
+                off += 32;
+            }
+            Ok(ProposalState::Active { approved })
         }
         2 => Ok(ProposalState::Rejected),
         3 => Ok(ProposalState::Approved),
@@ -743,16 +757,23 @@ mod tests {
 
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
-    fn proposal_active_reports_approved_count() {
+    fn proposal_active_reports_approved_members() {
         // 8 disc + 32 multisig + 8 tx_index, then status Active(1) + ts(8),
-        // bump(1), approved Vec len = 2.
+        // bump(1), approved Vec len = 2 + two 32-byte pubkeys.
         let mut data = vec![0u8; 8 + 32 + 8];
         data.push(1); // Active variant
         data.extend_from_slice(&1_700_000_000i64.to_le_bytes()); // timestamp
         data.push(254); // bump
         data.extend_from_slice(&2u32.to_le_bytes()); // approved len
+        data.extend_from_slice(&[0xA1; 32]);
+        data.extend_from_slice(&[0xA2; 32]);
         let st = parse_proposal_state(&account_info_envelope(&data)).expect("active");
-        assert_eq!(st, ProposalState::Active { approved: 2 });
+        assert_eq!(
+            st,
+            ProposalState::Active {
+                approved: vec![Pubkey::new([0xA1; 32]), Pubkey::new([0xA2; 32])]
+            }
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub mod evm_redeem;
 pub mod rebroadcast;
 pub mod redeem;
 pub mod remote_cosigner;
+pub mod solana_redeem;
+pub mod solana_redeem_store;
 pub mod xrp_redeem;
 
 pub use broadcast_registry::{
@@ -31,4 +33,12 @@ pub use rebroadcast::{run_watcher, WatcherConfig, WatcherError};
 pub use redeem::{
     decode_redeem_event, ExecuteError, InProcessExecutor, MultisigCosigner, RedeemTask,
     RedeemTaskSource,
+};
+pub use solana_redeem::{
+    SolanaCosigner, SolanaLockTable, SolanaMemberSig, SolanaRedeemConfig, SolanaRedeemError,
+    SolanaRedeemExecutor, SolanaRedeemLegOutcome, SolanaRedeemTask,
+};
+pub use solana_redeem_store::{
+    CachedBroadcast, InMemorySolanaRedeemStore, RedeemProgress, SolanaRedeemStore,
+    SolanaStoreError, SqliteSolanaRedeemStore,
 };

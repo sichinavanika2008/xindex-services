@@ -462,6 +462,106 @@ pub struct XrpSignResponse {
     pub signature: String,
 }
 
+/// Which of the three Squads V4 on-chain transactions a
+/// [`SolanaTxSignRequest`] asks a member to sign. Unlike Cosmos / XRP
+/// (all members sign ONE shared body), each Squads tx is a DIFFERENT
+/// Solana message signed by ONE member; `tx_kind` selects the daemon's
+/// per-kind validation branch (Phase 4.5 S6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SolanaTxKind {
+    /// `vault_transaction_create` (+ `proposal_create`) — defines where
+    /// funds go; the daemon validates the inner System transfer.
+    Create,
+    /// `proposal_approve` — one member's approval vote.
+    Approve,
+    /// `vault_transaction_execute` — runs the approved transfer.
+    Execute,
+}
+
+/// `POST /api/v1/sign/solana-tx` (Phase 4.5)
+///
+/// Squads V4 ed25519 single-member partial signing — the first ed25519
+/// custody family. The wire carries the full serialized legacy message
+/// (`message_hex`) PLUS the semantic fields the daemon needs to
+/// **re-derive and re-validate** that message before signing: the daemon
+/// NEVER blind-signs `message_hex`. The per-kind validation (S6) is the
+/// security core — a compromised coordinator must not be able to collect
+/// `threshold` signatures over any transfer that does not pay the correct
+/// user from our vault.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SolanaTxSignRequest {
+    /// Solana `ChainId`. MUST satisfy
+    /// `chain_id.custody_family() == CustodyFamily::Solana`; the serde
+    /// validator rejects non-Solana ids with [`error_codes::NON_SOLANA_CHAIN`].
+    #[serde(deserialize_with = "deserialize_solana_chain_id")]
+    pub chain_id: ChainId,
+    /// Which Squads tx shape this is — selects the daemon validation branch.
+    pub tx_kind: SolanaTxKind,
+    /// The Squads multisig PDA (base58). Must equal the daemon's configured
+    /// custody multisig — mismatch → [`error_codes::WRONG_SOLANA_MULTISIG`].
+    pub multisig_pda: String,
+    /// The expected single ed25519 signer (base58). The daemon refuses if
+    /// it is not its configured member key
+    /// ([`error_codes::WRONG_SOLANA_MEMBER`]).
+    pub member_pubkey: String,
+    /// The Squads `transaction_index` (decimal `u64` string) — the replay
+    /// coordinate: the daemon refuses a DIFFERENT message at the same
+    /// `(chain, multisig, transaction_index, tx_kind, member)`.
+    pub transaction_index: String,
+    /// The recent blockhash bound into the message (base58).
+    pub recent_blockhash: String,
+    /// `Create` only: the vault index whose PDA the inner transfer spends
+    /// from (the daemon re-derives the vault PDA and checks the source).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_index: Option<u8>,
+    /// `Create` only: the inner System-transfer destination (the user's
+    /// own Solana address, base58).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_destination: Option<String>,
+    /// `Create` only: the inner transfer lamports (decimal `u64` string).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_amount_lamports: Option<String>,
+    /// `Create` only: the SPL-Memo string carried by the inner message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    /// The full serialized legacy message (`0x`-prefixed hex) the
+    /// coordinator claims. The daemon RE-BUILDS the message from the
+    /// semantic fields and refuses with [`error_codes::SOLANA_TX_MISMATCH`]
+    /// on divergence — it signs the bytes IT rebuilt.
+    pub message_hex: String,
+}
+
+/// Serde validator: refuse a [`SolanaTxSignRequest`] with a non-Solana
+/// `chain_id`. Defence-in-depth above the runtime `custody_family` check.
+fn deserialize_solana_chain_id<'de, D>(deserializer: D) -> Result<ChainId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let chain = ChainId::deserialize(deserializer)?;
+    if chain.custody_family() != CustodyFamily::Solana {
+        return Err(serde::de::Error::custom(format!(
+            "{}: chain '{chain}' is not a Solana custody family chain",
+            error_codes::NON_SOLANA_CHAIN
+        )));
+    }
+    Ok(chain)
+}
+
+/// Response for `solana-tx` signing.
+///
+/// `pubkey` is the 32-byte ed25519 member pubkey (base58); the coordinator
+/// pins it and checks it matches the cosigner it asked. `signature` is the
+/// 64-byte ed25519 signature (`0x`-prefixed hex) over the serialized
+/// message — the coordinator verifies it before assembling the transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SolanaSignResponse {
+    /// Base58 32-byte ed25519 member pubkey.
+    pub pubkey: String,
+    /// `0x`-prefixed 64-byte ed25519 signature.
+    pub signature: String,
+}
+
 /// `GET /api/v1/keys`
 ///
 /// Daemon identity — coordinator pins this and checks every response
@@ -572,6 +672,31 @@ pub mod error_codes {
     /// / `last_ledger_sequence` / `memo`) and the result did not match
     /// the caller-supplied `signing_blob`. HTTP 422.
     pub const XRP_TX_MISMATCH: &str = "xrp_tx_mismatch";
+    /// Phase 4.5: the request's `chain_id` is not a Solana custody-family
+    /// chain — the `solana-tx` endpoint only accepts Solana chains. HTTP 422.
+    pub const NON_SOLANA_CHAIN: &str = "non_solana_chain";
+    /// Phase 4.5: the request's `multisig_pda` did not match this daemon's
+    /// configured Squads multisig. HTTP 422.
+    pub const WRONG_SOLANA_MULTISIG: &str = "wrong_solana_multisig";
+    /// Phase 4.5: the request's `member_pubkey` is not this daemon's
+    /// configured ed25519 member key. HTTP 422.
+    pub const WRONG_SOLANA_MEMBER: &str = "wrong_solana_member";
+    /// Phase 4.5: the daemon rebuilt the Solana message from the request's
+    /// semantic fields and the result did not byte-match `message_hex`.
+    /// HTTP 422.
+    pub const SOLANA_TX_MISMATCH: &str = "solana_tx_mismatch";
+    /// Phase 4.5: the inner System transfer's source is not the daemon's
+    /// re-derived vault PDA — refusing to sign a spend from any other
+    /// account. HTTP 422.
+    pub const SOLANA_NOT_OUR_VAULT: &str = "solana_not_our_vault";
+    /// Phase 4.5: the inner transfer destination / amount is not the
+    /// permitted redemption value, or the destination is the vault /
+    /// a member / the program itself. HTTP 422.
+    pub const SOLANA_DEST_NOT_PERMITTED: &str = "solana_dest_not_permitted";
+    /// Phase 4.5: the message invokes a program outside the allowlist
+    /// (Squads / System / SPL-Memo), or carries an unexpected instruction.
+    /// HTTP 422.
+    pub const SOLANA_FOREIGN_INSTRUCTION: &str = "solana_foreign_instruction";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -887,6 +1012,66 @@ mod tests {
         };
         let s = serde_json::to_string(&r).expect("serialize");
         let back: XrpSignResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, r);
+    }
+
+    /// Phase 4.5: a `SolanaTxSignRequest` round-trips JSON for the Solana
+    /// chain (sol) including the `Create`-only inner fields.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn solana_tx_request_round_trip() {
+        let req = SolanaTxSignRequest {
+            chain_id: ChainId::Sol,
+            tx_kind: SolanaTxKind::Create,
+            multisig_pda: "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf".to_string(),
+            member_pubkey: "11111111111111111111111111111111".to_string(),
+            transaction_index: "7".to_string(),
+            recent_blockhash: "3aMY3wX4pNMJCXBCzmMUaBkNRCWNcPjkD56V67aWwDra".to_string(),
+            vault_index: Some(0),
+            inner_destination: Some("4xXE3kHs2bP".to_string()),
+            inner_amount_lamports: Some("2000000000".to_string()),
+            memo: Some("=:ETH.USDT:0xabc:1".to_string()),
+            message_hex: format!("0x{}", "ab".repeat(64)),
+        };
+        let s = serde_json::to_string(&req).expect("serialize");
+        let back: SolanaTxSignRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, req);
+        assert!(s.contains("\"chain_id\":\"sol\""));
+        assert!(s.contains("\"tx_kind\":\"create\""));
+    }
+
+    /// Phase 4.5: the serde validator rejects non-Solana `ChainId`s on the
+    /// `solana-tx` request — defence-in-depth above the daemon's runtime
+    /// `custody_family` check.
+    #[test]
+    fn solana_tx_request_rejects_non_solana_chains() {
+        for chain in [
+            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "gaia", "xrp",
+        ] {
+            let json = format!(
+                r#"{{"chain_id":"{chain}","tx_kind":"approve","multisig_pda":"M","member_pubkey":"K","transaction_index":"0","recent_blockhash":"B","message_hex":"0x00"}}"#
+            );
+            let result: Result<SolanaTxSignRequest, _> = serde_json::from_str(&json);
+            let err_msg = match result {
+                Ok(req) => format!("expected NON_SOLANA_CHAIN rejection, got: {req:?}"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err_msg.contains(error_codes::NON_SOLANA_CHAIN),
+                "must surface NON_SOLANA_CHAIN; chain='{chain}', got: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn solana_sign_response_json_round_trip() {
+        let r = SolanaSignResponse {
+            pubkey: "11111111111111111111111111111111".to_string(),
+            signature: format!("0x{}", "cd".repeat(64)),
+        };
+        let s = serde_json::to_string(&r).expect("serialize");
+        let back: SolanaSignResponse = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, r);
     }
 }

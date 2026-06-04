@@ -25,6 +25,10 @@ xindex-cosmos-tx.workspace = true
 # multisigned tx-blob and reads Sequence/ledger from the XRP chain.
 xindex-chain-xrp.workspace = true
 xindex-xrp-tx.workspace = true
+# S5 (Phase 4.5): Solana redeem leg — orchestrates the Squads V4
+# propose/approve/execute choreography and reads multisig/proposal state.
+xindex-chain-solana.workspace = true
+xindex-solana-tx.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
