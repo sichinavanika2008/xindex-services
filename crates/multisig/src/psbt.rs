@@ -43,7 +43,7 @@ pub enum SignError {
     /// before broadcasting.
     #[error("op_return memo {0} bytes exceeds the per-chain OP_RETURN limit")]
     MemoTooLong(usize),
-    /// The legacy sighash flavor (BCH `SIGHASH_FORKID` / ZEC BLAKE2b) is
+    /// The legacy sighash flavor (BCH `SIGHASH_FORKID` / ZEC `BLAKE2b`) is
     /// not yet implemented (the executor is BTC/Witness-only). Fail closed
     /// at PSBT-build time rather than emit a network-rejected pre-BIP-143
     /// `0x01` sighash for BCH/ZEC (audit L1); the algorithms land with U10.
@@ -58,7 +58,7 @@ pub const MAX_OP_RETURN_BYTES: usize = 80;
 /// Sighash algorithm for a legacy (non-`SegWit`) spend. Pre-BIP-143
 /// `legacy_signature_hash` (`LegacyBtc`) is correct only for DOGE; BCH
 /// needs the BIP-143-style preimage with `SIGHASH_FORKID` (`0x41`) and
-/// ZEC the Sapling BLAKE2b sighash with a consensus-branch-id. Those are
+/// ZEC the Sapling `BLAKE2b` sighash with a consensus-branch-id. Those are
 /// NOT implemented yet — [`build_spending_psbt`] rejects them rather than
 /// silently producing a network-rejected sighash (audit L1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +67,7 @@ pub enum SighashFlavor {
     LegacyBtc,
     /// BCH: BIP-143 preimage with `SIGHASH_FORKID`. Unimplemented (U10).
     BchForkId,
-    /// ZEC: Sapling BLAKE2b sighash + consensus-branch-id. Unimplemented (U10).
+    /// ZEC: Sapling `BLAKE2b` sighash + consensus-branch-id. Unimplemented (U10).
     ZcashBlake2b,
 }
 
@@ -520,8 +520,8 @@ mod tests {
         }
     }
 
-    /// Audit L1: a NonWitness spend with an unimplemented sighash flavor
-    /// (BCH `SIGHASH_FORKID` / ZEC BLAKE2b) is rejected at PSBT-build time
+    /// Audit L1: a `NonWitness` spend with an unimplemented sighash flavor
+    /// (BCH `SIGHASH_FORKID` / ZEC `BLAKE2b`) is rejected at PSBT-build time
     /// — never produces a network-rejected pre-BIP-143 sighash.
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
