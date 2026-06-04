@@ -619,4 +619,33 @@ mod tests {
         assert_eq!(got.chain, ChainId::Xrp);
         assert_eq!(got.inbound_txid, "xrp-txhash");
     }
+
+    /// C8 / Phase 4.5: the Solana family chain (sol) is admitted by the
+    /// widened CHECK constraint; pre-existing UTXO + EVM + Cosmos + XRP
+    /// rows still insert.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_accepts_sol_post_v11_migration() {
+        let store = SqliteRedemptionDispatch::connect("sqlite::memory:")
+            .await
+            .expect("connect + migrate");
+        let id = b256!("00000000000000000000000000000000000000000000000000000000000000e4");
+        // Regression: UTXO + Cosmos + XRP still record post-migration.
+        store
+            .record(id, 0, ChainId::Btc, "btc-txid".into(), 1)
+            .await
+            .expect("btc record");
+        store
+            .record(id, 1, ChainId::Xrp, "xrp-txhash".into(), 2)
+            .await
+            .expect("xrp record");
+        // The Solana chain records its own leg.
+        store
+            .record(id, 2, ChainId::Sol, "sol-sig".into(), 3)
+            .await
+            .expect("sol record");
+        let got = store.get(&id, 2).await.expect("get").expect("recorded row");
+        assert_eq!(got.chain, ChainId::Sol);
+        assert_eq!(got.inbound_txid, "sol-sig");
+    }
 }

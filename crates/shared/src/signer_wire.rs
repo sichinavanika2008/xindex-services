@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn cosmos_tx_request_rejects_non_cosmos_chains() {
         for chain in [
-            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol",
+            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "xrp", "sol",
         ] {
             let json = format!(
                 r#"{{"chain_id":"{chain}","account_address":"cosmos1x","cosmos_chain_id":"cosmoshub-4","account_number":"0","sequence":"0","to_address":"cosmos1y","amount":"1","denom":"uatom","fee_amount":"0","gas_limit":"200000","memo":"","sign_doc_hash":"0x{hash}"}}"#,
@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn xrp_tx_request_rejects_non_xrp_chains() {
         for chain in [
-            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "gaia",
+            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "gaia", "sol",
         ] {
             let json = format!(
                 r#"{{"chain_id":"{chain}","account_address":"rX","destination":"rY","amount_drops":"1","fee_drops":"30","sequence":"0","last_ledger_sequence":"0","memo":"","signing_blob":"0x{blob}"}}"#,
