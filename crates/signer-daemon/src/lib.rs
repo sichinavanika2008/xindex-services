@@ -30,5 +30,6 @@ pub mod evm_safe;
 pub mod psbt;
 pub mod replay;
 pub mod server;
+pub mod solana_tx;
 pub mod web3signer;
 pub mod xrp_tx;

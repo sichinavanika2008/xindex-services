@@ -527,6 +527,7 @@ mod tests {
             evm: std::collections::HashMap::new(),
             cosmos: std::collections::HashMap::new(),
             xrp: std::collections::HashMap::new(),
+            sol: std::collections::HashMap::new(),
         };
         let app = Router::new()
             .route(

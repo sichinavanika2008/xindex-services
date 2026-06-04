@@ -5745,6 +5745,7 @@ dependencies = [
  "wiremock",
  "xindex-chain-cosmos",
  "xindex-chain-evm",
+ "xindex-chain-solana",
  "xindex-chain-xrp",
  "xindex-cosmos-tx",
  "xindex-executor",
@@ -5752,6 +5753,7 @@ dependencies = [
  "xindex-safe-evm",
  "xindex-shared",
  "xindex-signer",
+ "xindex-solana-tx",
  "xindex-xrp-tx",
 ]
 

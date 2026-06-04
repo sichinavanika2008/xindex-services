@@ -47,6 +47,7 @@ use crate::cosmos_tx::{handle_cosmos_tx, CosmosSignerConfig};
 use crate::evm_safe::{handle_evm_safe_tx, EvmSignerConfig};
 use crate::psbt::{handle_psbt_input, UtxoSignerConfig};
 use crate::replay::{CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore};
+use crate::solana_tx::{handle_solana_tx, SolSignerConfig};
 use crate::web3signer::{HsmDigestSigner, HsmError};
 use crate::xrp_tx::{handle_xrp_tx, XrpSignerConfig};
 
@@ -105,6 +106,11 @@ pub struct DaemonState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
     /// is then not registered. One [`XrpSignerConfig`] per XRP chain this
     /// daemon is a `SignerList` member of (DL-P3-7).
     pub xrp: HashMap<ChainId, Arc<XrpSignerConfig>>,
+    /// S6 (Phase 4.5): per-chain Solana Squads V4 ed25519 signing roles.
+    /// Empty map = no Solana key configured; the `/api/v1/sign/solana-tx`
+    /// route is then not registered. One [`SolSignerConfig`] per Solana
+    /// chain this daemon is a Squads member of (DL-P3-7).
+    pub sol: HashMap<ChainId, Arc<SolSignerConfig>>,
 }
 
 // Manual `Clone` impl: every field is cheap to clone (`Arc<_>` +
@@ -123,6 +129,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for DaemonSta
             evm: self.evm.clone(),
             cosmos: self.cosmos.clone(),
             xrp: self.xrp.clone(),
+            sol: self.sol.clone(),
         }
     }
 }
@@ -138,6 +145,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             evm: HashMap::new(),
             cosmos: HashMap::new(),
             xrp: HashMap::new(),
+            sol: HashMap::new(),
         }
     }
 
@@ -170,6 +178,13 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
     #[must_use]
     pub fn with_xrp(mut self, config: XrpSignerConfig) -> Self {
         self.xrp.insert(config.chain, Arc::new(config));
+        self
+    }
+
+    /// S6 (Phase 4.5) builder: attach a per-chain Solana Squads signing role.
+    #[must_use]
+    pub fn with_sol(mut self, config: SolSignerConfig) -> Self {
+        self.sol.insert(config.chain, Arc::new(config));
         self
     }
 }
@@ -205,6 +220,9 @@ where
     }
     if !state.xrp.is_empty() {
         r = r.route("/api/v1/sign/xrp-tx", post(handle_xrp_tx::<S, H>));
+    }
+    if !state.sol.is_empty() {
+        r = r.route("/api/v1/sign/solana-tx", post(handle_solana_tx::<S, H>));
     }
     r.with_state(state)
 }
