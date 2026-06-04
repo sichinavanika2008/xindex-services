@@ -15,7 +15,7 @@
 //! 4. [`pda`] — `create_program_address` / `find_program_address` (the
 //!    ed25519 on-curve check).
 //! 5. [`sigs`] — ed25519 sign / strict-verify.
-//! 6. `squads` (Phase 4.5 S3) — the 5 Squads V4 instruction encoders.
+//! 6. [`squads`] — the Squads V4 instruction + PDA encoders.
 //!
 //! No `solana-sdk`/`anchor` dependency — the byte surface we need (a
 //! handful of System / Memo / `ComputeBudget` / Squads instructions) is
@@ -33,6 +33,7 @@ pub mod message;
 pub mod pda;
 pub mod shortvec;
 pub mod sigs;
+pub mod squads;
 
 use std::fmt;
 
