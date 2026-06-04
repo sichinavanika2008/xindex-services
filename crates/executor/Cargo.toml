@@ -69,3 +69,7 @@ path = "src/bin/xindex-redeem-cosmos.rs"
 [[bin]]
 name = "xindex-redeem-xrp"
 path = "src/bin/xindex-redeem-xrp.rs"
+
+[[bin]]
+name = "xindex-redeem-solana"
+path = "src/bin/xindex-redeem-solana.rs"
