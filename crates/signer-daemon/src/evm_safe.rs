@@ -197,6 +197,42 @@ fn hsm_unavailable(e: &HsmError) -> (StatusCode, Json<ErrorBody>) {
     )
 }
 
+/// 1.13 — EIP-2 low-S normalization of the HSM's 65-byte `r ‖ s ‖ v`.
+///
+/// Safe's `checkSignatures` rejects a high-S ECDSA signature (the EIP-2
+/// malleability rule), so a high-S owner signature would make the assembled
+/// multisig `execTransaction` revert on-chain. If `s` is in the upper
+/// half-order we replace it with `n - s` and flip the recovery byte; the
+/// `(r, n-s)` pair recovers to the SAME signer with the opposite parity. The
+/// HSM (`Web3Signer`) already emits low-S, so this is normally a no-op —
+/// defense-in-depth against a non-canonical signing response. We preserve the
+/// HSM's `v` convention (only flipping 27↔28 / 0↔1), and the recover-verify
+/// below re-checks the normalized signature, so an incorrect normalization
+/// fails closed (never recorded). Confirming the HSM's BASE `v` convention
+/// against a live `Web3Signer` + Safe `checkSignatures` remains a separate
+/// pre-mainnet gate.
+fn normalize_low_s(sig: [u8; 65]) -> Result<[u8; 65], (StatusCode, Json<ErrorBody>)> {
+    let parsed = k256::ecdsa::Signature::from_slice(&sig[..64]).map_err(|e| {
+        err(
+            error_codes::SIGNER_RECOVER_MISMATCH,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("HSM signature r||s did not parse: {e}"),
+        )
+    })?;
+    let mut out = sig;
+    if let Some(low) = parsed.normalize_s() {
+        out[..64].copy_from_slice(&low.to_bytes());
+        out[64] = match sig[64] {
+            27 => 28,
+            28 => 27,
+            0 => 1,
+            1 => 0,
+            v => v,
+        };
+    }
+    Ok(out)
+}
+
 /// Axum handler for `/api/v1/sign/evm-safe-tx`.
 ///
 /// # Errors
@@ -331,20 +367,21 @@ where
         CheckOutcome::FirstTime => {}
     }
 
-    // 5. HSM-sign the digest.
+    // 5. HSM-sign the digest, then normalize to low-S (1.13) so Safe's
+    // `checkSignatures` accepts it; the recover-verify in 5a re-checks the
+    // normalized bytes, so a bad normalization fails closed.
     let sig = state
         .hsm
         .sign_digest(evm_cfg.my_signer_address, recomputed)
         .await
         .map_err(|e| hsm_unavailable(&e))?;
+    let sig = normalize_low_s(sig)?;
 
-    // 5a. Recover-verify (1.5 / H11). The signature the HSM returned MUST
-    // recover to this daemon's configured signer over the recomputed
-    // digest; otherwise an HSM key-mapping bug, a wrong-key signature, or
-    // a corrupted signing response would be recorded and returned as a
-    // valid owner signature. We only READ the signature here (no byte
-    // reconstruction), so there is no signature-format risk; low-S
-    // normalization (1.13) is deferred — see KNOWN_FINDINGS.
+    // 5a. Recover-verify (1.5 / H11). The (now low-S normalized) signature
+    // MUST recover to this daemon's configured signer over the recomputed
+    // digest; otherwise an HSM key-mapping bug, a wrong-key signature, a
+    // corrupted signing response, or a mis-normalization would be recorded
+    // and returned as a valid owner signature.
     let recovered = PrimitiveSignature::try_from(sig.as_slice())
         .map_err(|e| {
             err(
@@ -393,4 +430,68 @@ where
         })?;
 
     Ok(Json(render_signature(evm_cfg.my_signer_address, sig)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k256::ecdsa::{Signature, SigningKey};
+
+    /// Recover the EVM address of a k256 key (keccak of the uncompressed
+    /// pubkey, last 20 bytes).
+    fn evm_addr(sk: &SigningKey) -> Address {
+        let unc = sk.verifying_key().to_encoded_point(false);
+        let h = alloy_primitives::keccak256(&unc.as_bytes()[1..]);
+        Address::from_slice(&h.as_slice()[12..])
+    }
+
+    /// 1.13: a low-S signature passes through `normalize_low_s` unchanged.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn low_s_signature_unchanged() {
+        let sk = SigningKey::from_slice(&[5u8; 32]).expect("key");
+        let digest = [0x42u8; 32];
+        let (sig, recid) = sk.sign_prehash_recoverable(&digest).expect("sign"); // low-S
+        let mut bytes = [0u8; 65];
+        bytes[..64].copy_from_slice(&sig.to_bytes());
+        bytes[64] = 27 + recid.to_byte();
+        assert_eq!(normalize_low_s(bytes).expect("normalize"), bytes);
+    }
+
+    /// 1.13: a high-S signature is normalized to low-S, the recovery byte is
+    /// flipped, and the result still recovers to the signer.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn high_s_signature_is_normalized_and_recovers() {
+        let sk = SigningKey::from_slice(&[9u8; 32]).expect("key");
+        let digest = [0x11u8; 32];
+        let (low, recid) = sk.sign_prehash_recoverable(&digest).expect("sign");
+        let low_v = 27 + recid.to_byte();
+        // High-S counterpart: (r, n - s); recovers with the opposite parity.
+        let neg_s = -*low.s();
+        let high = Signature::from_scalars(low.r().to_bytes(), neg_s.to_bytes()).expect("high sig");
+        assert!(high.normalize_s().is_some(), "expected a high-S signature");
+        let high_v = if low_v == 27 { 28 } else { 27 };
+        let mut bytes = [0u8; 65];
+        bytes[..64].copy_from_slice(&high.to_bytes());
+        bytes[64] = high_v;
+
+        let out = normalize_low_s(bytes).expect("normalize");
+        // Output is the canonical low-S form with the flipped recovery byte.
+        assert_eq!(&out[..64], &low.to_bytes()[..]);
+        assert_eq!(out[64], low_v);
+        assert!(
+            Signature::from_slice(&out[..64])
+                .expect("parse")
+                .normalize_s()
+                .is_none(),
+            "output must be low-S"
+        );
+        // And it recovers to the signer.
+        let recovered = PrimitiveSignature::try_from(out.as_slice())
+            .expect("parse")
+            .recover_address_from_prehash(&alloy_primitives::B256::from(digest))
+            .expect("recover");
+        assert_eq!(recovered, evm_addr(&sk));
+    }
 }
