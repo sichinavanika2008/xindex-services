@@ -648,4 +648,33 @@ mod tests {
         assert_eq!(got.chain, ChainId::Sol);
         assert_eq!(got.inbound_txid, "sol-sig");
     }
+
+    /// C8 / Phase 4.6: the TRON family chain (tron) is admitted by the
+    /// widened CHECK constraint; pre-existing UTXO + XRP + Solana rows
+    /// still insert.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_accepts_tron_post_v12_migration() {
+        let store = SqliteRedemptionDispatch::connect("sqlite::memory:")
+            .await
+            .expect("connect + migrate");
+        let id = b256!("00000000000000000000000000000000000000000000000000000000000000e5");
+        // Regression: UTXO + Solana still record post-migration.
+        store
+            .record(id, 0, ChainId::Btc, "btc-txid".into(), 1)
+            .await
+            .expect("btc record");
+        store
+            .record(id, 1, ChainId::Sol, "sol-sig".into(), 2)
+            .await
+            .expect("sol record");
+        // The TRON chain records its own leg.
+        store
+            .record(id, 2, ChainId::Tron, "tron-txid".into(), 3)
+            .await
+            .expect("tron record");
+        let got = store.get(&id, 2).await.expect("get").expect("recorded row");
+        assert_eq!(got.chain, ChainId::Tron);
+        assert_eq!(got.inbound_txid, "tron-txid");
+    }
 }

@@ -64,6 +64,12 @@ pub enum ChainId {
     /// over native SOL (no account-level k-of-n exists for native SOL;
     /// FROST/TSS is deferred, so a program multisig is required).
     Sol,
+    /// TRON (TRX). TRON custody family — native account-permission k-of-n
+    /// multisig (an `Active` `Permission` with weighted keys + threshold).
+    /// Every member signs the IDENTICAL `txID = sha256(raw_data)`; the
+    /// 65-byte recoverable sigs append to `Transaction.signature[]` and the
+    /// node sums weights — distinct from XRP's per-signer blob.
+    Tron,
 }
 
 impl fmt::Display for ChainId {
@@ -82,6 +88,7 @@ impl fmt::Display for ChainId {
             Self::Gaia => "gaia",
             Self::Xrp => "xrp",
             Self::Sol => "sol",
+            Self::Tron => "tron",
         })
     }
 }
@@ -117,6 +124,7 @@ impl FromStr for ChainId {
             "gaia" => Ok(Self::Gaia),
             "xrp" => Ok(Self::Xrp),
             "sol" => Ok(Self::Sol),
+            "tron" => Ok(Self::Tron),
             other => Err(ParseChainIdError(other.to_string())),
         }
     }
@@ -145,6 +153,13 @@ pub enum CustodyFamily {
     /// from every other family. Core Solana has no account-level k-of-n
     /// for native SOL, so a program multisig is required (DL-2026-05-09).
     Solana,
+    /// TRON: native account-permission k-of-n multisig. An account's
+    /// `Active` `Permission` lists weighted keys + a threshold; a tx is
+    /// valid when the summed weights of the attached signatures reach the
+    /// threshold. All members sign the identical `txID = sha256(raw_data)`
+    /// (the `Permission_id` is inside `raw_data`, so it is bound into the
+    /// hash) — no per-signer payload divergence, unlike XRP (DL-P4.6-*).
+    Tron,
     // Substrate — future family.
 }
 
@@ -178,6 +193,14 @@ pub enum FeeUnit {
     /// base + priority — there is no per-size or per-gas rate. Distinct
     /// from every other unit.
     SolanaComputeUnits,
+    /// resource units — TRON. A TRON transaction burns two distinct
+    /// resources: `bandwidth` (per serialized byte, covered first by the
+    /// daily free-net allowance then by burned TRX or staked Energy) and,
+    /// for a `TriggerSmartContract` (TRC20), `energy` (per VM step, capped
+    /// by the tx's `fee_limit` in `sun`). A plain `TransferContract` (TRX)
+    /// pays bandwidth only. There is no single per-byte or per-gas scalar
+    /// — distinct from every other unit.
+    TronResource,
 }
 
 /// EVM transaction type per chain. Phase 3.2 picks one per chain at
@@ -209,6 +232,7 @@ pub const ALL_CHAINS: &[ChainId] = &[
     ChainId::Gaia,
     ChainId::Xrp,
     ChainId::Sol,
+    ChainId::Tron,
 ];
 
 impl ChainId {
@@ -232,13 +256,15 @@ impl ChainId {
             Self::Gaia => "GAIA.ATOM",
             Self::Xrp => "XRP.XRP",
             Self::Sol => "SOL.SOL",
+            Self::Tron => "TRON.TRX",
         }
     }
 
     /// Custody family. UTXO for Phase 3.1 chains; EVM (Safe v1.4.1
     /// multisig) for Phase 3.2 chains; Cosmos (`LegacyAminoPubKey`
     /// multisig) for Phase 3.3 chains; XRP (native `SignerList`
-    /// multisig) for Phase 4.4.
+    /// multisig) for Phase 4.4; Solana (Squads V4) for Phase 4.5; TRON
+    /// (native account-permission multisig) for Phase 4.6.
     #[must_use]
     pub const fn custody_family(self) -> CustodyFamily {
         match self {
@@ -247,18 +273,20 @@ impl ChainId {
             Self::Gaia => CustodyFamily::Cosmos,
             Self::Xrp => CustodyFamily::Xrp,
             Self::Sol => CustodyFamily::Solana,
+            Self::Tron => CustodyFamily::Tron,
         }
     }
 
     /// Native-unit decimals. UTXO family = 8 (sat); EVM family = 18 (wei);
     /// Cosmos GAIA = 6 (`uatom`); XRP = 6 (drops, 1 XRP = 10^6 drops);
-    /// Solana = 9 (lamports, 1 SOL = 10^9 lamports).
+    /// Solana = 9 (lamports, 1 SOL = 10^9 lamports); TRON = 6 (`sun`,
+    /// 1 TRX = 10^6 sun; TRC20 USDT on TRON is also 6-decimal).
     #[must_use]
     pub const fn decimals(self) -> u8 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 8,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => 18,
-            Self::Gaia | Self::Xrp => 6,
+            Self::Gaia | Self::Xrp | Self::Tron => 6,
             Self::Sol => 9,
         }
     }
@@ -282,7 +310,7 @@ impl ChainId {
     pub const fn scale(self) -> u64 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
-            Self::Gaia | Self::Xrp => 1_000_000,
+            Self::Gaia | Self::Xrp | Self::Tron => 1_000_000,
             Self::Sol => 1_000_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 panic!("ChainId::scale() does not fit u64 for the EVM family — use scale_u128()")
@@ -298,7 +326,7 @@ impl ChainId {
     pub const fn scale_u128(self) -> u128 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
-            Self::Gaia | Self::Xrp => 1_000_000,
+            Self::Gaia | Self::Xrp | Self::Tron => 1_000_000,
             Self::Sol => 1_000_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 1_000_000_000_000_000_000
@@ -325,6 +353,11 @@ impl ChainId {
     /// commitment `finalized`. 1 = one finalized observation, the same
     /// conservative margin as GAIA/XRP. The `chain-solana` client MUST
     /// only count txs at commitment `finalized`.
+    /// TRON 19 — TRON has NO single-block deterministic finality (unlike
+    /// GAIA/XRP/SOL): a block is irreversible only after 2/3+1 of the 27
+    /// super-representatives confirm it, ~19 blocks (≈57 s at 3-s blocks).
+    /// `THORChain` Bifrost reports TRON solvency at height-19, so we wait
+    /// the full SR finality window before attesting a delivery/refund.
     #[must_use]
     #[expect(
         clippy::match_same_arms,
@@ -348,6 +381,7 @@ impl ChainId {
             Self::Gaia => 1,
             Self::Xrp => 1,
             Self::Sol => 1,
+            Self::Tron => 19,
         }
     }
 
@@ -356,7 +390,9 @@ impl ChainId {
     /// Cosmos chains (the `THORChain` memo lives in the tx `memo` field,
     /// ≤250 bytes, enforced by the Cosmos tx builder — not here), and XRP
     /// (the memo lives in the `Memos` array, hex-encoded `MemoData`), and
-    /// Solana (the memo lives in an SPL-Memo program instruction).
+    /// Solana (the memo lives in an SPL-Memo program instruction), and TRON
+    /// (the memo lives in the `raw_data.data` field; length is bounded by
+    /// the tx builder, not here).
     #[must_use]
     pub const fn op_return_max(self) -> usize {
         match self {
@@ -369,13 +405,14 @@ impl ChainId {
             | Self::Pol
             | Self::Gaia
             | Self::Xrp
-            | Self::Sol => 0,
+            | Self::Sol
+            | Self::Tron => 0,
         }
     }
 
     /// Fee unit per chain. UTXO `SegWit` → `PerVbyte`; UTXO legacy →
     /// `PerByte`; EVM → `PerGwei`; Cosmos → `PerCosmosGas`; XRP →
-    /// `FlatXrpDrops`; Solana → `SolanaComputeUnits`.
+    /// `FlatXrpDrops`; Solana → `SolanaComputeUnits`; TRON → `TronResource`.
     #[must_use]
     pub const fn fee_unit(self) -> FeeUnit {
         match self {
@@ -385,6 +422,7 @@ impl ChainId {
             Self::Gaia => FeeUnit::PerCosmosGas,
             Self::Xrp => FeeUnit::FlatXrpDrops,
             Self::Sol => FeeUnit::SolanaComputeUnits,
+            Self::Tron => FeeUnit::TronResource,
         }
     }
 
@@ -403,7 +441,8 @@ impl ChainId {
             | Self::Zec
             | Self::Gaia
             | Self::Xrp
-            | Self::Sol => None,
+            | Self::Sol
+            | Self::Tron => None,
         }
     }
 
@@ -424,16 +463,18 @@ impl ChainId {
             | Self::Zec
             | Self::Gaia
             | Self::Xrp
-            | Self::Sol => None,
+            | Self::Sol
+            | Self::Tron => None,
         }
     }
 
     /// `THORChain` Router contract address on the chain itself. The
     /// executor sends Safe `execTransaction` output to this address to
-    /// initiate a swap back to USDT on Ethereum. UTXO, Cosmos, XRP, and
-    /// Solana chains return `None` (their `THORChain` side is an `Asgard`
-    /// vault / account address served by `ThorchainVaultRegistry`; Solana
-    /// outbound is a native System-Program transfer, not a router call).
+    /// initiate a swap back to USDT on Ethereum. UTXO, Cosmos, XRP, Solana,
+    /// and TRON chains return `None` (their `THORChain` side is an `Asgard`
+    /// vault / account address served by `ThorchainVaultRegistry`; the TRON
+    /// redeem leg is a native multisig transfer from our account, not a
+    /// router call).
     ///
     /// **DL-P3.2-5: placeholders pending source citation.** These
     /// addresses MUST be pinned from a specific `THORChain` docs
@@ -456,7 +497,8 @@ impl ChainId {
             | Self::Zec
             | Self::Gaia
             | Self::Xrp
-            | Self::Sol => None,
+            | Self::Sol
+            | Self::Tron => None,
         }
     }
 
@@ -511,6 +553,7 @@ mod tests {
         assert_eq!(ChainId::Gaia.thor_asset(), "GAIA.ATOM");
         assert_eq!(ChainId::Xrp.thor_asset(), "XRP.XRP");
         assert_eq!(ChainId::Sol.thor_asset(), "SOL.SOL");
+        assert_eq!(ChainId::Tron.thor_asset(), "TRON.TRX");
     }
 
     #[test]
@@ -608,6 +651,25 @@ mod tests {
         assert_eq!(c.thorchain_router_address(), None);
     }
 
+    /// Phase 4.6 TRON family: TRON = TRON.TRX, 6-dec (`sun`), SR finality
+    /// (conf 19), memo in the `raw_data.data` field (no `OP_RETURN`),
+    /// `TronResource` fee unit, no EVM tx-type / chain-id / router.
+    /// `scale()` fits u64 (10^6).
+    #[test]
+    fn tron_is_tron_family_with_6_decimals() {
+        let c = ChainId::Tron;
+        assert_eq!(c.custody_family(), CustodyFamily::Tron);
+        assert_eq!(c.decimals(), 6);
+        assert_eq!(c.scale(), 1_000_000);
+        assert_eq!(c.scale_u128(), 1_000_000_u128);
+        assert_eq!(c.conf_depth(), 19);
+        assert_eq!(c.fee_unit(), FeeUnit::TronResource);
+        assert_eq!(c.op_return_max(), 0);
+        assert_eq!(c.tx_type(), None);
+        assert_eq!(c.evm_chain_id(), None);
+        assert_eq!(c.thorchain_router_address(), None);
+    }
+
     /// Tx-type per DL-P3.2-4: EIP-1559 on ETH/AVAX/BASE/POL; legacy on BSC.
     #[test]
     fn tx_type_per_chain_matches_dl_p32_4() {
@@ -661,6 +723,8 @@ mod tests {
         assert_eq!(ChainId::Xrp.conf_depth(), 1);
         // SOL 1: irreversible finalized-commitment slots.
         assert_eq!(ChainId::Sol.conf_depth(), 1);
+        // TRON 19: SR super-representative finality (no single-block finality).
+        assert_eq!(ChainId::Tron.conf_depth(), 19);
     }
 
     /// BCH's 2019 post-fork relay policy raised the `OP_RETURN` limit
@@ -679,6 +743,8 @@ mod tests {
         assert_eq!(ChainId::Xrp.op_return_max(), 0);
         // SOL: memo lives in an SPL-Memo instruction, not OP_RETURN.
         assert_eq!(ChainId::Sol.op_return_max(), 0);
+        // TRON: memo lives in raw_data.data, not OP_RETURN.
+        assert_eq!(ChainId::Tron.op_return_max(), 0);
     }
 
     /// Fee unit per `SegWit` availability. BCH/DOGE/ZEC have no
@@ -694,6 +760,7 @@ mod tests {
         assert_eq!(ChainId::Gaia.fee_unit(), FeeUnit::PerCosmosGas);
         assert_eq!(ChainId::Xrp.fee_unit(), FeeUnit::FlatXrpDrops);
         assert_eq!(ChainId::Sol.fee_unit(), FeeUnit::SolanaComputeUnits);
+        assert_eq!(ChainId::Tron.fee_unit(), FeeUnit::TronResource);
     }
 
     /// `asset_id_hash` is `keccak256(thor_asset.as_bytes())`. Both
@@ -721,6 +788,10 @@ mod tests {
         );
         assert_eq!("XRP".parse::<ChainId>().expect("xrp upper"), ChainId::Xrp);
         assert_eq!("SOL".parse::<ChainId>().expect("sol upper"), ChainId::Sol);
+        assert_eq!(
+            "TRON".parse::<ChainId>().expect("tron upper"),
+            ChainId::Tron
+        );
         assert!("ada".parse::<ChainId>().is_err());
     }
 

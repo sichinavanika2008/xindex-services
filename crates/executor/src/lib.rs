@@ -23,6 +23,7 @@ pub mod redeem;
 pub mod remote_cosigner;
 pub mod solana_redeem;
 pub mod solana_redeem_store;
+pub mod tron_redeem;
 pub mod xrp_redeem;
 
 pub use broadcast_registry::{
@@ -41,4 +42,8 @@ pub use solana_redeem::{
 pub use solana_redeem_store::{
     CachedBroadcast, InMemorySolanaRedeemStore, RedeemProgress, SolanaRedeemStore,
     SolanaStoreError, SqliteSolanaRedeemStore,
+};
+pub use tron_redeem::{
+    member_evm_address, SignTronFuture, TronCosigner, TronRedeemConfig, TronRedeemError,
+    TronRedeemExecutor, TronRedeemLegOutcome, TronRedeemTask,
 };

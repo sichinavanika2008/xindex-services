@@ -29,6 +29,10 @@ xindex-xrp-tx.workspace = true
 # propose/approve/execute choreography and reads multisig/proposal state.
 xindex-chain-solana.workspace = true
 xindex-solana-tx.workspace = true
+# Phase 4.6: TRON redeem leg — builds the raw_data protobuf + signed
+# Transaction and reads the now-block (TAPOS ref) from the TRON chain.
+xindex-chain-tron.workspace = true
+xindex-tron-tx.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
@@ -73,3 +77,7 @@ path = "src/bin/xindex-redeem-xrp.rs"
 [[bin]]
 name = "xindex-redeem-solana"
 path = "src/bin/xindex-redeem-solana.rs"
+
+[[bin]]
+name = "xindex-redeem-tron"
+path = "src/bin/xindex-redeem-tron.rs"

@@ -1,0 +1,24 @@
+[package]
+name = "xindex-tron-tx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# secp256k1 recoverable sign / recover (txID signing). The repo standard —
+# pure Rust, no native secp256k1 C-FFI. `arithmetic` is needed for scalar
+# ops in low-S normalization; `ecdsa` for sign/verify/recover.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+# txID = sha256(raw_data); base58check checksum = sha256(sha256(addr)).
+sha2.workspace = true
+# base58 (Bitcoin alphabet) for the human-facing "T…" address codec.
+bs58.workspace = true
+# keccak256 for the TRON address derivation + the TRC20 function selector.
+# Already in the workspace tree (no new crate); avoids adding tiny-keccak.
+alloy-primitives.workspace = true
+thiserror.workspace = true

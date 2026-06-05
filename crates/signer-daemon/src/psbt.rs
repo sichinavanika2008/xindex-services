@@ -528,6 +528,7 @@ mod tests {
             cosmos: std::collections::HashMap::new(),
             xrp: std::collections::HashMap::new(),
             sol: std::collections::HashMap::new(),
+            tron: std::collections::HashMap::new(),
         };
         let app = Router::new()
             .route(

@@ -259,6 +259,31 @@ pub trait ReplayStore: Send + Sync {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// Phase 4.6: pre-flight a TRON multisig partial-signature. Keyed by
+    /// `(chain_id, owner_address, txid)` — TRON has NO account nonce, so the
+    /// `txID = sha256(raw_data)` IS the full payload identity (distinct
+    /// redemptions yield distinct `txID`s and never collide). `payload_hash`
+    /// equals `txid`; an identical retry is `Idempotent`. Because the key
+    /// already includes the whole-payload `txID`, a `Conflict` cannot arise.
+    fn check_tron_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        owner_address: String,
+        txid: [u8; 32],
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// Phase 4.6: record a fresh TRON multisig partial-signature.
+    fn record_tron_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        owner_address: String,
+        txid: [u8; 32],
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -276,6 +301,8 @@ struct InMemoryInner {
     cosmos_txs: HashMap<(&'static str, String, u64), SignedRecord>,
     /// C5 (Phase 4.4): XRP body replay key — `(chain_id_str, r_address, sequence)`.
     xrp_txs: HashMap<(&'static str, String, u64), SignedRecord>,
+    /// Phase 4.6: TRON tx replay key — `(chain_id_str, t_address, txid)`.
+    tron_txs: HashMap<(&'static str, String, [u8; 32]), SignedRecord>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -561,6 +588,50 @@ impl ReplayStore for InMemoryReplayStore {
         } else {
             Err(ReplayError::Decode(
                 "duplicate XRP-tx record (race)".to_string(),
+            ))
+        }
+    }
+
+    async fn check_tron_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        owner_address: String,
+        txid: [u8; 32],
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), owner_address, txid);
+        let g = self.inner.lock().await;
+        Ok(match g.tron_txs.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_tron_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        owner_address: String,
+        txid: [u8; 32],
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), owner_address, txid);
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.tron_txs.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Decode(
+                "duplicate TRON-tx record (race)".to_string(),
             ))
         }
     }
@@ -1029,6 +1100,70 @@ impl ReplayStore for SqliteReplayStore {
         .await?;
         Ok(())
     }
+
+    async fn check_tron_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        owner_address: String,
+        txid: [u8; 32],
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM signed_tron_txs
+             WHERE chain_id = ? AND owner_address = ? AND txid = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(&owner_address)
+        .bind(txid.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_tron_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        owner_address: String,
+        txid: [u8; 32],
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        sqlx::query(
+            "INSERT INTO signed_tron_txs
+                (chain_id, owner_address, txid, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(&owner_address)
+        .bind(txid.as_slice())
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1288,10 +1423,71 @@ mod tests {
         }
     }
 
+    /// Phase 4.6: TRON tx replay keyed by `(chain, owner, txid)`. Identical
+    /// retry → idempotent; a different `txID` (= different payload) is an
+    /// independent `FirstTime`; a different owner is independent too.
+    async fn run_tron_tx_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let owner = "TU6nEM4GTca2L5AuDTnY1qp1rkQ2t8NxvM".to_string();
+            let txid = [0x71u8; 32];
+            assert_eq!(
+                store
+                    .check_tron_tx(ChainId::Tron, owner.clone(), txid, txid)
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_tron_tx(ChainId::Tron, owner.clone(), txid, txid, vec![1, 2, 3], 100)
+                .await
+                .expect("record");
+            // Same (chain, owner, txid) → idempotent cached sig.
+            let out = store
+                .check_tron_tx(ChainId::Tron, owner.clone(), txid, txid)
+                .await
+                .expect("check");
+            assert!(matches!(out, CheckOutcome::Idempotent(rec) if rec.signature == vec![1,2,3]));
+            // Different txID (a different redemption) → independent FirstTime.
+            let other = [0x72u8; 32];
+            assert_eq!(
+                store
+                    .check_tron_tx(ChainId::Tron, owner, other, other)
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different owner, same txid → independent FirstTime.
+            assert_eq!(
+                store
+                    .check_tron_tx(ChainId::Tron, "TOther".to_string(), txid, txid)
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+        }
+    }
+
     #[tokio::test]
     async fn in_memory_attestation_lifecycle() {
         let store = InMemoryReplayStore::new();
         run_attestation_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_tron_tx_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_tron_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_tron_tx_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_tron_tx_lifecycle(&store).await;
     }
 
     #[tokio::test]

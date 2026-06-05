@@ -536,8 +536,8 @@ pub fn codec_for_mainnet(chain: ChainId) -> Box<dyn UtxoAddressCodec> {
         ChainId::Doge => Box::new(DogeCodec::mainnet()),
         ChainId::Zec => Box::new(ZecCodec::mainnet()),
         // Non-UTXO custody chains (EVM Phase 3.2, Cosmos Phase 3.3, XRP
-        // Phase 4.4, Solana Phase 4.5) have no UTXO codec — callers must
-        // dispatch on `CustodyFamily` before reaching here.
+        // Phase 4.4, Solana Phase 4.5, TRON Phase 4.6) have no UTXO codec
+        // — callers must dispatch on `CustodyFamily` before reaching here.
         ChainId::Eth
         | ChainId::Bsc
         | ChainId::Avax
@@ -545,7 +545,8 @@ pub fn codec_for_mainnet(chain: ChainId) -> Box<dyn UtxoAddressCodec> {
         | ChainId::Pol
         | ChainId::Gaia
         | ChainId::Xrp
-        | ChainId::Sol => {
+        | ChainId::Sol
+        | ChainId::Tron => {
             unreachable!()
         }
     }

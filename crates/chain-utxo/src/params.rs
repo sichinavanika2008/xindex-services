@@ -84,8 +84,9 @@ impl UtxoParams {
             // Non-UTXO custody chains belong to their own crates: EVM
             // (Phase 3.2) to `chain-evm`, Cosmos (Phase 3.3, Gaia) to
             // `chain-cosmos`, XRP (Phase 4.4) to `chain-xrp`, Solana
-            // (Phase 4.5) to `chain-solana`. Caller routing must dispatch
-            // on `CustodyFamily` before reaching this lookup.
+            // (Phase 4.5) to `chain-solana`, TRON (Phase 4.6) to
+            // `chain-tron`. Caller routing must dispatch on `CustodyFamily`
+            // before reaching this lookup.
             ChainId::Eth
             | ChainId::Bsc
             | ChainId::Avax
@@ -93,7 +94,8 @@ impl UtxoParams {
             | ChainId::Pol
             | ChainId::Gaia
             | ChainId::Xrp
-            | ChainId::Sol => {
+            | ChainId::Sol
+            | ChainId::Tron => {
                 unreachable!()
             }
         }

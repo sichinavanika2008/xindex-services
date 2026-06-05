@@ -5549,6 +5549,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-chain-tron"
+version = "0.0.1"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "xindex-shared",
+]
+
+[[package]]
 name = "xindex-chain-utxo"
 version = "0.0.1"
 dependencies = [
@@ -5617,6 +5630,7 @@ dependencies = [
  "xindex-chain-evm",
  "xindex-chain-solana",
  "xindex-chain-thor",
+ "xindex-chain-tron",
  "xindex-chain-utxo",
  "xindex-chain-xrp",
  "xindex-cosmos-tx",
@@ -5624,6 +5638,7 @@ dependencies = [
  "xindex-safe-evm",
  "xindex-shared",
  "xindex-solana-tx",
+ "xindex-tron-tx",
  "xindex-xrp-tx",
 ]
 
@@ -5746,6 +5761,7 @@ dependencies = [
  "xindex-chain-cosmos",
  "xindex-chain-evm",
  "xindex-chain-solana",
+ "xindex-chain-tron",
  "xindex-chain-xrp",
  "xindex-cosmos-tx",
  "xindex-executor",
@@ -5754,6 +5770,7 @@ dependencies = [
  "xindex-shared",
  "xindex-signer",
  "xindex-solana-tx",
+ "xindex-tron-tx",
  "xindex-xrp-tx",
 ]
 
@@ -5764,6 +5781,17 @@ dependencies = [
  "bs58",
  "curve25519-dalek",
  "ed25519-dalek",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "xindex-tron-tx"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "bs58",
+ "k256",
  "sha2",
  "thiserror 1.0.69",
 ]

@@ -79,6 +79,12 @@ ripemd = "0.1"
 ed25519-dalek = "2"
 curve25519-dalek = "4"
 bs58 = "0.5"
+# TRON stack (tron-tx, Phase 4.6). Hand-rolled protobuf-3 `raw_data` codec
+# + TRON address codec + secp256k1 recoverable signing — no TRON SDK / no
+# prost (the byte surface is narrow and gated on a tronweb byte-match). The
+# txID is sha256(raw_data) (sha2, above); the address derivation uses
+# keccak256 (reused from alloy-primitives, already in-tree — no tiny-keccak);
+# base58check uses bs58 (above); recoverable sign/recover reuses k256.
 # base64: Solana JSON-RPC returns account data base64-encoded (base58 only
 # covers data < 129 bytes; the Squads Multisig account is larger). Pure-Rust.
 base64 = "0.22"
@@ -87,11 +93,13 @@ xindex-shared = { path = "crates/shared" }
 xindex-cosmos-tx = { path = "crates/cosmos-tx" }
 xindex-xrp-tx = { path = "crates/xrp-tx" }
 xindex-solana-tx = { path = "crates/solana-tx" }
+xindex-tron-tx = { path = "crates/tron-tx" }
 xindex-chain-eth = { path = "crates/chain-eth" }
 xindex-chain-evm = { path = "crates/chain-evm" }
 xindex-chain-cosmos = { path = "crates/chain-cosmos" }
 xindex-chain-xrp = { path = "crates/chain-xrp" }
 xindex-chain-solana = { path = "crates/chain-solana" }
+xindex-chain-tron = { path = "crates/chain-tron" }
 xindex-chain-thor = { path = "crates/chain-thor" }
 xindex-chain-utxo = { path = "crates/chain-utxo" }
 xindex-multisig = { path = "crates/multisig" }

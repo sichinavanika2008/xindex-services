@@ -25,6 +25,10 @@ xindex-xrp-tx.workspace = true
 # S6 (Phase 4.5): Solana ed25519 — re-derives Squads PDAs + rebuilds the
 # message for the never-blind-sign validation. Same discipline.
 xindex-solana-tx.workspace = true
+# Phase 4.6: TRON — rebuilds the raw_data protobuf + recomputes the txID
+# for the never-blind-sign validation; recovers the signer to verify the
+# HSM signature. Same discipline.
+xindex-tron-tx.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
 async-trait = "0.1"
@@ -71,3 +75,7 @@ xindex-chain-xrp.workspace = true
 # `validate_and_sign` (S6). Needs the Solana chain trait (S4) for the stub
 # client; solana-tx (S2/S3) is already a non-dev dep for the handler.
 xindex-chain-solana.workspace = true
+# Phase 4.6 e2e: drives `TronRedeemExecutor` against three real daemons.
+# Needs the TRON chain trait for the stub client; tron-tx is already a
+# non-dev dep for the handler.
+xindex-chain-tron.workspace = true

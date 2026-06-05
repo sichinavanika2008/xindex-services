@@ -562,6 +562,129 @@ pub struct SolanaSignResponse {
     pub signature: String,
 }
 
+/// Which TRON asset a [`TronTxSignRequest`] moves — selects the contract
+/// the daemon rebuilds + validates (Phase 4.6).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TronAssetKind {
+    /// Native TRX — a `TransferContract` (`raw_data.contract[0]`).
+    Trx,
+    /// TRC20 USDT — a `TriggerSmartContract` calling
+    /// `transfer(address,uint256)` on the token contract.
+    Usdt,
+}
+
+/// `POST /api/v1/sign/tron-tx` (Phase 4.6)
+///
+/// TRON native account-permission k-of-n multisig partial-signature
+/// endpoint. Unlike XRP (each member signs a per-signer blob), EVERY TRON
+/// member signs the IDENTICAL `txID = sha256(raw_data)`; the daemon:
+///   1. Routes to the per-chain config keyed by `chain_id`
+///      (`endpoint_disabled` if no TRON role is configured).
+///   2. Verifies `owner_address` matches the daemon's configured multisig
+///      account ([`error_codes::WRONG_TRON_ACCOUNT`]).
+///   3. RE-BUILDS the `raw_data` protobuf from the semantic fields below
+///      (via the `tron-tx` crate) and recomputes `txID = sha256(raw_data)`;
+///      refuses with [`error_codes::TRON_TX_MISMATCH`] if it does not match
+///      `txid` — the daemon never blind-signs a coordinator-supplied hash
+///      (DL-M5-3). The destination, amount, memo, and `permission_id` are
+///      all bound into the `txID`, so the byte-match is the binding (same
+///      posture as the Cosmos / XRP THORChain-routed legs).
+///   4. Replay-keys on `(chain_id, owner_address, txid)` — idempotent
+///      retry returns the cached signature; the `txID` is the full payload
+///      identity (TRON has no nonce, so distinct redemptions yield distinct
+///      `txID`s and never collide).
+///   5. Signs the recomputed 32-byte `txID` with its single secp256k1 key,
+///      produces a 65-byte recoverable `r ‖ s ‖ v` (v = recid 0/1), and
+///      VERIFIES it recovers to its configured member address before
+///      recording.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TronTxSignRequest {
+    /// TRON `ChainId`. MUST satisfy
+    /// `chain_id.custody_family() == CustodyFamily::Tron`; the serde
+    /// validator rejects non-TRON ids with [`error_codes::NON_TRON_CHAIN`].
+    #[serde(deserialize_with = "deserialize_tron_chain_id")]
+    pub chain_id: ChainId,
+    /// Which asset this leg sends (selects `TransferContract` vs
+    /// `TriggerSmartContract`).
+    pub asset: TronAssetKind,
+    /// The multisig account that owns the funds (base58 `T…` address).
+    /// This is `contract[0].owner_address` AND the daemon's configured
+    /// custody account — mismatch → [`error_codes::WRONG_TRON_ACCOUNT`].
+    pub owner_address: String,
+    /// The `THORChain` Asgard inbound (base58 `T…` address) the leg sends
+    /// to — for `Trx` the `TransferContract.to_address`; for `Usdt` the
+    /// TRC20 `transfer` recipient encoded in the call data. `THORChain` then
+    /// swaps to USDT and delivers to the `IndexToken` on Ethereum per the
+    /// `memo` (same routing as the Cosmos / XRP legs).
+    pub to_address: String,
+    /// Send amount in the asset's smallest unit (decimal string): `sun`
+    /// for TRX (1 TRX = 10^6 sun), or 6-decimal base units for USDT.
+    pub amount: String,
+    /// `Usdt` only: the TRC20 contract address (base58 `T…`). Ignored for
+    /// `Trx`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_address: Option<String>,
+    /// The active `Permission.id` the multisig signs under (the witness
+    /// permission is id 1; active permissions start at 2). Bound INSIDE
+    /// `raw_data`, so it is part of the `txID` — all members must agree.
+    pub permission_id: u32,
+    /// `raw_data.ref_block_bytes` (`0x`-prefixed 2-byte hex) — the low 2
+    /// bytes of the TAPOS reference block height.
+    pub ref_block_bytes: String,
+    /// `raw_data.ref_block_hash` (`0x`-prefixed 8-byte hex) — bytes [8:16]
+    /// of the TAPOS reference block id.
+    pub ref_block_hash: String,
+    /// `raw_data.expiration` in unix milliseconds (decimal `u64` string).
+    pub expiration: String,
+    /// `raw_data.timestamp` in unix milliseconds (decimal `u64` string).
+    pub timestamp: String,
+    /// `raw_data.fee_limit` in `sun` (decimal `u64` string). `Usdt` only —
+    /// caps the energy spend for the contract call; `0`/ignored for `Trx`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_limit: Option<String>,
+    /// `THORChain` memo carried in `raw_data.data` (raw bytes as a UTF-8
+    /// string). Empty omits the field.
+    pub memo: String,
+    /// The `txID = sha256(raw_data)` the coordinator claims, `0x`-prefixed
+    /// 32-byte hex. The daemon rebuilds `raw_data` from the semantic fields
+    /// above and refuses with [`error_codes::TRON_TX_MISMATCH`] on
+    /// divergence; it signs the bytes IT rebuilt.
+    pub txid: String,
+}
+
+/// Serde validator: refuse a [`TronTxSignRequest`] with a non-TRON
+/// `chain_id`. Defence-in-depth above the runtime `custody_family` check.
+fn deserialize_tron_chain_id<'de, D>(deserializer: D) -> Result<ChainId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let chain = ChainId::deserialize(deserializer)?;
+    if chain.custody_family() != CustodyFamily::Tron {
+        return Err(serde::de::Error::custom(format!(
+            "{}: chain '{chain}' is not a TRON custody family chain",
+            error_codes::NON_TRON_CHAIN
+        )));
+    }
+    Ok(chain)
+}
+
+/// Response for `tron-tx` signing (Phase 4.6).
+///
+/// TRON signatures are 65-byte recoverable secp256k1 (`r ‖ s ‖ v`, v =
+/// raw recovery id 0/1, go-ethereum style) over the 32-byte `txID` — the
+/// same primitive the EVM path produces, but appended to
+/// `Transaction.signature[]` rather than recovered on-chain. `pubkey` is
+/// the 33-byte compressed member pubkey so the coordinator can confirm the
+/// signer and sum its `Permission` weight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TronSignResponse {
+    /// `0x`-prefixed 33-byte compressed secp256k1 pubkey.
+    pub pubkey: String,
+    /// `0x`-prefixed 65-byte recoverable signature (`r ‖ s ‖ v`, v ∈ {0,1}).
+    pub signature: String,
+}
+
 /// `GET /api/v1/keys`
 ///
 /// Daemon identity — coordinator pins this and checks every response
@@ -697,6 +820,16 @@ pub mod error_codes {
     /// (Squads / System / SPL-Memo), or carries an unexpected instruction.
     /// HTTP 422.
     pub const SOLANA_FOREIGN_INSTRUCTION: &str = "solana_foreign_instruction";
+    /// Phase 4.6: the request's `chain_id` is not a TRON custody-family
+    /// chain — the `tron-tx` endpoint only accepts TRON chains. HTTP 422.
+    pub const NON_TRON_CHAIN: &str = "non_tron_chain";
+    /// Phase 4.6: the request's `owner_address` did not match this daemon's
+    /// configured TRON multisig account. HTTP 422.
+    pub const WRONG_TRON_ACCOUNT: &str = "wrong_tron_account";
+    /// Phase 4.6: the daemon rebuilt the `raw_data` protobuf from the
+    /// request's semantic fields and the recomputed `txID = sha256(raw_data)`
+    /// did not match the caller-supplied `txid`. HTTP 422.
+    pub const TRON_TX_MISMATCH: &str = "tron_tx_mismatch";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -926,6 +1059,7 @@ mod tests {
     fn cosmos_tx_request_rejects_non_cosmos_chains() {
         for chain in [
             "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "xrp", "sol",
+            "tron",
         ] {
             let json = format!(
                 r#"{{"chain_id":"{chain}","account_address":"cosmos1x","cosmos_chain_id":"cosmoshub-4","account_number":"0","sequence":"0","to_address":"cosmos1y","amount":"1","denom":"uatom","fee_amount":"0","gas_limit":"200000","memo":"","sign_doc_hash":"0x{hash}"}}"#,
@@ -985,6 +1119,7 @@ mod tests {
     fn xrp_tx_request_rejects_non_xrp_chains() {
         for chain in [
             "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "gaia", "sol",
+            "tron",
         ] {
             let json = format!(
                 r#"{{"chain_id":"{chain}","account_address":"rX","destination":"rY","amount_drops":"1","fee_drops":"30","sequence":"0","last_ledger_sequence":"0","memo":"","signing_blob":"0x{blob}"}}"#,
@@ -1047,6 +1182,7 @@ mod tests {
     fn solana_tx_request_rejects_non_solana_chains() {
         for chain in [
             "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "gaia", "xrp",
+            "tron",
         ] {
             let json = format!(
                 r#"{{"chain_id":"{chain}","tx_kind":"approve","multisig_pda":"M","member_pubkey":"K","transaction_index":"0","recent_blockhash":"B","message_hex":"0x00"}}"#
@@ -1072,6 +1208,80 @@ mod tests {
         };
         let s = serde_json::to_string(&r).expect("serialize");
         let back: SolanaSignResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, r);
+    }
+
+    /// Phase 4.6: a `TronTxSignRequest` round-trips JSON for the TRON chain
+    /// for both asset kinds (TRX `TransferContract` + USDT
+    /// `TriggerSmartContract`, including the `Usdt`-only fields).
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn tron_tx_request_round_trip() {
+        for (asset, contract, fee_limit) in [
+            (TronAssetKind::Trx, None, None),
+            (
+                TronAssetKind::Usdt,
+                Some("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".to_string()),
+                Some("30000000".to_string()),
+            ),
+        ] {
+            let req = TronTxSignRequest {
+                chain_id: ChainId::Tron,
+                asset,
+                owner_address: "TU6nEM4GTca2L5AuDTnY1qp1rkQ2t8NxvM".to_string(),
+                to_address: "TJRabPrwbZy45sbavfcjinPJC18kjpRTv8".to_string(),
+                amount: "1000000".to_string(),
+                contract_address: contract,
+                permission_id: 2,
+                ref_block_bytes: "0x00b0".to_string(),
+                ref_block_hash: "0x3f1bc96dc80e7f61".to_string(),
+                expiration: "1548974130000".to_string(),
+                timestamp: "1548974072663".to_string(),
+                fee_limit,
+                memo: "=:ETH.USDT:0xabc:0/1/0".to_string(),
+                txid: format!("0x{}", "ab".repeat(32)),
+            };
+            let s = serde_json::to_string(&req).expect("serialize");
+            let back: TronTxSignRequest = serde_json::from_str(&s).expect("deserialize");
+            assert_eq!(back, req);
+            assert!(s.contains("\"chain_id\":\"tron\""));
+        }
+    }
+
+    /// Phase 4.6: the serde validator rejects non-TRON `ChainId`s on the
+    /// `tron-tx` request — defence-in-depth above the daemon's runtime
+    /// `custody_family` check.
+    #[test]
+    fn tron_tx_request_rejects_non_tron_chains() {
+        for chain in [
+            "btc", "ltc", "bch", "doge", "zec", "eth", "bsc", "avax", "base", "pol", "gaia", "xrp",
+            "sol",
+        ] {
+            let json = format!(
+                r#"{{"chain_id":"{chain}","asset":"trx","owner_address":"T1","to_address":"T2","amount":"1","permission_id":2,"ref_block_bytes":"0x00b0","ref_block_hash":"0x3f1bc96dc80e7f61","expiration":"1","timestamp":"1","memo":"","txid":"0x{hash}"}}"#,
+                hash = "00".repeat(32),
+            );
+            let result: Result<TronTxSignRequest, _> = serde_json::from_str(&json);
+            let err_msg = match result {
+                Ok(req) => format!("expected NON_TRON_CHAIN rejection, got: {req:?}"),
+                Err(e) => format!("{e}"),
+            };
+            assert!(
+                err_msg.contains(error_codes::NON_TRON_CHAIN),
+                "must surface NON_TRON_CHAIN; chain='{chain}', got: {err_msg}"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn tron_sign_response_json_round_trip() {
+        let r = TronSignResponse {
+            pubkey: format!("0x{}", "02".repeat(33)),
+            signature: format!("0x{}", "cd".repeat(65)),
+        };
+        let s = serde_json::to_string(&r).expect("serialize");
+        let back: TronSignResponse = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, r);
     }
 }

@@ -48,6 +48,7 @@ use crate::evm_safe::{handle_evm_safe_tx, EvmSignerConfig};
 use crate::psbt::{handle_psbt_input, UtxoSignerConfig};
 use crate::replay::{CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore};
 use crate::solana_tx::{handle_solana_tx, SolSignerConfig};
+use crate::tron_tx::{handle_tron_tx, TronSignerConfig};
 use crate::web3signer::{HsmDigestSigner, HsmError};
 use crate::xrp_tx::{handle_xrp_tx, XrpSignerConfig};
 
@@ -111,6 +112,11 @@ pub struct DaemonState<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> {
     /// route is then not registered. One [`SolSignerConfig`] per Solana
     /// chain this daemon is a Squads member of (DL-P3-7).
     pub sol: HashMap<ChainId, Arc<SolSignerConfig>>,
+    /// Phase 4.6: per-chain TRON account-permission multisig signing roles.
+    /// Empty map = no TRON key configured; the `/api/v1/sign/tron-tx` route
+    /// is then not registered. One [`TronSignerConfig`] per TRON chain this
+    /// daemon is a permission member of (DL-P3-7).
+    pub tron: HashMap<ChainId, Arc<TronSignerConfig>>,
 }
 
 // Manual `Clone` impl: every field is cheap to clone (`Arc<_>` +
@@ -130,6 +136,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> Clone for DaemonSta
             cosmos: self.cosmos.clone(),
             xrp: self.xrp.clone(),
             sol: self.sol.clone(),
+            tron: self.tron.clone(),
         }
     }
 }
@@ -146,6 +153,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             cosmos: HashMap::new(),
             xrp: HashMap::new(),
             sol: HashMap::new(),
+            tron: HashMap::new(),
         }
     }
 
@@ -187,6 +195,13 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
         self.sol.insert(config.chain, Arc::new(config));
         self
     }
+
+    /// Phase 4.6 builder: attach a per-chain TRON multisig signing role.
+    #[must_use]
+    pub fn with_tron(mut self, config: TronSignerConfig) -> Self {
+        self.tron.insert(config.chain, Arc::new(config));
+        self
+    }
 }
 
 /// Build the daemon router. Returns a `Router` ready to be served with
@@ -223,6 +238,9 @@ where
     }
     if !state.sol.is_empty() {
         r = r.route("/api/v1/sign/solana-tx", post(handle_solana_tx::<S, H>));
+    }
+    if !state.tron.is_empty() {
+        r = r.route("/api/v1/sign/tron-tx", post(handle_tron_tx::<S, H>));
     }
     r.with_state(state)
 }
