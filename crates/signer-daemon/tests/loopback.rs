@@ -380,11 +380,18 @@ async fn coordinator_to_daemon_psbt_input_signs_with_real_ecdsa_and_finalizes() 
     // Coordinator side: RemoteMultisigCosigner pinned to the daemon's
     // disclosed BTC pubkey. Run the blocking HTTP call inside
     // spawn_blocking so reqwest::blocking can drive its own runtime.
+    // audit M2: pass the leg's expected outputs that MATCH this PSBT's
+    // sole OP_RETURN output, proving a legitimate leg passes the veto.
+    let expected = xindex_executor::ExpectedOutputs {
+        destination_spk: ScriptBuf::new_op_return(b"z").into_bytes(),
+        amount_sats: 99_000,
+        memo: b"z".to_vec(),
+    };
     let url_for_sign = url;
     let psbt_send = psbt.clone();
     let (got_pk, got_sig) = tokio::task::spawn_blocking(move || {
         let cosigner = RemoteMultisigCosigner::new(ChainId::Btc, url_for_sign, btc_pk);
-        cosigner.sign_input(&psbt_send, 0)
+        cosigner.sign_input(&psbt_send, 0, Some(&expected))
     })
     .await
     .expect("join")

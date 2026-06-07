@@ -106,6 +106,23 @@ pub struct PsbtInputSignRequest {
     pub psbt_base64: String,
     /// Which input index of the PSBT to partial-sign.
     pub input_index: u32,
+    /// Optional output veto (audit M2, defense-in-depth): hex of the
+    /// expected payout output's `scriptPubKey`. When `Some`, the daemon
+    /// refuses to sign unless at least one output of `psbt.unsigned_tx`
+    /// has a byte-identical `scriptPubKey`. Binds the leg's intended
+    /// `THORChain` Asgard destination to the PSBT the daemon signs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_destination_spk: Option<String>,
+    /// Optional output veto (audit M2): the expected payout amount in
+    /// sats. When `Some` (and `expected_destination_spk` is `Some`), the
+    /// matched destination output's `value` must equal this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_amount_sats: Option<u64>,
+    /// Optional output veto (audit M2): hex of the expected `OP_RETURN`
+    /// data payload (the `THORChain` memo bytes). When `Some`, the daemon
+    /// refuses unless some `OP_RETURN` output pushes byte-identical data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_memo: Option<String>,
 }
 
 /// `POST /api/v1/sign/evm-safe-tx`
@@ -830,6 +847,24 @@ pub mod error_codes {
     /// request's semantic fields and the recomputed `txID = sha256(raw_data)`
     /// did not match the caller-supplied `txid`. HTTP 422.
     pub const TRON_TX_MISMATCH: &str = "tron_tx_mismatch";
+    /// Audit M2: a `PsbtInputSignRequest` carried `expected_*` output
+    /// constraints (destination `scriptPubKey` / amount / `OP_RETURN`
+    /// memo) and the PSBT's outputs did not satisfy them — the daemon
+    /// refuses to sign a spend whose payout does not match the leg's
+    /// intent. HTTP 422.
+    pub const PSBT_OUTPUTS_MISMATCH: &str = "psbt_outputs_mismatch";
+    /// Audit M2b (partial floor): the PSBT carried an output that is
+    /// neither the pinned payout, the (zero-value) `OP_RETURN` memo, nor
+    /// change back to the daemon's own multisig descriptor. Change can
+    /// only return to self, so a malicious coordinator cannot redirect
+    /// the residue to an attacker address. HTTP 422.
+    pub const PSBT_UNEXPECTED_OUTPUT: &str = "psbt_unexpected_output";
+    /// Audit M2b (partial floor): the implied miner fee
+    /// (`Σ inputs − Σ outputs`) exceeds the per-chain
+    /// `ChainId::max_redeem_fee_sats` ceiling, or an input was missing a
+    /// `witness_utxo` so the fee could not be bounded. Stops a malicious
+    /// coordinator from burning the residue as an unbounded fee. HTTP 422.
+    pub const PSBT_FEE_EXCEEDS_CAP: &str = "psbt_fee_exceeds_cap";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -901,6 +936,9 @@ mod tests {
             chain_id: ChainId::Btc,
             psbt_base64: "cHNidP8BAA==".to_string(),
             input_index: 0,
+            expected_destination_spk: Some("0014abcd".to_string()),
+            expected_amount_sats: Some(100_000),
+            expected_memo: Some("3d3a4554482e55534454".to_string()),
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -927,10 +965,15 @@ mod tests {
                 chain_id: chain,
                 psbt_base64: "cHNidP8BAA==".to_string(),
                 input_index: 0,
+                expected_destination_spk: None,
+                expected_amount_sats: None,
+                expected_memo: None,
             };
             let s = serde_json::to_string(&req).expect("serialize");
             let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
             assert_eq!(back, req);
+            // Omitted optional veto fields must not appear on the wire.
+            assert!(!s.contains("expected_destination_spk"));
         }
     }
 

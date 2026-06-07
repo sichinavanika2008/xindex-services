@@ -34,3 +34,6 @@ pub mod solana_tx;
 pub mod tron_tx;
 pub mod web3signer;
 pub mod xrp_tx;
+
+#[cfg(test)]
+mod test_support;

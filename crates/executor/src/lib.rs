@@ -32,8 +32,8 @@ pub use broadcast_registry::{
 };
 pub use rebroadcast::{run_watcher, WatcherConfig, WatcherError};
 pub use redeem::{
-    decode_redeem_event, ExecuteError, InProcessExecutor, MultisigCosigner, RedeemTask,
-    RedeemTaskSource,
+    decode_redeem_event, ExecuteError, ExpectedOutputs, InProcessExecutor, MultisigCosigner,
+    RedeemTask, RedeemTaskSource,
 };
 pub use solana_redeem::{
     SolanaCosigner, SolanaLockTable, SolanaMemberSig, SolanaRedeemConfig, SolanaRedeemError,

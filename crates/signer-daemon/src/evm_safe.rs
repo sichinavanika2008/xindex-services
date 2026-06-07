@@ -410,7 +410,7 @@ where
     }
 
     // 5b. Record + return.
-    state
+    if let Err(e) = state
         .replay
         .record_safe_tx(
             req.chain_id,
@@ -421,13 +421,50 @@ where
             now_unix_secs(),
         )
         .await
-        .map_err(|e| {
-            err(
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(err(
                 error_codes::BAD_REQUEST,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("replay record: {e}"),
-            )
-        })?;
+            ));
+        }
+        // L10: lost the write race; the winner already recorded. Re-read
+        // and return its cached signature idempotently.
+        return match state
+            .replay
+            .check_safe_tx(req.chain_id, req_safe, nonce_u64, recomputed_bytes)
+            .await
+            .map_err(|e| {
+                err(
+                    error_codes::BAD_REQUEST,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("replay db: {e}"),
+                )
+            })? {
+            CheckOutcome::Idempotent(rec) => {
+                let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
+                    err(
+                        error_codes::BAD_REQUEST,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "stored signature not 65 bytes".to_string(),
+                    )
+                })?;
+                Ok(Json(render_signature(evm_cfg.my_signer_address, arr)))
+            }
+            CheckOutcome::Conflict { .. } => Err(err(
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                StatusCode::CONFLICT,
+                "Safe-tx already signed for this (chain, safe, nonce) under a different payload"
+                    .to_string(),
+            )),
+            CheckOutcome::FirstTime => Err(err(
+                error_codes::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "record race left no row".to_string(),
+            )),
+        };
+    }
 
     Ok(Json(render_signature(evm_cfg.my_signer_address, sig)))
 }

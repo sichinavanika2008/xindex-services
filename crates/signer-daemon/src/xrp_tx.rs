@@ -281,7 +281,7 @@ where
     })?;
 
     // 6b. Record + return.
-    state
+    if let Err(e) = state
         .replay
         .record_xrp_tx(
             req.chain_id,
@@ -292,13 +292,48 @@ where
             now_unix_secs(),
         )
         .await
-        .map_err(|e| {
-            err(
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(err(
                 error_codes::BAD_REQUEST,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("replay record: {e}"),
+            ));
+        }
+        // L10: lost the write race; the winner already recorded. Re-read
+        // and return its cached signature idempotently.
+        return match state
+            .replay
+            .check_xrp_tx(
+                req.chain_id,
+                req.account_address.clone(),
+                u64::from(sequence),
+                digest,
             )
-        })?;
+            .await
+            .map_err(|e| {
+                err(
+                    error_codes::BAD_REQUEST,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("replay db: {e}"),
+                )
+            })? {
+            CheckOutcome::Idempotent(rec) => Ok(Json(render(cfg.my_member_pubkey, &rec.signature))),
+            CheckOutcome::Conflict { .. } => Err(err(
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                StatusCode::CONFLICT,
+                "xrp-tx already signed for this (chain, account, sequence) under a \
+                 different body (e.g. a different LastLedgerSequence) — pick one \
+                 deadline per sequence"
+                    .to_string(),
+            )),
+            CheckOutcome::FirstTime => Err(err(
+                error_codes::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "record race left no row".to_string(),
+            )),
+        };
+    }
 
     Ok(Json(render(cfg.my_member_pubkey, &der)))
 }

@@ -34,6 +34,18 @@ pub enum ReplayError {
     /// loud — corrupt rows signal data damage that must surface.
     #[error("decode error: {0}")]
     Decode(String),
+
+    /// A concurrent request already recorded this exact identity tuple — the
+    /// write-side race the `check_*` pre-flight cannot fully close (two
+    /// identical requests both observe `FirstTime`, both sign deterministically,
+    /// both attempt to `record_*`). The PK admits exactly one row, so the
+    /// second `record_*` surfaces this instead of a generic error; the handler
+    /// recovers by re-reading the now-present row and returning the cached
+    /// signature idempotently — deterministic ECDSA means the bytes are
+    /// identical anyway, so the race-loser never gets a spurious 4xx/5xx
+    /// (audit L10).
+    #[error("duplicate record (concurrent write race)")]
+    Duplicate,
 }
 
 /// One previously-signed record. Returned on an idempotent re-query so
@@ -356,10 +368,8 @@ impl ReplayStore for InMemoryReplayStore {
             });
             Ok(())
         } else {
-            // Mirror the SQLite UNIQUE violation surface.
-            Err(ReplayError::Decode(
-                "duplicate attestation record (race)".to_string(),
-            ))
+            // Mirror the SQLite UNIQUE violation surface (audit L10).
+            Err(ReplayError::Duplicate)
         }
     }
 
@@ -412,9 +422,7 @@ impl ReplayStore for InMemoryReplayStore {
             ));
             Ok(())
         } else {
-            Err(ReplayError::Decode(
-                "duplicate redemption record (race)".to_string(),
-            ))
+            Err(ReplayError::Duplicate)
         }
     }
 
@@ -454,9 +462,7 @@ impl ReplayStore for InMemoryReplayStore {
             });
             Ok(())
         } else {
-            Err(ReplayError::Decode(
-                "duplicate PSBT-input record (race)".to_string(),
-            ))
+            Err(ReplayError::Duplicate)
         }
     }
 
@@ -498,9 +504,7 @@ impl ReplayStore for InMemoryReplayStore {
             });
             Ok(())
         } else {
-            Err(ReplayError::Decode(
-                "duplicate Safe-tx record (race)".to_string(),
-            ))
+            Err(ReplayError::Duplicate)
         }
     }
 
@@ -542,9 +546,7 @@ impl ReplayStore for InMemoryReplayStore {
             });
             Ok(())
         } else {
-            Err(ReplayError::Decode(
-                "duplicate Cosmos-tx record (race)".to_string(),
-            ))
+            Err(ReplayError::Duplicate)
         }
     }
 
@@ -586,9 +588,7 @@ impl ReplayStore for InMemoryReplayStore {
             });
             Ok(())
         } else {
-            Err(ReplayError::Decode(
-                "duplicate XRP-tx record (race)".to_string(),
-            ))
+            Err(ReplayError::Duplicate)
         }
     }
 
@@ -630,9 +630,7 @@ impl ReplayStore for InMemoryReplayStore {
             });
             Ok(())
         } else {
-            Err(ReplayError::Decode(
-                "duplicate TRON-tx record (race)".to_string(),
-            ))
+            Err(ReplayError::Duplicate)
         }
     }
 }
@@ -673,6 +671,26 @@ impl SqliteReplayStore {
 
     fn slot_index_to_bytes(slot_index: U256) -> [u8; 32] {
         slot_index.to_be_bytes()
+    }
+
+    /// Map an INSERT result, translating a UNIQUE-constraint violation (the
+    /// write-side race two identical concurrent requests hit) into
+    /// [`ReplayError::Duplicate`] so the handler recovers idempotently rather
+    /// than surface a 5xx to the race-loser (audit L10). Any other DB error
+    /// propagates unchanged.
+    fn map_insert(
+        res: Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>,
+    ) -> Result<(), ReplayError> {
+        match res {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
+            {
+                Err(ReplayError::Duplicate)
+            }
+            Err(e) => Err(ReplayError::Sqlite(e)),
+        }
     }
 }
 
@@ -723,7 +741,7 @@ impl ReplayStore for SqliteReplayStore {
         now_unix: i64,
     ) -> Result<(), ReplayError> {
         let slot_bytes = Self::slot_index_to_bytes(slot_index);
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO signed_attestations
                 (intent_id, slot_index, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?)",
@@ -734,8 +752,8 @@ impl ReplayStore for SqliteReplayStore {
         .bind(&signature)
         .bind(now_unix)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        Self::map_insert(res)
     }
 
     async fn check_redemption(
@@ -800,7 +818,7 @@ impl ReplayStore for SqliteReplayStore {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> Result<(), ReplayError> {
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO signed_redemptions
                 (redemption_id, leg_index, kind, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -812,8 +830,8 @@ impl ReplayStore for SqliteReplayStore {
         .bind(&signature)
         .bind(now_unix)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        Self::map_insert(res)
     }
 
     async fn check_psbt_input(
@@ -862,7 +880,7 @@ impl ReplayStore for SqliteReplayStore {
         now_unix: i64,
     ) -> Result<(), ReplayError> {
         let vout = i64::from(input_vout);
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO signed_psbt_inputs
                 (input_txid, input_vout, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?)",
@@ -873,8 +891,8 @@ impl ReplayStore for SqliteReplayStore {
         .bind(&signature)
         .bind(now_unix)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        Self::map_insert(res)
     }
 
     async fn check_safe_tx(
@@ -937,7 +955,7 @@ impl ReplayStore for SqliteReplayStore {
             reason = "Safe nonce cannot reach i64::MAX in practice"
         )]
         let nonce_i = nonce as i64;
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO signed_safe_txs
                 (chain_id, safe_address, nonce, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -949,8 +967,8 @@ impl ReplayStore for SqliteReplayStore {
         .bind(&signature)
         .bind(now_unix)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        Self::map_insert(res)
     }
 
     async fn check_cosmos_tx(
@@ -1011,7 +1029,7 @@ impl ReplayStore for SqliteReplayStore {
             reason = "Cosmos sequence cannot reach i64::MAX in practice"
         )]
         let seq_i = sequence as i64;
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO signed_cosmos_txs
                 (chain_id, account_address, sequence, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1023,8 +1041,8 @@ impl ReplayStore for SqliteReplayStore {
         .bind(&signature)
         .bind(now_unix)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        Self::map_insert(res)
     }
 
     async fn check_xrp_tx(
@@ -1085,7 +1103,7 @@ impl ReplayStore for SqliteReplayStore {
             reason = "XRPL sequence is u32; cannot reach i64::MAX"
         )]
         let seq_i = sequence as i64;
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO signed_xrp_txs
                 (chain_id, account_address, sequence, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1097,8 +1115,8 @@ impl ReplayStore for SqliteReplayStore {
         .bind(&signature)
         .bind(now_unix)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        Self::map_insert(res)
     }
 
     async fn check_tron_tx(
@@ -1149,7 +1167,7 @@ impl ReplayStore for SqliteReplayStore {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> Result<(), ReplayError> {
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO signed_tron_txs
                 (chain_id, owner_address, txid, payload_hash, signature, signed_at_unix)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1161,8 +1179,8 @@ impl ReplayStore for SqliteReplayStore {
         .bind(&signature)
         .bind(now_unix)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+        Self::map_insert(res)
     }
 }
 

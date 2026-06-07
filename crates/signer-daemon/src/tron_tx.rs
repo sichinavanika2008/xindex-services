@@ -323,7 +323,7 @@ where
     }
 
     // 5b. Record + return.
-    state
+    if let Err(e) = state
         .replay
         .record_tron_tx(
             req.chain_id,
@@ -334,13 +334,51 @@ where
             now_unix_secs(),
         )
         .await
-        .map_err(|e| {
-            err(
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(err(
                 error_codes::BAD_REQUEST,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("replay record: {e}"),
-            )
-        })?;
+            ));
+        }
+        // L10: lost the write race; the winner already recorded. Re-read
+        // and return its cached signature idempotently.
+        return match state
+            .replay
+            .check_tron_tx(req.chain_id, req.owner_address.clone(), computed, computed)
+            .await
+            .map_err(|e| {
+                err(
+                    error_codes::BAD_REQUEST,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("replay db: {e}"),
+                )
+            })? {
+            CheckOutcome::Idempotent(rec) => {
+                let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
+                    err(
+                        error_codes::BAD_REQUEST,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "stored signature not 65 bytes".to_string(),
+                    )
+                })?;
+                Ok(Json(render(cfg.my_member_pubkey, &arr)))
+            }
+            CheckOutcome::Conflict { .. } => Err(err(
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                StatusCode::CONFLICT,
+                "tron-tx already signed for this (chain, owner, txid) — unexpected, since \
+                 the txID is the whole payload"
+                    .to_string(),
+            )),
+            CheckOutcome::FirstTime => Err(err(
+                error_codes::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "record race left no row".to_string(),
+            )),
+        };
+    }
 
     Ok(Json(render(cfg.my_member_pubkey, &sig65)))
 }

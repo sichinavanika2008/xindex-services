@@ -486,7 +486,7 @@ where
         .await
         .map_err(|e| hsm_unavailable(&e))?;
     recover_verify_signer(&sig, digest, state.config.eth_address)?;
-    state
+    if let Err(e) = state
         .replay
         .record_attestation(
             intent_id,
@@ -496,7 +496,37 @@ where
             now_unix_secs(),
         )
         .await
-        .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay record: {e}")))?;
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+        }
+        // L10: lost the write race; the winner already recorded. Re-read
+        // and return its cached signature idempotently.
+        return match state
+            .replay
+            .check_attestation(intent_id, slot_index, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
+        {
+            CheckOutcome::Idempotent(rec) => {
+                let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
+                    bad(
+                        error_codes::BAD_REQUEST,
+                        "stored signature not 65 bytes".to_string(),
+                    )
+                })?;
+                Ok(Json(render_signature(&state.config, arr)))
+            }
+            CheckOutcome::Conflict { .. } => Err(conflict(
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                "intent already attested with a different amount",
+            )),
+            CheckOutcome::FirstTime => Err(internal(
+                error_codes::BAD_REQUEST,
+                "record race left no row",
+            )),
+        };
+    }
     Ok(Json(render_signature(&state.config, sig)))
 }
 
@@ -614,7 +644,7 @@ where
         .await
         .map_err(|e| hsm_unavailable(&e))?;
     recover_verify_signer(&sig, digest, state.config.eth_address)?;
-    state
+    if let Err(e) = state
         .replay
         .record_redemption(
             redemption_id,
@@ -625,7 +655,42 @@ where
             now_unix_secs(),
         )
         .await
-        .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay record: {e}")))?;
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+        }
+        // L10: lost the write race; the winner already recorded. Re-read
+        // and return its cached signature idempotently (handle all four
+        // RedemptionCheckOutcome variants).
+        return match state
+            .replay
+            .check_redemption(redemption_id, leg_index, kind, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
+        {
+            RedemptionCheckOutcome::Idempotent(rec) => {
+                let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
+                    bad(
+                        error_codes::BAD_REQUEST,
+                        "stored signature not 65 bytes".to_string(),
+                    )
+                })?;
+                Ok(Json(render_signature(&state.config, arr)))
+            }
+            RedemptionCheckOutcome::Conflict { .. } => Err(conflict(
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                "redemption already signed with a different amount",
+            )),
+            RedemptionCheckOutcome::MutexViolation { .. } => Err(conflict(
+                error_codes::CONFLICT_DELIVERY_REFUND_MUTEX,
+                "redemption already resolved as the opposite leg",
+            )),
+            RedemptionCheckOutcome::FirstTime => Err(internal(
+                error_codes::BAD_REQUEST,
+                "record race left no row",
+            )),
+        };
+    }
     Ok(Json(render_signature(&state.config, sig)))
 }
 
@@ -774,6 +839,62 @@ mod tests {
         #[expect(clippy::unwrap_used, reason = "test code")]
         let seen = hsm.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
+    }
+
+    /// L10: the attestation handler loses the `record_attestation` write
+    /// race (store returns `Duplicate`). It must re-read the winner's row
+    /// and return the cached signature idempotently — HTTP 200, NOT an
+    /// error.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn attestation_record_race_recovers_cached_signature() {
+        use crate::replay::InMemoryReplayStore;
+        use crate::test_support::{RacePath, RaceReplayStore};
+
+        let intent_id = B256::repeat_byte(0x6c);
+        let slot_index = U256::from(0u8);
+        let attested_amount = U256::from(1_000_000u32);
+        let payload_hash = hash_attestation_payload(intent_id, slot_index, attested_amount);
+
+        // The winner already recorded a valid 65-byte signature.
+        let winner_sig: [u8; 65] = {
+            use alloy::signers::SignerSync;
+            let att = attestation(intent_id, slot_index, attested_amount);
+            let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
+            let digest = attestation_signing_hash(&att, &domain);
+            test_key().sign_hash_sync(&digest).expect("sign").as_bytes()
+        };
+        let inner = InMemoryReplayStore::new();
+        inner
+            .record_attestation(
+                intent_id,
+                slot_index,
+                payload_hash,
+                winner_sig.to_vec(),
+                100,
+            )
+            .await
+            .expect("seed winner");
+        let replay = Arc::new(RaceReplayStore::new(inner, RacePath::Attestation));
+        let hsm = Arc::new(CapturingSigner::default());
+        let state = DaemonState::new(cfg(), replay, hsm);
+        let app = router(state);
+
+        let (status, body) = post_json(
+            &app,
+            "/api/v1/sign/eip712-attestation",
+            serde_json::json!({
+                "intent_id": format!("{intent_id:#x}"),
+                "slot_index": slot_index.to_string(),
+                "attested_amount": attested_amount.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["signature"].as_str().unwrap_or(""),
+            format!("0x{}", alloy_primitives::hex::encode(winner_sig))
+        );
     }
 
     #[tokio::test]

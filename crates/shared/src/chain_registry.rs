@@ -410,6 +410,35 @@ impl ChainId {
         }
     }
 
+    /// Daemon-side upper bound (sats) on the implied miner fee
+    /// (`Σ inputs − Σ outputs`) of a redemption spend, used by the UTXO
+    /// PSBT signer to bound a fee-burning grief (M2b partial floor): a
+    /// malicious coordinator that omits the change output would otherwise
+    /// burn the entire residue to miners. The honest redemption fee is
+    /// `tx_size × fee_rate` — a few hundred thousand sats even at extreme
+    /// congestion — so these ceilings are deliberately generous and never
+    /// reject an honest spend; they only cap how much can be destroyed.
+    /// **Tighten per-chain at the DL-P3-7 mainnet gate.** `u64::MAX`
+    /// (no cap) for non-UTXO chains, which have their own fee models and
+    /// never reach this path.
+    #[must_use]
+    pub const fn max_redeem_fee_sats(self) -> u64 {
+        match self {
+            Self::Btc => 1_000_000,
+            Self::Ltc | Self::Bch | Self::Zec => 5_000_000,
+            Self::Doge => 1_000_000_000,
+            Self::Eth
+            | Self::Bsc
+            | Self::Avax
+            | Self::Base
+            | Self::Pol
+            | Self::Gaia
+            | Self::Xrp
+            | Self::Sol
+            | Self::Tron => u64::MAX,
+        }
+    }
+
     /// Fee unit per chain. UTXO `SegWit` → `PerVbyte`; UTXO legacy →
     /// `PerByte`; EVM → `PerGwei`; Cosmos → `PerCosmosGas`; XRP →
     /// `FlatXrpDrops`; Solana → `SolanaComputeUnits`; TRON → `TronResource`.
@@ -745,6 +774,24 @@ mod tests {
         assert_eq!(ChainId::Sol.op_return_max(), 0);
         // TRON: memo lives in raw_data.data, not OP_RETURN.
         assert_eq!(ChainId::Tron.op_return_max(), 0);
+    }
+
+    /// M2b fee ceiling: a generous per-UTXO-chain bound on the implied
+    /// miner fee (never rejects an honest redeem; caps a fee-burn grief);
+    /// `u64::MAX` (no cap) for non-UTXO chains that never reach the PSBT
+    /// fee check.
+    #[test]
+    fn max_redeem_fee_sats_per_chain() {
+        assert_eq!(ChainId::Btc.max_redeem_fee_sats(), 1_000_000);
+        assert_eq!(ChainId::Ltc.max_redeem_fee_sats(), 5_000_000);
+        assert_eq!(ChainId::Bch.max_redeem_fee_sats(), 5_000_000);
+        assert_eq!(ChainId::Doge.max_redeem_fee_sats(), 1_000_000_000);
+        assert_eq!(ChainId::Zec.max_redeem_fee_sats(), 5_000_000);
+        assert_eq!(ChainId::Eth.max_redeem_fee_sats(), u64::MAX);
+        assert_eq!(ChainId::Gaia.max_redeem_fee_sats(), u64::MAX);
+        assert_eq!(ChainId::Xrp.max_redeem_fee_sats(), u64::MAX);
+        assert_eq!(ChainId::Sol.max_redeem_fee_sats(), u64::MAX);
+        assert_eq!(ChainId::Tron.max_redeem_fee_sats(), u64::MAX);
     }
 
     /// Fee unit per `SegWit` availability. BCH/DOGE/ZEC have no

@@ -200,6 +200,20 @@ impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorUtxoPolicy<C> {
             });
         }
 
+        // Resolve the live Asgard vault — the UTXO MUST originate there
+        // (sender binding, P3.3-9 for BTC). Refuse while BTC trading is
+        // halted (defense-in-depth — an operator incident signal).
+        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+            CrossCheckError::ThorNotReady {
+                reason: "no BTC inbound address from THORChain".to_string(),
+            }
+        })?;
+        if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "BTC trading halted on THORChain".to_string(),
+            });
+        }
+
         // Step 2: Bitcoin side.
         let needed = Amount::from_sat(expected_sats);
         let utxo = find_arrival(
@@ -216,6 +230,16 @@ impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorUtxoPolicy<C> {
             return Err(CrossCheckError::AmountMismatch {
                 thor_sats: utxo.value.to_sat(),
                 claim_sats: expected_sats,
+            });
+        }
+
+        // Bind the UTXO's funding inputs to the live Asgard vault — a
+        // recipient+amount match alone is forgeable since our multisig
+        // address is public.
+        let funders = self.btc.tx_input_addresses(&utxo.txid)?;
+        if !funders.iter().any(|f| f == &vault.address) {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "BTC UTXO not funded by the live Asgard vault".to_string(),
             });
         }
 
@@ -600,6 +624,20 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
                     reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
                 })?;
 
+        // Resolve the live Asgard vault — the refund UTXO MUST originate
+        // there (sender binding, P3.3-9 for BTC). Refuse while BTC trading
+        // is halted on THORChain.
+        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+            RefundCrossCheckError::ThorNotReady {
+                reason: "no BTC inbound address from THORChain".to_string(),
+            }
+        })?;
+        if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+            return Err(RefundCrossCheckError::ThorNotReady {
+                reason: "BTC trading halted on THORChain".to_string(),
+            });
+        }
+
         // Independent Bitcoin observation. BTC is 1e8 BOTH on THORChain
         // and on-chain (sats) — no scaling, unlike USDT.
         let floor = Amount::from_sat(thor_sats.saturating_sub(self.tolerance_sats));
@@ -618,6 +656,14 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
             return Err(RefundCrossCheckError::AmountMismatch {
                 thor_sats,
                 utxo_sats,
+            });
+        }
+
+        // Bind the refund UTXO's funding inputs to the live Asgard vault.
+        let funders = self.btc.tx_input_addresses(&utxo.txid)?;
+        if !funders.iter().any(|f| f == &vault.address) {
+            return Err(RefundCrossCheckError::ThorNotReady {
+                reason: "BTC refund UTXO not funded by the live Asgard vault".to_string(),
             });
         }
         info!(btc_txid, refunded_sats = utxo_sats, "refund cross-check OK");
@@ -656,6 +702,28 @@ mod tests {
         fn broadcast(&self, _tx: &bitcoin::Transaction) -> Result<Txid, UtxoError> {
             Err(UtxoError::Upstream("not used".to_string()))
         }
+        fn tx_input_addresses(&self, _txid: &Txid) -> Result<Vec<String>, UtxoError> {
+            Ok(vec![ASGARD_BTC.to_string()])
+        }
+    }
+
+    /// Mainnet bech32 address standing in for the live Asgard vault that
+    /// funds every BTC UTXO `StubBtc` reports.
+    const ASGARD_BTC: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+
+    /// Mock `GET /thorchain/inbound_addresses` returning a single BTC vault
+    /// with the given address + halted flag.
+    async fn mount_btc_inbound(server: &wiremock::MockServer, vault_addr: &str, halted: bool) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/inbound_addresses"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "chain": "BTC", "pub_key": "thorpub1addwnpepq", "address": vault_addr,
+                    "halted": halted
+                }])),
+            )
+            .mount(server)
+            .await;
     }
 
     #[expect(clippy::expect_used, reason = "test code")]
@@ -700,6 +768,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
@@ -900,6 +969,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         // Seed BTC stub with a confirmed UTXO matching the claim.
@@ -915,6 +985,114 @@ mod tests {
         });
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         policy.verify("abc", 100_000).await.expect("should pass");
+    }
+
+    /// Sender binding (audit M4): the UTXO arrives at our multisig with the
+    /// right amount + confs, but its funding inputs come from a DIFFERENT
+    /// address than the live Asgard vault → `ThorNotReady`.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn thor_btc_policy_rejects_utxo_not_from_asgard() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "observed_tx": {
+                        "tx": {
+                            "id": "abc", "chain": "ETH",
+                            "from_address": "0xUser", "to_address": "0xRouter",
+                            "coins": [], "memo": ""
+                        },
+                        "status": "done"
+                    },
+                    "actions": [{
+                        "chain": "BTC",
+                        "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+                        "coin": { "asset": "BTC.BTC", "amount": "100000" },
+                        "memo": "OUT:abc",
+                        "max_gas": []
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+        // Inbound reports a DIFFERENT vault than StubBtc::tx_input_addresses.
+        mount_btc_inbound(&server, "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh", false).await;
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let btc = StubBtc::default();
+        let txid =
+            Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
+                .expect("txid");
+        btc.utxos.lock().expect("lock").push(UtxoEntry {
+            txid,
+            vout: 0,
+            value: Amount::from_sat(100_000),
+            confirmations: 6,
+            block_hash: None,
+        });
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let err = policy
+            .verify("abc", 100_000)
+            .await
+            .expect_err("must reject UTXO not from Asgard");
+        assert!(
+            matches!(err, CrossCheckError::ThorNotReady { .. }),
+            "expected ThorNotReady, got {err:?}"
+        );
+    }
+
+    /// Halt gate (audit L8): `THORChain` reports BTC trading halted →
+    /// `ThorNotReady` even when the UTXO + sender would otherwise match.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn thor_btc_policy_rejects_when_btc_halted() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "observed_tx": {
+                        "tx": {
+                            "id": "abc", "chain": "ETH",
+                            "from_address": "0xUser", "to_address": "0xRouter",
+                            "coins": [], "memo": ""
+                        },
+                        "status": "done"
+                    },
+                    "actions": [{
+                        "chain": "BTC",
+                        "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+                        "coin": { "asset": "BTC.BTC", "amount": "100000" },
+                        "memo": "OUT:abc",
+                        "max_gas": []
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_btc_inbound(&server, ASGARD_BTC, true).await; // halted
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let btc = StubBtc::default();
+        let txid =
+            Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
+                .expect("txid");
+        btc.utxos.lock().expect("lock").push(UtxoEntry {
+            txid,
+            vout: 0,
+            value: Amount::from_sat(100_000),
+            confirmations: 6,
+            block_hash: None,
+        });
+        let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
+        let err = policy
+            .verify("abc", 100_000)
+            .await
+            .expect_err("must reject while halted");
+        assert!(
+            matches!(err, CrossCheckError::ThorNotReady { .. }),
+            "expected ThorNotReady, got {err:?}"
+        );
     }
 
     /* ----------------- redemption / refund cross-checks ------------------ */
@@ -1075,6 +1253,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         btc.utxos.lock().expect("lock").push(UtxoEntry {
@@ -1269,6 +1448,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         btc.utxos.lock().expect("lock").push(UtxoEntry {
@@ -1366,6 +1546,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         btc.utxos.lock().expect("lock").push(UtxoEntry {
@@ -1499,6 +1680,15 @@ pub mod evm {
             /// EVM-log-decoded wei.
             onchain_wei: u128,
         },
+        /// The Router `TransferOut` delivered a different asset than the
+        /// policy expects (audit L5). Never sign for a wrong asset.
+        #[error("asset mismatch: delivered {delivered:#x} vs expected {expected:#x}")]
+        AssetMismatch {
+            /// Asset decoded from the Router event.
+            delivered: EthAddress,
+            /// Asset the policy was configured to expect.
+            expected: EthAddress,
+        },
         /// Mint path observed a REFUND action — caller MUST attest via
         /// the refund policy, never delivery (mutually exclusive on-chain).
         #[error("`THORChain` refunded (not delivered) — use the refund path")]
@@ -1517,6 +1707,10 @@ pub mod evm {
         pub value_wei: u128,
         /// Recipient (the Safe expected to receive).
         pub to: EthAddress,
+        /// Delivered asset address (Router event `data[0..32]`). The zero
+        /// address denotes the chain's native coin (ETH/BNB/AVAX). Bound
+        /// against the policy's expected native asset (audit L5).
+        pub asset: EthAddress,
         /// Tx-hash the event was emitted in.
         pub transaction_hash: B256,
         /// Confirmation depth at the current tip.
@@ -1562,7 +1756,7 @@ pub mod evm {
         };
         let logs = client.eth_get_logs(filter).await?;
         for log in logs {
-            if let Some(decoded) = decode_router_transfer_out(&log, safe, tip) {
+            if let Some(decoded) = decode_router_transfer_out(&log, router, safe, tip) {
                 if decoded.value_wei >= min_value_wei && decoded.confirmations >= min_confs {
                     return Ok(Some(decoded));
                 }
@@ -1599,7 +1793,7 @@ pub mod evm {
         };
         let logs = client.eth_get_logs(filter).await?;
         for log in logs {
-            if let Some(decoded) = decode_erc20_transfer(&log, to_addr, tip) {
+            if let Some(decoded) = decode_erc20_transfer(&log, token, to_addr, tip) {
                 if decoded.value_wei >= min_value && decoded.confirmations >= min_confs {
                     return Ok(Some(decoded));
                 }
@@ -1622,9 +1816,16 @@ pub mod evm {
     /// the cross-check (the policy validates amount + recipient).
     fn decode_router_transfer_out(
         log: &EvmLogEntry,
+        expected_contract: EthAddress,
         expected_to: EthAddress,
         tip: u64,
     ) -> Option<RouterTransferOut> {
+        // Client-side emitter re-assert (audit I5): the node-side address
+        // filter already binds the emitting contract to the Router, but a
+        // non-compliant RPC could return a log from another contract.
+        if log.address != expected_contract {
+            return None;
+        }
         // `topic[2]` = to (indexed).
         let to_topic = *log.topics.get(2)?;
         let mut to_bytes = [0u8; 20];
@@ -1638,11 +1839,14 @@ pub mod evm {
         }
         // `data` ABI: address (32) ‖ uint256 (32) ‖ offset (32) ‖
         //             length (32) ‖ memo-bytes (padded).
-        // We only need the amount at offset 32..64.
+        // Decode asset at 0..32 (left-padded address) and amount at 32..64.
         let data = log.data.as_ref();
         if data.len() < 64 {
             return None;
         }
+        let mut asset_bytes = [0u8; 20];
+        asset_bytes.copy_from_slice(&data[12..32]);
+        let asset = EthAddress::from(asset_bytes);
         let amount_word: [u8; 32] = data[32..64].try_into().ok()?;
         let amount = U256::from_be_slice(&amount_word);
         let value_wei = u128::try_from(amount).ok()?;
@@ -1651,6 +1855,7 @@ pub mod evm {
         Some(RouterTransferOut {
             value_wei,
             to,
+            asset,
             transaction_hash: log.transaction_hash,
             confirmations,
         })
@@ -1660,9 +1865,16 @@ pub mod evm {
     /// is the 32-byte value.
     fn decode_erc20_transfer(
         log: &EvmLogEntry,
+        expected_token: EthAddress,
         expected_to: EthAddress,
         tip: u64,
     ) -> Option<RouterTransferOut> {
+        // Client-side emitter re-assert (audit I5): the emitting contract of
+        // an ERC20 Transfer IS the token; a non-compliant RPC ignoring the
+        // address filter could otherwise smuggle a Transfer from another token.
+        if log.address != expected_token {
+            return None;
+        }
         let to_topic = *log.topics.get(2)?;
         let mut to_bytes = [0u8; 20];
         to_bytes.copy_from_slice(&to_topic.as_slice()[12..]);
@@ -1682,6 +1894,8 @@ pub mod evm {
         Some(RouterTransferOut {
             value_wei,
             to,
+            // For an ERC20 Transfer the emitting contract IS the token.
+            asset: log.address,
             transaction_hash: log.transaction_hash,
             confirmations,
         })
@@ -1721,6 +1935,11 @@ pub mod evm {
         /// `THORChain` chain string (`ETH` / `BSC` / `AVAX` / `BASE` /
         /// `POL`). Filter for the action's `chain` field.
         thor_chain_label: &'static str,
+        /// Expected delivered asset (Router event `data[0..32]`). `None`
+        /// skips the asset binding (preserves the prior behaviour);
+        /// `Some(addr)` rejects any `TransferOut` whose decoded asset
+        /// differs — e.g. `Some(EthAddress::ZERO)` for native ETH (audit L5).
+        expected_asset: Option<EthAddress>,
         min_confirmations: u32,
         /// Max |thor − on-chain| wei.
         tolerance_wei: u128,
@@ -1736,6 +1955,7 @@ pub mod evm {
                 .field("safe_address", &self.safe_address)
                 .field("router_address", &self.router_address)
                 .field("thor_chain_label", &self.thor_chain_label)
+                .field("expected_asset", &self.expected_asset)
                 .field("min_confirmations", &self.min_confirmations)
                 .field("tolerance_wei", &self.tolerance_wei)
                 .field("lookback_blocks", &self.lookback_blocks)
@@ -1748,6 +1968,11 @@ pub mod evm {
         /// destination chain's THORChain identifier
         /// (`ChainId::thor_asset` minus the asset suffix:
         /// `"ETH"` for `ETH.ETH`, `"BSC"` for `BSC.BNB`, etc.).
+        ///
+        /// `expected_asset` binds the delivered asset decoded from the
+        /// Router `TransferOut` event (audit L5). Pass `Some(addr)` to
+        /// require an exact asset (`Some(EthAddress::ZERO)` for the native
+        /// coin); `None` skips the binding.
         #[must_use]
         pub fn new(
             thor: ThorClient,
@@ -1755,6 +1980,7 @@ pub mod evm {
             safe_address: EthAddress,
             router_address: EthAddress,
             thor_chain_label: &'static str,
+            expected_asset: Option<EthAddress>,
             min_confirmations: u32,
             tolerance_wei: u128,
             lookback_blocks: u64,
@@ -1765,6 +1991,7 @@ pub mod evm {
                 safe_address,
                 router_address,
                 thor_chain_label,
+                expected_asset,
                 min_confirmations,
                 tolerance_wei,
                 lookback_blocks,
@@ -1786,6 +2013,23 @@ pub mod evm {
                         "observed_tx.status = {} (expected 'done')",
                         resp.observed_tx.status
                     ),
+                });
+            }
+            // Refuse while this EVM chain's trading is halted on THORChain
+            // (defense-in-depth — an operator incident signal, audit L8).
+            let vault = self
+                .thor
+                .vault_for_chain(self.thor_chain_label)
+                .await?
+                .ok_or_else(|| EvmCrossCheckError::ThorNotReady {
+                    reason: format!(
+                        "no {} inbound address from THORChain",
+                        self.thor_chain_label
+                    ),
+                })?;
+            if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+                return Err(EvmCrossCheckError::ThorNotReady {
+                    reason: format!("{} trading halted on THORChain", self.thor_chain_label),
                 });
             }
             // REFUND memo on this chain → caller used the wrong path.
@@ -1839,6 +2083,15 @@ pub mod evm {
                 min_confs: self.min_confirmations,
                 safe: self.safe_address,
             })?;
+            // Bind the delivered asset (audit L5). `None` skips the check.
+            if let Some(expected) = self.expected_asset {
+                if observed.asset != expected {
+                    return Err(EvmCrossCheckError::AssetMismatch {
+                        delivered: observed.asset,
+                        expected,
+                    });
+                }
+            }
             if !within(thor_wei, observed.value_wei, self.tolerance_wei) {
                 return Err(EvmCrossCheckError::AmountMismatch {
                     thor_wei,
@@ -1912,6 +2165,23 @@ pub mod evm {
             if resp.observed_tx.status != "done" {
                 return Err(RefundCrossCheckError::ThorNotReady {
                     reason: format!("observed_tx.status = {}", resp.observed_tx.status),
+                });
+            }
+            // Refuse while this EVM chain's trading is halted on THORChain
+            // (defense-in-depth — an operator incident signal, audit L8).
+            let vault = self
+                .thor
+                .vault_for_chain(self.thor_chain_label)
+                .await?
+                .ok_or_else(|| RefundCrossCheckError::ThorNotReady {
+                    reason: format!(
+                        "no {} inbound address from THORChain",
+                        self.thor_chain_label
+                    ),
+                })?;
+            if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+                return Err(RefundCrossCheckError::ThorNotReady {
+                    reason: format!("{} trading halted on THORChain", self.thor_chain_label),
                 });
             }
             // Mutual-exclusion: a delivery (USDT or native to user wallet)
@@ -2287,6 +2557,24 @@ pub mod evm {
             server
         }
 
+        /// Mock `GET /thorchain/inbound_addresses` returning a single ETH
+        /// vault with the given halted flag (address is irrelevant for the
+        /// EVM policies — they have no sender binding, only the halt gate).
+        async fn mount_eth_inbound(server: &wiremock::MockServer, halted: bool) {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/thorchain/inbound_addresses"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([{
+                        "chain": "ETH", "pub_key": "thorpub1addwnpepq",
+                        "address": "0xeAf72A36ec9F0F8D90C0E5e3b9C2A95eAfBcDef0",
+                        "router": "0xD37BbE5744D730a1d98d8DC97c42F0Ca46aD7146",
+                        "halted": halted
+                    }]),
+                ))
+                .mount(server)
+                .await;
+        }
+
         /// Mint path happy case: THORChain reports done with a matching
         /// outbound; EVM Router emitted a TransferOut to the Safe at
         /// the expected amount + enough confs.
@@ -2302,10 +2590,22 @@ pub mod evm {
                 "max_gas": []
             }))
             .await;
+            mount_eth_inbound(&server, false).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let evm = StubEvm::new(ChainId::Eth, 100);
             evm.push(router_log(ROUTER, SAFE, 1_000_000_000_000_000_000, 95));
-            let policy = ThorEvmPolicy::new(thor, evm, SAFE, ROUTER, "ETH", 3, 0, 1000);
+            // router_log encodes the asset word as all-zero → native ETH.
+            let policy = ThorEvmPolicy::new(
+                thor,
+                evm,
+                SAFE,
+                ROUTER,
+                "ETH",
+                Some(Address::ZERO),
+                3,
+                0,
+                1000,
+            );
             let out = policy
                 .verify("abc", 1_000_000_000_000_000_000)
                 .await
@@ -2327,10 +2627,11 @@ pub mod evm {
                 "max_gas": []
             }))
             .await;
+            mount_eth_inbound(&server, false).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let evm = StubEvm::new(ChainId::Eth, 100);
             // No log pushed.
-            let policy = ThorEvmPolicy::new(thor, evm, SAFE, ROUTER, "ETH", 3, 0, 1000);
+            let policy = ThorEvmPolicy::new(thor, evm, SAFE, ROUTER, "ETH", None, 3, 0, 1000);
             let err = policy
                 .verify("abc", 5_000)
                 .await
@@ -2354,9 +2655,10 @@ pub mod evm {
                 "max_gas": []
             }))
             .await;
+            mount_eth_inbound(&server, false).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let evm = StubEvm::new(ChainId::Eth, 100);
-            let policy = ThorEvmPolicy::new(thor, evm, SAFE, ROUTER, "ETH", 3, 0, 1000);
+            let policy = ThorEvmPolicy::new(thor, evm, SAFE, ROUTER, "ETH", None, 3, 0, 1000);
             let err = policy
                 .verify("abc", 5_000)
                 .await
@@ -2381,11 +2683,12 @@ pub mod evm {
                 "max_gas": []
             }))
             .await;
+            mount_eth_inbound(&server, false).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let evm = StubEvm::new(ChainId::Eth, 100);
             // On-chain log has DIFFERENT amount than THORChain claims.
             evm.push(router_log(ROUTER, SAFE, 9_999, 95));
-            let policy = ThorEvmPolicy::new(thor, evm, SAFE, ROUTER, "ETH", 3, 0, 1000);
+            let policy = ThorEvmPolicy::new(thor, evm, SAFE, ROUTER, "ETH", None, 3, 0, 1000);
             let err = policy
                 .verify("abc", 1_000)
                 .await
@@ -2410,6 +2713,7 @@ pub mod evm {
                 "max_gas": []
             }))
             .await;
+            mount_eth_inbound(&server, false).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let evm = StubEvm::new(ChainId::Eth, 50);
             evm.push(router_log(ROUTER, SAFE, 777, 45));
@@ -2432,6 +2736,7 @@ pub mod evm {
                 "max_gas": []
             }))
             .await;
+            mount_eth_inbound(&server, false).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let evm = StubEvm::new(ChainId::Eth, 50);
             let policy = ThorEvmRefundPolicy::new(thor, evm, SAFE, ROUTER, "ETH", 3, 0, 1000);
@@ -2471,6 +2776,103 @@ pub mod evm {
             let policy = ThorEvmToUsdtPolicy::new(thor, evm, USDT, 3, 0, 1000);
             let out = policy.verify("abc", INDEX_TOKEN).await.expect("ok");
             assert_eq!(out, 1_000_000);
+        }
+
+        /// Halt gate (audit L8): THORChain reports ETH trading halted →
+        /// ThorNotReady even when THORChain reports done.
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn evm_mint_policy_rejects_when_eth_halted() {
+            let safe_str = format!("{SAFE:#x}");
+            let server = thor_done_responder(serde_json::json!({
+                "chain": "ETH",
+                "to_address": safe_str,
+                "coin": { "asset": "ETH.ETH", "amount": "1000000000000000000" },
+                "memo": "OUT:abc",
+                "max_gas": []
+            }))
+            .await;
+            mount_eth_inbound(&server, true).await; // halted
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let evm = StubEvm::new(ChainId::Eth, 100);
+            evm.push(router_log(ROUTER, SAFE, 1_000_000_000_000_000_000, 95));
+            let policy = ThorEvmPolicy::new(
+                thor,
+                evm,
+                SAFE,
+                ROUTER,
+                "ETH",
+                Some(Address::ZERO),
+                3,
+                0,
+                1000,
+            );
+            let err = policy
+                .verify("abc", 1_000_000_000_000_000_000)
+                .await
+                .expect_err("must reject while halted");
+            assert!(
+                matches!(err, EvmCrossCheckError::ThorNotReady { .. }),
+                "expected ThorNotReady, got {err:?}"
+            );
+        }
+
+        /// Asset binding (audit L5): the Router delivered a non-zero asset
+        /// (an ERC20) but the policy expects native ETH (zero address) →
+        /// AssetMismatch.
+        #[tokio::test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        async fn evm_mint_policy_rejects_wrong_asset() {
+            const WRONG_ASSET: Address = Address::new([0x99; 20]);
+            let safe_str = format!("{SAFE:#x}");
+            let server = thor_done_responder(serde_json::json!({
+                "chain": "ETH",
+                "to_address": safe_str,
+                "coin": { "asset": "ETH.ETH", "amount": "1000000000000000000" },
+                "memo": "OUT:abc",
+                "max_gas": []
+            }))
+            .await;
+            mount_eth_inbound(&server, false).await;
+            let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+            let evm = StubEvm::new(ChainId::Eth, 100);
+            // Encode a non-zero asset word in data[0..32].
+            let mut to_topic = [0u8; 32];
+            to_topic[12..].copy_from_slice(SAFE.as_slice());
+            let mut data = vec![0u8; 64];
+            data[12..32].copy_from_slice(WRONG_ASSET.as_slice()); // asset
+            data[32..64]
+                .copy_from_slice(&U256::from(1_000_000_000_000_000_000u128).to_be_bytes::<32>());
+            data.extend_from_slice(&[0u8; 32]); // offset
+            data.extend_from_slice(&[0u8; 32]); // length=0
+            evm.push(EvmLogEntry {
+                address: ROUTER,
+                topics: vec![THOR_TRANSFER_OUT_TOPIC0, B256::ZERO, B256::from(to_topic)],
+                data: Bytes::from(data),
+                block_number: 95,
+                transaction_hash: B256::ZERO,
+            });
+            // Policy expects native ETH (zero asset) but the event delivered
+            // WRONG_ASSET.
+            let policy = ThorEvmPolicy::new(
+                thor,
+                evm,
+                SAFE,
+                ROUTER,
+                "ETH",
+                Some(Address::ZERO),
+                3,
+                0,
+                1000,
+            );
+            let err = policy
+                .verify("abc", 1_000_000_000_000_000_000)
+                .await
+                .expect_err("must reject wrong asset");
+            assert!(
+                matches!(err, EvmCrossCheckError::AssetMismatch { .. }),
+                "expected AssetMismatch, got {err:?}"
+            );
         }
     }
 }

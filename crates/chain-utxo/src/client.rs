@@ -110,6 +110,22 @@ pub trait UtxoChainClient {
             "fee estimation unsupported by this client".to_string(),
         ))
     }
+
+    /// Addresses that funded the inputs of `txid` (vin prev-out `script_pubkeys`
+    /// resolved to addresses for this client's network). Used to bind a UTXO's
+    /// sender to the live `THORChain` Asgard vault. Default impl errors so test
+    /// fakes that don't need it stay boilerplate-free.
+    ///
+    /// # Errors
+    /// [`UtxoError::Upstream`] from the default impl; production impls map
+    /// transport/decoding failures to [`UtxoError::Transport`] /
+    /// [`UtxoError::Decode`].
+    fn tx_input_addresses(&self, txid: &Txid) -> Result<Vec<String>, UtxoError> {
+        let _ = txid;
+        Err(UtxoError::Upstream(
+            "tx_input_addresses unsupported by this client".to_string(),
+        ))
+    }
 }
 
 /// Pick the fee rate for confirming within `target_blocks` from an
@@ -381,6 +397,26 @@ impl UtxoChainClient for EsploraClient {
             .map_err(|e| UtxoError::Transport(e.to_string()))?;
         pick_fee_estimate(&estimates, target_blocks)
             .ok_or_else(|| UtxoError::Upstream("esplora returned no fee estimates".to_string()))
+    }
+
+    fn tx_input_addresses(&self, txid: &Txid) -> Result<Vec<String>, UtxoError> {
+        let tx = self
+            .inner
+            .get_tx_info(txid)
+            .map_err(|e| UtxoError::Transport(e.to_string()))?
+            .ok_or_else(|| UtxoError::Decode(format!("tx {txid} not found")))?;
+        let mut addresses = Vec::with_capacity(tx.vin.len());
+        for vin in tx.vin {
+            // Coinbase inputs carry no prevout — skip (an Asgard outbound is
+            // never coinbase, so this only drops irrelevant inputs).
+            let Some(prevout) = vin.prevout else {
+                continue;
+            };
+            let address = Address::from_script(prevout.scriptpubkey.as_script(), self.network)
+                .map_err(|e| UtxoError::Decode(format!("vin script not an address: {e}")))?;
+            addresses.push(address.to_string());
+        }
+        Ok(addresses)
     }
 }
 

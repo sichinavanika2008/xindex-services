@@ -227,6 +227,20 @@ where
         )
     })?;
 
+    // 4b. (audit I3) Bind the prevout scriptPubKey to the descriptor.
+    //     BIP-143 commits witness_utxo.value into the sighash but NOT
+    //     that the prevout scriptPubKey is our descriptor's P2WSH program.
+    //     A forged witness_utxo.script_pubkey would otherwise pass the
+    //     witness_script check yet attest a UTXO we don't actually own.
+    let expected_spk = bitcoin::ScriptBuf::new_p2wsh(&expected_ws.wscript_hash());
+    if witness_utxo.script_pubkey != expected_spk {
+        return Err(err(
+            error_codes::WRONG_DESCRIPTOR,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "input witness_utxo.script_pubkey is not the descriptor P2WSH program",
+        ));
+    }
+
     // 5. Compute the BIP-143 P2WSH sighash.
     let mut cache = SighashCache::new(&psbt.unsigned_tx);
     let sighash = cache
@@ -281,6 +295,20 @@ where
         CheckOutcome::FirstTime => {}
     }
 
+    // 7b. (audit M2) Output veto: when the caller pins expected outputs,
+    //     refuse unless the PSBT pays them. Enforce-if-present, before
+    //     the HSM is ever touched.
+    veto_outputs(&psbt, &req)?;
+
+    // 7c. (audit M2b, partial floor) Two daemon-LOCAL output constraints
+    //     that need no trusted intent beyond our own descriptor + the
+    //     per-chain fee ceiling: change can only return to self, and the
+    //     implied miner fee is bounded. Closes the change-redirection and
+    //     fee-burning legs of M2b. Does NOT close the coordinator-supplied
+    //     payout destination/amount/memo (the fleet-wide destination-trust
+    //     gap — see KNOWN_FINDINGS), which is the Branch-B follow-on.
+    enforce_change_and_fee(&psbt, &req, &expected_spk)?;
+
     // 8. Sign the 32-byte sighash via the HSM frontend (raw secp256k1
     //    over the digest, no further hashing).
     let raw_sig = state
@@ -332,7 +360,7 @@ where
     };
     // 9. Record (sig_bytes is what we hand back; storing it makes
     //    idempotent re-queries observable).
-    state
+    if let Err(e) = state
         .replay
         .record_psbt_input(
             prev_txid,
@@ -342,13 +370,44 @@ where
             now_unix_secs(),
         )
         .await
-        .map_err(|e| {
-            err(
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(err(
                 error_codes::BAD_REQUEST,
                 StatusCode::BAD_REQUEST,
                 format!("replay record: {e}"),
-            )
-        })?;
+            ));
+        }
+        // L10: lost the write race; the winner already recorded. Re-read
+        // and return its cached signature idempotently (deterministic
+        // ECDSA → identical bytes anyway).
+        return match state
+            .replay
+            .check_psbt_input(prev_txid, prev_vout, payload_hash)
+            .await
+            .map_err(|e| {
+                err(
+                    error_codes::BAD_REQUEST,
+                    StatusCode::BAD_REQUEST,
+                    format!("replay db: {e}"),
+                )
+            })? {
+            CheckOutcome::Idempotent(rec) => Ok(Json(decode_stored_response(
+                rec.signature.as_slice(),
+                &btc.my_pubkey,
+            ))),
+            CheckOutcome::Conflict { .. } => Err(err(
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                StatusCode::CONFLICT,
+                "outpoint already signed for a different sighash (different consuming tx)",
+            )),
+            CheckOutcome::FirstTime => Err(err(
+                error_codes::BAD_REQUEST,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "record race left no row",
+            )),
+        };
+    }
     Ok(Json(response))
 }
 
@@ -362,6 +421,159 @@ fn derive_witness_script(descriptor: &MultisigDescriptor) -> Result<bitcoin::Scr
         .map_err(|e| e.to_string())?
         .explicit_script()
         .map_err(|e| e.to_string())
+}
+
+/// (audit M2) Enforce the optional output constraints carried in the
+/// request. Each `expected_*` field is enforce-if-present: a `None`
+/// imposes no constraint, a `Some` must be satisfied by some output of
+/// `psbt.unsigned_tx` or the daemon refuses with `PSBT_OUTPUTS_MISMATCH`.
+///
+/// - `expected_destination_spk`: at least one output whose
+///   `script_pubkey` equals the hex-decoded value, and (if
+///   `expected_amount_sats` is `Some`) that output's `value` in sats
+///   equals it.
+/// - `expected_memo`: at least one `OP_RETURN` output that pushes data
+///   byte-equal to the hex-decoded value.
+fn veto_outputs(
+    psbt: &Psbt,
+    req: &PsbtInputSignRequest,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if let Some(spk_hex) = req.expected_destination_spk.as_deref() {
+        let want_spk = decode_hex_field("expected_destination_spk", spk_hex)?;
+        let matched = psbt.unsigned_tx.output.iter().any(|o| {
+            o.script_pubkey.as_bytes() == want_spk.as_slice()
+                && req
+                    .expected_amount_sats
+                    .is_none_or(|sats| o.value.to_sat() == sats)
+        });
+        if !matched {
+            return Err(err(
+                error_codes::PSBT_OUTPUTS_MISMATCH,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no output matches expected destination scriptPubKey (and amount)",
+            ));
+        }
+    }
+    if let Some(memo_hex) = req.expected_memo.as_deref() {
+        let want_memo = decode_hex_field("expected_memo", memo_hex)?;
+        let matched = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .any(|o| op_return_data_eq(&o.script_pubkey, &want_memo));
+        if !matched {
+            return Err(err(
+                error_codes::PSBT_OUTPUTS_MISMATCH,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no OP_RETURN output matches expected memo",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// (audit M2b, partial floor) Enforce two output constraints the daemon
+/// can decide entirely from its OWN descriptor + per-chain config, with no
+/// trust in the coordinator beyond what it already supplies:
+///
+/// 1. **Change-to-self** (only when the payout is pinned via
+///    `expected_destination_spk`): every output must be one of
+///    {the pinned payout `scriptPubKey`, a **zero-value** `OP_RETURN`
+///    (the memo), the daemon's own descriptor P2WSH program}. A malicious
+///    coordinator therefore cannot route the residue to an attacker
+///    address, nor burn value through a funded `OP_RETURN` (whose value
+///    the fee check below would not see as fee).
+/// 2. **Fee cap**: the implied miner fee `Σ inputs − Σ outputs` must be
+///    ≤ [`ChainId::max_redeem_fee_sats`]. Stops the "omit change → residue
+///    burned as fee" grief. Every input must carry a `witness_utxo` or the
+///    fee cannot be bounded (the single-input redeem path always does).
+///
+/// This is NOT a never-blind-sign guarantee: the pinned payout
+/// destination/amount/memo remain coordinator-supplied, and the
+/// change-to-self check is skipped when the payout is absent. The
+/// fleet-wide destination-trust gap (each daemon must derive the canonical
+/// intent from the on-chain `RedeemDispatched` event) is tracked
+/// separately and is the Branch-B fix.
+fn enforce_change_and_fee(
+    psbt: &Psbt,
+    req: &PsbtInputSignRequest,
+    descriptor_spk: &bitcoin::ScriptBuf,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if let Some(spk_hex) = req.expected_destination_spk.as_deref() {
+        let payout_spk = decode_hex_field("expected_destination_spk", spk_hex)?;
+        for o in &psbt.unsigned_tx.output {
+            let is_payout = o.script_pubkey.as_bytes() == payout_spk.as_slice();
+            let is_memo = o.script_pubkey.is_op_return() && o.value.to_sat() == 0;
+            let is_change_to_self = o.script_pubkey.as_bytes() == descriptor_spk.as_bytes();
+            if !(is_payout || is_memo || is_change_to_self) {
+                return Err(err(
+                    error_codes::PSBT_UNEXPECTED_OUTPUT,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "output is neither the pinned payout, a zero-value OP_RETURN memo, nor change-to-self",
+                ));
+            }
+        }
+    }
+
+    let mut total_in: u64 = 0;
+    for input in &psbt.inputs {
+        let wu = input.witness_utxo.as_ref().ok_or_else(|| {
+            err(
+                error_codes::PSBT_FEE_EXCEEDS_CAP,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "input missing witness_utxo; cannot bound fee",
+            )
+        })?;
+        total_in = total_in.saturating_add(wu.value.to_sat());
+    }
+    let total_out = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
+    let fee = total_in.checked_sub(total_out).ok_or_else(|| {
+        err(
+            error_codes::PSBT_FEE_EXCEEDS_CAP,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "outputs exceed inputs (negative fee)",
+        )
+    })?;
+    if fee > req.chain_id.max_redeem_fee_sats() {
+        return Err(err(
+            error_codes::PSBT_FEE_EXCEEDS_CAP,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "implied miner fee exceeds per-chain cap",
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a hex field (no `0x` prefix expected — the wire carries raw
+/// hex for these), mapping a bad value to `PSBT_OUTPUTS_MISMATCH`.
+fn decode_hex_field(field: &str, hex_str: &str) -> Result<Vec<u8>, (StatusCode, Json<ErrorBody>)> {
+    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    alloy_primitives::hex::decode(stripped).map_err(|e| {
+        err(
+            error_codes::PSBT_OUTPUTS_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("{field}: bad hex: {e}"),
+        )
+    })
+}
+
+/// Does `script` push exactly `data` after an `OP_RETURN`? Returns false
+/// for non-`OP_RETURN` scripts, scripts whose pushed data differs, or
+/// scripts that fail to parse.
+fn op_return_data_eq(script: &bitcoin::Script, data: &[u8]) -> bool {
+    if !script.is_op_return() {
+        return false;
+    }
+    script.instructions().any(|instr| {
+        instr
+            .ok()
+            .and_then(|i| i.push_bytes().map(|b| b.as_bytes() == data))
+            .unwrap_or(false)
+    })
 }
 
 /// `payload_hash = keccak256(prev_txid ‖ prev_vout_le_u32 ‖ sighash)`.
@@ -500,6 +712,56 @@ mod tests {
         psbt
     }
 
+    /// As [`build_test_psbt`] but with TWO outputs — a payout to
+    /// `recipient_script` plus an `OP_RETURN(memo)` — so the M2 output
+    /// veto (destination + amount + memo) can be exercised together.
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn build_test_psbt_with_memo(
+        descriptor: &MultisigDescriptor,
+        prev_txid: bitcoin::Txid,
+        value: Amount,
+        recipient_script: ScriptBuf,
+        payout: Amount,
+        memo: &[u8],
+    ) -> Psbt {
+        let witness_script = derive_witness_script(descriptor).expect("ws");
+        let prev_spk = descriptor
+            .address(Network::Bitcoin)
+            .expect("addr")
+            .script_pubkey();
+        let push = bitcoin::script::PushBytesBuf::try_from(memo.to_vec()).expect("push");
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: payout,
+                    script_pubkey: recipient_script,
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return(push),
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value,
+            script_pubkey: prev_spk,
+        });
+        psbt.inputs[0].witness_script = Some(witness_script);
+        psbt
+    }
+
     fn build_state_with_btc(
         descriptor: MultisigDescriptor,
         my_pubkey: bitcoin::PublicKey,
@@ -540,6 +802,23 @@ mod tests {
     }
 
     async fn post_psbt(app: &Router, b64: String, idx: u32) -> (StatusCode, serde_json::Value) {
+        post_psbt_body(
+            app,
+            serde_json::json!({
+                "chain_id": "btc",
+                "psbt_base64": b64,
+                "input_index": idx
+            }),
+        )
+        .await
+    }
+
+    /// POST an arbitrary request body — lets the M2 veto tests attach the
+    /// optional `expected_*` fields.
+    async fn post_psbt_body(
+        app: &Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         #[expect(clippy::expect_used, reason = "test code")]
         let resp = app
             .clone()
@@ -548,14 +827,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/sign/psbt-input")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "chain_id": "btc",
-                            "psbt_base64": b64,
-                            "input_index": idx
-                        })
-                        .to_string(),
-                    ))
+                    .body(Body::from(body.to_string()))
                     .expect("req"),
             )
             .await
@@ -694,6 +966,497 @@ mod tests {
         assert_eq!(
             body["code"].as_str().expect("code"),
             error_codes::WRONG_DESCRIPTOR
+        );
+    }
+
+    /// Test fixture: 2-of-3 descriptor + the daemon + a real `SoftHsm`.
+    fn veto_fixture() -> (MultisigDescriptor, Router) {
+        let secp = Secp256k1::new();
+        let (desc, sks) = make_descriptor(&secp, 3, 2);
+        let my_pubkey = bitcoin::PublicKey::new(sks[0].public_key(&secp));
+        let hsm = Arc::new(SoftHsm {
+            secp: secp.clone(),
+            secret: sks[0],
+            public: my_pubkey,
+            seen: Mutex::new(0),
+        });
+        let (_state, app) = build_state_with_btc(desc.clone(), my_pubkey, hsm);
+        (desc, app)
+    }
+
+    /// An arbitrary P2WPKH destination scriptPubKey + its hex.
+    fn dest_spk() -> (ScriptBuf, String) {
+        let spk = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x42; 20]));
+        let hex = alloy_primitives::hex::encode(spk.as_bytes());
+        (spk, hex)
+    }
+
+    fn veto_body(b64: &str, dest_hex: &str, amount: u64, memo_hex: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": b64,
+            "input_index": 0,
+            "expected_destination_spk": dest_hex,
+            "expected_amount_sats": amount,
+            "expected_memo": memo_hex,
+        })
+    }
+
+    /// M2 PASS: destination spk + amount + memo all match the PSBT → 200.
+    #[tokio::test]
+    async fn output_veto_passes_when_expected_match() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let memo = b"=:ETH.USDT:0xabc:0";
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xa1u8; 32]));
+        let psbt = build_test_psbt_with_memo(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            spk,
+            Amount::from_sat(70_000),
+            memo,
+        );
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(memo),
+        );
+        let (status, _) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// M2 REJECT: a destination scriptPubKey not present in any output.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn output_veto_rejects_wrong_destination() {
+        let (desc, app) = veto_fixture();
+        let (spk, _spk_hex) = dest_spk();
+        let memo = b"=:ETH.USDT:0xabc:0";
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xa2u8; 32]));
+        let psbt = build_test_psbt_with_memo(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            spk,
+            Amount::from_sat(70_000),
+            memo,
+        );
+        // Pin a DIFFERENT destination spk than the PSBT pays.
+        let wrong = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x99; 20]));
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &alloy_primitives::hex::encode(wrong.as_bytes()),
+            70_000,
+            &alloy_primitives::hex::encode(memo),
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::PSBT_OUTPUTS_MISMATCH
+        );
+    }
+
+    /// M2 REJECT: right destination, wrong pinned amount.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn output_veto_rejects_wrong_amount() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let memo = b"=:ETH.USDT:0xabc:0";
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xa3u8; 32]));
+        let psbt = build_test_psbt_with_memo(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            spk,
+            Amount::from_sat(70_000),
+            memo,
+        );
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            69_999, // ← off by one
+            &alloy_primitives::hex::encode(memo),
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::PSBT_OUTPUTS_MISMATCH
+        );
+    }
+
+    /// M2 REJECT: right destination + amount, but the pinned memo does
+    /// not match any `OP_RETURN` output (wrong/missing memo).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn output_veto_rejects_wrong_memo() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xa4u8; 32]));
+        let psbt = build_test_psbt_with_memo(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            spk,
+            Amount::from_sat(70_000),
+            b"=:ETH.USDT:0xabc:0",
+        );
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(b"=:ETH.USDT:0xDIFFERENT:0"),
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::PSBT_OUTPUTS_MISMATCH
+        );
+    }
+
+    /// Build a single-input PSBT with an explicit output set, so the M2b
+    /// change-to-self + fee-cap tests can attach arbitrary (attacker /
+    /// funded-OP_RETURN / change) outputs.
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn build_psbt_outputs(
+        descriptor: &MultisigDescriptor,
+        prev_txid: bitcoin::Txid,
+        input_value: Amount,
+        outputs: Vec<TxOut>,
+    ) -> Psbt {
+        let witness_script = derive_witness_script(descriptor).expect("ws");
+        let prev_spk = descriptor
+            .address(Network::Bitcoin)
+            .expect("addr")
+            .script_pubkey();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: outputs,
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: input_value,
+            script_pubkey: prev_spk,
+        });
+        psbt.inputs[0].witness_script = Some(witness_script);
+        psbt
+    }
+
+    /// An `OP_RETURN(memo)` output carrying `value` sats.
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn op_return_out(memo: &[u8], value: Amount) -> TxOut {
+        let push = bitcoin::script::PushBytesBuf::try_from(memo.to_vec()).expect("push");
+        TxOut {
+            value,
+            script_pubkey: ScriptBuf::new_op_return(push),
+        }
+    }
+
+    const M2B_MEMO: &[u8] = b"=:ETH.USDT:0xabc:0";
+
+    /// M2b ACCEPT: payout + zero-value memo + change back to the
+    /// descriptor's own P2WSH → all three are whitelisted, fee is bounded.
+    #[tokio::test]
+    async fn m2b_change_to_self_is_accepted() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let change_spk = desc
+            .address(Network::Bitcoin)
+            .map(|a| a.script_pubkey())
+            .unwrap_or_default();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xb1u8; 32]));
+        let psbt = build_psbt_outputs(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            vec![
+                TxOut {
+                    value: Amount::from_sat(70_000),
+                    script_pubkey: spk,
+                },
+                op_return_out(M2B_MEMO, Amount::ZERO),
+                TxOut {
+                    value: Amount::from_sat(25_000),
+                    script_pubkey: change_spk,
+                },
+            ],
+        );
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(M2B_MEMO),
+        );
+        let (status, _) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// M2b REJECT: change routed to an attacker address (not the
+    /// descriptor P2WSH) → `PSBT_UNEXPECTED_OUTPUT`. This is the core
+    /// theft leg of M2b.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn m2b_change_to_attacker_is_rejected() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let attacker = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0xee; 20]));
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xb2u8; 32]));
+        let psbt = build_psbt_outputs(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            vec![
+                TxOut {
+                    value: Amount::from_sat(70_000),
+                    script_pubkey: spk,
+                },
+                op_return_out(M2B_MEMO, Amount::ZERO),
+                TxOut {
+                    value: Amount::from_sat(25_000),
+                    script_pubkey: attacker,
+                },
+            ],
+        );
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(M2B_MEMO),
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::PSBT_UNEXPECTED_OUTPUT
+        );
+    }
+
+    /// M2b REJECT: change omitted, residue dumped into the miner fee
+    /// (input ≫ payout) → `PSBT_FEE_EXCEEDS_CAP`. The fee-burning leg.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn m2b_excessive_fee_is_rejected() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xb3u8; 32]));
+        // 5 BTC in, 0.0007 BTC out → ~4.999 BTC implied fee, far over the
+        // 0.01 BTC (1_000_000 sat) BTC cap.
+        let psbt = build_psbt_outputs(
+            &desc,
+            prev_txid,
+            Amount::from_sat(500_000_000),
+            vec![
+                TxOut {
+                    value: Amount::from_sat(70_000),
+                    script_pubkey: spk,
+                },
+                op_return_out(M2B_MEMO, Amount::ZERO),
+            ],
+        );
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(M2B_MEMO),
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::PSBT_FEE_EXCEEDS_CAP
+        );
+    }
+
+    /// M2b REJECT: a FUNDED `OP_RETURN` (value > 0) would burn that value
+    /// while passing the presence-only memo veto and escaping the fee
+    /// check (it is an output, not fee). The zero-value rule catches it →
+    /// `PSBT_UNEXPECTED_OUTPUT`.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn m2b_funded_op_return_is_rejected() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xb4u8; 32]));
+        let psbt = build_psbt_outputs(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            vec![
+                TxOut {
+                    value: Amount::from_sat(70_000),
+                    script_pubkey: spk,
+                },
+                // memo bytes present (passes veto) but carries 25_000 sats
+                op_return_out(M2B_MEMO, Amount::from_sat(25_000)),
+            ],
+        );
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(M2B_MEMO),
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::PSBT_UNEXPECTED_OUTPUT
+        );
+    }
+
+    /// I3: a forged `witness_utxo.script_pubkey` (not the descriptor
+    /// P2WSH program) is refused even though `witness_script` matches.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn forged_witness_utxo_spk_is_rejected() {
+        let (desc, app) = veto_fixture();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xa5u8; 32]));
+        let mut psbt = build_test_psbt(
+            &desc,
+            prev_txid,
+            0,
+            Amount::from_sat(100_000),
+            ScriptBuf::new_op_return(b"x"),
+        );
+        // Keep the (correct) witness_script but forge the prevout spk.
+        let forged = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x77; 20]));
+        let value = psbt.inputs[0].witness_utxo.as_ref().expect("wu").value;
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value,
+            script_pubkey: forged,
+        });
+        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::WRONG_DESCRIPTOR
+        );
+    }
+
+    /// Recompute the daemon's replay key for a single-input PSBT (mirrors
+    /// handler steps 5-6) so the L10 test can pre-seed the winner's row.
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn replay_key_for(psbt: &Psbt) -> ([u8; 32], u32, [u8; 32]) {
+        let input = &psbt.inputs[0];
+        let ws = input.witness_script.as_ref().expect("ws");
+        let wu = input.witness_utxo.as_ref().expect("wu");
+        let mut cache = SighashCache::new(&psbt.unsigned_tx);
+        let sighash = cache
+            .p2wsh_signature_hash(0, ws, wu.value, EcdsaSighashType::All)
+            .expect("sighash");
+        let sighash_bytes: [u8; 32] = sighash.to_byte_array();
+        let txin = &psbt.unsigned_tx.input[0];
+        let prev_txid: [u8; 32] = *txin.previous_output.txid.as_ref();
+        let prev_vout = txin.previous_output.vout;
+        let payload_hash = hash_psbt_payload(&prev_txid, prev_vout, &sighash_bytes);
+        (prev_txid, prev_vout, payload_hash)
+    }
+
+    /// L10: the handler loses the `record_psbt_input` write race (the
+    /// store returns `Duplicate`). It must re-read the winner's row and
+    /// return the cached signature idempotently — HTTP 200, NOT an error.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn psbt_record_race_recovers_cached_signature() {
+        let secp = Secp256k1::new();
+        let (desc, sks) = make_descriptor(&secp, 3, 2);
+        let my_pubkey = bitcoin::PublicKey::new(sks[0].public_key(&secp));
+        let hsm = Arc::new(SoftHsm {
+            secp: secp.clone(),
+            secret: sks[0],
+            public: my_pubkey,
+            seen: Mutex::new(0),
+        });
+
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xb1u8; 32]));
+        let psbt = build_test_psbt(
+            &desc,
+            prev_txid,
+            0,
+            Amount::from_sat(100_000),
+            ScriptBuf::new_op_return(b"x"),
+        );
+        let (txid, vout, payload_hash) = replay_key_for(&psbt);
+
+        // Winner already recorded a (distinct, recognizable) signature.
+        let winner_sig = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
+        let inner = InMemoryReplayStore::new();
+        inner
+            .record_psbt_input(txid, vout, payload_hash, winner_sig.clone(), 100)
+            .await
+            .expect("seed winner");
+        let replay = Arc::new(crate::test_support::RaceReplayStore::new(
+            inner,
+            crate::test_support::RacePath::PsbtInput,
+        ));
+
+        let cfg = UtxoSignerConfig {
+            chain_id: ChainId::Btc,
+            network: Network::Bitcoin,
+            descriptor: desc,
+            my_pubkey,
+            hsm_address: Address::repeat_byte(0xcd),
+        };
+        let mut utxo = std::collections::HashMap::new();
+        utxo.insert(ChainId::Btc, Arc::new(cfg));
+        let state = DaemonState {
+            config: DaemonConfig {
+                chain_id: 31337,
+                verifying_contract: Address::repeat_byte(0xab),
+                eth_address: Address::repeat_byte(0xcd),
+            },
+            replay,
+            hsm,
+            utxo,
+            evm: std::collections::HashMap::new(),
+            cosmos: std::collections::HashMap::new(),
+            xrp: std::collections::HashMap::new(),
+            sol: std::collections::HashMap::new(),
+            tron: std::collections::HashMap::new(),
+        };
+        let app = Router::new()
+            .route(
+                "/api/v1/sign/psbt-input",
+                post(
+                    handle_psbt_input::<
+                        crate::test_support::RaceReplayStore<InMemoryReplayStore>,
+                        SoftHsm,
+                    >,
+                ),
+            )
+            .with_state(state);
+
+        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0).await;
+        assert_eq!(status, StatusCode::OK);
+        // The cached winner's signature is returned, not the loser's.
+        assert_eq!(
+            body["signature"].as_str().expect("signature"),
+            alloy_primitives::hex::encode(&winner_sig)
         );
     }
 }

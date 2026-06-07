@@ -92,7 +92,24 @@ fn parse_hex_u64(s: &str) -> Result<u64, Erc20Error> {
 /// Decode one `eth_getLogs` entry into an [`Erc20Arrival`] given the
 /// current tip. `value` is the 32-byte data word; confirmations =
 /// `tip − logBlock + 1` (0 if the log is somehow ahead of tip).
-fn decode_transfer_log(log: &serde_json::Value, tip: u64) -> Result<Erc20Arrival, Erc20Error> {
+fn decode_transfer_log(
+    log: &serde_json::Value,
+    tip: u64,
+    token: Address,
+) -> Result<Erc20Arrival, Erc20Error> {
+    // Client-side emitter re-assert (audit I5): the node-side `address` filter
+    // already binds the emitting contract to `token`, but a non-compliant RPC
+    // could return a Transfer log emitted by a different contract — never
+    // count it as a credit of `token`.
+    let log_addr = log
+        .get("address")
+        .and_then(|a| a.as_str())
+        .ok_or_else(|| Erc20Error::Rpc("log missing address".into()))?;
+    if !log_addr.eq_ignore_ascii_case(&format!("{token:#x}")) {
+        return Err(Erc20Error::Rpc(format!(
+            "log address {log_addr} != expected token {token:#x}"
+        )));
+    }
     let data = log
         .get("data")
         .and_then(|d| d.as_str())
@@ -132,7 +149,7 @@ impl Erc20ArrivalClient for RpcErc20LogClient {
             .ok_or_else(|| Erc20Error::Rpc("getLogs result not array".into()))?;
         let mut out = Vec::with_capacity(arr.len());
         for log in arr {
-            out.push(decode_transfer_log(log, tip)?);
+            out.push(decode_transfer_log(log, tip, token)?);
         }
         Ok(out)
     }
@@ -164,13 +181,30 @@ mod tests {
     #[expect(clippy::expect_used, reason = "test code")]
     fn decode_transfer_log_value_and_confirmations() {
         // 70 USDT (1e6) = 70_000_000 = 0x42c1d80, block 100, tip 105 ⇒ 6 confs.
+        let token = Address::from([0x11u8; 20]);
         let log = json!({
+            "address": format!("{token:#x}"),
             "data": "0x00000000000000000000000000000000000000000000000000000000042c1d80",
             "blockNumber": "0x64"
         });
-        let a = decode_transfer_log(&log, 105).expect("decode");
+        let a = decode_transfer_log(&log, 105, token).expect("decode");
         assert_eq!(a.value, 70_000_000);
         assert_eq!(a.confirmations, 6);
+    }
+
+    /// I5: a Transfer log whose emitting contract is NOT the expected token
+    /// (a non-compliant RPC ignoring the `address` filter) is rejected, never
+    /// counted as a credit of `token`.
+    #[test]
+    fn decode_transfer_log_rejects_foreign_token_address() {
+        let token = Address::from([0x11u8; 20]);
+        let foreign = Address::from([0x22u8; 20]);
+        let log = json!({
+            "address": format!("{foreign:#x}"),
+            "data": "0x00000000000000000000000000000000000000000000000000000000042c1d80",
+            "blockNumber": "0x64"
+        });
+        assert!(decode_transfer_log(&log, 105, token).is_err());
     }
 
     #[test]

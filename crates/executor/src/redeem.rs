@@ -161,6 +161,22 @@ pub struct InProcessExecutor<C: UtxoChainClient> {
     fee_sats: u64,
 }
 
+/// The leg's intended payout, derived from the decoded `RedeemDispatched`
+/// event (NOT from the PSBT) and forwarded to the daemon as the audit-M2
+/// output veto. Because these come from the event, they bind the leg's
+/// intent independently of how the PSBT was assembled — the daemon refuses
+/// to sign any spend whose outputs do not pay this destination/amount and
+/// carry this memo.
+#[derive(Debug, Clone)]
+pub struct ExpectedOutputs {
+    /// The `THORChain` Asgard destination `scriptPubKey` bytes.
+    pub destination_spk: Vec<u8>,
+    /// The payout to that destination, in sats.
+    pub amount_sats: u64,
+    /// The `OP_RETURN` memo data bytes (the contract-built swap memo).
+    pub memo: Vec<u8>,
+}
+
 /// Production trait: K independent signer daemons each hold one HSM-
 /// backed key. **Lands in M5.** [`InProcessExecutor`] is the dev-only
 /// stand-in while the wire protocol + HSM integration are absent.
@@ -170,12 +186,17 @@ pub trait MultisigCosigner: Send + Sync {
 
     /// Sign a single PSBT input with the HSM-held key.
     ///
+    /// `expected`, when `Some`, is forwarded to the daemon as the
+    /// audit-M2 output veto (destination `scriptPubKey` / amount / memo);
+    /// the daemon refuses unless the PSBT pays it.
+    ///
     /// # Errors
     /// Returns the cosigner's transport / HSM / authorization error.
     fn sign_input(
         &self,
         psbt: &bitcoin::psbt::Psbt,
         input_index: usize,
+        expected: Option<&ExpectedOutputs>,
     ) -> Result<(bitcoin::PublicKey, bitcoin::ecdsa::Signature), ExecuteError>;
 }
 
@@ -370,8 +391,16 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
                 }
             }
             SigningBackend::Cosigners(cosigners) => {
+                // audit M2: forward the leg's intended payout (from the
+                // decoded event, not the PSBT) so each daemon vetoes any
+                // spend whose outputs diverge from it.
+                let expected = ExpectedOutputs {
+                    destination_spk: asgard.script_pubkey().into_bytes(),
+                    amount_sats: recipient_value.to_sat(),
+                    memo: task.memo.clone(),
+                };
                 for (i, cosigner) in cosigners.iter().take(self.descriptor.threshold).enumerate() {
-                    let (pk, sig) = cosigner.sign_input(&psbt, 0)?;
+                    let (pk, sig) = cosigner.sign_input(&psbt, 0, Some(&expected))?;
                     // Daemon-side already verified the descriptor +
                     // vin[0] invariant + signature recovery. Coordinator
                     // pins per-response pubkey; if it didn't match, the
