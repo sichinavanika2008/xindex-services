@@ -34,7 +34,7 @@ use bitcoin::{Address, Amount, Network};
 use thiserror::Error;
 use tracing::{info, warn};
 
-use xindex_chain_thor::{ThorClient, ThorError};
+use xindex_chain_thor::{ThorClient, ThorError, TxResponse};
 use xindex_chain_utxo::{find_arrival, UtxoChainClient, UtxoError};
 
 /// Errors surfaced by the cross-check.
@@ -672,6 +672,267 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
     }
 }
 
+/* -------------------------------------------------------------------------- */
+/*              COMBINED STREAMED-SETTLEMENT CROSS-CHECK (burn)               */
+/* -------------------------------------------------------------------------- */
+
+/// The on-chain-observed outcome of a partially-filled streaming redeem
+/// swap. Either field may be zero (a full delivery or a full refund); a
+/// genuine partial carries both non-zero. Both are the AUTHORITATIVE
+/// on-chain figures, NOT `THORChain`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamedOutcome {
+    /// USDT delivered to the `IndexToken` (1e6), observed on Ethereum.
+    pub delivered_usdt_1e6: u128,
+    /// Native BTC refunded to our custody (sats), observed on Bitcoin.
+    pub refunded_sats: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum StreamedSettlementCrossCheckError {
+    #[error("`THORChain` RPC error: {0}")]
+    Thor(#[from] ThorError),
+    #[error("ETH error: {0}")]
+    Eth(#[from] Erc20Error),
+    #[error("Bitcoin chain error: {0}")]
+    Btc(#[from] UtxoError),
+    #[error("`THORChain` not yet ready: {reason}")]
+    ThorNotReady { reason: String },
+    #[error("USDT not yet confirmed at IndexToken: need ≥{need_1e6} (1e6) with ≥{confs} confs")]
+    UsdtNotReady { need_1e6: u128, confs: u32 },
+    #[error("refund BTC not yet confirmed at multisig: need ≥{need_sats} sats ≥{confs} confs")]
+    BtcNotReady { need_sats: u64, confs: u32 },
+    #[error("USDT amount mismatch: `THORChain` {thor_1e6} vs on-chain {onchain_1e6} (1e6)")]
+    UsdtAmountMismatch { thor_1e6: u128, onchain_1e6: u128 },
+    #[error("refund amount mismatch: `THORChain` {thor_sats} vs UTXO {utxo_sats} sats")]
+    BtcAmountMismatch { thor_sats: u64, utxo_sats: u64 },
+    /// Neither a USDT delivery NOR a BTC refund outbound is observable yet
+    /// — the streamed swap has produced no leg, so there is nothing to
+    /// settle (retry once `THORChain` emits the outbound(s)).
+    #[error("streamed settlement has neither a delivery nor a refund yet")]
+    NoSettlement,
+}
+
+/// Combined streamed-settlement cross-check (re-audit-gated burn-side
+/// streaming). A streaming redeem swap can partially fill, producing BOTH
+/// a USDT delivery to the `IndexToken` AND a native-asset refund to our
+/// custody. Returns the on-chain-observed amount for each leg the
+/// signer should attest via `AttestationOracle.attestStreamedSettlement`.
+///
+/// **Finality:** the caller (coordinator) MUST invoke this only once the
+/// streaming swap has FULLY finalised — otherwise a partial that has
+/// emitted only its delivery outbound (refund still pending) would settle
+/// delivery-only and under-credit the refund. The finality gate
+/// (`tx_status` `swap_finalised.completed` / `EventStreamingSwap`) is the
+/// coordinator's responsibility; this policy verifies the already-final
+/// outcome.
+#[async_trait]
+pub trait StreamedSettlementCrossCheck: Send + Sync {
+    async fn verify(
+        &self,
+        btc_txid: &str,
+        index_token: EthAddress,
+    ) -> Result<StreamedOutcome, StreamedSettlementCrossCheckError>;
+}
+
+/// Production combined policy: observes the delivery leg (Ethereum USDT
+/// arrival) AND the refund leg (Bitcoin UTXO to multisig, vault-bound)
+/// for one finalised streaming redeem swap. Unlike the XOR delivery /
+/// refund policies, it accepts BOTH (or either) on the same `btc_txid`.
+pub struct ThorUtxoStreamedSettlementPolicy<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
+{
+    thor: ThorClient,
+    erc20: E,
+    btc: C,
+    usdt_token: EthAddress,
+    btc_multisig_address: Address,
+    min_confirmations: u32,
+    tolerance_1e6: u128,
+    tolerance_sats: u64,
+}
+
+impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> std::fmt::Debug
+    for ThorUtxoStreamedSettlementPolicy<E, C>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThorUtxoStreamedSettlementPolicy")
+            .field("usdt_token", &self.usdt_token)
+            .field("btc_multisig_address", &self.btc_multisig_address)
+            .field("min_confirmations", &self.min_confirmations)
+            .field("tolerance_1e6", &self.tolerance_1e6)
+            .field("tolerance_sats", &self.tolerance_sats)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
+    ThorUtxoStreamedSettlementPolicy<E, C>
+{
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "combined policy threads both the delivery (erc20, usdt_token, tolerance_1e6) and refund (btc, multisig, tolerance_sats) verification params"
+    )]
+    pub fn new(
+        thor: ThorClient,
+        erc20: E,
+        btc: C,
+        usdt_token: EthAddress,
+        btc_multisig_address: Address,
+        min_confirmations: u32,
+        tolerance_1e6: u128,
+        tolerance_sats: u64,
+    ) -> Self {
+        Self {
+            thor,
+            erc20,
+            btc,
+            usdt_token,
+            btc_multisig_address,
+            min_confirmations,
+            tolerance_1e6,
+            tolerance_sats,
+        }
+    }
+
+    /// Delivery leg: `Ok(None)` if `THORChain` emitted no USDT outbound
+    /// (a full refund); `Ok(Some(value_1e6))` once the on-chain arrival is
+    /// confirmed; an error while the THOR action is present but the
+    /// on-chain USDT is not yet confirmed / mismatched.
+    fn verify_delivery_leg(
+        &self,
+        resp: &TxResponse,
+        index_token: EthAddress,
+    ) -> Result<Option<u128>, StreamedSettlementCrossCheckError> {
+        let want = eth_addr_lc(index_token);
+        let Some(action) = resp.actions.iter().find(|a| {
+            a.chain == "ETH"
+                && a.coin.asset.to_uppercase().starts_with("ETH.USDT")
+                && a.to_address.to_lowercase() == want
+        }) else {
+            return Ok(None);
+        };
+        let thor_1e8: u128 = action.coin.amount.parse().map_err(|e| {
+            StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!("non-integer outbound amount '{}': {e}", action.coin.amount),
+            }
+        })?;
+        let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
+        let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
+        let arrival = confirm_erc20_arrival(
+            &self.erc20,
+            self.usdt_token,
+            index_token,
+            floor,
+            self.min_confirmations,
+        )?
+        .ok_or(StreamedSettlementCrossCheckError::UsdtNotReady {
+            need_1e6: thor_1e6,
+            confs: self.min_confirmations,
+        })?;
+        if !within(thor_1e6, arrival.value, self.tolerance_1e6) {
+            return Err(StreamedSettlementCrossCheckError::UsdtAmountMismatch {
+                thor_1e6,
+                onchain_1e6: arrival.value,
+            });
+        }
+        Ok(Some(arrival.value))
+    }
+
+    /// Refund leg: `Ok(None)` if `THORChain` emitted no BTC refund (a full
+    /// delivery); `Ok(Some(sats))` once the vault-bound UTXO is confirmed.
+    async fn verify_refund_leg(
+        &self,
+        resp: &TxResponse,
+    ) -> Result<Option<u64>, StreamedSettlementCrossCheckError> {
+        let multisig = self.btc_multisig_address.to_string();
+        let Some(action) = resp.actions.iter().find(|a| {
+            a.chain == "BTC"
+                && a.to_address == multisig
+                && a.memo.to_uppercase().starts_with("REFUND:")
+                && a.coin.asset.to_uppercase() == "BTC.BTC"
+        }) else {
+            return Ok(None);
+        };
+        let thor_sats: u64 = action.coin.amount.parse().map_err(|e| {
+            StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
+            }
+        })?;
+        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+            StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "no BTC inbound address from THORChain".to_string(),
+            }
+        })?;
+        if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "BTC trading halted on THORChain".to_string(),
+            });
+        }
+        let floor = Amount::from_sat(thor_sats.saturating_sub(self.tolerance_sats));
+        let utxo = find_arrival(
+            &self.btc,
+            &self.btc_multisig_address,
+            floor,
+            self.min_confirmations,
+        )?
+        .ok_or(StreamedSettlementCrossCheckError::BtcNotReady {
+            need_sats: thor_sats,
+            confs: self.min_confirmations,
+        })?;
+        let utxo_sats = utxo.value.to_sat();
+        if utxo_sats.abs_diff(thor_sats) > self.tolerance_sats {
+            return Err(StreamedSettlementCrossCheckError::BtcAmountMismatch {
+                thor_sats,
+                utxo_sats,
+            });
+        }
+        let funders = self.btc.tx_input_addresses(&utxo.txid)?;
+        if !funders.iter().any(|f| f == &vault.address) {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "BTC refund UTXO not funded by the live Asgard vault".to_string(),
+            });
+        }
+        Ok(Some(utxo_sats))
+    }
+}
+
+#[async_trait]
+impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> StreamedSettlementCrossCheck
+    for ThorUtxoStreamedSettlementPolicy<E, C>
+{
+    async fn verify(
+        &self,
+        btc_txid: &str,
+        index_token: EthAddress,
+    ) -> Result<StreamedOutcome, StreamedSettlementCrossCheckError> {
+        let resp = self.thor.tx_status(btc_txid).await?;
+        if resp.observed_tx.status != "done" {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!("observed_tx.status = {}", resp.observed_tx.status),
+            });
+        }
+        let delivered = self.verify_delivery_leg(&resp, index_token)?;
+        let refunded = self.verify_refund_leg(&resp).await?;
+        match (delivered, refunded) {
+            (None, None) => Err(StreamedSettlementCrossCheckError::NoSettlement),
+            (d, r) => {
+                let outcome = StreamedOutcome {
+                    delivered_usdt_1e6: d.unwrap_or(0),
+                    refunded_sats: r.unwrap_or(0),
+                };
+                info!(
+                    btc_txid,
+                    delivered_usdt_1e6 = outcome.delivered_usdt_1e6,
+                    refunded_sats = outcome.refunded_sats,
+                    "streamed-settlement cross-check OK"
+                );
+                Ok(outcome)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,6 +1530,162 @@ mod tests {
         let policy = ThorUtxoRefundPolicy::new(thor, btc, test_address(), 1, 0);
         let attested = policy.verify("btc-in").await.expect("ok");
         assert_eq!(attested, 99_990_000, "attest the on-chain UTXO sats");
+    }
+
+    /* ------------- combined streamed-settlement (burn streaming) ------------- */
+
+    /// Partial fill: `THORChain` emitted BOTH an ETH.USDT delivery to the
+    /// `IndexToken` AND a BTC `REFUND:` to our multisig on the same inbound.
+    /// The combined policy returns both on-chain-observed amounts.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn streamed_partial_fill_returns_both_legs() {
+        let server = wiremock::MockServer::start().await;
+        let to_lc = eth_addr_lc(idx_token());
+        let multisig = test_address().to_string();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/tx/streamed-in"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "observed_tx": { "tx": { "id":"streamed-in","chain":"BTC",
+                        "from_address":"bc1qour","to_address":"thor-asgard",
+                        "coins":[],"memo":"" }, "status":"done" },
+                    "actions": [
+                        {
+                            "chain":"ETH", "to_address": to_lc,
+                            "coin": { "asset":"ETH.USDT-0XDAC17F958D2EE523A2206206994597C13D831EC7",
+                                      "amount":"7000000000" }, // 70 USDT 1e8
+                            "memo":"OUT:streamed-in", "max_gas":[]
+                        },
+                        {
+                            "chain":"BTC", "to_address": multisig,
+                            "coin": { "asset":"BTC.BTC","amount":"30000000" }, // 0.3 BTC refunded
+                            "memo":"REFUND:streamed-in", "max_gas":[]
+                        }
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let erc20 = StubErc20::default();
+        erc20.arrivals.lock().expect("lock").push(Erc20Arrival {
+            value: 70_000_000,
+            confirmations: 6,
+        });
+        let btc = StubBtc::default();
+        btc.utxos.lock().expect("lock").push(UtxoEntry {
+            txid: Txid::from_str(
+                "0000000000000000000000000000000000000000000000000000000000000abc",
+            )
+            .expect("txid"),
+            vout: 0,
+            value: Amount::from_sat(30_000_000),
+            confirmations: 6,
+            block_hash: None,
+        });
+        let policy = ThorUtxoStreamedSettlementPolicy::new(
+            thor,
+            erc20,
+            btc,
+            usdt_token(),
+            test_address(),
+            1,
+            0,
+            0,
+        );
+        let outcome = policy.verify("streamed-in", idx_token()).await.expect("ok");
+        assert_eq!(
+            outcome.delivered_usdt_1e6, 70_000_000,
+            "delivered USDT (1e6)"
+        );
+        assert_eq!(outcome.refunded_sats, 30_000_000, "refunded BTC (sats)");
+    }
+
+    /// Full delivery: only the ETH.USDT outbound exists → refund leg is
+    /// zero (a streamed swap that fully filled).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn streamed_full_delivery_returns_zero_refund() {
+        let server = wiremock::MockServer::start().await;
+        let to_lc = eth_addr_lc(idx_token());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/tx/streamed-in"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "observed_tx": { "tx": { "id":"streamed-in","chain":"BTC",
+                        "from_address":"bc1qour","to_address":"thor-asgard",
+                        "coins":[],"memo":"" }, "status":"done" },
+                    "actions": [{
+                        "chain":"ETH", "to_address": to_lc,
+                        "coin": { "asset":"ETH.USDT-0XDAC17F958D2EE523A2206206994597C13D831EC7",
+                                  "amount":"9000000000" }, // 90 USDT 1e8
+                        "memo":"OUT:streamed-in", "max_gas":[]
+                    }]
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let erc20 = StubErc20::default();
+        erc20.arrivals.lock().expect("lock").push(Erc20Arrival {
+            value: 90_000_000,
+            confirmations: 6,
+        });
+        let policy = ThorUtxoStreamedSettlementPolicy::new(
+            thor,
+            erc20,
+            StubBtc::default(),
+            usdt_token(),
+            test_address(),
+            1,
+            0,
+            0,
+        );
+        let outcome = policy.verify("streamed-in", idx_token()).await.expect("ok");
+        assert_eq!(outcome.delivered_usdt_1e6, 90_000_000);
+        assert_eq!(outcome.refunded_sats, 0, "no refund leg ⇒ zero");
+    }
+
+    /// No outbound yet: neither a delivery nor a refund action exists →
+    /// `NoSettlement` (the coordinator retries once the stream finalises).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn streamed_no_outbound_errors_no_settlement() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/tx/streamed-in"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "observed_tx": { "tx": { "id":"streamed-in","chain":"BTC",
+                        "from_address":"bc1qour","to_address":"thor-asgard",
+                        "coins":[],"memo":"" }, "status":"done" },
+                    "actions": []
+                })),
+            )
+            .mount(&server)
+            .await;
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let policy = ThorUtxoStreamedSettlementPolicy::new(
+            thor,
+            StubErc20::default(),
+            StubBtc::default(),
+            usdt_token(),
+            test_address(),
+            1,
+            0,
+            0,
+        );
+        let err = policy
+            .verify("streamed-in", idx_token())
+            .await
+            .expect_err("nothing to settle");
+        assert!(matches!(
+            err,
+            StreamedSettlementCrossCheckError::NoSettlement
+        ));
     }
 
     #[tokio::test]

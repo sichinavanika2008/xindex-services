@@ -12,10 +12,14 @@
 //! poll catches it. We never authoritatively decide intents — only the
 //! contract's `IntentState` is canonical.
 
+pub mod hint_builder;
 pub mod redemption_store;
 pub mod store;
 pub mod tracker;
 
+pub use hint_builder::{
+    plan_stream, slip_bps, HintParams, StreamPlan, MAX_STREAM_BLOCKS, THOR_BLOCK_SECS,
+};
 pub use redemption_store::{
     InMemoryRedemptionTracker, RedemptionTrackerError, RedemptionTrackerStore,
     SqliteRedemptionTracker, StuckDecision, TrackedRedemption,

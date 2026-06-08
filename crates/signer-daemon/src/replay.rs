@@ -99,6 +99,12 @@ pub enum RedemptionKind {
     Delivery,
     /// Burn → BTC refund attestation.
     Refund,
+    /// Burn → combined streamed-settlement attestation (re-audit-gated
+    /// burn-side streaming): a partially-filled streaming redeem swap that
+    /// delivered USDT AND refunded native on one leg. A DISTINCT third kind
+    /// so the per-leg mutex rejects a `Delivery`/`Refund` after a
+    /// `Streamed` (and vice versa) — a streamed leg is one-shot.
+    Streamed,
 }
 
 impl RedemptionKind {
@@ -106,6 +112,7 @@ impl RedemptionKind {
         match self {
             Self::Delivery => "delivery",
             Self::Refund => "refund",
+            Self::Streamed => "streamed",
         }
     }
 }
@@ -777,6 +784,7 @@ impl ReplayStore for SqliteReplayStore {
                 let prev_kind = match prev_kind_s.as_str() {
                     "delivery" => RedemptionKind::Delivery,
                     "refund" => RedemptionKind::Refund,
+                    "streamed" => RedemptionKind::Streamed,
                     other => {
                         return Err(ReplayError::Decode(format!(
                             "unknown redemption kind '{other}' in row"
@@ -1384,6 +1392,56 @@ mod tests {
                     ..
                 }
             ));
+
+            // Streamed-settlement kind (re-audit-gated burn streaming): a
+            // fresh leg records `Streamed`; a later `Delivery` or `Refund`
+            // on that leg is a one-shot mutex violation (and vice versa).
+            assert_eq!(
+                store
+                    .check_redemption(id2(), 5, RedemptionKind::Streamed, hash_a())
+                    .await
+                    .expect("leg5 streamed"),
+                RedemptionCheckOutcome::FirstTime
+            );
+            store
+                .record_redemption(id2(), 5, RedemptionKind::Streamed, hash_a(), vec![9], 250)
+                .await
+                .expect("record streamed");
+            // Same kind + payload → idempotent.
+            assert!(matches!(
+                store
+                    .check_redemption(id2(), 5, RedemptionKind::Streamed, hash_a())
+                    .await
+                    .expect("check"),
+                RedemptionCheckOutcome::Idempotent(_)
+            ));
+            // Delivery after streamed → mutex.
+            assert!(matches!(
+                store
+                    .check_redemption(id2(), 5, RedemptionKind::Delivery, hash_a())
+                    .await
+                    .expect("check"),
+                RedemptionCheckOutcome::MutexViolation {
+                    previous_kind: RedemptionKind::Streamed,
+                    ..
+                }
+            ));
+            // Streamed after a prior delivery (id2 leg 6) → mutex.
+            store
+                .record_redemption(id2(), 6, RedemptionKind::Delivery, hash_a(), vec![1], 260)
+                .await
+                .expect("record delivery leg6");
+            assert!(matches!(
+                store
+                    .check_redemption(id2(), 6, RedemptionKind::Streamed, hash_a())
+                    .await
+                    .expect("check"),
+                RedemptionCheckOutcome::MutexViolation {
+                    previous_kind: RedemptionKind::Delivery,
+                    ..
+                }
+            ));
+
             // Second record on same (id, leg) errors (race-safety net).
             assert!(store
                 .record_redemption(id1(), 0, RedemptionKind::Delivery, hash_a(), vec![], 300)

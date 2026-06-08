@@ -22,7 +22,8 @@ use alloy_sol_types::Eip712Domain;
 use thiserror::Error;
 use xindex_shared::eip712::{
     attestation_signing_hash, redemption_attestation_signing_hash, refund_attestation_signing_hash,
-    AsyncLegDeliveryAttestation, AsyncLegRefundAttestation, Attestation,
+    streamed_settlement_signing_hash, AsyncLegDeliveryAttestation, AsyncLegRefundAttestation,
+    AsyncLegStreamedSettlement, Attestation,
 };
 
 /// Errors surfaced by signer operations. Concrete enough that callers
@@ -104,6 +105,21 @@ pub trait HsmBackend {
         attestation: &AsyncLegRefundAttestation,
     ) -> Result<[u8; 65], SignerError> {
         self.sign_digest(refund_attestation_signing_hash(attestation, domain))
+    }
+
+    /// Sign a typed per-leg [`AsyncLegStreamedSettlement`] (re-audit-gated
+    /// burn-side streaming: a partially-filled redeem swap that delivered
+    /// USDT AND refunded native on one leg). FOURTH distinct typehash.
+    /// Default impl = digest-then-`sign_digest`; remote daemons override.
+    ///
+    /// # Errors
+    /// Forwards any [`SignerError`].
+    fn sign_streamed_settlement_msg(
+        &self,
+        domain: &Eip712Domain,
+        attestation: &AsyncLegStreamedSettlement,
+    ) -> Result<[u8; 65], SignerError> {
+        self.sign_digest(streamed_settlement_signing_hash(attestation, domain))
     }
 }
 
@@ -275,6 +291,37 @@ pub fn aggregate_refund_signatures<H: HsmBackend>(
     Ok(sigs)
 }
 
+/// Sign a per-leg `AsyncLegStreamedSettlement` (re-audit-gated burn-side
+/// streaming: a partially-filled redeem swap that delivered USDT AND
+/// refunded native on one leg). FOURTH separate typehash.
+///
+/// # Errors
+/// Forwards any [`SignerError`] from the backend.
+pub fn sign_streamed_settlement<H: HsmBackend>(
+    backend: &H,
+    domain: &Eip712Domain,
+    attestation: &AsyncLegStreamedSettlement,
+) -> Result<[u8; 65], SignerError> {
+    backend.sign_streamed_settlement_msg(domain, attestation)
+}
+
+/// Aggregate k-of-n signatures for an `AsyncLegStreamedSettlement` →
+/// `AttestationOracle.attestStreamedSettlement`'s `signatures: bytes[]`.
+///
+/// # Errors
+/// Forwards the first [`SignerError`]; stops on first failure.
+pub fn aggregate_streamed_settlement_signatures<H: HsmBackend>(
+    backends: &[&H],
+    domain: &Eip712Domain,
+    attestation: &AsyncLegStreamedSettlement,
+) -> Result<Vec<Vec<u8>>, SignerError> {
+    let mut sigs = Vec::with_capacity(backends.len());
+    for b in backends {
+        sigs.push(sign_streamed_settlement(*b, domain, attestation)?.to_vec());
+    }
+    Ok(sigs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +329,7 @@ mod tests {
     use xindex_shared::eip712::{
         attestation, attestation_oracle_domain, redemption_attestation,
         redemption_attestation_signing_hash, refund_attestation, refund_attestation_signing_hash,
+        streamed_settlement, streamed_settlement_signing_hash,
     };
 
     /// Anvil's first deterministic private key (account 0).
@@ -467,6 +515,51 @@ mod tests {
             r_recovered,
             s.signer_address(),
             "redemption sig must not verify under the refund digest"
+        );
+    }
+
+    /// Same closure for the combined streamed-settlement leg (fourth
+    /// typehash). Proves the streamed digest is independently correct and
+    /// that a delivery signature does not satisfy it.
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test code: panic on bad fixture is fine"
+    )]
+    fn sign_streamed_settlement_recovers_to_signer_address() {
+        let s = SoftwareSigner::from_hex(ANVIL_KEY_0).expect("valid Anvil key");
+        let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
+        let a = streamed_settlement(
+            B256::repeat_byte(0xc0),
+            U256::ZERO,
+            B256::repeat_byte(0xa1),
+            U256::from(60_000_000u32),
+            U256::from(30_000_000u32),
+        );
+
+        let sig_bytes = sign_streamed_settlement(&s, &domain, &a).expect("sign");
+        let digest = streamed_settlement_signing_hash(&a, &domain);
+        let sig = PrimitiveSignature::try_from(sig_bytes.as_slice()).expect("65-byte sig");
+        let recovered = sig.recover_address_from_prehash(&digest).expect("recover");
+        assert_eq!(recovered, s.signer_address());
+
+        // Cross-typehash negative: a delivery signature over the same ids
+        // must NOT recover to the signer under the streamed digest.
+        let r = redemption_attestation(
+            B256::repeat_byte(0xc0),
+            U256::ZERO,
+            B256::repeat_byte(0xa1),
+            U256::from(60_000_000u32),
+        );
+        let r_sig = sign_redemption_attestation(&s, &domain, &r).expect("sign");
+        let r_parsed = PrimitiveSignature::try_from(r_sig.as_slice()).expect("65-byte");
+        let r_recovered = r_parsed
+            .recover_address_from_prehash(&digest)
+            .expect("recover");
+        assert_ne!(
+            r_recovered,
+            s.signer_address(),
+            "delivery sig must not verify under the streamed digest"
         );
     }
 

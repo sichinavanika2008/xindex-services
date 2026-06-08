@@ -198,6 +198,64 @@ pub fn refund_attestation_signing_hash(
     attestation.eip712_signing_hash(domain)
 }
 
+sol! {
+    /// Per-leg combined streamed-settlement attestation (re-audit-gated
+    /// burn-side streaming): a streaming redeem swap partially filled,
+    /// delivering `deliveredUsdt` to the `IndexToken` AND refunding
+    /// `refundedNative` of the source asset to our custody on ONE leg.
+    /// A FOURTH separate struct / typehash; the on-chain queue reads the
+    /// resulting `attested && refunded` state as the combined outcome.
+    /// Mirrors `AttestationOracle.ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH`.
+    /// Either amount may be zero (the queue rejects both-zero).
+    struct AsyncLegStreamedSettlement {
+        bytes32 redemptionId;
+        uint256 legIndex;
+        bytes32 assetId;
+        uint256 deliveredUsdt;
+        uint256 refundedNative;
+    }
+}
+
+/// Verbatim type string. MUST match `AttestationOracle.sol`'s
+/// `ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH` source string.
+pub const ASYNC_LEG_STREAMED_SETTLEMENT_TYPE_STRING: &[u8] = b"AsyncLegStreamedSettlement(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredUsdt,uint256 refundedNative)";
+
+/// `keccak256(ASYNC_LEG_STREAMED_SETTLEMENT_TYPE_STRING)` — equals
+/// `AttestationOracle.ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH` on-chain.
+#[must_use]
+pub fn streamed_settlement_typehash() -> B256 {
+    keccak256(ASYNC_LEG_STREAMED_SETTLEMENT_TYPE_STRING)
+}
+
+/// Construct an `AsyncLegStreamedSettlement` from raw fields.
+#[must_use]
+pub fn streamed_settlement(
+    redemption_id: B256,
+    leg_index: U256,
+    asset_id: B256,
+    delivered_usdt: U256,
+    refunded_native: U256,
+) -> AsyncLegStreamedSettlement {
+    AsyncLegStreamedSettlement {
+        redemptionId: redemption_id,
+        legIndex: leg_index,
+        assetId: asset_id,
+        deliveredUsdt: delivered_usdt,
+        refundedNative: refunded_native,
+    }
+}
+
+/// EIP-712 signing hash for an `AsyncLegStreamedSettlement`. Reuses
+/// `attestation_oracle_domain`. Equivalent to
+/// `AttestationOracle.streamedSettlementHash(...)` on-chain.
+#[must_use]
+pub fn streamed_settlement_signing_hash(
+    attestation: &AsyncLegStreamedSettlement,
+    domain: &Eip712Domain,
+) -> B256 {
+    attestation.eip712_signing_hash(domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,15 +357,42 @@ mod tests {
         );
     }
 
-    /// The three typehashes MUST be pairwise distinct — the type-level
-    /// mint↔delivery↔refund separation the on-chain design relies on.
+    /// Pinned from
+    /// `cast keccak "AsyncLegStreamedSettlement(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredUsdt,uint256 refundedNative)"`.
+    /// Source of truth: `Xindex/src/AttestationOracle.sol`'s
+    /// `ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH`.
     #[test]
-    fn three_typehashes_pairwise_distinct() {
+    fn streamed_settlement_typehash_matches_solidity_source() {
+        let pinned = B256::new([
+            0x8b, 0x30, 0x71, 0x2f, 0x33, 0xfa, 0xc5, 0xba, 0x21, 0x2a, 0x51, 0xbc, 0xcc, 0x8a,
+            0xc1, 0x0c, 0xba, 0x09, 0xac, 0xa9, 0x31, 0x33, 0xef, 0x28, 0x42, 0xf0, 0x04, 0x15,
+            0x1d, 0x50, 0xf4, 0x33,
+        ]);
+        assert_eq!(
+            streamed_settlement_typehash(),
+            pinned,
+            "Rust typehash drifted from on-chain ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH"
+        );
+        assert_eq!(
+            keccak256(AsyncLegStreamedSettlement::eip712_root_type().as_bytes()),
+            streamed_settlement_typehash(),
+            "sol! macro-derived streamed-settlement typehash drifted"
+        );
+    }
+
+    /// The four typehashes MUST be pairwise distinct — the type-level
+    /// mint↔delivery↔refund↔streamed separation the on-chain design relies on.
+    #[test]
+    fn four_typehashes_pairwise_distinct() {
         let m = attestation_typehash();
         let r = redemption_attestation_typehash();
         let f = refund_attestation_typehash();
+        let s = streamed_settlement_typehash();
         assert_ne!(m, r, "mint vs delivery typehash collision");
         assert_ne!(m, f, "mint vs refund typehash collision");
+        assert_ne!(m, s, "mint vs streamed typehash collision");
         assert_ne!(r, f, "delivery vs refund typehash collision");
+        assert_ne!(r, s, "delivery vs streamed typehash collision");
+        assert_ne!(f, s, "refund vs streamed typehash collision");
     }
 }

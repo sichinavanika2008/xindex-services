@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 xindex-shared.workspace = true
 xindex-chain-eth.workspace = true
+xindex-chain-thor.workspace = true
 xindex-ops.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
@@ -25,6 +26,7 @@ clap.workspace = true
 futures-util.workspace = true
 sqlx.workspace = true
 prometheus.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "xindex-cancel"
@@ -33,3 +35,7 @@ path = "src/bin/xindex-cancel.rs"
 [[bin]]
 name = "xindex-finalize-redeem"
 path = "src/bin/xindex-finalize-redeem.rs"
+
+[[bin]]
+name = "xindex-hint-builder"
+path = "src/bin/xindex-hint-builder.rs"

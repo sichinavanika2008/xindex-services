@@ -527,6 +527,28 @@ chain family.
 | P-TRON-9 | Medium | ⏳ Deferred (mainnet gate) | **No TRON-side inbound observer / refund cross-check in v1.** `chain-tron` implements the redeem essentials (`now_block` for the TAPOS reference, `broadcast_hex`, `transaction_info`) but NOT a `transfers_to` inbound scanner, and there is no `ThorTron` refund/delivery cross-check policy (the XRP/Cosmos C6 analogue). TRON is redeem-only in our flow (mint is USDT-on-Ethereum), so no inbound-deposit scan is needed; the gap is the THORChain **refund** path (a bounced swap returning native TRON to our multisig), which the attestation layer cannot yet observe on TRON. FAIL-CLOSED — a refund that cannot be observed simply does not get attested (a bounded stuck-redemption / liveness risk, no false attestation, no fund loss), the same shape as P4.4-18 / P-SOL-10. Cross-repo follow-on: add a TronGrid-backed `transfers_to` + a `ThorTron` policy before TRON refunds are relied on. The generic delivery cross-check (THORChain → USDT on Ethereum) already covers TRON via `from_asset_id` routing. |
 | P-TRON-10 | Info | ❌ Accepted | **No fee oracle in v1; TAPOS replay/expiry, not a nonce.** Operators supply `fee_limit` (the TRC20 energy cap, in `sun`) per leg via the `xindex-redeem-tron` CLI; native TRX legs pay bandwidth only (`fee_limit` omitted). A stale `ref_block_*` / `expiration` fails closed at broadcast (`TRANSACTION_EXPIRATION_ERROR`, `broadcast.accepted()==false`), never burning resources at the wrong rate. `Permission_id` is bound INSIDE `raw_data` (hashed into the `txID`), so all signers agree on it by construction. Mirror of P4.4-14 / DL-P3.2-7. |
 
+## Streaming swaps — burn-side off-chain (Part B2 + A2) (2026-06-09)
+
+Off-chain support for THORChain **streaming** redeem swaps (re-audit-gated;
+see the Solidity-repo KNOWN_FINDINGS for the on-chain combined-settlement
+state machine). A streaming redeem can partially fill — delivering USDT to the
+IndexToken AND refunding native to our custody on ONE leg — settled by a FOURTH
+EIP-712 typehash.
+
+| ID | Severity | Status | Resolution |
+|---|---|---|---|
+| **STREAM-B2-EIP712** | Info | ✅ Done | `crates/shared/src/eip712.rs`: `AsyncLegStreamedSettlement` typed-data + `streamed_settlement_typehash()`. A pinned-value test asserts the Rust typehash byte-matches the Solidity `ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH`, plus a 4-way pairwise-distinct test (mint/delivery/refund/streamed). Drift = signers produce digests the oracle rejects. |
+| **STREAM-B2-SIGNER** | Info | ✅ Done | `crates/signer/src/lib.rs`: `HsmBackend::sign_streamed_settlement_msg` + `sign_streamed_settlement` + `aggregate_streamed_settlement_signatures`. Recover-to-signer test + cross-typehash negative (a delivery sig must NOT verify under the streamed digest). |
+| **STREAM-B2-CROSSCHECK** | Info | ✅ Done | `crates/signer/src/crosscheck.rs`: `ThorUtxoStreamedSettlementPolicy` + `StreamedSettlementCrossCheck` trait, returning the AUTHORITATIVE on-chain `StreamedOutcome { delivered_usdt_1e6, refunded_sats }`. Unlike the XOR delivery/refund policies it accepts BOTH (or either) on one `btc_txid`; verifies the ERC20 arrival AND the vault-bound BTC UTXO independently. wiremock tests: partial-fill (both legs), full-delivery (zero refund), no-outbound (`NoSettlement`). |
+| **STREAM-B2-REPLAY** | Info | ✅ Done | `crates/signer-daemon/src/replay.rs`: `RedemptionKind::Streamed` (third kind) + migration `0007_redemptions_allow_streamed.sql` (widen the `kind` CHECK). The per-leg `(redemption_id, leg_index)` one-shot mutex now rejects a delivery/refund after a streamed settlement (and vice versa). InMemory + Sqlite lifecycle tests assert the mutex. |
+| **STREAM-A2-HINTS** | Info | ✅ Done | `crates/relayer/src/hint_builder.rs` + `xindex-hint-builder` binary. Pure `plan_stream` computes `(interval, quantity)` from live pool depth: size-gate (don't stream below `min_slip_bps`), the on-chain `MAX_STREAM_BLOCKS` bound, and the **mandatory deadline-margin gate** (the worst-case stream must finish inside the intent deadline with confirmation+attestation headroom). 7 unit tests. The binary pulls `ThorClient::pools()` and prints the hint JSON. |
+| **STREAM-B2-COORD** | — | ⏳ **Deferred (audit-gated integration)** | The coordinator finality-gate branch (`xindex-attest-redeem`: poll until the streaming swap is FULLY finalised, then call the combined policy → `aggregate_streamed_settlement_signatures` → `attestStreamedSettlement`), the daemon streamed-settlement HTTP endpoint, and the `AttestationOracle.json` ABI entry. The verified primitives above wire together here. **Central risk: the partial-fill finality race** — settle ONLY after both outbounds are final; settling on the first observed outbound would under-credit the other leg. Mainnet-gated behind the fresh focused audit the plan requires for the whole burn-streaming path. |
+
+**Gate (2026-06-09):** `cargo fmt --all --check` clean; `cargo clippy --workspace
+--all-targets --all-features -- -D warnings` clean; `cargo test --workspace` all
+green (incl. the new eip712 / signer / crosscheck / replay / hint_builder tests).
+`cargo audit` rsa advisory is pre-existing (unchanged).
+
 ## When this file gets updated
 
 - New audit pass (internal or external) → add a section
