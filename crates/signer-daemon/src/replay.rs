@@ -346,6 +346,31 @@ pub trait ReplayStore: Send + Sync {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// CTD-1 (`DL-CTD-2`): ONE-SHOT Redemption Intent Certificate pre-flight,
+    /// keyed `(chain_id, redemption_id, leg_index)`. The custody spend for a
+    /// given redemption leg is authorized exactly ONCE — a single valid RIC
+    /// cannot be re-driven into N payouts across the family-specific spend keys
+    /// (the RA-1 killer). `payload_hash` is the RIC digest: an identical retry
+    /// is `Idempotent`, a DIFFERENT RIC for the same leg is a `Conflict`.
+    fn check_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// CTD-1: record a consumed RIC one-shot authorization.
+    fn record_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -370,6 +395,8 @@ struct InMemoryInner {
     /// P-SOL-6: Solana replay key —
     /// `(chain_id_str, multisig, transaction_index, kind, member)`.
     solana_txs: HashMap<(&'static str, String, u64, &'static str, String), SignedRecord>,
+    /// CTD-1 (`DL-CTD-2`): RIC one-shot key — `(chain_id_str, redemption_id, leg_index)`.
+    ric_intents: HashMap<(&'static str, B256, u32), SignedRecord>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -738,6 +765,48 @@ impl ReplayStore for InMemoryReplayStore {
         let key = (chain_id.thor_asset(), owner_address, txid);
         let mut g = self.inner.lock().await;
         if let std::collections::hash_map::Entry::Vacant(e) = g.tron_txs.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Duplicate)
+        }
+    }
+
+    async fn check_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), redemption_id, leg_index);
+        let g = self.inner.lock().await;
+        Ok(match g.ric_intents.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), redemption_id, leg_index);
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.ric_intents.entry(key) {
             e.insert(SignedRecord {
                 payload_hash,
                 signature,
@@ -1384,6 +1453,72 @@ impl ReplayStore for SqliteReplayStore {
         .await;
         Self::map_insert(res)
     }
+
+    async fn check_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let leg_i = i64::from(leg_index);
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM ric_intents
+             WHERE chain_id = ? AND redemption_id = ? AND leg_index = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(redemption_id.as_slice())
+        .bind(leg_i)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let leg_i = i64::from(leg_index);
+        let res = sqlx::query(
+            "INSERT INTO ric_intents
+                (chain_id, redemption_id, leg_index, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(redemption_id.as_slice())
+        .bind(leg_i)
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await;
+        Self::map_insert(res)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1851,6 +1986,69 @@ mod tests {
         }
     }
 
+    /// CTD-1 (`DL-CTD-2`): RIC one-shot keyed `(chain, redemption_id, leg)`.
+    /// Same leg + same RIC → idempotent; same leg + a DIFFERENT RIC (a re-drive
+    /// with a forged/rotated cert) → Conflict; a different leg / redemption /
+    /// chain is independent. This is the RA-1 anti-re-drive guard.
+    async fn run_ric_intent_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let rid = id1();
+            assert_eq!(
+                store
+                    .check_ric_intent(ChainId::Btc, rid, 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_ric_intent(ChainId::Btc, rid, 0, hash_a(), vec![1, 2, 3], 100)
+                .await
+                .expect("record");
+            // Same leg + same RIC → idempotent.
+            assert!(matches!(
+                store
+                    .check_ric_intent(ChainId::Btc, rid, 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1, 2, 3]
+            ));
+            // Same leg + DIFFERENT RIC (re-drive / forged cert) → Conflict.
+            assert!(matches!(
+                store
+                    .check_ric_intent(ChainId::Btc, rid, 0, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            // Different leg → independent.
+            assert_eq!(
+                store
+                    .check_ric_intent(ChainId::Btc, rid, 1, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different redemption → independent.
+            assert_eq!(
+                store
+                    .check_ric_intent(ChainId::Btc, id2(), 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different chain (LTC), same redemption+leg → independent.
+            assert_eq!(
+                store
+                    .check_ric_intent(ChainId::Ltc, rid, 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+        }
+    }
+
     #[tokio::test]
     async fn in_memory_attestation_lifecycle() {
         let store = InMemoryReplayStore::new();
@@ -1870,6 +2068,21 @@ mod tests {
             .await
             .expect("connect");
         run_tron_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_ric_intent_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_ric_intent_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_ric_intent_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_ric_intent_lifecycle(&store).await;
     }
 
     #[tokio::test]

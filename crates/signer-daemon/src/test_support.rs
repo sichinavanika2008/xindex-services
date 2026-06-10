@@ -336,4 +336,37 @@ impl<S: ReplayStore> ReplayStore for RaceReplayStore<S> {
             )
             .await
     }
+
+    async fn check_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        self.inner
+            .check_ric_intent(chain_id, redemption_id, leg_index, payload_hash)
+            .await
+    }
+
+    async fn record_ric_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        self.inner
+            .record_ric_intent(
+                chain_id,
+                redemption_id,
+                leg_index,
+                payload_hash,
+                signature,
+                now_unix,
+            )
+            .await
+    }
 }

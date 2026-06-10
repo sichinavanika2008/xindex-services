@@ -256,6 +256,90 @@ pub fn streamed_settlement_signing_hash(
     attestation.eip712_signing_hash(domain)
 }
 
+sol! {
+    /// CTD-1 Redemption Intent Certificate (RIC) — the FIFTH typed-data on
+    /// the `attestation_oracle_domain`, **off-chain only** (no on-chain
+    /// verification; `DL-CTD-RIC-V2` Q1 / `DL-CTD-2`). k-of-n Set-B signers
+    /// (the attestation set) certify the canonical custody-spend for one
+    /// redemption leg so an RPC-free custody daemon can verify the spend
+    /// destination it is about to sign WITHOUT trusting the coordinator.
+    ///
+    /// Each operator's observer independently resolves the Asgard inbound
+    /// (`immediateTargetHash`) + the amount from its OWN diverse `THORChain`
+    /// sources, then signs this; the custody daemon recovers k-of-n signers
+    /// and binds the spend to these fields. Unlike the four attestation
+    /// typehashes this has NO Solidity counterpart — the pinned test locks
+    /// the type string for CROSS-OPERATOR consistency, not a Solidity match.
+    ///
+    /// - `immediateTargetHash` = keccak of the native-chain Asgard inbound
+    ///   the multisig pays (BTC scriptPubKey / address bytes) — the field
+    ///   with no on-chain root, hence the k-of-n observer attestation.
+    /// - `amountDecimals` pins the unit of `amount` to `chain_registry` (RA-4).
+    /// - `vaultResolvedAt` (unix secs) is the observer's Asgard-resolution
+    ///   time; the daemon enforces a local `ric_max_age` so a RIC can't be
+    ///   replayed onto a rotated vault (recency; replaces the unsourceable
+    ///   strict `vaultEpoch`, RA-5).
+    struct RedemptionIntentCertificate {
+        bytes32 redemptionId;
+        uint256 legIndex;
+        bytes32 assetId;
+        uint256 amount;
+        uint8 amountDecimals;
+        bytes32 immediateTargetHash;
+        bytes32 memoHash;
+        bytes32 finalDestinationHash;
+        uint64 vaultResolvedAt;
+    }
+}
+
+/// Verbatim RIC type string. Off-chain only — pinned for cross-operator
+/// consistency (every operator's Rust MUST compute the identical digest).
+pub const RIC_TYPE_STRING: &[u8] = b"RedemptionIntentCertificate(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 amount,uint8 amountDecimals,bytes32 immediateTargetHash,bytes32 memoHash,bytes32 finalDestinationHash,uint64 vaultResolvedAt)";
+
+/// `keccak256(RIC_TYPE_STRING)`.
+#[must_use]
+pub fn ric_typehash() -> B256 {
+    keccak256(RIC_TYPE_STRING)
+}
+
+/// Construct a `RedemptionIntentCertificate` from raw fields.
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the RIC binds 9 distinct certified fields; a wrapper struct param would just re-wrap them"
+)]
+pub fn redemption_intent_certificate(
+    redemption_id: B256,
+    leg_index: U256,
+    asset_id: B256,
+    amount: U256,
+    amount_decimals: u8,
+    immediate_target_hash: B256,
+    memo_hash: B256,
+    final_destination_hash: B256,
+    vault_resolved_at: u64,
+) -> RedemptionIntentCertificate {
+    RedemptionIntentCertificate {
+        redemptionId: redemption_id,
+        legIndex: leg_index,
+        assetId: asset_id,
+        amount,
+        amountDecimals: amount_decimals,
+        immediateTargetHash: immediate_target_hash,
+        memoHash: memo_hash,
+        finalDestinationHash: final_destination_hash,
+        vaultResolvedAt: vault_resolved_at,
+    }
+}
+
+/// EIP-712 signing hash for a `RedemptionIntentCertificate`. Reuses
+/// `attestation_oracle_domain` — the RIC binds to the same `(chainId,
+/// AttestationOracle)` domain even though it is never posted on-chain.
+#[must_use]
+pub fn ric_signing_hash(ric: &RedemptionIntentCertificate, domain: &Eip712Domain) -> B256 {
+    ric.eip712_signing_hash(domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,19 +464,44 @@ mod tests {
         );
     }
 
-    /// The four typehashes MUST be pairwise distinct — the type-level
-    /// mint↔delivery↔refund↔streamed separation the on-chain design relies on.
+    /// RIC (5th typehash, off-chain only — `DL-CTD-2`). No Solidity
+    /// counterpart; the pin locks the type string for CROSS-OPERATOR
+    /// consistency so every operator's daemon computes the identical RIC
+    /// digest. Recompute with `cast keccak "<RIC_TYPE_STRING>"`.
     #[test]
-    fn four_typehashes_pairwise_distinct() {
-        let m = attestation_typehash();
-        let r = redemption_attestation_typehash();
-        let f = refund_attestation_typehash();
-        let s = streamed_settlement_typehash();
-        assert_ne!(m, r, "mint vs delivery typehash collision");
-        assert_ne!(m, f, "mint vs refund typehash collision");
-        assert_ne!(m, s, "mint vs streamed typehash collision");
-        assert_ne!(r, f, "delivery vs refund typehash collision");
-        assert_ne!(r, s, "delivery vs streamed typehash collision");
-        assert_ne!(f, s, "refund vs streamed typehash collision");
+    fn ric_typehash_pinned_and_macro_consistent() {
+        let pinned = B256::new([
+            0x66, 0x3a, 0xa6, 0x05, 0x67, 0x7f, 0xa5, 0x9b, 0x65, 0x89, 0x17, 0x88, 0x2d, 0xed,
+            0x96, 0x78, 0x00, 0x75, 0x71, 0x14, 0xb6, 0x05, 0x25, 0xe2, 0xf2, 0x48, 0x7d, 0xb2,
+            0xf4, 0x49, 0xf9, 0x37,
+        ]);
+        assert_eq!(
+            ric_typehash(),
+            pinned,
+            "RIC type string changed — cross-operator digest drift"
+        );
+        assert_eq!(
+            keccak256(RedemptionIntentCertificate::eip712_root_type().as_bytes()),
+            ric_typehash(),
+            "sol! macro-derived RIC typehash drifted from RIC_TYPE_STRING"
+        );
+    }
+
+    /// The FIVE typehashes MUST be pairwise distinct — the type-level
+    /// mint↔delivery↔refund↔streamed↔RIC separation the design relies on.
+    #[test]
+    fn five_typehashes_pairwise_distinct() {
+        let all = [
+            attestation_typehash(),
+            redemption_attestation_typehash(),
+            refund_attestation_typehash(),
+            streamed_settlement_typehash(),
+            ric_typehash(),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "typehash collision");
+            }
+        }
     }
 }
