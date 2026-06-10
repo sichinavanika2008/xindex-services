@@ -38,7 +38,7 @@ use xindex_xrp_tx::sigs as xrp_sigs;
 use xindex_xrp_tx::tx::{serialize_for_multisign, PaymentBody};
 
 use crate::replay::{CheckOutcome, ReplayStore};
-use crate::server::DaemonState;
+use crate::server::{bind_account_send_to_cert, gate_ric_intent, DaemonState};
 use crate::web3signer::{HsmDigestSigner, HsmError};
 
 /// Per-chain XRP signing role. One entry per XRP chain this daemon is a
@@ -195,6 +195,19 @@ where
             ),
         ));
     }
+
+    // 2b. CTD-1 (`DL-CTD-2`): mandatory k-of-n RIC gate + the semantic
+    //     field binds (destination / amount_drops / memo). The body
+    //     re-serialization below then guarantees the signed bytes match
+    //     THESE fields, so cert == fields == tx.
+    let (cert, _ric_digest) = gate_ric_intent(
+        &state.config,
+        state.replay.as_ref(),
+        req.chain_id,
+        req.intent_proof.as_ref(),
+    )
+    .await?;
+    bind_account_send_to_cert(&req.destination, &req.amount_drops, &req.memo, &cert)?;
 
     // 3. Re-serialize the canonical Payment body and compare to the claim.
     let (body_inputs, sequence) = build_payment_body(&req)?;
@@ -389,6 +402,7 @@ mod tests {
             chain_id: 1,
             verifying_contract: Address::ZERO,
             eth_address: Address::ZERO,
+            intent_policy: crate::test_support::ric::policy(),
         }
     }
 
@@ -414,13 +428,25 @@ mod tests {
             XrpTxSignRequest {
                 chain_id: ChainId::Xrp,
                 account_address: account,
-                destination: dest,
+                destination: dest.clone(),
                 amount_drops: "1000000".to_string(),
                 fee_drops: "60".to_string(),
                 sequence: "7".to_string(),
                 last_ledger_sequence: "9000007".to_string(),
                 memo: "=:ETH.USDT:0xabc:0".to_string(),
                 signing_blob: format!("0x{}", alloy_primitives::hex::encode(&serialized)),
+                intent_proof: Some(crate::test_support::ric::proof_for(
+                    1,
+                    Address::ZERO,
+                    &crate::test_support::ric::CertSpec {
+                        chain: ChainId::Xrp,
+                        redemption_id: B256::repeat_byte(0x78),
+                        leg_index: 0,
+                        amount: alloy_primitives::U256::from(1_000_000_u64),
+                        immediate_target: dest.clone().into_bytes(),
+                        memo: b"=:ETH.USDT:0xabc:0".to_vec(),
+                    },
+                )),
             },
         )
     }

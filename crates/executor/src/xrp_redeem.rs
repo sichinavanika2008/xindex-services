@@ -55,7 +55,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use xindex_chain_xrp::{XrpChainClient, XrpChainError};
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
-use xindex_shared::signer_wire::XrpTxSignRequest;
+use xindex_shared::signer_wire::{IntentProof, XrpTxSignRequest};
 use xindex_xrp_tx::addr::decode_classic_address;
 use xindex_xrp_tx::signing::multisign_digest;
 use xindex_xrp_tx::sigs::{aggregate_verified, verify_der, PartialSig, SigError};
@@ -172,6 +172,11 @@ pub struct XrpRedeemTask {
     pub memo: String,
     /// Native send amount in drops.
     pub send_amount: u128,
+    /// CTD-1 (`DL-CTD-2`): the leg's k-of-n Redemption Intent
+    /// Certificate proof. Attached by the binary (Slice B: collected
+    /// from the per-operator observers); `None` is forwarded as-is and
+    /// refused daemon-side (fail closed).
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Static per-executor config. One executor instance per multisig account.
@@ -310,6 +315,7 @@ impl<C: XrpChainClient> XrpRedeemExecutor<C> {
             last_ledger_sequence: last_ledger_sequence.to_string(),
             memo: task.memo.clone(),
             signing_blob: format!("0x{}", alloy_primitives::hex::encode(&body)),
+            intent_proof: task.intent_proof.clone(),
         };
 
         let parts = self.collect_signatures(&req, &body).await?;
@@ -566,6 +572,7 @@ mod tests {
             chain: ChainId::Xrp,
             memo: "=:ETH.USDT:0xdeadbeef:1000000".to_string(),
             send_amount: 5_000_000,
+            intent_proof: None,
         }
     }
 

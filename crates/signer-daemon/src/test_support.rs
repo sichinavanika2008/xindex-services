@@ -403,3 +403,116 @@ impl<S: ReplayStore> ReplayStore for RaceReplayStore<S> {
             .await
     }
 }
+
+/// CTD-1 (`DL-CTD-2`) test fixtures: a deterministic 3-member Set-B
+/// whose addresses form every test daemon's `intent_policy` whitelist,
+/// plus a builder that signs a Redemption Intent Certificate exactly
+/// the way the per-operator observers will (Slice B): asset id +
+/// decimals from the chain registry, target/memo hashes = keccak of
+/// the raw bytes, `vault_resolved_at` = now.
+pub mod ric {
+    use alloy_primitives::{keccak256, Address, B256, U256};
+    use k256::ecdsa::SigningKey;
+    use xindex_shared::chain_registry::ChainId;
+    use xindex_shared::eip712::{
+        attestation_oracle_domain, redemption_intent_certificate, ric_signing_hash,
+    };
+    use xindex_shared::signer_wire::IntentProof;
+
+    use crate::intent::IntentPolicy;
+
+    /// Deterministic Set-B test keys (seeds 41/42/43) → (key, EOA).
+    #[expect(clippy::expect_used, reason = "test code")]
+    pub fn set_b_keys() -> Vec<(SigningKey, Address)> {
+        [41u8, 42, 43]
+            .iter()
+            .map(|seed| {
+                let sk = SigningKey::from_slice(&[*seed; 32]).expect("key");
+                let vk = sk.verifying_key();
+                let uncompressed = vk.to_encoded_point(false);
+                let hash = keccak256(&uncompressed.as_bytes()[1..]);
+                let addr = Address::from_slice(&hash[12..]);
+                (sk, addr)
+            })
+            .collect()
+    }
+
+    /// 2-of-3 test policy over [`set_b_keys`].
+    pub fn policy() -> IntentPolicy {
+        IntentPolicy {
+            signer_whitelist: set_b_keys().into_iter().map(|(_, a)| a).collect(),
+            intent_quorum: 2,
+            ric_max_age_secs: 3_600,
+        }
+    }
+
+    /// The certified fields of one test leg. `immediate_target` and
+    /// `memo` are the RAW bytes the family hashes (BTC: scriptPubKey
+    /// bytes / memo bytes; EVM: the 20-byte Asgard vault address;
+    /// account families: the canonical address / memo strings as
+    /// UTF-8).
+    #[derive(Debug, Clone)]
+    pub struct CertSpec {
+        pub chain: ChainId,
+        pub redemption_id: B256,
+        pub leg_index: u32,
+        pub amount: U256,
+        pub immediate_target: Vec<u8>,
+        pub memo: Vec<u8>,
+    }
+
+    /// Build + quorum-sign an [`IntentProof`] over `spec`.
+    #[expect(clippy::expect_used, reason = "test code")]
+    pub fn proof_for(
+        eth_chain_id: u64,
+        verifying_contract: Address,
+        spec: &CertSpec,
+    ) -> IntentProof {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let immediate_target_hash = keccak256(&spec.immediate_target);
+        let memo_hash = keccak256(&spec.memo);
+        let final_destination_hash = B256::repeat_byte(0x12);
+        let ric = redemption_intent_certificate(
+            spec.redemption_id,
+            U256::from(spec.leg_index),
+            spec.chain.asset_id_hash(),
+            spec.amount,
+            spec.chain.decimals(),
+            immediate_target_hash,
+            memo_hash,
+            final_destination_hash,
+            now,
+        );
+        let digest = ric_signing_hash(
+            &ric,
+            &attestation_oracle_domain(eth_chain_id, verifying_contract),
+        );
+        let signatures = set_b_keys()
+            .iter()
+            .take(2)
+            .map(|(sk, _)| {
+                let (sig, recid) = sk
+                    .sign_prehash_recoverable(digest.as_slice())
+                    .expect("sign");
+                let mut out = [0u8; 65];
+                out[..64].copy_from_slice(sig.to_bytes().as_ref());
+                out[64] = 27 + recid.to_byte();
+                format!("0x{}", alloy_primitives::hex::encode(out))
+            })
+            .collect();
+        IntentProof {
+            redemption_id: format!("{:#x}", spec.redemption_id),
+            leg_index: spec.leg_index.to_string(),
+            asset_id: format!("{:#x}", spec.chain.asset_id_hash()),
+            amount: spec.amount.to_string(),
+            amount_decimals: spec.chain.decimals(),
+            immediate_target_hash: format!("{immediate_target_hash:#x}"),
+            memo_hash: format!("{memo_hash:#x}"),
+            final_destination_hash: format!("{final_destination_hash:#x}"),
+            vault_resolved_at: now,
+            signatures,
+        }
+    }
+}

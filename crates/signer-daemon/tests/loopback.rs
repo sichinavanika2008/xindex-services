@@ -53,6 +53,8 @@ use xindex_signer::HsmBackend;
 use xindex_signer_daemon::psbt::UtxoSignerConfig;
 use xindex_signer_daemon::replay::InMemoryReplayStore;
 use xindex_signer_daemon::server::{router, DaemonConfig, DaemonState};
+
+mod ric_common;
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HsmError};
 
 /// Software-keyed HSM frontend. Produces real ECDSA signatures over
@@ -140,6 +142,7 @@ async fn spawn_daemon(
         chain_id: 31337,
         verifying_contract: Address::repeat_byte(0xab),
         eth_address,
+        intent_policy: ric_common::policy(),
     };
     let mut state = DaemonState::new(cfg, replay, Arc::clone(&hsm));
     if let Some(btc_cfg) = btc {
@@ -317,6 +320,10 @@ async fn coordinator_to_daemon_redemption_delivery_then_refund_is_mutex_409() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single sequential coordinator→daemon e2e flow; splitting fragments the audit-relevant ordering (honest PSBT shape + M2 veto + CTD-1 proof + ECDSA round-trip)"
+)]
 async fn coordinator_to_daemon_psbt_input_signs_with_real_ecdsa_and_finalizes() {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
     use bitcoin::psbt::Psbt;
@@ -365,10 +372,18 @@ async fn coordinator_to_daemon_psbt_input_signs_with_real_ecdsa_and_finalizes() 
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(99_000),
-            script_pubkey: ScriptBuf::new_op_return(b"z"),
-        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                    [0x42; 20],
+                )),
+            },
+            TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return(b"=:ETH.USDT:0xabc:0"),
+            },
+        ],
     };
     let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
     psbt.inputs[0].witness_utxo = Some(TxOut {
@@ -381,17 +396,29 @@ async fn coordinator_to_daemon_psbt_input_signs_with_real_ecdsa_and_finalizes() 
     // disclosed BTC pubkey. Run the blocking HTTP call inside
     // spawn_blocking so reqwest::blocking can drive its own runtime.
     // audit M2: pass the leg's expected outputs that MATCH this PSBT's
-    // sole OP_RETURN output, proving a legitimate leg passes the veto.
+    // payout + memo, proving a legitimate leg passes the veto. CTD-1:
+    // attach a quorum-signed certificate over the same payout.
+    let dest_spk = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x42; 20]));
     let expected = xindex_executor::ExpectedOutputs {
-        destination_spk: ScriptBuf::new_op_return(b"z").into_bytes(),
+        destination_spk: dest_spk.clone().into_bytes(),
         amount_sats: 99_000,
-        memo: b"z".to_vec(),
+        memo: b"=:ETH.USDT:0xabc:0".to_vec(),
     };
+    let proof = ric_common::proof(
+        31337,
+        Address::repeat_byte(0xab),
+        ChainId::Btc,
+        0x91,
+        0,
+        99_000,
+        dest_spk.as_bytes(),
+        b"=:ETH.USDT:0xabc:0",
+    );
     let url_for_sign = url;
     let psbt_send = psbt.clone();
     let (got_pk, got_sig) = tokio::task::spawn_blocking(move || {
         let cosigner = RemoteMultisigCosigner::new(ChainId::Btc, url_for_sign, btc_pk);
-        cosigner.sign_input(&psbt_send, 0, Some(&expected))
+        cosigner.sign_input(&psbt_send, 0, Some(&expected), Some(&proof))
     })
     .await
     .expect("join")

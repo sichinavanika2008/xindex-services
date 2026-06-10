@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, Bytes, B256, U256};
-use alloy_sol_types::{sol, SolCall};
+use alloy_sol_types::SolCall;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -56,19 +56,10 @@ use xindex_safe_evm::{
     SafeOperation,
 };
 use xindex_shared::chain_registry::ChainId;
-
-sol! {
-    /// THORChain Router v6.1 `depositWithExpiry`. Same ABI on every
-    /// Phase 3.2 EVM chain (Bifrost deploys the identical Router on
-    /// ETH / BSC / AVAX / BASE / POL).
-    function depositWithExpiry(
-        address payable vault,
-        address asset,
-        uint256 amount,
-        string memo,
-        uint256 expiry
-    ) external payable;
-}
+use xindex_shared::signer_wire::IntentProof;
+// One shared ABI definition (CTD-1): the daemon's EVM gate decodes the
+// exact call this builder encodes.
+use xindex_shared::thorchain_router::depositWithExpiryCall;
 
 /// Errors surfaced by V7 executor.
 #[derive(Debug, Error)]
@@ -116,6 +107,11 @@ pub struct EvmRedeemTask {
     pub memo: String,
     /// Native amount in wei (1e18 base for the EVM family).
     pub amount_wei: U256,
+    /// CTD-1 (`DL-CTD-2`): the leg's k-of-n Redemption Intent
+    /// Certificate proof. Attached by the binary (Slice B: collected
+    /// from the per-operator observers); `None` is forwarded as-is and
+    /// refused daemon-side (fail closed).
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Boxed future returned by [`EvmCosigner::sign_safe_tx`]. Object-safe
@@ -146,6 +142,7 @@ pub trait EvmCosigner: Send + Sync {
         tx: &'a SafeTransaction,
         safe_tx_hash: B256,
         fee_wei: u128,
+        intent_proof: Option<&'a IntentProof>,
     ) -> SignSafeTxFuture<'a>;
 }
 
@@ -341,7 +338,9 @@ impl<E: EvmChainClient> EvmRedeemExecutor<E> {
         let digest = safe_tx_hash(evm_chain_id, self.config.safe_address, &safe_tx);
 
         // Collect signatures.
-        let parts = self.collect_signatures(&safe_tx, digest).await?;
+        let parts = self
+            .collect_signatures(&safe_tx, digest, task.intent_proof.as_ref())
+            .await?;
 
         // Aggregate.
         let sig_blob = aggregate_signatures(digest, &parts)?;
@@ -368,6 +367,7 @@ impl<E: EvmChainClient> EvmRedeemExecutor<E> {
         &self,
         safe_tx: &SafeTransaction,
         digest: B256,
+        intent_proof: Option<&IntentProof>,
     ) -> Result<Vec<SignedBy>, EvmRedeemError> {
         let need = usize::from(self.config.safe_threshold);
         let mut parts: Vec<SignedBy> = Vec::with_capacity(need);
@@ -389,6 +389,7 @@ impl<E: EvmChainClient> EvmRedeemExecutor<E> {
                     safe_tx,
                     digest,
                     fee_wei,
+                    intent_proof,
                 )
                 .await
             {
@@ -586,6 +587,7 @@ mod tests {
             _tx: &'a SafeTransaction,
             digest: B256,
             _fee_wei: u128,
+            _intent_proof: Option<&'a IntentProof>,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<EcdsaSig, EvmRedeemError>> + Send + 'a>,
         > {
@@ -612,6 +614,7 @@ mod tests {
             _tx: &'a SafeTransaction,
             digest: B256,
             _fee_wei: u128,
+            _intent_proof: Option<&'a IntentProof>,
         ) -> SignSafeTxFuture<'a> {
             let kb = self.key_byte;
             Box::pin(async move {
@@ -680,6 +683,7 @@ mod tests {
             chain,
             memo: "=:ETH.USDT:0xdeadbeef:1000000000".to_string(),
             amount_wei: U256::from(amount),
+            intent_proof: None,
         }
     }
 

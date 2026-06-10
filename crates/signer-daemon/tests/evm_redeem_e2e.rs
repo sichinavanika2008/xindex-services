@@ -66,6 +66,8 @@ use xindex_signer_daemon::replay::InMemoryReplayStore;
 use xindex_signer_daemon::server::{router, DaemonConfig, DaemonState};
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HsmError};
 
+mod ric_common;
+
 // ─── Software HSM ─────────────────────────────────────────────────────
 
 /// Real k1-keyed HSM frontend. Wraps an `alloy::signers::local::
@@ -118,6 +120,7 @@ async fn spawn_evm_daemon(key_hex: &str, safe: Address) -> (String, Address, Arc
         chain_id: 1,
         verifying_contract: Address::repeat_byte(0xab),
         eth_address: signer_addr,
+        intent_policy: ric_common::policy(),
     };
     let replay = Arc::new(InMemoryReplayStore::new());
     let state = DaemonState::new(cfg, replay, Arc::clone(&hsm)).with_evm(EvmSignerConfig {
@@ -212,6 +215,7 @@ impl EvmCosigner for RemoteEvmCosigner {
         tx: &'a SafeTransaction,
         safe_tx_hash: B256,
         fee_wei: u128,
+        intent_proof: Option<&'a xindex_shared::signer_wire::IntentProof>,
     ) -> SignSafeTxFuture<'a> {
         let url = format!("{}/api/v1/sign/evm-safe-tx", self.base_url);
         let signer = self.signer;
@@ -231,6 +235,7 @@ impl EvmCosigner for RemoteEvmCosigner {
             nonce: tx.nonce.to_string(),
             safe_tx_hash: format!("0x{}", alloy_primitives::hex::encode(safe_tx_hash)),
             fee_wei: fee_wei.to_string(),
+            intent_proof: intent_proof.cloned(),
         };
         Box::pin(async move {
             let resp = client.post(&url).json(&req).send().await.map_err(|e| {
@@ -353,6 +358,16 @@ fn task(memo: &str, amount: u128) -> EvmRedeemTask {
         chain: ChainId::Eth,
         memo: memo.to_string(),
         amount_wei: U256::from(amount),
+        intent_proof: Some(ric_common::proof(
+            1,
+            Address::repeat_byte(0xab),
+            ChainId::Eth,
+            0xd2,
+            0,
+            amount,
+            Address::new([0xde; 20]).as_slice(),
+            memo.as_bytes(),
+        )),
     }
 }
 

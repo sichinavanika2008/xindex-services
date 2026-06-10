@@ -241,6 +241,9 @@ async fn main() -> Result<()> {
         chain,
         memo: args.memo,
         send_amount: args.amount,
+        // CTD-1: certificate supplied by the observer/relay (Slice B);
+        // None is refused daemon-side (fail closed).
+        intent_proof: None,
     };
     info!(?chain, "build_leg start");
     let outcome = executor

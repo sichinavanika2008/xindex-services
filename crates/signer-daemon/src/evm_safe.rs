@@ -23,7 +23,8 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, Bytes, PrimitiveSignature, U256};
+use alloy_primitives::{keccak256, Address, Bytes, PrimitiveSignature, U256};
+use alloy_sol_types::SolCall;
 use axum::{extract::State, http::StatusCode, response::Json};
 use xindex_safe_evm::{
     digest::{safe_tx_hash, SafeTransaction},
@@ -33,9 +34,11 @@ use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{
     error_codes, Eip712SignResponse, ErrorBody, EvmSafeTxSignRequest,
 };
+use xindex_shared::thorchain_router::depositWithExpiryCall;
 
+use crate::intent::VerifiedIntent;
 use crate::replay::{CheckOutcome, ReplayStore};
-use crate::server::DaemonState;
+use crate::server::{gate_ric_intent, DaemonState};
 use crate::sig_norm::normalize_low_s;
 use crate::web3signer::{HsmDigestSigner, HsmError};
 
@@ -187,6 +190,80 @@ fn enforce_evm_safe_floor(tx: &SafeTransaction) -> Result<(), (StatusCode, Json<
     Ok(())
 }
 
+/// CTD-1 (`DL-CTD-2`): bind the Safe-tx to the certified intent. The
+/// honest redemption leg is exactly
+/// `Router.depositWithExpiry(vault, address(0), amount, memo, expiry)`
+/// with `value == amount` (`evm_redeem.rs` builds nothing else), so the
+/// daemon refuses anything that is not byte-decodable as that call with:
+///
+/// - `to` == the registry-pinned `THORChain` Router for this chain (the
+///   daemon's OWN pin, not a certified field — a fake router IS the
+///   drain);
+/// - `asset` == `address(0)` (native-asset leg, matching the gate's
+///   `asset_id_hash` bind);
+/// - `keccak256(vault)` == the certified Asgard target;
+/// - calldata `amount` == Safe `value` == the certified amount;
+/// - `keccak256(memo)` == the certified memo hash.
+///
+/// `expiry` is execution-local (executor-chosen) and deliberately NOT
+/// certified.
+fn bind_safe_tx_to_cert(
+    chain: ChainId,
+    tx: &SafeTransaction,
+    cert: &VerifiedIntent,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let mismatch = |what: String| {
+        err(
+            error_codes::INTENT_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            what,
+        )
+    };
+    let router = chain.thorchain_router_address().ok_or_else(|| {
+        mismatch(format!(
+            "chain {chain:?} has no registry-pinned THORChain Router"
+        ))
+    })?;
+    if tx.to != router {
+        return Err(mismatch(format!(
+            "Safe-tx `to` {:#x} is not the registry-pinned THORChain Router {router:#x}",
+            tx.to
+        )));
+    }
+    let call = depositWithExpiryCall::abi_decode(&tx.data, true)
+        .map_err(|e| mismatch(format!("calldata is not depositWithExpiry: {e}")))?;
+    if call.asset != Address::ZERO {
+        return Err(mismatch(format!(
+            "deposit asset {:#x} != address(0) — RIC v1 certifies native-asset legs only",
+            call.asset
+        )));
+    }
+    if keccak256(call.vault.as_slice()) != cert.immediate_target_hash {
+        return Err(mismatch(format!(
+            "deposit vault {:#x} does not hash to the certified Asgard target",
+            call.vault
+        )));
+    }
+    if call.amount != cert.amount {
+        return Err(mismatch(format!(
+            "deposit amount {} != certified amount {}",
+            call.amount, cert.amount
+        )));
+    }
+    if tx.value != cert.amount {
+        return Err(mismatch(format!(
+            "Safe-tx value {} != certified amount {} (native deposit carries msg.value)",
+            tx.value, cert.amount
+        )));
+    }
+    if keccak256(call.memo.as_bytes()) != cert.memo_hash {
+        return Err(mismatch(
+            "deposit memo does not hash to the certified memo".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_nonce_u64(nonce_str: &str) -> Result<u64, (StatusCode, Json<ErrorBody>)> {
     let n = U256::from_str_radix(nonce_str, 10).map_err(|e| {
         err(
@@ -275,6 +352,18 @@ where
         )
     })?;
 
+    // 1b. CTD-1 (`DL-CTD-2`): mandatory k-of-n RIC gate — stateless
+    //     verification + native-asset/decimals binds + one-shot consume
+    //     BEFORE the HSM. The Safe-tx field bind happens at step 3b
+    //     once the SafeTransaction is reassembled.
+    let (cert, _ric_digest) = gate_ric_intent(
+        &state.config,
+        state.replay.as_ref(),
+        req.chain_id,
+        req.intent_proof.as_ref(),
+    )
+    .await?;
+
     // 2. Parse the Safe-tx ABI inputs.
     let req_safe = parse_address("safe_address", &req.safe_address)?;
     if req_safe != evm_cfg.safe_address {
@@ -328,6 +417,10 @@ where
     // the HSM is ever consulted. Needs no trusted intent (the honest template
     // is a constant), so it holds even under coordinator compromise.
     enforce_evm_safe_floor(&safe_tx)?;
+
+    // 3b. CTD-1: bind the Safe-tx to the certified intent — router /
+    //     vault / asset / amount / memo.
+    bind_safe_tx_to_cert(req.chain_id, &safe_tx, &cert)?;
 
     let recomputed = safe_tx_hash(evm_chain_id, req_safe, &safe_tx);
     let recomputed_bytes: [u8; 32] = recomputed.into();

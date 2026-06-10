@@ -9,3 +9,4 @@ pub mod chain_registry;
 pub mod eip712;
 pub mod redemption_dispatch;
 pub mod signer_wire;
+pub mod thorchain_router;

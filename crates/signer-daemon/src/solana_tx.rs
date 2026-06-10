@@ -640,6 +640,7 @@ mod tests {
                 chain_id: 1,
                 verifying_contract: Address::ZERO,
                 eth_address: Address::ZERO,
+                intent_policy: crate::test_support::ric::policy(),
             },
             Arc::new(InMemoryReplayStore::new()),
             Arc::new(UnusedHsm),

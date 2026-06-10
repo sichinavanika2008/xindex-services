@@ -37,7 +37,7 @@ use xindex_tron_tx::tx::{
 };
 
 use crate::replay::{CheckOutcome, ReplayStore};
-use crate::server::DaemonState;
+use crate::server::{bind_account_send_to_cert, gate_ric_intent, DaemonState};
 use crate::web3signer::{HsmDigestSigner, HsmError};
 
 /// Per-chain TRON signing role. One entry per TRON chain this daemon is a
@@ -244,6 +244,30 @@ where
         ));
     }
 
+    // 2b. CTD-1 (`DL-CTD-2`): mandatory k-of-n RIC gate + the semantic
+    //     field binds. The gate's `asset_id_hash` check pins the leg to
+    //     TRON's native asset, so a `TriggerSmartContract` USDT spend
+    //     can never satisfy a certificate — refuse it explicitly here
+    //     (TRON.USDT legs need a registry-mapped asset id first). The
+    //     raw_data rebuild below then guarantees the signed bytes match
+    //     THESE fields, so cert == fields == tx.
+    let (cert, _ric_digest) = gate_ric_intent(
+        &state.config,
+        state.replay.as_ref(),
+        req.chain_id,
+        req.intent_proof.as_ref(),
+    )
+    .await?;
+    if req.asset != TronAssetKind::Trx {
+        return Err(err(
+            error_codes::INTENT_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "certified leg is TRON's native TRX; TRON.USDT legs are not RIC-certifiable \
+             until the registry maps their asset id",
+        ));
+    }
+    bind_account_send_to_cert(&req.to_address, &req.amount, &req.memo, &cert)?;
+
     // 3. Re-build raw_data, recompute txID, compare to the claim.
     let raw_data = rebuild_raw_data(&req)?;
     let computed = txid(&raw_data);
@@ -437,6 +461,7 @@ mod tests {
             chain_id: 1,
             verifying_contract: Address::ZERO,
             eth_address: Address::ZERO,
+            intent_policy: crate::test_support::ric::policy(),
         }
     }
 
@@ -452,7 +477,7 @@ mod tests {
             chain_id: ChainId::Tron,
             asset: TronAssetKind::Trx,
             owner_address: owner.clone(),
-            to_address: dest,
+            to_address: dest.clone(),
             amount: "5000000".to_string(),
             contract_address: None,
             permission_id: 2,
@@ -463,6 +488,18 @@ mod tests {
             fee_limit: None,
             memo: "=:ETH.USDT:0xabc:1".to_string(),
             txid: String::new(),
+            intent_proof: Some(crate::test_support::ric::proof_for(
+                1,
+                Address::ZERO,
+                &crate::test_support::ric::CertSpec {
+                    chain: ChainId::Tron,
+                    redemption_id: B256::repeat_byte(0x79),
+                    leg_index: 0,
+                    amount: alloy_primitives::U256::from(5_000_000_u64),
+                    immediate_target: dest.clone().into_bytes(),
+                    memo: b"=:ETH.USDT:0xabc:1".to_vec(),
+                },
+            )),
         };
         #[expect(clippy::expect_used, reason = "test code")]
         let raw = rebuild_raw_data(&req).expect("rebuild");
@@ -538,13 +575,14 @@ mod tests {
     async fn tampered_amount_changes_txid_and_is_rejected() {
         let (sk, signer, pubkey) = key_identity(7);
         let (owner, mut req) = sample_trx(pubkey);
-        // Keep the (matching) txid but bump the amount — the rebuilt
-        // raw_data no longer hashes to the claimed txid.
+        // Keep the (matching) txid but bump the amount. Post-CTD-1 the
+        // certificate bind fires FIRST (amount != certified amount);
+        // the txid recompute would also have caught the divergence.
         req.amount = "9999999".to_string();
         let st = state(owner, pubkey, signer, sk);
         let (status, body) = handle_tron_tx(State(st), Json(req)).await.expect_err("err");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(body.code, error_codes::TRON_TX_MISMATCH);
+        assert_eq!(body.code, error_codes::INTENT_MISMATCH);
     }
 
     #[tokio::test]

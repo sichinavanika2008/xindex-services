@@ -123,6 +123,12 @@ pub struct PsbtInputSignRequest {
     /// refuses unless some `OP_RETURN` output pushes byte-identical data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_memo: Option<String>,
+    /// CTD-1 (`DL-CTD-2`): the k-of-n Redemption Intent Certificate
+    /// proof authorizing THIS spend. `Option` ON THE WIRE only, so a
+    /// missing proof is a typed 422 `intent_proof_required` rather
+    /// than an opaque serde 400 — the daemon REJECTS `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// `POST /api/v1/sign/evm-safe-tx`
@@ -202,6 +208,13 @@ pub struct EvmSafeTxSignRequest {
     /// string. NOT part of the Safe digest — passed through for
     /// transport convenience; daemon ignores during signing.
     pub fee_wei: String,
+
+    /// CTD-1 (`DL-CTD-2`): the k-of-n Redemption Intent Certificate
+    /// proof authorizing THIS spend. `Option` ON THE WIRE only, so a
+    /// missing proof is a typed 422 `intent_proof_required` rather
+    /// than an opaque serde 400 — the daemon REJECTS `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Serde validator: refuse to deserialize an [`EvmSafeTxSignRequest`]
@@ -297,6 +310,12 @@ pub struct CosmosTxSignRequest {
     /// hex. The daemon recomputes from the semantic fields above and
     /// refuses with [`error_codes::SIGN_DOC_MISMATCH`] on divergence.
     pub sign_doc_hash: String,
+    /// CTD-1 (`DL-CTD-2`): the k-of-n Redemption Intent Certificate
+    /// proof authorizing THIS spend. `Option` ON THE WIRE only, so a
+    /// missing proof is a typed 422 `intent_proof_required` rather
+    /// than an opaque serde 400 — the daemon REJECTS `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Serde validator: refuse to deserialize a [`CosmosTxSignRequest`]
@@ -394,6 +413,12 @@ pub struct XrpTxSignRequest {
     /// its own per-signer signing blob by appending its configured
     /// `AccountID`. NOT a digest, and NOT per-signer.
     pub signing_blob: String,
+    /// CTD-1 (`DL-CTD-2`): the k-of-n Redemption Intent Certificate
+    /// proof authorizing THIS spend. `Option` ON THE WIRE only, so a
+    /// missing proof is a typed 422 `intent_proof_required` rather
+    /// than an opaque serde 400 — the daemon REJECTS `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Serde validator: refuse to deserialize an [`XrpTxSignRequest`] with a
@@ -668,6 +693,12 @@ pub struct TronTxSignRequest {
     /// above and refuses with [`error_codes::TRON_TX_MISMATCH`] on
     /// divergence; it signs the bytes IT rebuilt.
     pub txid: String,
+    /// CTD-1 (`DL-CTD-2`): the k-of-n Redemption Intent Certificate
+    /// proof authorizing THIS spend. `Option` ON THE WIRE only, so a
+    /// missing proof is a typed 422 `intent_proof_required` rather
+    /// than an opaque serde 400 — the daemon REJECTS `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Serde validator: refuse a [`TronTxSignRequest`] with a non-TRON
@@ -1080,6 +1111,7 @@ mod tests {
             expected_destination_spk: Some("0014abcd".to_string()),
             expected_amount_sats: Some(100_000),
             expected_memo: Some("3d3a4554482e55534454".to_string()),
+            intent_proof: None,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1109,12 +1141,14 @@ mod tests {
                 expected_destination_spk: None,
                 expected_amount_sats: None,
                 expected_memo: None,
+                intent_proof: None,
             };
             let s = serde_json::to_string(&req).expect("serialize");
             let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
             assert_eq!(back, req);
             // Omitted optional veto fields must not appear on the wire.
             assert!(!s.contains("expected_destination_spk"));
+            assert!(!s.contains("intent_proof"));
         }
     }
 
@@ -1157,6 +1191,7 @@ mod tests {
                 nonce: "7".to_string(),
                 safe_tx_hash: format!("0x{}", "ab".repeat(32)),
                 fee_wei: "1000000000".to_string(),
+                intent_proof: None,
             };
             let s = serde_json::to_string(&req).expect("serialize");
             let back: EvmSafeTxSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1229,6 +1264,7 @@ mod tests {
             gas_limit: "200000".to_string(),
             memo: "=:ETH.USDT:0xabc:0/1/0".to_string(),
             sign_doc_hash: format!("0x{}", "ab".repeat(32)),
+            intent_proof: None,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: CosmosTxSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1289,6 +1325,7 @@ mod tests {
             last_ledger_sequence: "9000007".to_string(),
             memo: "=:ETH.USDT:0xabc:0/1/0".to_string(),
             signing_blob: format!("0x{}", "ab".repeat(80)),
+            intent_proof: None,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: XrpTxSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1424,6 +1461,7 @@ mod tests {
                 fee_limit,
                 memo: "=:ETH.USDT:0xabc:0/1/0".to_string(),
                 txid: format!("0x{}", "ab".repeat(32)),
+                intent_proof: None,
             };
             let s = serde_json::to_string(&req).expect("serialize");
             let back: TronTxSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1482,6 +1520,38 @@ mod tests {
         let s = serde_json::to_string(&proof).expect("serialize");
         let back: IntentProof = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, proof);
+    }
+
+    /// CTD-1: a custody-spend request carrying `Some(IntentProof)`
+    /// round-trips with the proof intact, and the field appears on the
+    /// wire only when present.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn psbt_request_with_intent_proof_round_trips() {
+        let req = PsbtInputSignRequest {
+            chain_id: ChainId::Btc,
+            psbt_base64: "cHNidP8BAA==".to_string(),
+            input_index: 0,
+            expected_destination_spk: None,
+            expected_amount_sats: None,
+            expected_memo: None,
+            intent_proof: Some(IntentProof {
+                redemption_id: format!("0x{}", "ab".repeat(32)),
+                leg_index: "0".to_string(),
+                asset_id: format!("0x{}", "a1".repeat(32)),
+                amount: "100000000".to_string(),
+                amount_decimals: 8,
+                immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+                memo_hash: format!("0x{}", "ef".repeat(32)),
+                final_destination_hash: format!("0x{}", "12".repeat(32)),
+                vault_resolved_at: 1_750_000_000,
+                signatures: vec![format!("0x{}", "ab".repeat(65))],
+            }),
+        };
+        let s = serde_json::to_string(&req).expect("serialize");
+        let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, req);
+        assert!(s.contains("intent_proof"));
     }
 
     /// CTD-1 Slice A.7: a `RicSignRequest` round-trips JSON for every

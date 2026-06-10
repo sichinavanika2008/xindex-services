@@ -63,6 +63,8 @@ use xindex_signer_daemon::replay::InMemoryReplayStore;
 use xindex_signer_daemon::server::{router, DaemonConfig, DaemonState};
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HsmError};
 
+mod ric_common;
+
 // ─── Software HSM ─────────────────────────────────────────────────────
 
 struct SoftHsm {
@@ -127,6 +129,7 @@ async fn spawn_cosmos_daemon(
         chain_id: 1,
         verifying_contract: Address::repeat_byte(0xab),
         eth_address: signer_addr,
+        intent_policy: ric_common::policy(),
     };
     let state = DaemonState::new(cfg, Arc::new(InMemoryReplayStore::new()), Arc::clone(&hsm))
         .with_cosmos(CosmosSignerConfig {
@@ -323,6 +326,16 @@ fn task(memo: &str, amount: u128) -> CosmosRedeemTask {
         chain: ChainId::Gaia,
         memo: memo.to_string(),
         send_amount: amount,
+        intent_proof: Some(ric_common::proof(
+            1,
+            Address::repeat_byte(0xab),
+            ChainId::Gaia,
+            0xd2,
+            0,
+            amount,
+            b"cosmos1asgardvault",
+            memo.as_bytes(),
+        )),
     }
 }
 

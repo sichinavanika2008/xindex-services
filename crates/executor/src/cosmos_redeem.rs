@@ -49,7 +49,7 @@ use xindex_cosmos_tx::sigs::{aggregate_verified, verify, MemberSig, SigError};
 use xindex_cosmos_tx::tx::{build_tx_raw, CosmosTxParams};
 use xindex_cosmos_tx::CosmosMultisig;
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
-use xindex_shared::signer_wire::CosmosTxSignRequest;
+use xindex_shared::signer_wire::{CosmosTxSignRequest, IntentProof};
 
 /// Errors surfaced by the C7 Cosmos redeem executor.
 #[derive(Debug, Error)]
@@ -160,6 +160,11 @@ pub struct CosmosRedeemTask {
     pub memo: String,
     /// Native send amount in the micro-unit (uatom for GAIA).
     pub send_amount: u128,
+    /// CTD-1 (`DL-CTD-2`): the leg's k-of-n Redemption Intent
+    /// Certificate proof. Attached by the binary (Slice B: collected
+    /// from the per-operator observers); `None` is forwarded as-is and
+    /// refused daemon-side (fail closed).
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Static per-executor config. One executor instance per multisig account.
@@ -293,6 +298,7 @@ impl<C: CosmosChainClient> CosmosRedeemExecutor<C> {
             gas_limit: gas.clone(),
             memo: task.memo.clone(),
             sign_doc_hash: format!("0x{}", alloy_primitives::hex::encode(digest)),
+            intent_proof: task.intent_proof.clone(),
         };
 
         let parts = self.collect_signatures(&req, &digest).await?;
@@ -556,6 +562,7 @@ mod tests {
             chain: ChainId::Gaia,
             memo: "=:ETH.USDT:0xdeadbeef:1000000".to_string(),
             send_amount: 5_000_000,
+            intent_proof: None,
         }
     }
 

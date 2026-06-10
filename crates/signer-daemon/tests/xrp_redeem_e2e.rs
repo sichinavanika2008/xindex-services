@@ -56,6 +56,8 @@ use xindex_shared::signer_wire::{XrpSignResponse, XrpTxSignRequest};
 use xindex_signer_daemon::replay::InMemoryReplayStore;
 use xindex_signer_daemon::server::{router, DaemonConfig, DaemonState};
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HsmError};
+
+mod ric_common;
 use xindex_signer_daemon::xrp_tx::XrpSignerConfig;
 use xindex_xrp_tx::addr::{account_id, decode_classic_address, encode_classic_address};
 use xindex_xrp_tx::signing::multisign_digest;
@@ -143,6 +145,7 @@ async fn spawn_xrp_daemon(
         chain_id: 1,
         verifying_contract: Address::repeat_byte(0xab),
         eth_address: signer_addr,
+        intent_policy: ric_common::policy(),
     };
     let state = DaemonState::new(cfg, Arc::new(InMemoryReplayStore::new()), Arc::clone(&hsm))
         .with_xrp(XrpSignerConfig {
@@ -342,6 +345,16 @@ fn task(memo: &str, amount: u128) -> XrpRedeemTask {
         chain: ChainId::Xrp,
         memo: memo.to_string(),
         send_amount: amount,
+        intent_proof: Some(ric_common::proof(
+            1,
+            Address::repeat_byte(0xab),
+            ChainId::Xrp,
+            0xd2,
+            0,
+            amount,
+            encode_classic_address(&vault_bytes()).as_bytes(),
+            memo.as_bytes(),
+        )),
     }
 }
 
@@ -388,6 +401,16 @@ async fn xrp_redeem_e2e_each_daemon_signs_a_distinct_blob() {
         last_ledger_sequence: (deadline()).to_string(),
         memo: MEMO.to_string(),
         signing_blob: format!("0x{}", alloy_primitives::hex::encode(&body)),
+        intent_proof: Some(ric_common::proof(
+            1,
+            Address::repeat_byte(0xab),
+            ChainId::Xrp,
+            0xe1,
+            0,
+            u128::from(AMOUNT),
+            encode_classic_address(&vault_bytes()).as_bytes(),
+            MEMO.as_bytes(),
+        )),
     };
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

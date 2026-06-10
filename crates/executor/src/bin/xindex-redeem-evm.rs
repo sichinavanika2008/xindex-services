@@ -158,6 +158,7 @@ impl EvmCosigner for RemoteEvmCosigner {
         tx: &'a xindex_safe_evm::digest::SafeTransaction,
         safe_tx_hash: alloy_primitives::B256,
         fee_wei: u128,
+        intent_proof: Option<&'a xindex_shared::signer_wire::IntentProof>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -189,6 +190,7 @@ impl EvmCosigner for RemoteEvmCosigner {
             nonce: tx.nonce.to_string(),
             safe_tx_hash: format!("0x{}", alloy_primitives::hex::encode(safe_tx_hash)),
             fee_wei: fee_wei.to_string(),
+            intent_proof: intent_proof.cloned(),
         };
         Box::pin(async move {
             let resp = client.post(&url).json(&req).send().await.map_err(|e| {
@@ -340,6 +342,9 @@ async fn main() -> Result<()> {
         chain,
         memo: args.memo,
         amount_wei,
+        // CTD-1: certificate supplied by the observer/relay (Slice B);
+        // None is refused daemon-side (fail closed).
+        intent_proof: None,
     };
     info!(?chain, ?safe_address, ?amount_wei, "build_leg start");
     let outcome = executor

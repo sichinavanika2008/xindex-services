@@ -50,7 +50,7 @@ use thiserror::Error;
 use tracing::warn;
 use xindex_chain_tron::{TronChainClient, TronChainError};
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
-use xindex_shared::signer_wire::{TronAssetKind, TronTxSignRequest};
+use xindex_shared::signer_wire::{IntentProof, TronAssetKind, TronTxSignRequest};
 use xindex_tron_tx::addr::{decode_base58check, decode_to_evm20, evm_address};
 use xindex_tron_tx::sigs::{aggregate_verified, recover_evm20};
 use xindex_tron_tx::tx::{
@@ -133,6 +133,11 @@ pub struct TronRedeemTask {
     /// Native send amount in the asset's smallest unit (sun for TRX,
     /// 6-decimal base units for USDT).
     pub send_amount: u128,
+    /// CTD-1 (`DL-CTD-2`): the leg's k-of-n Redemption Intent
+    /// Certificate proof. Attached by the binary (Slice B: collected
+    /// from the per-operator observers); `None` is forwarded as-is and
+    /// refused daemon-side (fail closed).
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Static per-executor config. One executor instance per (multisig, asset).
@@ -302,6 +307,7 @@ impl<C: TronChainClient> TronRedeemExecutor<C> {
             fee_limit: fee_limit.map(|f| f.to_string()),
             memo: task.memo.clone(),
             txid: format!("0x{}", alloy_primitives::hex::encode(tx_id)),
+            intent_proof: task.intent_proof.clone(),
         };
 
         let parts = self.collect_signatures(&req, &tx_id).await?;
@@ -535,6 +541,7 @@ mod tests {
             chain: ChainId::Tron,
             memo: "=:ETH.USDT:0xdeadbeef:1000000".to_string(),
             send_amount: 5_000_000,
+            intent_proof: None,
         }
     }
 

@@ -55,6 +55,8 @@ use xindex_signer_daemon::replay::InMemoryReplayStore;
 use xindex_signer_daemon::server::{router, DaemonConfig, DaemonState};
 use xindex_signer_daemon::tron_tx::TronSignerConfig;
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HsmError};
+
+mod ric_common;
 use xindex_tron_tx::addr::{encode_base58check, evm_address, raw21};
 use xindex_tron_tx::sigs::{aggregate_verified, recover_evm20};
 use xindex_tron_tx::tx::{build_trx_raw_data, txid, Tapos, TrxTransfer};
@@ -140,6 +142,7 @@ async fn spawn_tron_daemon(
         chain_id: 1,
         verifying_contract: Address::repeat_byte(0xab),
         eth_address: signer_addr,
+        intent_policy: ric_common::policy(),
     };
     let state = DaemonState::new(cfg, Arc::new(InMemoryReplayStore::new()), Arc::clone(&hsm))
         .with_tron(TronSignerConfig {
@@ -314,6 +317,16 @@ fn task(memo: &str, amount: u128) -> TronRedeemTask {
         chain: ChainId::Tron,
         memo: memo.to_string(),
         send_amount: amount,
+        intent_proof: Some(ric_common::proof(
+            1,
+            Address::repeat_byte(0xab),
+            ChainId::Tron,
+            0xd2,
+            0,
+            amount,
+            vault_address().as_bytes(),
+            memo.as_bytes(),
+        )),
     }
 }
 
@@ -385,6 +398,16 @@ async fn tron_redeem_e2e_all_daemons_sign_identical_txid() {
         fee_limit: None,
         memo: MEMO.to_string(),
         txid: format!("0x{}", alloy_primitives::hex::encode(tx_id)),
+        intent_proof: Some(ric_common::proof(
+            1,
+            Address::repeat_byte(0xab),
+            ChainId::Tron,
+            0xe1,
+            0,
+            u128::from(AMOUNT),
+            vault_address().as_bytes(),
+            MEMO.as_bytes(),
+        )),
     };
 
     let http = reqwest::Client::builder()

@@ -18,7 +18,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use bitcoin::ecdsa::Signature as BtcEcdsaSig;
 use bitcoin::psbt::Psbt;
 use xindex_shared::chain_registry::ChainId;
-use xindex_shared::signer_wire::{PsbtInputSignRequest, PsbtSignResponse};
+use xindex_shared::signer_wire::{IntentProof, PsbtInputSignRequest, PsbtSignResponse};
 
 use crate::redeem::{ExecuteError, ExpectedOutputs, MultisigCosigner};
 
@@ -89,6 +89,7 @@ impl MultisigCosigner for RemoteMultisigCosigner {
         psbt: &Psbt,
         input_index: usize,
         expected: Option<&ExpectedOutputs>,
+        intent_proof: Option<&IntentProof>,
     ) -> Result<(bitcoin::PublicKey, BtcEcdsaSig), ExecuteError> {
         let bytes = psbt.serialize();
         let idx_u32 = u32::try_from(input_index).map_err(|_| {
@@ -102,6 +103,7 @@ impl MultisigCosigner for RemoteMultisigCosigner {
                 .map(|e| alloy_primitives::hex::encode(&e.destination_spk)),
             expected_amount_sats: expected.map(|e| e.amount_sats),
             expected_memo: expected.map(|e| alloy_primitives::hex::encode(&e.memo)),
+            intent_proof: intent_proof.cloned(),
         };
         let resp = self
             .inner
@@ -268,7 +270,7 @@ mod tests {
         let psbt_clone = psbt.clone();
         let (got_pk, got_sig) = tokio::task::spawn_blocking(move || {
             let cosigner = RemoteMultisigCosigner::new(ChainId::Btc, url, pk);
-            cosigner.sign_input(&psbt_clone, 0, None)
+            cosigner.sign_input(&psbt_clone, 0, None, None)
         })
         .await
         .expect("join")
@@ -304,7 +306,12 @@ mod tests {
         let url = server.uri();
         let psbt_clone = psbt.clone();
         let err = tokio::task::spawn_blocking(move || {
-            RemoteMultisigCosigner::new(ChainId::Btc, url, pk).sign_input(&psbt_clone, 0, None)
+            RemoteMultisigCosigner::new(ChainId::Btc, url, pk).sign_input(
+                &psbt_clone,
+                0,
+                None,
+                None,
+            )
         })
         .await
         .expect("join")
@@ -329,7 +336,12 @@ mod tests {
         let url = server.uri();
         let psbt_clone = psbt.clone();
         let err = tokio::task::spawn_blocking(move || {
-            RemoteMultisigCosigner::new(ChainId::Btc, url, pk).sign_input(&psbt_clone, 0, None)
+            RemoteMultisigCosigner::new(ChainId::Btc, url, pk).sign_input(
+                &psbt_clone,
+                0,
+                None,
+                None,
+            )
         })
         .await
         .expect("join")

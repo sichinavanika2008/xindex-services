@@ -32,8 +32,9 @@ use xindex_multisig::MultisigDescriptor;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{error_codes, ErrorBody, PsbtInputSignRequest, PsbtSignResponse};
 
+use crate::intent::VerifiedIntent;
 use crate::replay::{CheckOutcome, ReplayStore};
-use crate::server::DaemonState;
+use crate::server::{gate_ric_intent, DaemonState};
 use crate::web3signer::HsmDigestSigner;
 
 /// Per-chain UTXO signing role configuration. One entry per UTXO chain
@@ -151,6 +152,19 @@ where
         )
     })?;
 
+    // 0. CTD-1 (`DL-CTD-2`): mandatory k-of-n RIC gate. Verifies the
+    //    proof statelessly, binds asset/decimals to this chain, and
+    //    consumes the (chain, redemption, leg) one-shot BEFORE the HSM
+    //    can ever be reached. The output-set bind happens at step 4c
+    //    once the PSBT is decoded.
+    let (cert, _ric_digest) = gate_ric_intent(
+        &state.config,
+        state.replay.as_ref(),
+        req.chain_id,
+        req.intent_proof.as_ref(),
+    )
+    .await?;
+
     // 1. Decode PSBT.
     let raw = B64.decode(req.psbt_base64.as_bytes()).map_err(|e| {
         err(
@@ -240,6 +254,10 @@ where
             "input witness_utxo.script_pubkey is not the descriptor P2WSH program",
         ));
     }
+
+    // 4c. CTD-1: bind the PSBT's ENTIRE output set to the certified
+    //     intent (exact-set OP_RETURN discipline, RA-3).
+    bind_outputs_to_cert(&psbt, &expected_spk, &cert)?;
 
     // 5. Compute the BIP-143 P2WSH sighash.
     let mut cache = SighashCache::new(&psbt.unsigned_tx);
@@ -422,6 +440,118 @@ fn derive_witness_script(descriptor: &MultisigDescriptor) -> Result<bitcoin::Scr
         .map_err(|e| e.to_string())?
         .explicit_script()
         .map_err(|e| e.to_string())
+}
+
+/// CTD-1 (`DL-CTD-2` / RA-3): bind the PSBT's output set to the
+/// certified intent. Exact-set discipline — every output must be
+/// accounted for:
+///
+/// - exactly ONE payout output, identified by
+///   `keccak256(scriptPubKey) == cert.immediate_target_hash` (the
+///   Asgard inbound the operators independently resolved), paying
+///   exactly `cert.amount` sats;
+/// - exactly ONE `OP_RETURN`, zero-value, whose full pushed payload
+///   hashes to `cert.memo_hash` — `THORChain` concatenates ALL
+///   `OP_RETURN`s into the memo, so a second one is memo injection
+///   (RA-3) regardless of content;
+/// - every other output is change back to our own descriptor P2WSH
+///   (unconditional now — the M2b floor's change-to-self no longer
+///   depends on the coordinator pinning a payout).
+fn bind_outputs_to_cert(
+    psbt: &Psbt,
+    descriptor_spk: &bitcoin::ScriptBuf,
+    cert: &VerifiedIntent,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let want_sats = u64::try_from(cert.amount).map_err(|_| {
+        err(
+            error_codes::INTENT_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "certified amount does not fit u64 sats",
+        )
+    })?;
+    let mut payouts = 0usize;
+    let mut op_returns = 0usize;
+    for o in &psbt.unsigned_tx.output {
+        if o.script_pubkey.is_op_return() {
+            op_returns += 1;
+            if o.value.to_sat() != 0 {
+                return Err(err(
+                    error_codes::INTENT_MISMATCH,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "OP_RETURN output carries value (memo outputs must be zero-value)",
+                ));
+            }
+            let payload = op_return_payload(&o.script_pubkey).ok_or_else(|| {
+                err(
+                    error_codes::INTENT_MISMATCH,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "OP_RETURN output pushes no data",
+                )
+            })?;
+            if alloy_primitives::keccak256(&payload) != cert.memo_hash {
+                return Err(err(
+                    error_codes::INTENT_MISMATCH,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "OP_RETURN payload does not hash to the certified memo",
+                ));
+            }
+        } else if alloy_primitives::keccak256(o.script_pubkey.as_bytes())
+            == cert.immediate_target_hash
+        {
+            payouts += 1;
+            if o.value.to_sat() != want_sats {
+                return Err(err(
+                    error_codes::INTENT_MISMATCH,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!(
+                        "payout output pays {} sats, certificate authorizes {want_sats}",
+                        o.value.to_sat()
+                    ),
+                ));
+            }
+        } else if o.script_pubkey.as_bytes() != descriptor_spk.as_bytes() {
+            return Err(err(
+                error_codes::PSBT_UNEXPECTED_OUTPUT,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "output is neither the certified payout, the memo OP_RETURN, nor change-to-self",
+            ));
+        }
+    }
+    if payouts != 1 {
+        return Err(err(
+            error_codes::INTENT_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("expected exactly one certified payout output, found {payouts}"),
+        ));
+    }
+    if op_returns != 1 {
+        return Err(err(
+            error_codes::INTENT_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("expected exactly one OP_RETURN memo output, found {op_returns} (RA-3)"),
+        ));
+    }
+    Ok(())
+}
+
+/// Concatenated pushed payload of an `OP_RETURN` script, or `None` if
+/// the script is not `OP_RETURN`, fails to parse, or pushes nothing.
+fn op_return_payload(script: &bitcoin::Script) -> Option<Vec<u8>> {
+    if !script.is_op_return() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for instr in script.instructions() {
+        match instr {
+            Ok(i) => {
+                if let Some(b) = i.push_bytes() {
+                    out.extend_from_slice(b.as_bytes());
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// (audit M2) Enforce the optional output constraints carried in the
@@ -685,10 +815,35 @@ mod tests {
         (desc, sks)
     }
 
-    /// Build a minimal valid spending PSBT: one input spending a
-    /// `previous_output` that's a P2WSH funded with our descriptor;
-    /// one output. The `witness_utxo` + `witness_script` populate the
-    /// fields the daemon expects.
+    /// Default test memo for [`build_test_psbt`]-shaped transactions.
+    const TEST_MEMO: &[u8] = b"=:ETH.USDT:0xribbon:1";
+
+    /// CTD-1: a quorum-signed proof certifying (recipient, payout,
+    /// memo) for the BTC chain on the test daemon's domain.
+    fn ric_proof(
+        recipient: &ScriptBuf,
+        payout_sats: u64,
+        memo: &[u8],
+        rid: u8,
+    ) -> xindex_shared::signer_wire::IntentProof {
+        crate::test_support::ric::proof_for(
+            31337,
+            Address::repeat_byte(0xab),
+            &crate::test_support::ric::CertSpec {
+                chain: ChainId::Btc,
+                redemption_id: B256::repeat_byte(rid),
+                leg_index: 0,
+                amount: alloy_primitives::U256::from(payout_sats),
+                immediate_target: recipient.as_bytes().to_vec(),
+                memo: memo.to_vec(),
+            },
+        )
+    }
+
+    /// Build a minimal valid spending PSBT in the HONEST redemption
+    /// shape the CTD-1 bind accepts: one input spending a P2WSH funded
+    /// with our descriptor; a payout output to `recipient_script` plus
+    /// a zero-value `OP_RETURN(TEST_MEMO)`.
     #[expect(clippy::expect_used, reason = "test code")]
     fn build_test_psbt(
         descriptor: &MultisigDescriptor,
@@ -700,6 +855,7 @@ mod tests {
         let witness_script = derive_witness_script(descriptor).expect("ws");
         let address = descriptor.address(Network::Bitcoin).expect("addr");
         let prev_spk = address.script_pubkey();
+        let push = bitcoin::script::PushBytesBuf::try_from(TEST_MEMO.to_vec()).expect("push");
 
         let tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
@@ -713,10 +869,16 @@ mod tests {
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: value - Amount::from_sat(1_000),
-                script_pubkey: recipient_script,
-            }],
+            output: vec![
+                TxOut {
+                    value: value - Amount::from_sat(1_000),
+                    script_pubkey: recipient_script,
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return(push),
+                },
+            ],
         };
         let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
         psbt.inputs[0].witness_utxo = Some(TxOut {
@@ -797,6 +959,7 @@ mod tests {
                 chain_id: 31337,
                 verifying_contract: Address::repeat_byte(0xab),
                 eth_address: Address::repeat_byte(0xcd),
+                intent_policy: crate::test_support::ric::policy(),
             },
             replay,
             hsm,
@@ -816,13 +979,19 @@ mod tests {
         (state, app)
     }
 
-    async fn post_psbt(app: &Router, b64: String, idx: u32) -> (StatusCode, serde_json::Value) {
+    async fn post_psbt(
+        app: &Router,
+        b64: String,
+        idx: u32,
+        proof: &xindex_shared::signer_wire::IntentProof,
+    ) -> (StatusCode, serde_json::Value) {
         post_psbt_body(
             app,
             serde_json::json!({
                 "chain_id": "btc",
                 "psbt_base64": b64,
-                "input_index": idx
+                "input_index": idx,
+                "intent_proof": serde_json::to_value(proof).unwrap_or(serde_json::Value::Null),
             }),
         )
         .await
@@ -871,16 +1040,12 @@ mod tests {
 
         let prev_txid =
             bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0x11u8; 32]));
-        let psbt = build_test_psbt(
-            &desc,
-            prev_txid,
-            0,
-            Amount::from_sat(100_000),
-            ScriptBuf::new_op_return(b"x"),
-        );
+        let (spk, _) = dest_spk();
+        let psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk.clone());
         let b64 = B64.encode(psbt.serialize());
+        let proof = ric_proof(&spk, 99_000, TEST_MEMO, 0x51);
 
-        let (status, body) = post_psbt(&app, b64.clone(), 0).await;
+        let (status, body) = post_psbt(&app, b64.clone(), 0, &proof).await;
         assert_eq!(status, StatusCode::OK);
         let sig_hex = body["signature"].as_str().expect("signature");
         // DER signatures are 70-72 bytes + 1 sighash byte → 71-73 bytes.
@@ -904,7 +1069,7 @@ mod tests {
         // re-invoking the HSM.
         #[expect(clippy::unwrap_used, reason = "test code")]
         let before = *hsm.seen.lock().unwrap();
-        let (status2, body2) = post_psbt(&app, b64, 0).await;
+        let (status2, body2) = post_psbt(&app, b64, 0, &proof).await;
         assert_eq!(status2, StatusCode::OK);
         assert_eq!(body2["signature"], body["signature"]);
         #[expect(clippy::unwrap_used, reason = "test code")]
@@ -927,23 +1092,30 @@ mod tests {
         let (_state, app) = build_state_with_btc(desc.clone(), my_pubkey, hsm);
         let prev_txid =
             bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0x22u8; 32]));
+        let (spk_a, _) = dest_spk();
+        let spk_b = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x43; 20]));
         let psbt_a = build_test_psbt(
             &desc,
             prev_txid,
             0,
             Amount::from_sat(100_000),
-            ScriptBuf::new_op_return(b"a"),
+            spk_a.clone(),
         );
+        // different output → different sighash
         let psbt_b = build_test_psbt(
             &desc,
             prev_txid,
             0,
             Amount::from_sat(100_000),
-            ScriptBuf::new_op_return(b"b"), // different output → different sighash
+            spk_b.clone(),
         );
-        let (s1, _) = post_psbt(&app, B64.encode(psbt_a.serialize()), 0).await;
+        // Distinct legs (rids), so the RIC one-shot passes for both and
+        // the OUTPOINT replay is what fires.
+        let proof_a = ric_proof(&spk_a, 99_000, TEST_MEMO, 0x52);
+        let proof_b = ric_proof(&spk_b, 99_000, TEST_MEMO, 0x53);
+        let (s1, _) = post_psbt(&app, B64.encode(psbt_a.serialize()), 0, &proof_a).await;
         assert_eq!(s1, StatusCode::OK);
-        let (s2, body2) = post_psbt(&app, B64.encode(psbt_b.serialize()), 0).await;
+        let (s2, body2) = post_psbt(&app, B64.encode(psbt_b.serialize()), 0, &proof_b).await;
         assert_eq!(s2, StatusCode::CONFLICT);
         assert_eq!(
             body2["code"].as_str().expect("code"),
@@ -968,15 +1140,11 @@ mod tests {
         // unrelated → daemon refuses.
         let prev_txid =
             bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0x33u8; 32]));
-        let mut psbt = build_test_psbt(
-            &desc,
-            prev_txid,
-            0,
-            Amount::from_sat(100_000),
-            ScriptBuf::new_op_return(b"x"),
-        );
+        let (spk, _) = dest_spk();
+        let mut psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk.clone());
         psbt.inputs[0].witness_script = Some(ScriptBuf::from_bytes(vec![0x00, 0x01, 0x02]));
-        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0).await;
+        let proof = ric_proof(&spk, 99_000, TEST_MEMO, 0x54);
+        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0, &proof).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             body["code"].as_str().expect("code"),
@@ -1006,7 +1174,13 @@ mod tests {
         (spk, hex)
     }
 
-    fn veto_body(b64: &str, dest_hex: &str, amount: u64, memo_hex: &str) -> serde_json::Value {
+    fn veto_body(
+        b64: &str,
+        dest_hex: &str,
+        amount: u64,
+        memo_hex: &str,
+        proof: &xindex_shared::signer_wire::IntentProof,
+    ) -> serde_json::Value {
         serde_json::json!({
             "chain_id": "btc",
             "psbt_base64": b64,
@@ -1014,6 +1188,7 @@ mod tests {
             "expected_destination_spk": dest_hex,
             "expected_amount_sats": amount,
             "expected_memo": memo_hex,
+            "intent_proof": serde_json::to_value(proof).unwrap_or(serde_json::Value::Null),
         })
     }
 
@@ -1029,15 +1204,17 @@ mod tests {
             &desc,
             prev_txid,
             Amount::from_sat(100_000),
-            spk,
+            spk.clone(),
             Amount::from_sat(70_000),
             memo,
         );
+        let proof = ric_proof(&spk, 70_000, memo, 0x61);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             70_000,
             &alloy_primitives::hex::encode(memo),
+            &proof,
         );
         let (status, _) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::OK);
@@ -1056,17 +1233,21 @@ mod tests {
             &desc,
             prev_txid,
             Amount::from_sat(100_000),
-            spk,
+            spk.clone(),
             Amount::from_sat(70_000),
             memo,
         );
-        // Pin a DIFFERENT destination spk than the PSBT pays.
+        // Pin a DIFFERENT destination spk than the PSBT pays. The
+        // CERTIFICATE matches the PSBT, so the CTD-1 bind passes and the
+        // M2 expected-field veto is what fires.
         let wrong = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x99; 20]));
+        let proof = ric_proof(&spk, 70_000, memo, 0x62);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &alloy_primitives::hex::encode(wrong.as_bytes()),
             70_000,
             &alloy_primitives::hex::encode(memo),
+            &proof,
         );
         let (status, body) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1089,15 +1270,17 @@ mod tests {
             &desc,
             prev_txid,
             Amount::from_sat(100_000),
-            spk,
+            spk.clone(),
             Amount::from_sat(70_000),
             memo,
         );
+        let proof = ric_proof(&spk, 70_000, memo, 0x63);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             69_999, // ← off by one
             &alloy_primitives::hex::encode(memo),
+            &proof,
         );
         let (status, body) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1120,15 +1303,17 @@ mod tests {
             &desc,
             prev_txid,
             Amount::from_sat(100_000),
-            spk,
+            spk.clone(),
             Amount::from_sat(70_000),
             b"=:ETH.USDT:0xabc:0",
         );
+        let proof = ric_proof(&spk, 70_000, b"=:ETH.USDT:0xabc:0", 0x64);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             70_000,
             &alloy_primitives::hex::encode(b"=:ETH.USDT:0xDIFFERENT:0"),
+            &proof,
         );
         let (status, body) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1207,7 +1392,7 @@ mod tests {
             vec![
                 TxOut {
                     value: Amount::from_sat(70_000),
-                    script_pubkey: spk,
+                    script_pubkey: spk.clone(),
                 },
                 op_return_out(M2B_MEMO, Amount::ZERO),
                 TxOut {
@@ -1216,11 +1401,13 @@ mod tests {
                 },
             ],
         );
+        let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x65);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             70_000,
             &alloy_primitives::hex::encode(M2B_MEMO),
+            &proof,
         );
         let (status, _) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::OK);
@@ -1244,7 +1431,7 @@ mod tests {
             vec![
                 TxOut {
                     value: Amount::from_sat(70_000),
-                    script_pubkey: spk,
+                    script_pubkey: spk.clone(),
                 },
                 op_return_out(M2B_MEMO, Amount::ZERO),
                 TxOut {
@@ -1253,11 +1440,13 @@ mod tests {
                 },
             ],
         );
+        let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x66);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             70_000,
             &alloy_primitives::hex::encode(M2B_MEMO),
+            &proof,
         );
         let (status, body) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1285,16 +1474,18 @@ mod tests {
             vec![
                 TxOut {
                     value: Amount::from_sat(70_000),
-                    script_pubkey: spk,
+                    script_pubkey: spk.clone(),
                 },
                 op_return_out(M2B_MEMO, Amount::ZERO),
             ],
         );
+        let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x67);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             70_000,
             &alloy_primitives::hex::encode(M2B_MEMO),
+            &proof,
         );
         let (status, body) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1322,23 +1513,27 @@ mod tests {
             vec![
                 TxOut {
                     value: Amount::from_sat(70_000),
-                    script_pubkey: spk,
+                    script_pubkey: spk.clone(),
                 },
                 // memo bytes present (passes veto) but carries 25_000 sats
                 op_return_out(M2B_MEMO, Amount::from_sat(25_000)),
             ],
         );
+        let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x68);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             70_000,
             &alloy_primitives::hex::encode(M2B_MEMO),
+            &proof,
         );
         let (status, body) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        // The CTD-1 output bind fires first: a funded OP_RETURN is memo
+        // value-burn regardless of the M2b whitelisting.
         assert_eq!(
             body["code"].as_str().expect("code"),
-            error_codes::PSBT_UNEXPECTED_OUTPUT
+            error_codes::INTENT_MISMATCH
         );
     }
 
@@ -1387,7 +1582,7 @@ mod tests {
             output: vec![
                 TxOut {
                     value: Amount::from_sat(70_000),
-                    script_pubkey: spk,
+                    script_pubkey: spk.clone(),
                 },
                 op_return_out(M2B_MEMO, Amount::ZERO),
             ],
@@ -1404,11 +1599,13 @@ mod tests {
             value: Amount::from_sat(10_000_000_000),
             script_pubkey: foreign_spk,
         });
+        let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x69);
         let body = veto_body(
             &B64.encode(psbt.serialize()),
             &spk_hex,
             70_000,
             &alloy_primitives::hex::encode(M2B_MEMO),
+            &proof,
         );
         let (status, body) = post_psbt_body(&app, body).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1426,13 +1623,8 @@ mod tests {
         let (desc, app) = veto_fixture();
         let prev_txid =
             bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xa5u8; 32]));
-        let mut psbt = build_test_psbt(
-            &desc,
-            prev_txid,
-            0,
-            Amount::from_sat(100_000),
-            ScriptBuf::new_op_return(b"x"),
-        );
+        let (spk, _) = dest_spk();
+        let mut psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk.clone());
         // Keep the (correct) witness_script but forge the prevout spk.
         let forged = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x77; 20]));
         let value = psbt.inputs[0].witness_utxo.as_ref().expect("wu").value;
@@ -1440,7 +1632,8 @@ mod tests {
             value,
             script_pubkey: forged,
         });
-        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0).await;
+        let proof = ric_proof(&spk, 99_000, TEST_MEMO, 0x55);
+        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0, &proof).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             body["code"].as_str().expect("code"),
@@ -1485,13 +1678,8 @@ mod tests {
 
         let prev_txid =
             bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xb1u8; 32]));
-        let psbt = build_test_psbt(
-            &desc,
-            prev_txid,
-            0,
-            Amount::from_sat(100_000),
-            ScriptBuf::new_op_return(b"x"),
-        );
+        let (spk, _) = dest_spk();
+        let psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk.clone());
         let (txid, vout, payload_hash) = replay_key_for(&psbt);
 
         // Winner already recorded a (distinct, recognizable) signature.
@@ -1527,6 +1715,7 @@ mod tests {
                 chain_id: 31337,
                 verifying_contract: Address::repeat_byte(0xab),
                 eth_address: Address::repeat_byte(0xcd),
+                intent_policy: crate::test_support::ric::policy(),
             },
             replay,
             hsm,
@@ -1549,12 +1738,99 @@ mod tests {
             )
             .with_state(state);
 
-        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0).await;
+        let proof = ric_proof(&spk, 99_000, TEST_MEMO, 0x56);
+        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0, &proof).await;
         assert_eq!(status, StatusCode::OK);
         // The cached winner's signature is returned, not the loser's.
         assert_eq!(
             body["signature"].as_str().expect("signature"),
             alloy_primitives::hex::encode(&winner_sig)
+        );
+    }
+
+    /// CTD-1: a request WITHOUT an `IntentProof` is refused before
+    /// anything else — there is no proof-less carve-out on the BTC
+    /// custody path.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn psbt_missing_intent_proof_is_422_required() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xd1u8; 32]));
+        let psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk);
+        let body = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt.serialize()),
+            "input_index": 0,
+        });
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::INTENT_PROOF_REQUIRED
+        );
+    }
+
+    /// CTD-1 / RA-3 exact-set: a SECOND `OP_RETURN` — even zero-value,
+    /// even alongside a fully-certified payout+memo — is memo
+    /// injection (`THORChain` concatenates ALL `OP_RETURN`s) and is
+    /// refused.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn psbt_second_op_return_is_rejected() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xd2u8; 32]));
+        let psbt = build_psbt_outputs(
+            &desc,
+            prev_txid,
+            Amount::from_sat(100_000),
+            vec![
+                TxOut {
+                    value: Amount::from_sat(70_000),
+                    script_pubkey: spk.clone(),
+                },
+                op_return_out(M2B_MEMO, Amount::ZERO),
+                // The injected memo fragment.
+                op_return_out(b"+:ETH.ETH:attacker", Amount::ZERO),
+            ],
+        );
+        let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x71);
+        let body = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt.serialize()),
+            "input_index": 0,
+            "intent_proof": serde_json::to_value(&proof).unwrap_or(serde_json::Value::Null),
+        });
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::INTENT_MISMATCH
+        );
+    }
+
+    /// CTD-1 core property: the PSBT pays a destination the operators
+    /// did NOT certify → refused before the HSM, even though the
+    /// attached proof itself is a perfectly valid k-of-n certificate.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn psbt_uncertified_payout_is_rejected() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let attacker = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0x66; 20]));
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xd3u8; 32]));
+        // PSBT pays the ATTACKER; the certificate authorizes `spk`.
+        let psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), attacker);
+        let proof = ric_proof(&spk, 99_000, TEST_MEMO, 0x72);
+        let (status, body) = post_psbt(&app, B64.encode(psbt.serialize()), 0, &proof).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::PSBT_UNEXPECTED_OUTPUT
         );
     }
 }

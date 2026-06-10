@@ -24,6 +24,7 @@ use xindex_multisig::{
     SignError, MAX_OP_RETURN_BYTES,
 };
 use xindex_shared::chain_registry::ChainId;
+use xindex_shared::signer_wire::IntentProof;
 
 /// Errors surfaced during a single redemption execution.
 #[derive(Debug, Error)]
@@ -78,6 +79,12 @@ pub struct RedeemTask {
     /// `THORChain` swap memo, emitted by the contract. Trusted verbatim;
     /// only length-bounded here.
     pub memo: Vec<u8>,
+    /// CTD-1 (`DL-CTD-2`): the k-of-n Redemption Intent Certificate
+    /// proof for this leg. NOT derivable from the event — the binary
+    /// attaches it (Slice B: collected from the per-operator
+    /// observers). `None` is forwarded as-is and the daemons refuse to
+    /// sign (fail closed).
+    pub intent_proof: Option<IntentProof>,
 }
 
 /// Either we're streaming events live, or replaying from a database; the
@@ -112,6 +119,9 @@ pub fn decode_redeem_event(
         target_token: event.targetToken,
         amount: event.amount,
         memo,
+        // The event carries no certificate; the binary attaches one
+        // before execution (CTD-1).
+        intent_proof: None,
     })
 }
 
@@ -190,6 +200,11 @@ pub trait MultisigCosigner: Send + Sync {
     /// audit-M2 output veto (destination `scriptPubKey` / amount / memo);
     /// the daemon refuses unless the PSBT pays it.
     ///
+    /// `intent_proof` is the leg's k-of-n Redemption Intent Certificate
+    /// (CTD-1); the daemon REQUIRES it and binds the spend's outputs to
+    /// the certified destination/amount/memo. `None` is forwarded
+    /// verbatim and refused daemon-side (fail closed).
+    ///
     /// # Errors
     /// Returns the cosigner's transport / HSM / authorization error.
     fn sign_input(
@@ -197,6 +212,7 @@ pub trait MultisigCosigner: Send + Sync {
         psbt: &bitcoin::psbt::Psbt,
         input_index: usize,
         expected: Option<&ExpectedOutputs>,
+        intent_proof: Option<&IntentProof>,
     ) -> Result<(bitcoin::PublicKey, bitcoin::ecdsa::Signature), ExecuteError>;
 }
 
@@ -400,7 +416,12 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
                     memo: task.memo.clone(),
                 };
                 for (i, cosigner) in cosigners.iter().take(self.descriptor.threshold).enumerate() {
-                    let (pk, sig) = cosigner.sign_input(&psbt, 0, Some(&expected))?;
+                    let (pk, sig) = cosigner.sign_input(
+                        &psbt,
+                        0,
+                        Some(&expected),
+                        task.intent_proof.as_ref(),
+                    )?;
                     // Daemon-side already verified the descriptor +
                     // vin[0] invariant + signature recovery. Coordinator
                     // pins per-response pubkey; if it didn't match, the
@@ -499,6 +520,7 @@ mod tests {
             target_token: EvmAddress::ZERO,
             amount: U256::from(amount),
             memo: memo.as_bytes().to_vec(),
+            intent_proof: None,
         }
     }
 

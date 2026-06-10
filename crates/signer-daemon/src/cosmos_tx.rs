@@ -30,9 +30,51 @@ use xindex_cosmos_tx::sigs as cosmos_sigs;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{error_codes, CosmosSignResponse, CosmosTxSignRequest, ErrorBody};
 
+use crate::intent::VerifiedIntent;
 use crate::replay::{CheckOutcome, ReplayStore};
-use crate::server::DaemonState;
+use crate::server::{gate_ric_intent, DaemonState};
 use crate::web3signer::{HsmDigestSigner, HsmError};
+
+/// The native staking denom per Cosmos chain — the ONLY denom a
+/// certified native-asset leg may move (CTD-1: an unpinned denom would
+/// let a poisoned request send `amount` of a different token under a
+/// native-asset certificate).
+const fn native_denom(chain: ChainId) -> Option<&'static str> {
+    match chain {
+        ChainId::Gaia => Some("uatom"),
+        _ => None,
+    }
+}
+
+/// CTD-1: cosmos-leg bind — the native-denom pin plus the shared
+/// account-send bind (destination / amount / memo against the
+/// certificate).
+fn bind_send_to_cert(
+    chain: ChainId,
+    to_address: &str,
+    amount: &str,
+    denom: &str,
+    memo: &str,
+    cert: &VerifiedIntent,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let want_denom = native_denom(chain).ok_or_else(|| {
+        err(
+            error_codes::INTENT_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("chain {chain:?} has no pinned native denom"),
+        )
+    })?;
+    if denom != want_denom {
+        return Err(err(
+            error_codes::INTENT_MISMATCH,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "denom {denom} != native denom {want_denom} — RIC v1 certifies native-asset legs only"
+            ),
+        ));
+    }
+    crate::server::bind_account_send_to_cert(to_address, amount, memo, cert)
+}
 
 /// Per-chain Cosmos signing role. One entry per Cosmos chain this daemon
 /// is a multisig member of (no cross-chain key sharing — DL-P3-7).
@@ -180,6 +222,25 @@ where
             ),
         ));
     }
+
+    // 2c. CTD-1 (`DL-CTD-2`): mandatory k-of-n RIC gate + the semantic
+    //     field binds. The sign-doc recompute below then guarantees the
+    //     signed bytes match THESE fields, so cert == fields == tx.
+    let (cert, _ric_digest) = gate_ric_intent(
+        &state.config,
+        state.replay.as_ref(),
+        req.chain_id,
+        req.intent_proof.as_ref(),
+    )
+    .await?;
+    bind_send_to_cert(
+        req.chain_id,
+        &req.to_address,
+        &req.amount,
+        &req.denom,
+        &req.memo,
+        &cert,
+    )?;
 
     // 3. Recompute the amino sign-bytes hash and compare to the claim.
     let doc = CosmosSendSignDoc {
@@ -386,6 +447,7 @@ mod tests {
             chain_id: 1,
             verifying_contract: Address::ZERO,
             eth_address: Address::ZERO,
+            intent_policy: crate::test_support::ric::policy(),
         }
     }
 
@@ -405,6 +467,18 @@ mod tests {
             gas_limit: "200000".to_string(),
             memo: "=:ETH.USDT:0xabc:0/1/0".to_string(),
             sign_doc_hash: format!("0x{}", alloy_primitives::hex::encode(sign_doc_hash)),
+            intent_proof: Some(crate::test_support::ric::proof_for(
+                1,
+                Address::ZERO,
+                &crate::test_support::ric::CertSpec {
+                    chain: ChainId::Gaia,
+                    redemption_id: B256::repeat_byte(0x77),
+                    leg_index: 0,
+                    amount: alloy_primitives::U256::from(1_000_000_u64),
+                    immediate_target: b"cosmos1asgard0inbound".to_vec(),
+                    memo: b"=:ETH.USDT:0xabc:0/1/0".to_vec(),
+                },
+            )),
         }
     }
 

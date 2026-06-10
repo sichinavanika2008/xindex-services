@@ -37,8 +37,10 @@ use xindex_shared::eip712::{
 };
 use xindex_shared::signer_wire::{
     error_codes, AttestationSignRequest, Eip712SignResponse, ErrorBody, HealthResponse,
-    KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
+    IntentProof, KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
 };
+
+use crate::intent::{validate_intent_proof, IntentPolicy, VerifiedIntent};
 
 use std::collections::HashMap;
 
@@ -69,6 +71,14 @@ pub struct DaemonConfig {
     /// `docs/runbooks/key-ceremony.md`). Asserted to match the HSM
     /// frontend's response on every sign.
     pub eth_address: Address,
+    /// CTD-1 (`DL-CTD-2`): the daemon's Redemption-Intent-Certificate
+    /// verification policy — static Set-B whitelist + quorum + recency
+    /// window. MANDATORY: every custody-spend handler refuses to sign
+    /// without a valid k-of-n RIC verified against this; there is no
+    /// proof-less carve-out. Construction sites must call
+    /// [`IntentPolicy::validate`] at startup (the gate also fails
+    /// closed on a policy that could never verify).
+    pub intent_policy: IntentPolicy,
 }
 
 impl DaemonConfig {
@@ -706,6 +716,172 @@ where
     Ok(Json(render_signature(&state.config, sig)))
 }
 
+/// CTD-1 (`DL-CTD-2`) — the shared custody-spend RIC gate. Every spend
+/// handler (PSBT / EVM-Safe / Cosmos / XRP / TRON; Solana excluded,
+/// RA-2) calls this BEFORE family-specific work:
+///
+/// 1. `None` proof → 422 `intent_proof_required` (mandatory — there is
+///    no proof-less carve-out).
+/// 2. Stateless k-of-n verification ([`validate_intent_proof`]) against
+///    the static Set-B whitelist in [`DaemonConfig::intent_policy`].
+/// 3. Family-agnostic binds: the certified asset must be THIS chain's
+///    native asset (`asset_id_hash` — RIC v1 certifies native-asset
+///    legs only, so a BTC certificate can never authorize an LTC spend
+///    of the same numeric amount) and `amount_decimals` must equal the
+///    registry decimals (RA-4, like-for-like — never rescaled).
+/// 4. One-shot CONSUME (RA-1), recorded BEFORE the HSM: a same-digest
+///    retry passes idempotently (the family replay arm dedups the tx
+///    signature), a DIFFERENT certificate for a consumed leg is a 409
+///    `intent_already_signed`, and a post-record HSM failure cannot
+///    brick the leg (a retry with the SAME certificate proceeds).
+///
+/// The caller still binds the certified destination/amount/memo to the
+/// family-specific tx shape — that part cannot be shared.
+pub(crate) async fn gate_ric_intent<S: ReplayStore>(
+    config: &DaemonConfig,
+    replay: &S,
+    chain: ChainId,
+    proof: Option<&IntentProof>,
+) -> Result<(VerifiedIntent, B256), (StatusCode, Json<ErrorBody>)> {
+    let proof = proof.ok_or_else(|| {
+        unprocessable(
+            error_codes::INTENT_PROOF_REQUIRED,
+            "custody-spend request carries no IntentProof (k-of-n RIC) — required",
+        )
+    })?;
+    let now = u64::try_from(now_unix_secs()).unwrap_or(0);
+    let (cert, digest) = validate_intent_proof(
+        proof,
+        config.chain_id,
+        config.verifying_contract,
+        &config.intent_policy,
+        now,
+    )
+    .map_err(|e| unprocessable(e.error_code(), e.to_string()))?;
+    if cert.asset_id != chain.asset_id_hash() {
+        return Err(unprocessable(
+            error_codes::INTENT_MISMATCH,
+            format!(
+                "certified asset id is not chain {chain:?}'s native asset — \
+                 RIC v1 certifies native-asset legs only"
+            ),
+        ));
+    }
+    if cert.amount_decimals != chain.decimals() {
+        return Err(unprocessable(
+            error_codes::INTENT_MISMATCH,
+            format!(
+                "certified amount_decimals {} != chain {chain:?} native decimals {} (RA-4)",
+                cert.amount_decimals,
+                chain.decimals()
+            ),
+        ));
+    }
+    consume_ric_one_shot(replay, chain, &cert, digest).await?;
+    Ok((cert, digest))
+}
+
+/// RA-1: consume the `(chain, redemptionId, legIndex)` one-shot. The
+/// row is recorded BEFORE the HSM is consulted — the row IS the
+/// authorization; the family replay table holds the actual signature
+/// (the stored signature here is empty by design).
+async fn consume_ric_one_shot<S: ReplayStore>(
+    replay: &S,
+    chain: ChainId,
+    cert: &VerifiedIntent,
+    digest: B256,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    const REDRIVEN: &str =
+        "custody spend for this (chain, redemption, leg) was already authorized under a \
+         different certificate";
+    let outcome = replay
+        .check_ric_intent(chain, cert.redemption_id, cert.leg_index, digest.0)
+        .await
+        .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+    match outcome {
+        // Same certificate retried — the family replay arm dedups the
+        // actual tx signature; nothing to consume twice.
+        CheckOutcome::Idempotent(_) => return Ok(()),
+        CheckOutcome::Conflict { .. } => {
+            return Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN));
+        }
+        CheckOutcome::FirstTime => {}
+    }
+    if let Err(e) = replay
+        .record_ric_intent(
+            chain,
+            cert.redemption_id,
+            cert.leg_index,
+            digest.0,
+            Vec::new(),
+            now_unix_secs(),
+        )
+        .await
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+        }
+        // Lost a same-leg race — proceed only if the winner consumed
+        // the SAME certificate.
+        return match replay
+            .check_ric_intent(chain, cert.redemption_id, cert.leg_index, digest.0)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
+        {
+            CheckOutcome::Idempotent(_) => Ok(()),
+            CheckOutcome::Conflict { .. } => {
+                Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN))
+            }
+            CheckOutcome::FirstTime => Err(internal(
+                error_codes::BAD_REQUEST,
+                "ric one-shot record race left no row",
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// CTD-1: bind an account-model send (Cosmos / XRP / TRON) to the
+/// certified intent: the destination string's keccak must equal the
+/// certified Asgard target, the decimal amount must equal the
+/// certified amount exactly (like-for-like — the gate already pinned
+/// the unit via `amount_decimals`), and the memo bytes must hash to
+/// the certified memo. The family handlers' sign-bytes recompute then
+/// guarantees the signed tx matches THESE fields, so
+/// certificate == request fields == transaction bytes.
+pub(crate) fn bind_account_send_to_cert(
+    to_address: &str,
+    amount_dec: &str,
+    memo: &str,
+    cert: &VerifiedIntent,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if alloy_primitives::keccak256(to_address.as_bytes()) != cert.immediate_target_hash {
+        return Err(unprocessable(
+            error_codes::INTENT_MISMATCH,
+            format!("destination {to_address} does not hash to the certified Asgard target"),
+        ));
+    }
+    let amount = U256::from_str_radix(amount_dec, 10).map_err(|e| {
+        unprocessable(
+            error_codes::INTENT_MISMATCH,
+            format!("amount: bad decimal: {e}"),
+        )
+    })?;
+    if amount != cert.amount {
+        return Err(unprocessable(
+            error_codes::INTENT_MISMATCH,
+            format!("amount {amount} != certified amount {}", cert.amount),
+        ));
+    }
+    if alloy_primitives::keccak256(memo.as_bytes()) != cert.memo_hash {
+        return Err(unprocessable(
+            error_codes::INTENT_MISMATCH,
+            "memo does not hash to the certified memo".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// CTD-1 Slice A.7: how long after `vault_resolved_at` a Set-B daemon
 /// is still willing to SIGN a RIC. Deliberately tighter than the
 /// custody-side verification window: an honest observer requests
@@ -914,6 +1090,7 @@ mod tests {
             chain_id: 31337,
             verifying_contract: Address::repeat_byte(0xab),
             eth_address: test_key().address(),
+            intent_policy: crate::test_support::ric::policy(),
         }
     }
 
@@ -1223,12 +1400,15 @@ mod tests {
     mod evm_safe_tx_tests {
         use super::*;
         use crate::evm_safe::EvmSignerConfig;
+        use crate::test_support::ric as ric_fixtures;
         use alloy_primitives::Bytes;
+        use alloy_sol_types::SolCall;
         use xindex_safe_evm::{
             digest::{safe_tx_hash, SafeTransaction},
             SafeOperation,
         };
         use xindex_shared::signer_wire::EvmSafeTxSignRequest;
+        use xindex_shared::thorchain_router::depositWithExpiryCall;
 
         const ETH_SAFE: Address = Address::new([0x11; 20]);
         const BSC_SAFE: Address = Address::new([0x33; 20]);
@@ -1296,19 +1476,32 @@ mod tests {
             (state, hsm)
         }
 
-        /// Build a `(SafeTransaction, request_body)` pair where the
-        /// `safe_tx_hash` in the request matches the digest we'd
-        /// recompute server-side.
+        /// Build the HONEST redemption template — the only shape the
+        /// CTD-1 bind accepts: `Router.depositWithExpiry(vault,
+        /// address(0), amount, memo, expiry)` with `value == amount` —
+        /// plus a matching k-of-n `IntentProof`. `memo` doubles as the
+        /// per-test discriminator (it derives the redemption id, so
+        /// different memos are different legs for the RIC one-shot).
         fn build_request(
             chain: ChainId,
             safe: Address,
             nonce: u64,
-            data: &[u8],
+            memo: &str,
         ) -> (SafeTransaction, EvmSafeTxSignRequest) {
+            let vault = Address::new([0xaa; 20]);
+            let amount = U256::from(1_500_000_000_000_000_u64);
+            let call = depositWithExpiryCall {
+                vault,
+                asset: Address::ZERO,
+                amount,
+                memo: memo.to_string(),
+                expiry: U256::from(1_900_000_000_u64),
+            };
+            let router = chain.thorchain_router_address().unwrap_or(Address::ZERO);
             let tx = SafeTransaction {
-                to: Address::new([0xa1; 20]),
-                value: U256::ZERO,
-                data: Bytes::from(data.to_vec()),
+                to: router,
+                value: amount,
+                data: Bytes::from(call.abi_encode()),
                 operation: SafeOperation::Call,
                 safe_tx_gas: U256::ZERO,
                 base_gas: U256::ZERO,
@@ -1320,6 +1513,18 @@ mod tests {
             #[expect(clippy::expect_used, reason = "test code")]
             let evm_chain_id = chain.evm_chain_id().expect("evm chain");
             let h = safe_tx_hash(evm_chain_id, safe, &tx);
+            let proof = ric_fixtures::proof_for(
+                cfg().chain_id,
+                cfg().verifying_contract,
+                &ric_fixtures::CertSpec {
+                    chain,
+                    redemption_id: alloy_primitives::keccak256(memo.as_bytes()),
+                    leg_index: 0,
+                    amount,
+                    immediate_target: vault.as_slice().to_vec(),
+                    memo: memo.as_bytes().to_vec(),
+                },
+            );
             let req = EvmSafeTxSignRequest {
                 chain_id: chain,
                 safe_address: format!("{safe:#x}"),
@@ -1335,6 +1540,7 @@ mod tests {
                 nonce: tx.nonce.to_string(),
                 safe_tx_hash: format!("0x{}", alloy_primitives::hex::encode(h)),
                 fee_wei: "0".to_string(),
+                intent_proof: Some(proof),
             };
             (tx, req)
         }
@@ -1350,7 +1556,7 @@ mod tests {
                 (ChainId::Eth, ETH_SAFE, evm_signer()),
                 (ChainId::Bsc, BSC_SAFE, evm_signer()),
             ] {
-                let (tx, req) = build_request(chain, safe, 0, b"hello");
+                let (tx, req) = build_request(chain, safe, 0, "hello");
                 let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
                 let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
                 assert_eq!(status, StatusCode::OK, "{chain:?} status: {body}");
@@ -1392,7 +1598,7 @@ mod tests {
                 my_signer_address: wrong_signer,
             });
             let app = router(state);
-            let (_, req) = build_request(ChainId::Eth, ETH_SAFE, 0, b"x");
+            let (_, req) = build_request(ChainId::Eth, ETH_SAFE, 0, "x");
             let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
             let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1411,7 +1617,7 @@ mod tests {
             let app = router(state);
             // Use AVAX's chain_id so the serde validator passes (AVAX
             // is a valid EVM chain), but the daemon has no AVAX config.
-            let (_, mut req) = build_request(ChainId::Avax, ETH_SAFE, 0, b"");
+            let (_, mut req) = build_request(ChainId::Avax, ETH_SAFE, 0, "");
             // The hash was computed for AVAX evm_chain_id; safe_address
             // doesn't matter — endpoint_disabled wins.
             req.safe_address = format!("{:#x}", Address::new([0xfe; 20]));
@@ -1433,7 +1639,7 @@ mod tests {
             // Build hash for the BOGUS safe so the hash matches its
             // ABI inputs — but the daemon's ETH config has ETH_SAFE,
             // not the bogus one.
-            let (_, req) = build_request(ChainId::Eth, bogus_safe, 0, b"");
+            let (_, req) = build_request(ChainId::Eth, bogus_safe, 0, "");
             let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
             let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1450,7 +1656,7 @@ mod tests {
         async fn mismatched_safe_tx_hash_is_rejected() {
             let (state, hsm) = evm_state();
             let app = router(state);
-            let (_, mut req) = build_request(ChainId::Eth, ETH_SAFE, 0, b"original");
+            let (_, mut req) = build_request(ChainId::Eth, ETH_SAFE, 0, "original");
             // Substitute a hash that doesn't match the rest of the
             // request. (Use a random-looking but valid 32-byte hex.)
             req.safe_tx_hash = format!("0x{}", "de".repeat(32));
@@ -1475,7 +1681,7 @@ mod tests {
         async fn identical_replay_returns_cached_signature() {
             let (state, hsm) = evm_state();
             let app = router(state);
-            let (_, req) = build_request(ChainId::Eth, ETH_SAFE, 42, b"once");
+            let (_, req) = build_request(ChainId::Eth, ETH_SAFE, 42, "once");
             let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
             let (s1, b1) = post_json(&app, "/api/v1/sign/evm-safe-tx", body.clone()).await;
             let (s2, b2) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
@@ -1494,8 +1700,8 @@ mod tests {
         async fn same_nonce_different_payload_is_409() {
             let (state, hsm) = evm_state();
             let app = router(state);
-            let (_, req1) = build_request(ChainId::Eth, ETH_SAFE, 7, b"first");
-            let (_, req2) = build_request(ChainId::Eth, ETH_SAFE, 7, b"different");
+            let (_, req1) = build_request(ChainId::Eth, ETH_SAFE, 7, "first");
+            let (_, req2) = build_request(ChainId::Eth, ETH_SAFE, 7, "different");
             // Both requests pass the digest-recompute check (each is
             // internally self-consistent) but their `payload_hash`
             // differs → conflict.
@@ -1520,6 +1726,129 @@ mod tests {
             #[expect(clippy::unwrap_used, reason = "test code")]
             let seen = hsm.seen.lock().unwrap();
             assert_eq!(seen.len(), 1);
+        }
+
+        /// CTD-1: a request WITHOUT an `IntentProof` is refused before
+        /// anything else — there is no proof-less carve-out.
+        #[tokio::test]
+        async fn missing_intent_proof_is_422_required() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            let (_, mut req) = build_request(ChainId::Eth, ETH_SAFE, 0, "no-proof");
+            req.intent_proof = None;
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                body["code"].as_str().unwrap_or(""),
+                error_codes::INTENT_PROOF_REQUIRED
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert!(seen.is_empty());
+        }
+
+        /// CTD-1 core property: the certificate authorizes ONE vault;
+        /// a Safe-tx paying a different vault under the same (valid)
+        /// proof is refused with `intent_mismatch` before the HSM.
+        #[tokio::test]
+        async fn poisoned_vault_is_422_mismatch() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            let (_, honest) = build_request(ChainId::Eth, ETH_SAFE, 0, "poison");
+            // Rebuild the Safe-tx paying an ATTACKER vault, keeping the
+            // honest certificate attached.
+            let attacker_vault = Address::new([0x66; 20]);
+            let amount = U256::from(1_500_000_000_000_000_u64);
+            let call = depositWithExpiryCall {
+                vault: attacker_vault,
+                asset: Address::ZERO,
+                amount,
+                memo: "poison".to_string(),
+                expiry: U256::from(1_900_000_000_u64),
+            };
+            let router_addr = ChainId::Eth
+                .thorchain_router_address()
+                .unwrap_or(Address::ZERO);
+            let tx = SafeTransaction {
+                to: router_addr,
+                value: amount,
+                data: Bytes::from(call.abi_encode()),
+                operation: SafeOperation::Call,
+                safe_tx_gas: U256::ZERO,
+                base_gas: U256::ZERO,
+                gas_price: U256::ZERO,
+                gas_token: Address::ZERO,
+                refund_receiver: Address::ZERO,
+                nonce: U256::ZERO,
+            };
+            #[expect(clippy::expect_used, reason = "test code")]
+            let evm_chain_id = ChainId::Eth.evm_chain_id().expect("evm chain");
+            let h = safe_tx_hash(evm_chain_id, ETH_SAFE, &tx);
+            let mut req = honest;
+            req.to = format!("{:#x}", tx.to);
+            req.data = format!("0x{}", alloy_primitives::hex::encode(&tx.data));
+            req.safe_tx_hash = format!("0x{}", alloy_primitives::hex::encode(h));
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (status, body) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+            assert_eq!(
+                body["code"].as_str().unwrap_or(""),
+                error_codes::INTENT_MISMATCH
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert!(seen.is_empty());
+        }
+
+        /// CTD-1 / RA-1: a SECOND, different certificate for an
+        /// already-consumed `(chain, redemption, leg)` is a 409
+        /// `intent_already_signed` — one valid RIC can never become
+        /// N payouts.
+        #[tokio::test]
+        async fn redriven_leg_with_different_cert_is_409() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            let (_, req1) = build_request(ChainId::Eth, ETH_SAFE, 0, "redrive");
+            let (s1, _) = post_json(
+                &app,
+                "/api/v1/sign/evm-safe-tx",
+                serde_json::to_value(&req1).unwrap_or(serde_json::Value::Null),
+            )
+            .await;
+            assert_eq!(s1, StatusCode::OK);
+
+            // Same redemption id + leg, DIFFERENT certified amount → a
+            // different RIC digest at the consumed one-shot key.
+            let amount2 = U256::from(2_000_000_000_000_000_u64);
+            let (_, mut req2) = build_request(ChainId::Eth, ETH_SAFE, 1, "redrive");
+            let proof2 = ric_fixtures::proof_for(
+                cfg().chain_id,
+                cfg().verifying_contract,
+                &ric_fixtures::CertSpec {
+                    chain: ChainId::Eth,
+                    redemption_id: alloy_primitives::keccak256("redrive".as_bytes()),
+                    leg_index: 0,
+                    amount: amount2,
+                    immediate_target: Address::new([0xaa; 20]).as_slice().to_vec(),
+                    memo: "redrive".as_bytes().to_vec(),
+                },
+            );
+            req2.intent_proof = Some(proof2);
+            let (s2, b2) = post_json(
+                &app,
+                "/api/v1/sign/evm-safe-tx",
+                serde_json::to_value(&req2).unwrap_or(serde_json::Value::Null),
+            )
+            .await;
+            assert_eq!(s2, StatusCode::CONFLICT, "body: {b2}");
+            assert_eq!(
+                b2["code"].as_str().unwrap_or(""),
+                error_codes::INTENT_ALREADY_SIGNED
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "second spend never reaches the HSM");
         }
 
         /// The EVM route is NOT registered when `state.evm` is empty.
