@@ -189,8 +189,13 @@ pub trait ReplayStore: Send + Sync {
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 
+    /// Keyed by `(chain_id, input_txid, input_vout)`. The `chain_id` (audit
+    /// AUD-PSBT-REPLAY-CHAINID) prevents a daemon serving multiple UTXO chains
+    /// (BTC / LTC / …) from false-conflicting on a same-outpoint collision
+    /// across chains — outpoints are only unique within a chain.
     fn check_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
         payload_hash: [u8; 32],
@@ -198,8 +203,46 @@ pub trait ReplayStore: Send + Sync {
 
     fn record_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// P-SOL-6 (Phase 4.5): pre-flight a Solana Squads signing step. Keyed by
+    /// `(chain_id, multisig, transaction_index, kind, member)` — a member signs
+    /// each `(transaction_index, kind)` step (create / approve / execute) once.
+    /// `payload_hash` is the SEMANTIC intent (kind + index + destination +
+    /// amount + memo), deliberately EXCLUDING the volatile `recent_blockhash`:
+    /// a re-sign with a fresh blockhash for the same intent is `Idempotent`
+    /// (the caller re-signs the fresh message — ed25519 is deterministic and
+    /// local), while a DIFFERENT destination/amount at an already-used step is
+    /// a `Conflict` (the defense). Defense-in-depth on top of the on-chain
+    /// Squads program (which already rejects a duplicate create/approve/execute).
+    fn check_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// P-SOL-6: record a fresh Solana signing step.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Solana replay identity is a 5-tuple (chain/multisig/index/kind/member) + payload + sig + timestamp; a struct would obscure the key shape shared with the sibling record_* methods"
+    )]
+    fn record_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
         payload_hash: [u8; 32],
         signature: Vec<u8>,
         now_unix: i64,
@@ -313,7 +356,9 @@ pub trait ReplayStore: Send + Sync {
 struct InMemoryInner {
     attestations: HashMap<(B256, U256), SignedRecord>,
     redemptions: HashMap<(B256, u32), (RedemptionKind, SignedRecord)>,
-    psbt_inputs: HashMap<([u8; 32], u32), SignedRecord>,
+    /// PSBT replay key — `(chain_id_str, input_txid, input_vout)` (`chain_id`
+    /// added per AUD-PSBT-REPLAY-CHAINID).
+    psbt_inputs: HashMap<(&'static str, [u8; 32], u32), SignedRecord>,
     /// V5: Safe-tx replay key — `(chain_id_str, safe_address_bytes, nonce)`.
     safe_txs: HashMap<(&'static str, [u8; 20], u64), SignedRecord>,
     /// C5: Cosmos sign-doc replay key — `(chain_id_str, account_bech32, sequence)`.
@@ -322,6 +367,9 @@ struct InMemoryInner {
     xrp_txs: HashMap<(&'static str, String, u64), SignedRecord>,
     /// Phase 4.6: TRON tx replay key — `(chain_id_str, t_address, txid)`.
     tron_txs: HashMap<(&'static str, String, [u8; 32]), SignedRecord>,
+    /// P-SOL-6: Solana replay key —
+    /// `(chain_id_str, multisig, transaction_index, kind, member)`.
+    solana_txs: HashMap<(&'static str, String, u64, &'static str, String), SignedRecord>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -435,12 +483,14 @@ impl ReplayStore for InMemoryReplayStore {
 
     async fn check_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
         payload_hash: [u8; 32],
     ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), input_txid, input_vout);
         let g = self.inner.lock().await;
-        Ok(match g.psbt_inputs.get(&(input_txid, input_vout)) {
+        Ok(match g.psbt_inputs.get(&key) {
             None => CheckOutcome::FirstTime,
             Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
             Some(rec) => CheckOutcome::Conflict {
@@ -452,16 +502,74 @@ impl ReplayStore for InMemoryReplayStore {
 
     async fn record_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
         payload_hash: [u8; 32],
         signature: Vec<u8>,
         now_unix: i64,
     ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), input_txid, input_vout);
         let mut g = self.inner.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(e) =
-            g.psbt_inputs.entry((input_txid, input_vout))
-        {
+        if let std::collections::hash_map::Entry::Vacant(e) = g.psbt_inputs.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Duplicate)
+        }
+    }
+
+    async fn check_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (
+            chain_id.thor_asset(),
+            multisig,
+            transaction_index,
+            kind,
+            member,
+        );
+        let g = self.inner.lock().await;
+        Ok(match g.solana_txs.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (
+            chain_id.thor_asset(),
+            multisig,
+            transaction_index,
+            kind,
+            member,
+        );
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.solana_txs.entry(key) {
             e.insert(SignedRecord {
                 payload_hash,
                 signature,
@@ -844,6 +952,7 @@ impl ReplayStore for SqliteReplayStore {
 
     async fn check_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
         payload_hash: [u8; 32],
@@ -851,8 +960,9 @@ impl ReplayStore for SqliteReplayStore {
         let vout = i64::from(input_vout);
         let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
             "SELECT payload_hash, signature, signed_at_unix
-             FROM signed_psbt_inputs WHERE input_txid = ? AND input_vout = ?",
+             FROM signed_psbt_inputs WHERE chain_id = ? AND input_txid = ? AND input_vout = ?",
         )
+        .bind(chain_id.thor_asset())
         .bind(input_txid.as_slice())
         .bind(vout)
         .fetch_optional(&self.pool)
@@ -881,6 +991,7 @@ impl ReplayStore for SqliteReplayStore {
 
     async fn record_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
         payload_hash: [u8; 32],
@@ -890,11 +1001,94 @@ impl ReplayStore for SqliteReplayStore {
         let vout = i64::from(input_vout);
         let res = sqlx::query(
             "INSERT INTO signed_psbt_inputs
-                (input_txid, input_vout, payload_hash, signature, signed_at_unix)
-             VALUES (?, ?, ?, ?, ?)",
+                (chain_id, input_txid, input_vout, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
+        .bind(chain_id.thor_asset())
         .bind(input_txid.as_slice())
         .bind(vout)
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await;
+        Self::map_insert(res)
+    }
+
+    async fn check_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "Squads transaction_index cannot reach i64::MAX in practice"
+        )]
+        let index_i = transaction_index as i64;
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM signed_solana_txs
+             WHERE chain_id = ? AND multisig = ? AND transaction_index = ? AND kind = ? AND member = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(&multisig)
+        .bind(index_i)
+        .bind(kind)
+        .bind(&member)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "Squads transaction_index cannot reach i64::MAX in practice"
+        )]
+        let index_i = transaction_index as i64;
+        let res = sqlx::query(
+            "INSERT INTO signed_solana_txs
+                (chain_id, multisig, transaction_index, kind, member, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(&multisig)
+        .bind(index_i)
+        .bind(kind)
+        .bind(&member)
         .bind(payload_hash.as_slice())
         .bind(&signature)
         .bind(now_unix)
@@ -1451,23 +1645,24 @@ mod tests {
     }
 
     async fn run_psbt_input_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
         #[expect(clippy::expect_used, reason = "test code")]
         {
             let outpoint = [0x55u8; 32];
             assert_eq!(
                 store
-                    .check_psbt_input(outpoint, 0, hash_a())
+                    .check_psbt_input(ChainId::Btc, outpoint, 0, hash_a())
                     .await
                     .expect("check"),
                 CheckOutcome::FirstTime
             );
             store
-                .record_psbt_input(outpoint, 0, hash_a(), vec![0xDE, 0xAD], 100)
+                .record_psbt_input(ChainId::Btc, outpoint, 0, hash_a(), vec![0xDE, 0xAD], 100)
                 .await
                 .expect("record");
             // Same outpoint + same payload → idempotent.
             let out = store
-                .check_psbt_input(outpoint, 0, hash_a())
+                .check_psbt_input(ChainId::Btc, outpoint, 0, hash_a())
                 .await
                 .expect("check");
             assert!(
@@ -1475,14 +1670,14 @@ mod tests {
             );
             // Same outpoint + DIFFERENT payload → conflict.
             let out = store
-                .check_psbt_input(outpoint, 0, hash_b())
+                .check_psbt_input(ChainId::Btc, outpoint, 0, hash_b())
                 .await
                 .expect("check");
             assert!(matches!(out, CheckOutcome::Conflict { .. }));
             // Different vout of same txid → independent FirstTime.
             assert_eq!(
                 store
-                    .check_psbt_input(outpoint, 1, hash_a())
+                    .check_psbt_input(ChainId::Btc, outpoint, 1, hash_a())
                     .await
                     .expect("check"),
                 CheckOutcome::FirstTime
@@ -1491,7 +1686,118 @@ mod tests {
             let other = [0x66u8; 32];
             assert_eq!(
                 store
-                    .check_psbt_input(other, 0, hash_a())
+                    .check_psbt_input(ChainId::Btc, other, 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // AUD-PSBT-REPLAY-CHAINID: the SAME outpoint on a DIFFERENT UTXO
+            // chain is an independent slot — NOT a false Conflict against the
+            // BTC row recorded above.
+            assert_eq!(
+                store
+                    .check_psbt_input(ChainId::Ltc, outpoint, 0, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_psbt_input(ChainId::Ltc, outpoint, 0, hash_b(), vec![0x11], 110)
+                .await
+                .expect("record ltc");
+            // The BTC row is untouched by the LTC record (still idempotent).
+            assert!(matches!(
+                store
+                    .check_psbt_input(ChainId::Btc, outpoint, 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(_)
+            ));
+        }
+    }
+
+    /// P-SOL-6: Solana replay keyed by `(chain, multisig, transaction_index,
+    /// kind, member)`. The same step + same semantic payload → idempotent; a
+    /// DIFFERENT payload at the same step → Conflict; a different kind / index
+    /// / member is an independent slot.
+    async fn run_solana_tx_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let ms = "msig111".to_string();
+            let mem = "member1".to_string();
+            assert_eq!(
+                store
+                    .check_solana_tx(ChainId::Sol, ms.clone(), 7, "create", mem.clone(), hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_solana_tx(
+                    ChainId::Sol,
+                    ms.clone(),
+                    7,
+                    "create",
+                    mem.clone(),
+                    hash_a(),
+                    vec![1, 2, 3],
+                    100,
+                )
+                .await
+                .expect("record");
+            // Same step + same semantic payload → idempotent (a blockhash-
+            // refresh re-sign of the same intent).
+            assert!(matches!(
+                store
+                    .check_solana_tx(ChainId::Sol, ms.clone(), 7, "create", mem.clone(), hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1, 2, 3]
+            ));
+            // Same step + DIFFERENT semantic payload (e.g. a different
+            // destination at an already-used transaction_index) → Conflict.
+            assert!(matches!(
+                store
+                    .check_solana_tx(ChainId::Sol, ms.clone(), 7, "create", mem.clone(), hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            // Different kind (approve vs create) at the same step → independent.
+            assert_eq!(
+                store
+                    .check_solana_tx(
+                        ChainId::Sol,
+                        ms.clone(),
+                        7,
+                        "approve",
+                        mem.clone(),
+                        hash_a()
+                    )
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different transaction_index → independent.
+            assert_eq!(
+                store
+                    .check_solana_tx(ChainId::Sol, ms.clone(), 8, "create", mem.clone(), hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different member → independent.
+            assert_eq!(
+                store
+                    .check_solana_tx(
+                        ChainId::Sol,
+                        ms,
+                        7,
+                        "create",
+                        "member2".to_string(),
+                        hash_a()
+                    )
                     .await
                     .expect("check"),
                 CheckOutcome::FirstTime
@@ -1576,6 +1882,21 @@ mod tests {
     async fn in_memory_psbt_input_lifecycle() {
         let store = InMemoryReplayStore::new();
         run_psbt_input_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_solana_tx_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_solana_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_solana_tx_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_solana_tx_lifecycle(&store).await;
     }
 
     #[tokio::test]

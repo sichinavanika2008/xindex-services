@@ -12,7 +12,9 @@ workspace = true
 [dependencies]
 alloy-primitives = { workspace = true, features = ["serde", "k256"] }
 alloy-sol-types.workspace = true
-k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# `arithmetic` adds `Signature::normalize_s` — the EIP-2 low-S assertion in
+# `sigs::recover_signer` (a Safe `checkSignatures` rejects high-S).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 serde.workspace = true
 thiserror.workspace = true
 xindex-shared.workspace = true

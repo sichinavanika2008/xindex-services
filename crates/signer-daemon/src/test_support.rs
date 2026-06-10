@@ -122,6 +122,7 @@ impl<S: ReplayStore> ReplayStore for RaceReplayStore<S> {
 
     async fn check_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
         payload_hash: [u8; 32],
@@ -130,12 +131,13 @@ impl<S: ReplayStore> ReplayStore for RaceReplayStore<S> {
             return Ok(CheckOutcome::FirstTime);
         }
         self.inner
-            .check_psbt_input(input_txid, input_vout, payload_hash)
+            .check_psbt_input(chain_id, input_txid, input_vout, payload_hash)
             .await
     }
 
     async fn record_psbt_input(
         &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
         input_txid: [u8; 32],
         input_vout: u32,
         payload_hash: [u8; 32],
@@ -146,7 +148,60 @@ impl<S: ReplayStore> ReplayStore for RaceReplayStore<S> {
             return Err(ReplayError::Duplicate);
         }
         self.inner
-            .record_psbt_input(input_txid, input_vout, payload_hash, signature, now_unix)
+            .record_psbt_input(
+                chain_id,
+                input_txid,
+                input_vout,
+                payload_hash,
+                signature,
+                now_unix,
+            )
+            .await
+    }
+
+    async fn check_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        self.inner
+            .check_solana_tx(
+                chain_id,
+                multisig,
+                transaction_index,
+                kind,
+                member,
+                payload_hash,
+            )
+            .await
+    }
+
+    async fn record_solana_tx(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        multisig: String,
+        transaction_index: u64,
+        kind: &'static str,
+        member: String,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        self.inner
+            .record_solana_tx(
+                chain_id,
+                multisig,
+                transaction_index,
+                kind,
+                member,
+                payload_hash,
+                signature,
+                now_unix,
+            )
             .await
     }
 

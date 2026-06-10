@@ -865,6 +865,19 @@ pub mod error_codes {
     /// `witness_utxo` so the fee could not be bounded. Stops a malicious
     /// coordinator from burning the residue as an unbounded fee. HTTP 422.
     pub const PSBT_FEE_EXCEEDS_CAP: &str = "psbt_fee_exceeds_cap";
+    /// EVM-Safe CTD-1 family floor: the Safe-tx `operation` was
+    /// `DelegateCall` (1). An honest redemption always uses `Call` (0); a
+    /// `DelegateCall` would execute arbitrary code in the Safe's own
+    /// context (owner takeover / asset sweep), so the daemon refuses to
+    /// sign it regardless of the recomputed `safeTxHash`. HTTP 422.
+    pub const EVM_SAFE_OPERATION_FORBIDDEN: &str = "evm_safe_operation_forbidden";
+    /// EVM-Safe CTD-1 family floor: a Safe-tx gas-refund field
+    /// (`gas_price` / `gas_token` / `refund_receiver`) was non-zero. Phase
+    /// 3.2 has no Safe-side refund — the honest executor zeroes all three
+    /// — so a non-zero value is a coordinator-supplied value-extraction
+    /// channel (the Safe pays `gasPrice·gasUsed` of `gasToken` to
+    /// `refundReceiver`). The daemon refuses to sign it. HTTP 422.
+    pub const EVM_SAFE_GAS_REFUND_FORBIDDEN: &str = "evm_safe_gas_refund_forbidden";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;

@@ -295,13 +295,20 @@ where
         CheckOutcome::FirstTime => {}
     }
 
-    // 5. HSM-sign the txID; normalize v to TRON 0/1; verify recovery.
+    // 5. HSM-sign the txID; low-S normalize; normalize v to TRON 0/1; verify
+    //    recovery.
     let sig_hsm = state
         .hsm
         .sign_digest(cfg.my_signer_address, B256::from(computed))
         .await
         .map_err(|e| hsm_unavailable(&e))?;
-    let mut sig65 = sig_hsm;
+    // AUD-TRON-LOWS: EIP-2 low-S normalization, while `v` is still in the HSM's
+    // 27/28 convention (the shared helper flips it on normalize). java-tron's
+    // `checkSign` may reject high-S; the Web3Signer HSM already emits low-S, so
+    // this is defense-in-depth. The recover-verify below re-checks the
+    // normalized bytes, so a mis-normalization fails closed.
+    let sig_low = crate::sig_norm::normalize_low_s(sig_hsm)?;
+    let mut sig65 = sig_low;
     sig65[64] = tron_recovery_v(sig65[64]);
     let recovered = recover_evm20(&computed, &sig65).map_err(|e| {
         err(
@@ -555,6 +562,67 @@ mod tests {
         let (status, body) = handle_tron_tx(State(st), Json(req)).await.expect_err("err");
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.code, error_codes::ENDPOINT_DISABLED);
+    }
+
+    /// HSM stub that returns a HIGH-S signature (r, n−s) with the recovery
+    /// byte that is correct for that high-S form. Exercises the
+    /// AUD-TRON-LOWS normalization on the handler path.
+    #[derive(Debug)]
+    struct HighSStubHsm {
+        sk: SigningKey,
+    }
+
+    #[async_trait::async_trait]
+    impl HsmDigestSigner for HighSStubHsm {
+        async fn sign_digest(&self, _address: Address, digest: B256) -> Result<[u8; 65], HsmError> {
+            let (sig, recid) = self
+                .sk
+                .sign_prehash_recoverable(digest.as_slice())
+                .map_err(|e| HsmError::Decode(format!("test sign: {e}")))?;
+            // Negate s → high-S; the high-S sig recovers with flipped parity.
+            let neg_s = -*sig.s();
+            let high = k256::ecdsa::Signature::from_scalars(sig.r().to_bytes(), neg_s.to_bytes())
+                .map_err(|e| HsmError::Decode(format!("test high sig: {e}")))?;
+            let mut out = [0u8; 65];
+            out[..64].copy_from_slice(high.to_bytes().as_ref());
+            out[64] = 27 + (recid.to_byte() ^ 1);
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn high_s_hsm_signature_is_normalized() {
+        let (_sk, signer, pubkey) = key_identity(7);
+        let (owner, req) = sample_trx(pubkey);
+        let st = DaemonState::new(
+            cfg(),
+            Arc::new(InMemoryReplayStore::new()),
+            Arc::new(HighSStubHsm {
+                sk: SigningKey::from_slice(&[7u8; 32]).expect("key"),
+            }),
+        )
+        .with_tron(TronSignerConfig {
+            chain: ChainId::Tron,
+            owner_address: owner,
+            my_signer_address: signer,
+            my_member_pubkey: pubkey,
+        });
+        // The handler must normalize the high-S response (and recover-verify
+        // the normalized bytes) rather than reject it.
+        let resp = handle_tron_tx(State(st), Json(req)).await.expect("sign");
+        let sig =
+            alloy_primitives::hex::decode(resp.signature.trim_start_matches("0x")).expect("hex");
+        assert_eq!(sig.len(), 65);
+        assert!(sig[64] <= 1, "v must be the TRON 0/1 form");
+        // The stored r||s is canonical low-S.
+        assert!(
+            k256::ecdsa::Signature::from_slice(&sig[..64])
+                .expect("parse")
+                .normalize_s()
+                .is_none(),
+            "output must be low-S after normalization"
+        );
     }
 
     #[tokio::test]

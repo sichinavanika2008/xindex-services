@@ -266,10 +266,10 @@ where
     let prev_vout: u32 = txin.previous_output.vout;
     let payload_hash = hash_psbt_payload(&prev_txid, prev_vout, &sighash_bytes);
 
-    // 7. Replay check.
+    // 7. Replay check (keyed by chain — AUD-PSBT-REPLAY-CHAINID).
     let outcome = state
         .replay
-        .check_psbt_input(prev_txid, prev_vout, payload_hash)
+        .check_psbt_input(req.chain_id, prev_txid, prev_vout, payload_hash)
         .await
         .map_err(|e| {
             err(
@@ -363,6 +363,7 @@ where
     if let Err(e) = state
         .replay
         .record_psbt_input(
+            req.chain_id,
             prev_txid,
             prev_vout,
             payload_hash,
@@ -383,7 +384,7 @@ where
         // ECDSA → identical bytes anyway).
         return match state
             .replay
-            .check_psbt_input(prev_txid, prev_vout, payload_hash)
+            .check_psbt_input(req.chain_id, prev_txid, prev_vout, payload_hash)
             .await
             .map_err(|e| {
                 err(
@@ -524,6 +525,20 @@ fn enforce_change_and_fee(
                 "input missing witness_utxo; cannot bound fee",
             )
         })?;
+        // AUD-PSBT-FEECAP-MULTIINPUT: every input must spend our OWN descriptor
+        // P2WSH. Step 4b binds only the SIGNED input's prevout; without this a
+        // coordinator-forged `witness_utxo.value` on a NON-signed input would
+        // inflate the apparent input sum and weaken the `Σin − Σout ≤ cap`
+        // bound. The redeem coin-selection only ever draws our own multisig
+        // UTXOs, so requiring it is exact — and it strengthens the Part-3
+        // vin-is-multisig invariant from vin[0] to ALL inputs.
+        if wu.script_pubkey != *descriptor_spk {
+            return Err(err(
+                error_codes::WRONG_DESCRIPTOR,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "a tx input does not spend the daemon descriptor P2WSH program",
+            ));
+        }
         total_in = total_in.saturating_add(wu.value.to_sat());
     }
     let total_out = psbt
@@ -1327,6 +1342,82 @@ mod tests {
         );
     }
 
+    /// AUD-PSBT-FEECAP-MULTIINPUT: a SECOND input that does not spend the
+    /// daemon descriptor P2WSH (a coordinator-injected foreign input whose
+    /// forged `witness_utxo.value` would otherwise inflate the fee-cap input
+    /// sum) is rejected — `WRONG_DESCRIPTOR`. The signed input (idx 0) is a
+    /// genuine descriptor UTXO, so steps 2-4b pass and the multi-input fee
+    /// loop is the gate that fires.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn foreign_second_input_is_rejected() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let witness_script = derive_witness_script(&desc).expect("ws");
+        let descriptor_spk = desc
+            .address(Network::Bitcoin)
+            .expect("addr")
+            .script_pubkey();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xc1u8; 32]));
+        let foreign_spk = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0xab; 20]));
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev_txid,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: prev_txid,
+                        vout: 1,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(70_000),
+                    script_pubkey: spk,
+                },
+                op_return_out(M2B_MEMO, Amount::ZERO),
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
+        // Input 0: genuine descriptor UTXO (signed input).
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: descriptor_spk,
+        });
+        psbt.inputs[0].witness_script = Some(witness_script);
+        // Input 1: foreign prevout with a huge forged value.
+        psbt.inputs[1].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10_000_000_000),
+            script_pubkey: foreign_spk,
+        });
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(M2B_MEMO),
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::WRONG_DESCRIPTOR
+        );
+    }
+
     /// I3: a forged `witness_utxo.script_pubkey` (not the descriptor
     /// P2WSH program) is refused even though `witness_script` matches.
     #[tokio::test]
@@ -1407,7 +1498,14 @@ mod tests {
         let winner_sig = vec![0xDEu8, 0xAD, 0xBE, 0xEF];
         let inner = InMemoryReplayStore::new();
         inner
-            .record_psbt_input(txid, vout, payload_hash, winner_sig.clone(), 100)
+            .record_psbt_input(
+                ChainId::Btc,
+                txid,
+                vout,
+                payload_hash,
+                winner_sig.clone(),
+                100,
+            )
             .await
             .expect("seed winner");
         let replay = Arc::new(crate::test_support::RaceReplayStore::new(

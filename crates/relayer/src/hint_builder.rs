@@ -129,6 +129,17 @@ pub fn plan_stream(
     deadline_secs: u64,
     p: &HintParams,
 ) -> StreamPlan {
+    // Unknown / empty pool depth ⇒ do NOT stream. `pool_depth == 0` is the
+    // sentinel `xindex-hint-builder::pool_depth` emits for a non-`Available`
+    // (Staged/Suspended/missing) pool. Without this guard `slip_bps` returns a
+    // full 100% slip for `(swap_size > 0, depth 0)` — `swap_size / swap_size`
+    // — which would drive MAXIMAL streaming, the exact opposite of the
+    // "streaming disabled" intent. A single plain swap is the safe fallback
+    // (AUD-HINT-SENTINEL).
+    if pool_depth == 0 {
+        return StreamPlan::NON_STREAMING;
+    }
+
     let slip = slip_bps(swap_size, pool_depth);
     if slip < p.min_slip_bps {
         return StreamPlan::NON_STREAMING;
@@ -226,5 +237,17 @@ mod tests {
         // Deadline inside the margin ⇒ zero budget ⇒ non-streaming.
         let plan = plan_stream(1_000, 1_000, 0, 19 * 60, &p);
         assert_eq!(plan, StreamPlan::NON_STREAMING);
+    }
+
+    #[test]
+    fn zero_depth_does_not_stream() {
+        // AUD-HINT-SENTINEL: `pool_depth == 0` (empty/unavailable pool, the
+        // hint-builder's sentinel) must NOT stream. Pre-fix `slip_bps` mapped
+        // it to a 100% slip → maximal streaming; the guard now falls back to a
+        // single swap regardless of swap size or deadline room.
+        let p = HintParams::default();
+        let plan = plan_stream(1_000_000, 0, 0, 4 * 3600, &p);
+        assert_eq!(plan, StreamPlan::NON_STREAMING);
+        assert!(!plan.is_streaming());
     }
 }

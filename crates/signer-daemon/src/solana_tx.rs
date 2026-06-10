@@ -38,7 +38,7 @@
 //! the same HSM-deferred posture all families carry, made explicit here
 //! because the key material is local.
 
-use alloy_primitives::hex;
+use alloy_primitives::{hex, keccak256};
 use axum::{extract::State, http::StatusCode, response::Json};
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
 use xindex_shared::signer_wire::{
@@ -47,7 +47,7 @@ use xindex_shared::signer_wire::{
 use xindex_solana_tx::message::Message;
 use xindex_solana_tx::{base58, sigs, squads, Pubkey};
 
-use crate::replay::ReplayStore;
+use crate::replay::{CheckOutcome, ReplayError, ReplayStore};
 use crate::server::DaemonState;
 use crate::web3signer::HsmDigestSigner;
 
@@ -99,6 +99,57 @@ fn bad(field: &str, e: impl std::fmt::Display) -> DaemonErr {
         StatusCode::BAD_REQUEST,
         format!("{field}: {e}"),
     )
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "unix secs within i64 range for centuries"
+            )]
+            let v = d.as_secs() as i64;
+            v
+        })
+}
+
+/// P-SOL-6: the on-chain Squads step kind as the stable replay-key string.
+fn solana_kind_str(kind: SolanaTxKind) -> &'static str {
+    match kind {
+        SolanaTxKind::Create => "create",
+        SolanaTxKind::Approve => "approve",
+        SolanaTxKind::Execute => "execute",
+    }
+}
+
+/// P-SOL-6: keccak of the SEMANTIC redemption intent — the fields that define
+/// WHAT is authorized (kind + `transaction_index` + destination + amount +
+/// memo), deliberately EXCLUDING the volatile `recent_blockhash`. So a re-sign
+/// of the same intent with a fresh blockhash is idempotent, while a different
+/// destination/amount at an already-used step is a `Conflict`. Each field is
+/// length-prefixed so no boundary is ambiguous.
+fn solana_semantic_hash(req: &SolanaTxSignRequest) -> [u8; 32] {
+    fn push(buf: &mut Vec<u8>, f: &[u8]) {
+        buf.extend_from_slice(&u32::try_from(f.len()).unwrap_or(u32::MAX).to_le_bytes());
+        buf.extend_from_slice(f);
+    }
+    let mut buf = Vec::new();
+    push(&mut buf, solana_kind_str(req.tx_kind).as_bytes());
+    push(&mut buf, req.transaction_index.as_bytes());
+    push(
+        &mut buf,
+        req.inner_destination.as_deref().unwrap_or("").as_bytes(),
+    );
+    push(
+        &mut buf,
+        req.inner_amount_lamports
+            .as_deref()
+            .unwrap_or("")
+            .as_bytes(),
+    );
+    push(&mut buf, req.memo.as_deref().unwrap_or("").as_bytes());
+    keccak256(&buf).into()
 }
 
 /// Parse the inner destination + lamports a Create / Execute request must
@@ -311,7 +362,78 @@ where
             "no Solana signing key configured for this chain",
         )
     })?;
-    Ok(Json(validate_and_sign(&req, config)?))
+
+    // Never-blind-sign: rebuild + byte-match + destination sanity, then
+    // ed25519-sign the rebuilt message.
+    let resp = validate_and_sign(&req, config)?;
+
+    // P-SOL-6: daemon-side replay defense-in-depth keyed on the on-chain Squads
+    // step identity `(chain, multisig, transaction_index, kind, member)`. The
+    // payload is the SEMANTIC intent (blockhash excluded) — a fresh-blockhash
+    // re-sign of the same intent is idempotent; a different destination/amount
+    // at an already-used step is a 409. Mirrors the on-chain Squads guards.
+    let transaction_index = req
+        .transaction_index
+        .parse::<u64>()
+        .map_err(|e| bad("transaction_index", e))?;
+    let kind = solana_kind_str(req.tx_kind);
+    let sem_hash = solana_semantic_hash(&req);
+    let replay_err = |e: ReplayError| {
+        err(
+            error_codes::BAD_REQUEST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("replay db: {e}"),
+        )
+    };
+
+    match state
+        .replay
+        .check_solana_tx(
+            req.chain_id,
+            req.multisig_pda.clone(),
+            transaction_index,
+            kind,
+            req.member_pubkey.clone(),
+            sem_hash,
+        )
+        .await
+        .map_err(replay_err)?
+    {
+        CheckOutcome::Conflict { .. } => {
+            return Err(err(
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                StatusCode::CONFLICT,
+                "this Squads step (transaction_index + kind) was already signed for a \
+                 different intent",
+            ));
+        }
+        // Same intent (possibly a fresh blockhash) — return the freshly-signed
+        // message; the row already exists, no re-record.
+        CheckOutcome::Idempotent(_) => return Ok(Json(resp)),
+        CheckOutcome::FirstTime => {}
+    }
+
+    let sig_bytes = hex::decode(resp.signature.strip_prefix("0x").unwrap_or(&resp.signature))
+        .unwrap_or_default();
+    if let Err(e) = state
+        .replay
+        .record_solana_tx(
+            req.chain_id,
+            req.multisig_pda.clone(),
+            transaction_index,
+            kind,
+            req.member_pubkey.clone(),
+            sem_hash,
+            sig_bytes,
+            now_unix_secs(),
+        )
+        .await
+    {
+        if !matches!(e, ReplayError::Duplicate) {
+            return Err(replay_err(e));
+        }
+    }
+    Ok(Json(resp))
 }
 
 #[cfg(test)]
@@ -490,5 +612,73 @@ mod tests {
         let req = request(&config, SolanaTxKind::Execute, vault);
         let (_status, body) = validate_and_sign(&req, &config).expect_err("reject");
         assert_eq!(body.0.code, error_codes::SOLANA_DEST_NOT_PERMITTED);
+    }
+
+    // ── P-SOL-6: handler-level replay arm ──────────────────────────────────
+
+    use crate::replay::InMemoryReplayStore;
+    use crate::server::{DaemonConfig, DaemonState};
+    use crate::web3signer::{HsmDigestSigner, HsmError};
+    use alloy_primitives::{Address, B256};
+    use std::sync::Arc;
+
+    /// ed25519 Solana signs locally via `member_seed`; the HSM is never
+    /// invoked, so this stub just satisfies the `DaemonState` type bound.
+    #[derive(Debug)]
+    struct UnusedHsm;
+
+    #[async_trait::async_trait]
+    impl HsmDigestSigner for UnusedHsm {
+        async fn sign_digest(&self, _a: Address, _d: B256) -> Result<[u8; 65], HsmError> {
+            Err(HsmError::Decode("solana never calls the HSM".to_string()))
+        }
+    }
+
+    fn sol_state(config: &SolSignerConfig) -> DaemonState<InMemoryReplayStore, UnusedHsm> {
+        DaemonState::new(
+            DaemonConfig {
+                chain_id: 1,
+                verifying_contract: Address::ZERO,
+                eth_address: Address::ZERO,
+            },
+            Arc::new(InMemoryReplayStore::new()),
+            Arc::new(UnusedHsm),
+        )
+        .with_sol(config.clone())
+    }
+
+    #[tokio::test]
+    async fn handler_records_then_idempotent_replay() {
+        let config = cfg([5; 32]);
+        let dest = Pubkey::new([0x99; 32]);
+        let st = sol_state(&config);
+        let req = request(&config, SolanaTxKind::Create, dest);
+        let first = handle_solana_tx(State(st.clone()), Json(req.clone()))
+            .await
+            .expect("first sign");
+        // Identical re-request (same blockhash) → idempotent, same signature.
+        let second = handle_solana_tx(State(st), Json(req))
+            .await
+            .expect("idempotent");
+        assert_eq!(first.signature, second.signature);
+    }
+
+    #[tokio::test]
+    async fn handler_conflicts_on_different_intent_same_step() {
+        // The same Squads step (transaction_index + kind) signed for a
+        // DIFFERENT destination is a 409 — the defense-in-depth P-SOL-6 adds.
+        let config = cfg([5; 32]);
+        let st = sol_state(&config);
+        let req1 = request(&config, SolanaTxKind::Create, Pubkey::new([0x99; 32]));
+        let _first = handle_solana_tx(State(st.clone()), Json(req1))
+            .await
+            .expect("first sign");
+        // Same transaction_index (11) + kind (Create), different dest.
+        let req2 = request(&config, SolanaTxKind::Create, Pubkey::new([0x55; 32]));
+        let (status, body) = handle_solana_tx(State(st), Json(req2))
+            .await
+            .expect_err("conflict");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0.code, error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT);
     }
 }

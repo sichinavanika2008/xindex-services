@@ -36,6 +36,7 @@ use xindex_shared::signer_wire::{
 
 use crate::replay::{CheckOutcome, ReplayStore};
 use crate::server::DaemonState;
+use crate::sig_norm::normalize_low_s;
 use crate::web3signer::{HsmDigestSigner, HsmError};
 
 /// Per-chain EVM signing role configuration. One entry per EVM chain
@@ -147,6 +148,45 @@ fn parse_operation(op: u8) -> Result<SafeOperation, (StatusCode, Json<ErrorBody>
     }
 }
 
+/// EVM-Safe CTD-1 family floor — the daemon-LOCAL spend bound that needs no
+/// trusted intent, mirroring the BTC `enforce_change_and_fee` floor (M2b).
+///
+/// The honest executor (`crates/executor/src/evm_redeem.rs`) ALWAYS emits a
+/// fixed Safe-tx template: `operation = Call` and every gas-refund field zero
+/// (Phase 3.2 has no Safe-side refund — `KNOWN_FINDINGS` P3.2-11). The
+/// `safeTxHash` recompute (never-blind-sign) only proves the daemon signs what
+/// the inputs SAY — not that the inputs are SAFE. Without this floor a
+/// compromised coordinator (UNTRUSTED per DL-CTD-1) could have the 3-of-5 sign:
+///   - `operation = DelegateCall` → arbitrary code in the Safe's own context =
+///     Safe TAKEOVER (add an owner / sweep every asset), far beyond a drain;
+///   - a non-zero `gas_price`/`gas_token`/`refund_receiver` → the Safe pays
+///     `gasPrice·gasUsed` of `gasToken` to `refundReceiver`, a value-extraction
+///     channel orthogonal to the `to`/`value`/`data` destination.
+///
+/// `to`/`value`/`data` remain coordinator-supplied — the destination residual
+/// the RIC fix closes (CTD-1). This floor is the necessary-but-not-sufficient
+/// per-family minimum the M2b note calls for.
+fn enforce_evm_safe_floor(tx: &SafeTransaction) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if tx.operation != SafeOperation::Call {
+        return Err(err(
+            error_codes::EVM_SAFE_OPERATION_FORBIDDEN,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "operation must be Call (0); DelegateCall is never used by an honest redemption",
+        ));
+    }
+    if !tx.gas_price.is_zero()
+        || tx.gas_token != Address::ZERO
+        || tx.refund_receiver != Address::ZERO
+    {
+        return Err(err(
+            error_codes::EVM_SAFE_GAS_REFUND_FORBIDDEN,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "gas_price/gas_token/refund_receiver must all be zero (no Safe-side refund in Phase 3.2)",
+        ));
+    }
+    Ok(())
+}
+
 fn parse_nonce_u64(nonce_str: &str) -> Result<u64, (StatusCode, Json<ErrorBody>)> {
     let n = U256::from_str_radix(nonce_str, 10).map_err(|e| {
         err(
@@ -195,42 +235,6 @@ fn hsm_unavailable(e: &HsmError) -> (StatusCode, Json<ErrorBody>) {
         StatusCode::SERVICE_UNAVAILABLE,
         e.to_string(),
     )
-}
-
-/// 1.13 — EIP-2 low-S normalization of the HSM's 65-byte `r ‖ s ‖ v`.
-///
-/// Safe's `checkSignatures` rejects a high-S ECDSA signature (the EIP-2
-/// malleability rule), so a high-S owner signature would make the assembled
-/// multisig `execTransaction` revert on-chain. If `s` is in the upper
-/// half-order we replace it with `n - s` and flip the recovery byte; the
-/// `(r, n-s)` pair recovers to the SAME signer with the opposite parity. The
-/// HSM (`Web3Signer`) already emits low-S, so this is normally a no-op —
-/// defense-in-depth against a non-canonical signing response. We preserve the
-/// HSM's `v` convention (only flipping 27↔28 / 0↔1), and the recover-verify
-/// below re-checks the normalized signature, so an incorrect normalization
-/// fails closed (never recorded). Confirming the HSM's BASE `v` convention
-/// against a live `Web3Signer` + Safe `checkSignatures` remains a separate
-/// pre-mainnet gate.
-fn normalize_low_s(sig: [u8; 65]) -> Result<[u8; 65], (StatusCode, Json<ErrorBody>)> {
-    let parsed = k256::ecdsa::Signature::from_slice(&sig[..64]).map_err(|e| {
-        err(
-            error_codes::SIGNER_RECOVER_MISMATCH,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("HSM signature r||s did not parse: {e}"),
-        )
-    })?;
-    let mut out = sig;
-    if let Some(low) = parsed.normalize_s() {
-        out[..64].copy_from_slice(&low.to_bytes());
-        out[64] = match sig[64] {
-            27 => 28,
-            28 => 27,
-            0 => 1,
-            1 => 0,
-            v => v,
-        };
-    }
-    Ok(out)
 }
 
 /// Axum handler for `/api/v1/sign/evm-safe-tx`.
@@ -319,6 +323,12 @@ where
         refund_receiver,
         nonce: nonce_u256,
     };
+
+    // CTD-1 family floor: reject DelegateCall + any Safe-side refund before
+    // the HSM is ever consulted. Needs no trusted intent (the honest template
+    // is a constant), so it holds even under coordinator compromise.
+    enforce_evm_safe_floor(&safe_tx)?;
+
     let recomputed = safe_tx_hash(evm_chain_id, req_safe, &safe_tx);
     let recomputed_bytes: [u8; 32] = recomputed.into();
     if recomputed_bytes != claimed_hash {
@@ -472,63 +482,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::ecdsa::{Signature, SigningKey};
 
-    /// Recover the EVM address of a k256 key (keccak of the uncompressed
-    /// pubkey, last 20 bytes).
-    fn evm_addr(sk: &SigningKey) -> Address {
-        let unc = sk.verifying_key().to_encoded_point(false);
-        let h = alloy_primitives::keccak256(&unc.as_bytes()[1..]);
-        Address::from_slice(&h.as_slice()[12..])
+    /// The honest executor's fixed template (Call + all gas-refund fields
+    /// zero, only `to`/`value`/`data`/`nonce` vary) passes the floor.
+    fn honest_safe_tx() -> SafeTransaction {
+        SafeTransaction {
+            to: Address::repeat_byte(0xab),
+            value: U256::from(1u64),
+            data: Bytes::new(),
+            operation: SafeOperation::Call,
+            safe_tx_gas: U256::ZERO,
+            base_gas: U256::ZERO,
+            gas_price: U256::ZERO,
+            gas_token: Address::ZERO,
+            refund_receiver: Address::ZERO,
+            nonce: U256::ZERO,
+        }
     }
 
-    /// 1.13: a low-S signature passes through `normalize_low_s` unchanged.
     #[test]
-    #[expect(clippy::expect_used, reason = "test code")]
-    fn low_s_signature_unchanged() {
-        let sk = SigningKey::from_slice(&[5u8; 32]).expect("key");
-        let digest = [0x42u8; 32];
-        let (sig, recid) = sk.sign_prehash_recoverable(&digest).expect("sign"); // low-S
-        let mut bytes = [0u8; 65];
-        bytes[..64].copy_from_slice(&sig.to_bytes());
-        bytes[64] = 27 + recid.to_byte();
-        assert_eq!(normalize_low_s(bytes).expect("normalize"), bytes);
+    fn floor_accepts_honest_template() {
+        assert!(enforce_evm_safe_floor(&honest_safe_tx()).is_ok());
     }
 
-    /// 1.13: a high-S signature is normalized to low-S, the recovery byte is
-    /// flipped, and the result still recovers to the signer.
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
-    fn high_s_signature_is_normalized_and_recovers() {
-        let sk = SigningKey::from_slice(&[9u8; 32]).expect("key");
-        let digest = [0x11u8; 32];
-        let (low, recid) = sk.sign_prehash_recoverable(&digest).expect("sign");
-        let low_v = 27 + recid.to_byte();
-        // High-S counterpart: (r, n - s); recovers with the opposite parity.
-        let neg_s = -*low.s();
-        let high = Signature::from_scalars(low.r().to_bytes(), neg_s.to_bytes()).expect("high sig");
-        assert!(high.normalize_s().is_some(), "expected a high-S signature");
-        let high_v = if low_v == 27 { 28 } else { 27 };
-        let mut bytes = [0u8; 65];
-        bytes[..64].copy_from_slice(&high.to_bytes());
-        bytes[64] = high_v;
+    fn floor_rejects_delegatecall() {
+        let mut tx = honest_safe_tx();
+        tx.operation = SafeOperation::DelegateCall;
+        let e = enforce_evm_safe_floor(&tx).expect_err("DelegateCall must be rejected");
+        assert_eq!(e.1.code, error_codes::EVM_SAFE_OPERATION_FORBIDDEN);
+    }
 
-        let out = normalize_low_s(bytes).expect("normalize");
-        // Output is the canonical low-S form with the flipped recovery byte.
-        assert_eq!(&out[..64], &low.to_bytes()[..]);
-        assert_eq!(out[64], low_v);
-        assert!(
-            Signature::from_slice(&out[..64])
-                .expect("parse")
-                .normalize_s()
-                .is_none(),
-            "output must be low-S"
-        );
-        // And it recovers to the signer.
-        let recovered = PrimitiveSignature::try_from(out.as_slice())
-            .expect("parse")
-            .recover_address_from_prehash(&alloy_primitives::B256::from(digest))
-            .expect("recover");
-        assert_eq!(recovered, evm_addr(&sk));
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn floor_rejects_nonzero_gas_price() {
+        let mut tx = honest_safe_tx();
+        tx.gas_price = U256::from(1u64);
+        let e = enforce_evm_safe_floor(&tx).expect_err("non-zero gas_price must be rejected");
+        assert_eq!(e.1.code, error_codes::EVM_SAFE_GAS_REFUND_FORBIDDEN);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn floor_rejects_nonzero_refund_receiver() {
+        let mut tx = honest_safe_tx();
+        tx.refund_receiver = Address::repeat_byte(0x11);
+        let e = enforce_evm_safe_floor(&tx).expect_err("non-zero refund_receiver must be rejected");
+        assert_eq!(e.1.code, error_codes::EVM_SAFE_GAS_REFUND_FORBIDDEN);
     }
 }

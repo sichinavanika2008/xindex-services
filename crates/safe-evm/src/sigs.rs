@@ -148,6 +148,14 @@ pub enum AggregateError {
     /// daemon mangled the sig bytes).
     #[error("ECDSA recovery failed: {0}")]
     Recovery(String),
+    /// `s` is in the upper half-order (high-S). Safe's `checkSignatures`
+    /// rejects a high-S signature (the EIP-2 malleability rule), so a
+    /// high-S partial would assemble into an on-chain-rejected bundle. The
+    /// daemon normalizes to low-S before returning (1.13); this is a
+    /// belt-and-suspenders assertion so a future non-normalizing signer
+    /// path cannot slip a high-S sig into the aggregate (AUD-EVMSAFE-AGG-LOWS).
+    #[error("non-canonical high-S signature")]
+    HighS,
 }
 
 /// Recover the 20-byte signer address from `(digest, sig)`. Uses
@@ -161,7 +169,9 @@ pub enum AggregateError {
 ///
 /// # Errors
 /// [`AggregateError::NonCanonicalV`] if `sig.v` is not 27 or 28;
-/// [`AggregateError::Recovery`] if `(r, s)` recover no point.
+/// [`AggregateError::HighS`] if `s` is in the upper half-order (Safe
+/// rejects high-S — EIP-2); [`AggregateError::Recovery`] if `(r, s)`
+/// recover no point.
 pub fn recover_signer(digest: B256, sig: &EcdsaSig) -> Result<Address, AggregateError> {
     use alloy_primitives::PrimitiveSignature;
     // EOA convention: v ∈ {27, 28} ⇒ y_parity ∈ {false, true}.
@@ -170,6 +180,19 @@ pub fn recover_signer(digest: B256, sig: &EcdsaSig) -> Result<Address, Aggregate
         28 => true,
         _ => return Err(AggregateError::NonCanonicalV(sig.v)),
     };
+    // EIP-2 low-S: reject a high-S `(r, s)` before it can be assembled into a
+    // bundle Safe's `checkSignatures` would revert. The daemon normalizes to
+    // low-S upstream (1.13); this assertion makes the aggregator self-defending
+    // (AUD-EVMSAFE-AGG-LOWS). `k256::ecdsa::Signature::normalize_s` returns
+    // `Some(low)` exactly when the input was high-S.
+    let mut rs = [0u8; 64];
+    rs[..32].copy_from_slice(sig.r.as_slice());
+    rs[32..].copy_from_slice(sig.s.as_slice());
+    let k_sig = k256::ecdsa::Signature::from_slice(&rs)
+        .map_err(|e| AggregateError::Recovery(format!("r||s parse: {e}")))?;
+    if k_sig.normalize_s().is_some() {
+        return Err(AggregateError::HighS);
+    }
     let s = PrimitiveSignature::from_scalars_and_parity(sig.r, sig.s, parity);
     s.recover_address_from_prehash(&digest)
         .map_err(|e| AggregateError::Recovery(format!("{e:?}")))
@@ -340,6 +363,45 @@ mod tests {
             }]
         )
         .is_ok());
+    }
+
+    /// AUD-EVMSAFE-AGG-LOWS: a high-S `(r, n - s)` partial is rejected at the
+    /// recovery cross-check (and therefore by `aggregate_signatures`), so a
+    /// non-normalizing signer path cannot assemble a Safe-rejected bundle.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn recover_signer_rejects_high_s() {
+        let (signer, low) = test_sign(
+            B256::from(hex!(
+                "4444444444444444444444444444444444444444444444444444444444444444"
+            )),
+            test_digest(),
+        );
+        // Form the high-S counterpart: (r, n - s). `from_scalars` re-validates.
+        let mut rs = [0u8; 64];
+        rs[..32].copy_from_slice(low.r.as_slice());
+        rs[32..].copy_from_slice(low.s.as_slice());
+        let k_low = k256::ecdsa::Signature::from_slice(&rs).expect("parse low");
+        let neg_s = -*k_low.s();
+        let k_high = k256::ecdsa::Signature::from_scalars(k_low.r().to_bytes(), neg_s.to_bytes())
+            .expect("high sig");
+        assert!(
+            k_high.normalize_s().is_some(),
+            "expected a high-S signature"
+        );
+        let high = EcdsaSig {
+            r: low.r,
+            s: B256::from(<[u8; 32]>::from(k_high.s().to_bytes())),
+            v: low.v,
+        };
+        assert_eq!(
+            recover_signer(test_digest(), &high),
+            Err(AggregateError::HighS)
+        );
+        // And the bulk aggregator rejects it too.
+        let err = aggregate_signatures(test_digest(), &[SignedBy { signer, sig: high }])
+            .expect_err("aggregate must reject high-S");
+        assert_eq!(err, AggregateError::HighS);
     }
 
     /// Helper: produce a deterministic test digest.
