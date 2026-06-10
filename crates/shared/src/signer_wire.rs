@@ -702,6 +702,58 @@ pub struct TronSignResponse {
     pub signature: String,
 }
 
+/// CTD-1 (`DL-CTD-2`): k-of-n Redemption Intent Certificate proof,
+/// attached to custody-spend signing requests (PSBT / EVM-Safe /
+/// Cosmos / XRP / TRON; Solana stays hard-gated out per RA-2).
+///
+/// Carries the PLAINTEXT fields of one `RedemptionIntentCertificate`
+/// ([`crate::eip712`], the 5th typed-data on the
+/// `attestation_oracle_domain`) plus the Set-B signatures over its
+/// EIP-712 digest. The RPC-free daemon recomputes the digest from
+/// these fields itself — it never trusts a coordinator-supplied
+/// digest — recovers each signature, requires ≥ quorum DISTINCT
+/// signers from its STATIC whitelist, then binds the spend's
+/// destination/amount/memo to the certified values. A compromised
+/// coordinator cannot forge k-of-n Set-B signatures, so it can no
+/// longer steer a custody spend to a destination the operators'
+/// observers did not independently resolve.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntentProof {
+    /// `bytes32` redemption id, `0x`-prefixed hex.
+    pub redemption_id: String,
+    /// `uint256` leg index, decimal string. Must additionally fit
+    /// `u32` (the daemon's replay-key width); on-chain leg indices
+    /// are bounded by basket size.
+    pub leg_index: String,
+    /// `bytes32` canonical asset id of THIS leg (e.g.
+    /// `keccak256("BTC.BTC")`), `0x`-prefixed hex.
+    pub asset_id: String,
+    /// `uint256` certified spend amount in the leg's native smallest
+    /// units (e.g. sats for BTC), decimal string.
+    pub amount: String,
+    /// Decimals pinning the unit of `amount` to the chain registry's
+    /// native decimals (RA-4) — bound like-for-like at the handler,
+    /// never rescaled.
+    pub amount_decimals: u8,
+    /// `bytes32` keccak of the immediate spend target the multisig
+    /// pays (the `THORChain` Asgard inbound: BTC `scriptPubKey`
+    /// bytes, EVM router address bytes, …), `0x`-prefixed hex.
+    pub immediate_target_hash: String,
+    /// `bytes32` keccak of the exact `THORChain` memo bytes, hex.
+    pub memo_hash: String,
+    /// `bytes32` keccak of the user's final native-chain payout
+    /// destination, hex.
+    pub final_destination_hash: String,
+    /// Unix seconds when the observers resolved the Asgard inbound.
+    /// The daemon enforces `now - vault_resolved_at <= ric_max_age`
+    /// so a certificate cannot be replayed onto a rotated vault
+    /// (RA-5 recency, replacing the unsourceable vault epoch).
+    pub vault_resolved_at: u64,
+    /// The k-of-n Set-B signatures over the RIC EIP-712 digest, each
+    /// a `0x`-prefixed 65-byte recoverable signature (`r ‖ s ‖ v`).
+    pub signatures: Vec<String>,
+}
+
 /// `GET /api/v1/keys`
 ///
 /// Daemon identity — coordinator pins this and checks every response
@@ -878,6 +930,37 @@ pub mod error_codes {
     /// channel (the Safe pays `gasPrice·gasUsed` of `gasToken` to
     /// `refundReceiver`). The daemon refuses to sign it. HTTP 422.
     pub const EVM_SAFE_GAS_REFUND_FORBIDDEN: &str = "evm_safe_gas_refund_forbidden";
+    /// CTD-1 (`DL-CTD-2`): the custody-spend request did not carry an
+    /// [`super::IntentProof`]. Every `THORChain`-family spend endpoint
+    /// (PSBT / EVM-Safe / Cosmos / XRP / TRON) REQUIRES a k-of-n
+    /// Redemption Intent Certificate once the RIC gate is wired —
+    /// there is no proof-less carve-out. HTTP 422.
+    pub const INTENT_PROOF_REQUIRED: &str = "intent_proof_required";
+    /// CTD-1: the attached `IntentProof` failed stateless verification
+    /// — an unparseable field, a malformed signature, a signer outside
+    /// the daemon's static Set-B whitelist, a duplicate signer, or
+    /// fewer than `intent_quorum` distinct valid signers over the
+    /// recomputed RIC digest. The daemon rejects the WHOLE proof on
+    /// any invalid element (strict — an honest relay never attaches
+    /// garbage). HTTP 422.
+    pub const INTENT_PROOF_INVALID: &str = "intent_proof_invalid";
+    /// CTD-1: the request's spend fields (destination / amount / memo
+    /// / redemption id / leg index) did not `==`-match the RIC's
+    /// certified values — the coordinator asked the daemon to sign a
+    /// spend the operators did not certify. HTTP 422.
+    pub const INTENT_MISMATCH: &str = "intent_mismatch";
+    /// CTD-1: the RIC's `vault_resolved_at` is outside the daemon's
+    /// `ric_max_age` window (or future-dated beyond clock-skew
+    /// tolerance) — the certified Asgard inbound may belong to a
+    /// rotated vault; observers must re-resolve and re-certify.
+    /// HTTP 422.
+    pub const INTENT_VAULT_STALE: &str = "intent_vault_stale";
+    /// CTD-1: a custody spend for this `(chain, redemption_id,
+    /// leg_index)` was already authorized under a DIFFERENT RIC digest
+    /// — the one-shot rule (one valid RIC ≠ N payouts, RA-1).
+    /// Identical retries are answered idempotently; only a re-drive
+    /// conflicts. HTTP 409.
+    pub const INTENT_ALREADY_SIGNED: &str = "intent_already_signed";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -1327,6 +1410,33 @@ mod tests {
                 "must surface NON_TRON_CHAIN; chain='{chain}', got: {err_msg}"
             );
         }
+    }
+
+    /// CTD-1: an `IntentProof` round-trips JSON without losing fields
+    /// — the k-of-n RIC attachment every custody-spend request will
+    /// carry once the gate is wired.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn intent_proof_json_round_trip() {
+        let proof = IntentProof {
+            redemption_id: format!("0x{}", "ab".repeat(32)),
+            leg_index: "0".to_string(),
+            asset_id: "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+                .to_string(),
+            amount: "100000000".to_string(),
+            amount_decimals: 8,
+            immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+            memo_hash: format!("0x{}", "ef".repeat(32)),
+            final_destination_hash: format!("0x{}", "12".repeat(32)),
+            vault_resolved_at: 1_750_000_000,
+            signatures: vec![
+                format!("0x{}", "ab".repeat(65)),
+                format!("0x{}", "cd".repeat(65)),
+            ],
+        };
+        let s = serde_json::to_string(&proof).expect("serialize");
+        let back: IntentProof = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, proof);
     }
 
     #[test]
