@@ -32,11 +32,12 @@ use axum::{
 };
 use xindex_shared::eip712::{
     attestation, attestation_oracle_domain, attestation_signing_hash, redemption_attestation,
-    redemption_attestation_signing_hash, refund_attestation, refund_attestation_signing_hash,
+    redemption_attestation_signing_hash, redemption_intent_certificate, refund_attestation,
+    refund_attestation_signing_hash, ric_signing_hash,
 };
 use xindex_shared::signer_wire::{
     error_codes, AttestationSignRequest, Eip712SignResponse, ErrorBody, HealthResponse,
-    KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest,
+    KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
 };
 
 use std::collections::HashMap;
@@ -223,7 +224,8 @@ where
             "/api/v1/sign/eip712-redemption-delivery",
             post(handle_redemption_delivery::<S, H>),
         )
-        .route("/api/v1/sign/eip712-refund", post(handle_refund::<S, H>));
+        .route("/api/v1/sign/eip712-refund", post(handle_refund::<S, H>))
+        .route("/api/v1/sign/eip712-ric", post(handle_ric_sign::<S, H>));
     if !state.utxo.is_empty() {
         r = r.route("/api/v1/sign/psbt-input", post(handle_psbt_input::<S, H>));
     }
@@ -305,6 +307,16 @@ fn bad(code: &str, message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) 
 fn conflict(code: &str, message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::CONFLICT,
+        Json(ErrorBody {
+            code: code.to_string(),
+            message: message.into(),
+        }),
+    )
+}
+
+fn unprocessable(code: &str, message: impl Into<String>) -> (StatusCode, Json<ErrorBody>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
         Json(ErrorBody {
             code: code.to_string(),
             message: message.into(),
@@ -690,6 +702,160 @@ where
                 "record race left no row",
             )),
         };
+    }
+    Ok(Json(render_signature(&state.config, sig)))
+}
+
+/// CTD-1 Slice A.7: how long after `vault_resolved_at` a Set-B daemon
+/// is still willing to SIGN a RIC. Deliberately tighter than the
+/// custody-side verification window: an honest observer requests
+/// certification immediately after resolving Asgard, so anything older
+/// signals a delayed or replayed certification attempt. Hardcoded —
+/// not operator-tunable — so a config mistake cannot widen it.
+const RIC_SIGN_MAX_AGE_SECS: u64 = 600;
+
+/// RA-5 at the SOURCE: a Set-B daemon only certifies a FRESH Asgard
+/// resolution. Future-dating beyond the shared clock-skew tolerance is
+/// refused so a compromised relay cannot mint long-lived certificates.
+fn check_ric_sign_recency(vault_resolved_at: u64) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let now = u64::try_from(now_unix_secs()).unwrap_or(0);
+    if vault_resolved_at > now.saturating_add(crate::intent::RIC_FUTURE_SKEW_TOLERANCE_SECS) {
+        return Err(unprocessable(
+            error_codes::INTENT_VAULT_STALE,
+            format!("vault_resolved_at {vault_resolved_at} is future-dated (now {now})"),
+        ));
+    }
+    if now.saturating_sub(vault_resolved_at) > RIC_SIGN_MAX_AGE_SECS {
+        return Err(unprocessable(
+            error_codes::INTENT_VAULT_STALE,
+            format!(
+                "vault_resolved_at {vault_resolved_at} older than the \
+                 {RIC_SIGN_MAX_AGE_SECS}s signing window (now {now})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Signing-endpoint response shape (the same tuple-error type every
+/// handler in this module returns).
+type SignResult = Result<Json<Eip712SignResponse>, (StatusCode, Json<ErrorBody>)>;
+
+/// Map a `ric_certs` replay outcome to a response: the cached RIC
+/// signature on an identical retry, 409 on an equivocating retry,
+/// `None` on first-time (caller proceeds — or treats it as impossible
+/// in the post-record race re-read).
+fn ric_cert_cached(config: &DaemonConfig, outcome: CheckOutcome) -> Option<SignResult> {
+    match outcome {
+        CheckOutcome::Idempotent(rec) => {
+            let arr: Result<[u8; 65], _> = rec.signature.as_slice().try_into();
+            Some(match arr {
+                Ok(a) => Ok(Json(render_signature(config, a))),
+                Err(_) => Err(bad(
+                    error_codes::BAD_REQUEST,
+                    "stored signature not 65 bytes".to_string(),
+                )),
+            })
+        }
+        CheckOutcome::Conflict { .. } => Some(Err(conflict(
+            error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+            "leg already certified under a different intent — refusing to equivocate",
+        ))),
+        CheckOutcome::FirstTime => None,
+    }
+}
+
+/// CTD-1 (`DL-CTD-2`) Slice A.7 — `POST /api/v1/sign/eip712-ric`.
+///
+/// Set-B certifies one redemption leg's custody-spend intent. The
+/// daemon: refuses Solana legs (RA-2 hard gate); recomputes the RIC
+/// EIP-712 digest from the plaintext fields on its locally-pinned
+/// domain (never a caller-supplied digest); refuses stale/future
+/// `vault_resolved_at` at the source; refuses to EQUIVOCATE — the
+/// `ric_certs` replay arm (SEPARATE from the custody one-shot) makes a
+/// second, different certificate for the same `(chain, redemption,
+/// leg)` a 409 that never reaches the HSM; recover-verifies the HSM
+/// signature (M6) before recording and returning it.
+async fn handle_ric_sign<S, H>(
+    State(state): State<DaemonState<S, H>>,
+    Json(req): Json<RicSignRequest>,
+) -> Result<Json<Eip712SignResponse>, (StatusCode, Json<ErrorBody>)>
+where
+    S: ReplayStore + 'static,
+    H: HsmDigestSigner + 'static,
+{
+    if req.chain_id == ChainId::Sol {
+        return Err(unprocessable(
+            error_codes::RIC_CHAIN_FORBIDDEN,
+            "solana legs are CTD-1 hard-gated (RA-2): no on-chain destination root to certify",
+        ));
+    }
+    let redemption_id = parse_b256(&req.redemption_id, "redemption_id")?;
+    let leg_index = parse_u256(&req.leg_index, "leg_index")?;
+    let leg = u32::try_from(leg_index)
+        .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
+    let asset_id = parse_b256(&req.asset_id, "asset_id")?;
+    let amount = parse_u256(&req.amount, "amount")?;
+    let immediate_target_hash = parse_b256(&req.immediate_target_hash, "immediate_target_hash")?;
+    let memo_hash = parse_b256(&req.memo_hash, "memo_hash")?;
+    let final_destination_hash = parse_b256(&req.final_destination_hash, "final_destination_hash")?;
+    check_ric_sign_recency(req.vault_resolved_at)?;
+
+    let ric = redemption_intent_certificate(
+        redemption_id,
+        leg_index,
+        asset_id,
+        amount,
+        req.amount_decimals,
+        immediate_target_hash,
+        memo_hash,
+        final_destination_hash,
+        req.vault_resolved_at,
+    );
+    let digest = ric_signing_hash(&ric, &state.config.domain());
+    let payload_hash: [u8; 32] = digest.0;
+
+    let outcome = state
+        .replay
+        .check_ric_cert(req.chain_id, redemption_id, leg, payload_hash)
+        .await
+        .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+    if let Some(resp) = ric_cert_cached(&state.config, outcome) {
+        return resp;
+    }
+    let sig = state
+        .hsm
+        .sign_digest(state.config.eth_address, digest)
+        .await
+        .map_err(|e| hsm_unavailable(&e))?;
+    recover_verify_signer(&sig, digest, state.config.eth_address)?;
+    if let Err(e) = state
+        .replay
+        .record_ric_cert(
+            req.chain_id,
+            redemption_id,
+            leg,
+            payload_hash,
+            sig.to_vec(),
+            now_unix_secs(),
+        )
+        .await
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+        }
+        // L10: lost the write race; return the winner's record.
+        let outcome = state
+            .replay
+            .check_ric_cert(req.chain_id, redemption_id, leg, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+        return ric_cert_cached(&state.config, outcome).unwrap_or_else(|| {
+            Err(internal(
+                error_codes::BAD_REQUEST,
+                "record race left no row",
+            ))
+        });
     }
     Ok(Json(render_signature(&state.config, sig)))
 }
@@ -1388,6 +1554,221 @@ mod tests {
             // path exists for a different method; the daemon doesn't
             // expose this path at all → 404.)
             assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// CTD-1 Slice A.7 — `/api/v1/sign/eip712-ric` (Set-B certifies a
+    /// redemption leg's custody-spend intent).
+    mod ric_sign_tests {
+        use super::*;
+
+        fn fresh_now() -> u64 {
+            u64::try_from(now_unix_secs()).unwrap_or(0)
+        }
+
+        fn ric_body(chain: &str, vault_resolved_at: u64) -> serde_json::Value {
+            serde_json::json!({
+                "chain_id": chain,
+                "redemption_id": format!("0x{}", "ab".repeat(32)),
+                "leg_index": "1",
+                "asset_id": format!("0x{}", "a1".repeat(32)),
+                "amount": "100000000",
+                "amount_decimals": 8,
+                "immediate_target_hash": format!("0x{}", "cd".repeat(32)),
+                "memo_hash": format!("0x{}", "ef".repeat(32)),
+                "final_destination_hash": format!("0x{}", "12".repeat(32)),
+                "vault_resolved_at": vault_resolved_at,
+            })
+        }
+
+        /// The single most important property: the daemon hands the HSM
+        /// the RIC digest recomputed from the request's plaintext fields
+        /// on ITS OWN pinned domain — independently recomputed here.
+        #[tokio::test]
+        async fn ric_sign_hands_hsm_the_recomputed_ric_digest() {
+            let (state, hsm) = build_state();
+            let app = router(state);
+            let resolved_at = fresh_now() - 5;
+
+            let (status, body) = post_json(
+                &app,
+                "/api/v1/sign/eip712-ric",
+                ric_body("btc", resolved_at),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "body: {body}");
+            let sig_hex = body["signature"].as_str().unwrap_or("");
+            assert!(sig_hex.starts_with("0x") && sig_hex.len() == 2 + 130);
+            assert_eq!(
+                body["signer_address"].as_str().unwrap_or(""),
+                format!("{:#x}", test_key().address())
+            );
+
+            let expected_ric = redemption_intent_certificate(
+                B256::repeat_byte(0xab),
+                U256::from(1u8),
+                B256::repeat_byte(0xa1),
+                U256::from(100_000_000_u64),
+                8,
+                B256::repeat_byte(0xcd),
+                B256::repeat_byte(0xef),
+                B256::repeat_byte(0x12),
+                resolved_at,
+            );
+            let expected_digest = ric_signing_hash(
+                &expected_ric,
+                &attestation_oracle_domain(cfg().chain_id, cfg().verifying_contract),
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap().clone();
+            assert_eq!(seen, vec![(test_key().address(), expected_digest)]);
+        }
+
+        /// Identical retry → cached signature, HSM invoked exactly once.
+        #[tokio::test]
+        async fn ric_sign_identical_retry_is_idempotent() {
+            let (state, hsm) = build_state();
+            let app = router(state);
+            let body = ric_body("btc", fresh_now() - 5);
+
+            let (s1, b1) = post_json(&app, "/api/v1/sign/eip712-ric", body.clone()).await;
+            let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", body).await;
+            assert_eq!(s1, StatusCode::OK);
+            assert_eq!(s2, StatusCode::OK);
+            assert_eq!(b1["signature"], b2["signature"]);
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let calls = hsm.seen.lock().unwrap().len();
+            assert_eq!(calls, 1, "idempotent retry must not re-invoke the HSM");
+        }
+
+        /// A DIFFERENT certificate for the same `(chain, redemption,
+        /// leg)` → 409 equivocation refusal, HSM never re-invoked.
+        #[tokio::test]
+        async fn ric_sign_equivocation_is_409() {
+            let (state, hsm) = build_state();
+            let app = router(state);
+            let resolved_at = fresh_now() - 5;
+
+            let (s1, _) = post_json(
+                &app,
+                "/api/v1/sign/eip712-ric",
+                ric_body("btc", resolved_at),
+            )
+            .await;
+            assert_eq!(s1, StatusCode::OK);
+
+            let mut second = ric_body("btc", resolved_at);
+            second["amount"] = serde_json::json!("200000000");
+            let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", second).await;
+            assert_eq!(s2, StatusCode::CONFLICT);
+            assert_eq!(
+                b2["code"].as_str().unwrap_or(""),
+                error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let calls = hsm.seen.lock().unwrap().len();
+            assert_eq!(calls, 1, "equivocating retry must never reach the HSM");
+        }
+
+        /// Same redemption+leg on a DIFFERENT chain is an independent
+        /// replay namespace (a leg belongs to exactly one chain; the
+        /// namespace split just keeps the key honest).
+        #[tokio::test]
+        async fn ric_sign_chain_namespaces_are_independent() {
+            let (state, _hsm) = build_state();
+            let app = router(state);
+            let resolved_at = fresh_now() - 5;
+
+            let (s1, _) = post_json(
+                &app,
+                "/api/v1/sign/eip712-ric",
+                ric_body("btc", resolved_at),
+            )
+            .await;
+            let (s2, _) = post_json(
+                &app,
+                "/api/v1/sign/eip712-ric",
+                ric_body("ltc", resolved_at),
+            )
+            .await;
+            assert_eq!(s1, StatusCode::OK);
+            assert_eq!(s2, StatusCode::OK);
+        }
+
+        /// RA-2: the daemon refuses to certify a Solana leg.
+        #[tokio::test]
+        async fn ric_sign_rejects_solana() {
+            let (state, hsm) = build_state();
+            let app = router(state);
+
+            let (status, body) = post_json(
+                &app,
+                "/api/v1/sign/eip712-ric",
+                ric_body("sol", fresh_now()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                body["code"].as_str().unwrap_or(""),
+                error_codes::RIC_CHAIN_FORBIDDEN
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let calls = hsm.seen.lock().unwrap().len();
+            assert_eq!(calls, 0, "the RA-2 gate must fire before the HSM");
+        }
+
+        /// RA-5 at the source: stale and future-dated resolutions are
+        /// refused before the HSM.
+        #[tokio::test]
+        async fn ric_sign_rejects_stale_and_future_resolution() {
+            let (state, hsm) = build_state();
+            let app = router(state);
+            let now = fresh_now();
+
+            let stale = ric_body("btc", now - RIC_SIGN_MAX_AGE_SECS - 30);
+            let (s1, b1) = post_json(&app, "/api/v1/sign/eip712-ric", stale).await;
+            assert_eq!(s1, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                b1["code"].as_str().unwrap_or(""),
+                error_codes::INTENT_VAULT_STALE
+            );
+
+            let future = ric_body(
+                "btc",
+                now + crate::intent::RIC_FUTURE_SKEW_TOLERANCE_SECS + 30,
+            );
+            let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", future).await;
+            assert_eq!(s2, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                b2["code"].as_str().unwrap_or(""),
+                error_codes::INTENT_VAULT_STALE
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let calls = hsm.seen.lock().unwrap().len();
+            assert_eq!(calls, 0, "recency rejections must never reach the HSM");
+        }
+
+        /// Malformed fields are 400s at the parse boundary.
+        #[tokio::test]
+        async fn ric_sign_rejects_malformed_fields() {
+            let (state, _hsm) = build_state();
+            let app = router(state);
+            let now = fresh_now();
+
+            let mut bad_rid = ric_body("btc", now - 5);
+            bad_rid["redemption_id"] = serde_json::json!("0x1234");
+            let (s1, _) = post_json(&app, "/api/v1/sign/eip712-ric", bad_rid).await;
+            assert_eq!(s1, StatusCode::BAD_REQUEST);
+
+            let mut big_leg = ric_body("btc", now - 5);
+            big_leg["leg_index"] = serde_json::json!("4294967296");
+            let (s2, _) = post_json(&app, "/api/v1/sign/eip712-ric", big_leg).await;
+            assert_eq!(s2, StatusCode::BAD_REQUEST);
+
+            let mut bad_amount = ric_body("btc", now - 5);
+            bad_amount["amount"] = serde_json::json!("12x");
+            let (s3, _) = post_json(&app, "/api/v1/sign/eip712-ric", bad_amount).await;
+            assert_eq!(s3, StatusCode::BAD_REQUEST);
         }
     }
 }

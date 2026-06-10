@@ -754,6 +754,45 @@ pub struct IntentProof {
     pub signatures: Vec<String>,
 }
 
+/// `POST /api/v1/sign/eip712-ric`
+///
+/// CTD-1 (`DL-CTD-2`) Slice A.7: Set-B Redemption-Intent-Certificate
+/// signing. The operator's OWN observer resolves the Asgard inbound +
+/// verifies the amount from diverse sources, then asks its daemon to
+/// certify the spend by signing the RIC typed-data. The daemon
+/// recomputes the EIP-712 digest from these plaintext fields on its
+/// locally-pinned domain (never a caller-supplied digest), refuses to
+/// EQUIVOCATE (a second, DIFFERENT certificate for the same
+/// `(chain, redemption, leg)` is a 409 and never reaches the HSM),
+/// and refuses stale/future `vault_resolved_at` at the source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RicSignRequest {
+    /// The leg's native chain — the replay-key namespace, plus the
+    /// RA-2 gate: `sol` is refused (Solana redemptions stay
+    /// CTD-1-open; the daemon must never certify one).
+    pub chain_id: ChainId,
+    /// `bytes32` redemption id, `0x`-prefixed hex.
+    pub redemption_id: String,
+    /// `uint256` leg index, decimal string (must fit `u32`).
+    pub leg_index: String,
+    /// `bytes32` canonical asset id of THIS leg, `0x`-prefixed hex.
+    pub asset_id: String,
+    /// `uint256` certified spend amount in the leg's native smallest
+    /// units, decimal string.
+    pub amount: String,
+    /// Decimals pinning the unit of `amount` (RA-4).
+    pub amount_decimals: u8,
+    /// `bytes32` keccak of the immediate spend target the multisig
+    /// pays (the `THORChain` Asgard inbound), `0x`-prefixed hex.
+    pub immediate_target_hash: String,
+    /// `bytes32` keccak of the exact `THORChain` memo bytes, hex.
+    pub memo_hash: String,
+    /// `bytes32` keccak of the user's final payout destination, hex.
+    pub final_destination_hash: String,
+    /// Observer's Asgard-resolution time (unix seconds).
+    pub vault_resolved_at: u64,
+}
+
 /// `GET /api/v1/keys`
 ///
 /// Daemon identity — coordinator pins this and checks every response
@@ -961,6 +1000,12 @@ pub mod error_codes {
     /// Identical retries are answered idempotently; only a re-drive
     /// conflicts. HTTP 409.
     pub const INTENT_ALREADY_SIGNED: &str = "intent_already_signed";
+    /// CTD-1 (RA-2): the `eip712-ric` endpoint refuses to certify a
+    /// Solana-leg intent — Solana has no on-chain destination root, so
+    /// its redemption path stays CTD-1-open and hard-gated off
+    /// mainnet; certifying one would launder the gap behind a k-of-n
+    /// signature. HTTP 422.
+    pub const RIC_CHAIN_FORBIDDEN: &str = "ric_chain_forbidden";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -1437,6 +1482,33 @@ mod tests {
         let s = serde_json::to_string(&proof).expect("serialize");
         let back: IntentProof = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, proof);
+    }
+
+    /// CTD-1 Slice A.7: a `RicSignRequest` round-trips JSON for every
+    /// `THORChain`-family chain. `sol` round-trips at the SERDE layer
+    /// too — the RA-2 refusal is the daemon handler's runtime gate
+    /// (`RIC_CHAIN_FORBIDDEN`), not a wire-schema rule, so a future
+    /// un-gating is a daemon change rather than a wire break.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn ric_sign_request_json_round_trip() {
+        for chain in [ChainId::Btc, ChainId::Eth, ChainId::Gaia, ChainId::Sol] {
+            let req = RicSignRequest {
+                chain_id: chain,
+                redemption_id: format!("0x{}", "ab".repeat(32)),
+                leg_index: "1".to_string(),
+                asset_id: format!("0x{}", "a1".repeat(32)),
+                amount: "100000000".to_string(),
+                amount_decimals: 8,
+                immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+                memo_hash: format!("0x{}", "ef".repeat(32)),
+                final_destination_hash: format!("0x{}", "12".repeat(32)),
+                vault_resolved_at: 1_750_000_000,
+            };
+            let s = serde_json::to_string(&req).expect("serialize");
+            let back: RicSignRequest = serde_json::from_str(&s).expect("deserialize");
+            assert_eq!(back, req);
+        }
     }
 
     #[test]

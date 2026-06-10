@@ -371,6 +371,34 @@ pub trait ReplayStore: Send + Sync {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// CTD-1 Slice A.7 — Set-B NON-EQUIVOCATION pre-flight for SIGNING a
+    /// Redemption Intent Certificate, keyed `(chain_id, redemption_id,
+    /// leg_index)`. SEPARATE from the custody-side `*_ric_intent` one-shot:
+    /// a multi-role daemon must never conflate "I certified this intent"
+    /// (this arm — stores the RIC signature) with "I authorized the spend"
+    /// (the intent arm — stores the spend authorization). `payload_hash`
+    /// is the RIC digest: an identical retry is `Idempotent` (cached RIC
+    /// signature), a DIFFERENT certificate for the same leg is a
+    /// `Conflict` — this daemon refuses to equivocate.
+    fn check_ric_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// CTD-1 Slice A.7: record a signed Redemption Intent Certificate.
+    fn record_ric_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -397,6 +425,9 @@ struct InMemoryInner {
     solana_txs: HashMap<(&'static str, String, u64, &'static str, String), SignedRecord>,
     /// CTD-1 (`DL-CTD-2`): RIC one-shot key — `(chain_id_str, redemption_id, leg_index)`.
     ric_intents: HashMap<(&'static str, B256, u32), SignedRecord>,
+    /// CTD-1 Slice A.7: Set-B signed-certificate key (non-equivocation) —
+    /// same tuple shape as `ric_intents` but a SEPARATE namespace.
+    ric_certs: HashMap<(&'static str, B256, u32), SignedRecord>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -807,6 +838,48 @@ impl ReplayStore for InMemoryReplayStore {
         let key = (chain_id.thor_asset(), redemption_id, leg_index);
         let mut g = self.inner.lock().await;
         if let std::collections::hash_map::Entry::Vacant(e) = g.ric_intents.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Duplicate)
+        }
+    }
+
+    async fn check_ric_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), redemption_id, leg_index);
+        let g = self.inner.lock().await;
+        Ok(match g.ric_certs.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_ric_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), redemption_id, leg_index);
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.ric_certs.entry(key) {
             e.insert(SignedRecord {
                 payload_hash,
                 signature,
@@ -1519,6 +1592,72 @@ impl ReplayStore for SqliteReplayStore {
         .await;
         Self::map_insert(res)
     }
+
+    async fn check_ric_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let leg_i = i64::from(leg_index);
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM ric_certs
+             WHERE chain_id = ? AND redemption_id = ? AND leg_index = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(redemption_id.as_slice())
+        .bind(leg_i)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_ric_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        redemption_id: B256,
+        leg_index: u32,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let leg_i = i64::from(leg_index);
+        let res = sqlx::query(
+            "INSERT INTO ric_certs
+                (chain_id, redemption_id, leg_index, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(redemption_id.as_slice())
+        .bind(leg_i)
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await;
+        Self::map_insert(res)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2083,6 +2222,118 @@ mod tests {
             .await
             .expect("connect");
         run_ric_intent_lifecycle(&store).await;
+    }
+
+    /// CTD-1 Slice A.7: the Set-B cert arm has the same lifecycle shape
+    /// as the custody one-shot — idempotent on the same digest, Conflict
+    /// (equivocation refusal) on a different digest for the same leg.
+    async fn run_ric_cert_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let rid = id1();
+            assert_eq!(
+                store
+                    .check_ric_cert(ChainId::Btc, rid, 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_ric_cert(ChainId::Btc, rid, 0, hash_a(), vec![9, 9], 100)
+                .await
+                .expect("record");
+            assert!(matches!(
+                store
+                    .check_ric_cert(ChainId::Btc, rid, 0, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![9, 9]
+            ));
+            // A DIFFERENT certificate for the same leg → equivocation
+            // refusal.
+            assert!(matches!(
+                store
+                    .check_ric_cert(ChainId::Btc, rid, 0, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            // Double-record is a Duplicate error.
+            assert!(matches!(
+                store
+                    .record_ric_cert(ChainId::Btc, rid, 0, hash_a(), vec![9, 9], 101)
+                    .await,
+                Err(ReplayError::Duplicate)
+            ));
+        }
+    }
+
+    /// CTD-1 Slice A.7: the cert arm and the custody one-shot arm are
+    /// SEPARATE namespaces — certifying a leg must not consume (or be
+    /// consumed by) the custody-spend authorization for the same
+    /// `(chain, redemption, leg)` key. A multi-role daemon that both
+    /// certifies (Set-B) and spends (custody key) depends on this.
+    async fn run_ric_cert_vs_intent_independence<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let rid = id1();
+            store
+                .record_ric_cert(ChainId::Btc, rid, 0, hash_a(), vec![1], 100)
+                .await
+                .expect("record cert");
+            // The custody one-shot for the same key is untouched.
+            assert_eq!(
+                store
+                    .check_ric_intent(ChainId::Btc, rid, 0, hash_a())
+                    .await
+                    .expect("check intent"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_ric_intent(ChainId::Btc, rid, 0, hash_a(), vec![2], 101)
+                .await
+                .expect("record intent");
+            // And the cert record is unchanged by the intent record.
+            assert!(matches!(
+                store
+                    .check_ric_cert(ChainId::Btc, rid, 0, hash_a())
+                    .await
+                    .expect("check cert"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1]
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_ric_cert_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_ric_cert_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_ric_cert_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_ric_cert_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_ric_cert_independent_of_ric_intent() {
+        let store = InMemoryReplayStore::new();
+        run_ric_cert_vs_intent_independence(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_ric_cert_independent_of_ric_intent() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_ric_cert_vs_intent_independence(&store).await;
     }
 
     #[tokio::test]

@@ -15,9 +15,14 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::Eip712Domain;
-use xindex_shared::eip712::{AsyncLegDeliveryAttestation, AsyncLegRefundAttestation, Attestation};
+use xindex_shared::chain_registry::ChainId;
+use xindex_shared::eip712::{
+    AsyncLegDeliveryAttestation, AsyncLegRefundAttestation, Attestation,
+    RedemptionIntentCertificate,
+};
 use xindex_shared::signer_wire::{
     AttestationSignRequest, Eip712SignResponse, RedemptionDeliverySignRequest, RefundSignRequest,
+    RicSignRequest,
 };
 
 use crate::{HsmBackend, SignerError, SoftwareSigner};
@@ -112,6 +117,40 @@ impl RemoteHsmBackend {
         bytes.as_slice().try_into().map_err(|_| {
             SignerError::Backend(format!("daemon signature length {} ≠ 65", bytes.len()))
         })
+    }
+
+    /// CTD-1 Slice A.7: ask the daemon to certify one redemption leg's
+    /// custody-spend intent (`POST /api/v1/sign/eip712-ric`). Typed
+    /// like the attestation methods — the daemon recomputes the RIC
+    /// digest from these plaintext fields on its own pinned domain and
+    /// refuses to equivocate per `(chain, redemption, leg)`. Called by
+    /// the per-operator observer (Slice B); inherent rather than a
+    /// [`HsmBackend`] trait method until the observer's software-mode
+    /// story needs one there.
+    ///
+    /// # Errors
+    /// [`SignerError::Backend`] on transport / HTTP / signer-pin /
+    /// signature-shape failures — including the daemon's 409
+    /// equivocation refusal and 422 stale-resolution rejections,
+    /// surfaced with their HTTP status code in the message.
+    pub fn sign_ric(
+        &self,
+        chain_id: ChainId,
+        ric: &RedemptionIntentCertificate,
+    ) -> Result<[u8; 65], SignerError> {
+        let req = RicSignRequest {
+            chain_id,
+            redemption_id: format!("{:#x}", ric.redemptionId),
+            leg_index: ric.legIndex.to_string(),
+            asset_id: format!("{:#x}", ric.assetId),
+            amount: ric.amount.to_string(),
+            amount_decimals: ric.amountDecimals,
+            immediate_target_hash: format!("{:#x}", ric.immediateTargetHash),
+            memo_hash: format!("{:#x}", ric.memoHash),
+            final_destination_hash: format!("{:#x}", ric.finalDestinationHash),
+            vault_resolved_at: ric.vaultResolvedAt,
+        };
+        self.post_sign("/api/v1/sign/eip712-ric", &req)
     }
 }
 
@@ -396,5 +435,56 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(err.contains("typed"));
+    }
+
+    /// CTD-1 Slice A.7: the RIC certification request reaches the
+    /// daemon's `eip712-ric` endpoint with the typed plaintext payload
+    /// (the daemon recomputes the digest itself — no digest on the
+    /// wire), and the signer-pin check applies to the response.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sign_ric_round_trip_via_mock_daemon() {
+        let server = wiremock::MockServer::start().await;
+        let ric = xindex_shared::eip712::redemption_intent_certificate(
+            B256::repeat_byte(0xab),
+            U256::from(1u8),
+            B256::repeat_byte(0xa1),
+            U256::from(100_000_000u64),
+            8,
+            B256::repeat_byte(0xcd),
+            B256::repeat_byte(0xef),
+            B256::repeat_byte(0x12),
+            1_750_000_000,
+        );
+
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/v1/sign/eip712-ric"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "chain_id": "btc",
+                "redemption_id": format!("{:#x}", ric.redemptionId),
+                "leg_index": "1",
+                "asset_id": format!("{:#x}", ric.assetId),
+                "amount": "100000000",
+                "amount_decimals": 8,
+                "vault_resolved_at": 1_750_000_000_u64,
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "signature": fake_sig_hex(),
+                    "signer_address": format!("{:#x}", signer_addr()),
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let url = server.uri();
+        let sig = tokio::task::spawn_blocking(move || {
+            RemoteHsmBackend::new(url, signer_addr())
+                .sign_ric(xindex_shared::chain_registry::ChainId::Btc, &ric)
+        })
+        .await
+        .expect("join")
+        .expect("sign");
+        assert_eq!(sig.as_slice(), fake_sig_bytes().as_slice());
     }
 }
