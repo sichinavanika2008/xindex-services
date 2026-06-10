@@ -144,7 +144,9 @@ struct Args {
     #[arg(long, env = "ETH_MIN_CONFIRMATIONS", default_value_t = 12)]
     eth_min_confirmations: u32,
 
-    /// Min BTC confirmations for a refund UTXO. Default 6.
+    /// Min BTC confirmations for a refund UTXO. Default 6 (the BTC
+    /// `conf_depth`); a lower override is rejected at startup, and each leg is
+    /// additionally checked against its own chain's `conf_depth` (audit M9).
     #[arg(long, env = "BTC_MIN_CONFIRMATIONS", default_value_t = 6)]
     btc_min_confirmations: u32,
 
@@ -191,6 +193,41 @@ fn parse_btc_network(s: &str) -> Result<Network> {
     }
 }
 
+/// M9 hard floor: refuse to start the production (`thor-btc-usdt`) cross-check
+/// with a confirmation threshold below the chain's `conf_depth`. An operator
+/// can RAISE a threshold (more conservative) but never lower it below the
+/// reorg-safety bar — `ChainId::Eth.conf_depth()` (12) for the USDT arrival,
+/// `ChainId::Btc.conf_depth()` (6) for the refund UTXO. Below the floor, a
+/// reorg could revert an "observed" delivery/refund AFTER the attestation
+/// signs, double-paying the redemption.
+fn enforce_confirmation_floors(eth_min: u32, btc_min: u32) -> Result<()> {
+    use xindex_shared::chain_registry::ChainId;
+    let eth_floor = ChainId::Eth.conf_depth();
+    if eth_min < eth_floor {
+        anyhow::bail!(
+            "--eth-min-confirmations {eth_min} is below the ETH conf_depth floor \
+             {eth_floor} (audit M9: refuse under-confirmation)"
+        );
+    }
+    let btc_floor = ChainId::Btc.conf_depth();
+    if btc_min < btc_floor {
+        anyhow::bail!(
+            "--btc-min-confirmations {btc_min} is below the BTC conf_depth floor \
+             {btc_floor} (audit M9: refuse under-confirmation)"
+        );
+    }
+    Ok(())
+}
+
+/// M9 per-leg depth: the configured UTXO confirmation threshold must meet the
+/// LEG chain's `conf_depth` (BTC 6, LTC 12, DOGE 40, ZEC 10). For a BTC leg
+/// with the default config this always holds; it fail-closes a leg whose chain
+/// requires deeper confirmation than the binary is configured for (a
+/// misconfiguration, or a premature non-BTC leg before the per-chain rollout).
+fn leg_depth_satisfied(configured: u32, leg: xindex_shared::chain_registry::ChainId) -> bool {
+    configured >= leg.conf_depth()
+}
+
 fn build_cross_checks(
     args: &Args,
 ) -> Result<(Arc<dyn RedemptionCrossCheck>, Arc<dyn RefundCrossCheck>)> {
@@ -204,6 +241,9 @@ fn build_cross_checks(
             }),
         )),
         CrossCheckMode::ThorBtcUsdt => {
+            // M9: refuse a sub-conf_depth confirmation threshold before any
+            // attestation can be posted.
+            enforce_confirmation_floors(args.eth_min_confirmations, args.btc_min_confirmations)?;
             let thor_url = args.thor_url.as_deref().context("--thor-url required")?;
             let http = args
                 .eth_http_rpc_url
@@ -401,6 +441,21 @@ async fn run(args: Args) -> Result<()> {
         info!(redemption_id = %rid, chain = ?leg_chain,
               "leg routed by asset_id");
 
+        // M9 per-leg depth: never attest a leg below its chain's conf_depth.
+        // The configured UTXO threshold (`btc_min_confirmations`) must meet the
+        // leg chain's requirement (BTC 6, LTC 12, DOGE 40, ZEC 10). For a BTC
+        // leg this is a no-op; it fail-closes a leg whose chain needs deeper
+        // confirmation than the binary is configured for, rather than attesting
+        // an under-confirmed (reorg-revertible) delivery/refund.
+        if !leg_depth_satisfied(args.btc_min_confirmations, leg_chain) {
+            warn!(redemption_id = %rid, chain = ?leg_chain,
+                  configured = args.btc_min_confirmations,
+                  required = leg_chain.conf_depth(),
+                  "configured confirmation threshold is below this leg chain's conf_depth; \
+                   refusing to attest under-confirmed (runbook)");
+            return;
+        }
+
         // F2 correlation: the executor records (redemptionId, legIndex)
         // → inbound_txid AFTER it broadcasts the Asgard deposit. If
         // absent, the executor hasn't dispatched this leg yet — skip;
@@ -529,10 +584,40 @@ async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xindex_shared::chain_registry::ChainId;
 
     #[test]
     fn parse_btc_network_canonical() {
         assert!(matches!(parse_btc_network("signet"), Ok(Network::Signet)));
         assert!(parse_btc_network("doge").is_err());
+    }
+
+    /// M9: the startup floor accepts at/above `conf_depth` and rejects below.
+    #[test]
+    fn confirmation_floors_reject_under_depth() {
+        // Defaults (ETH 12, BTC 6) are exactly the floors → ok.
+        assert!(enforce_confirmation_floors(12, 6).is_ok());
+        // Raising is fine.
+        assert!(enforce_confirmation_floors(20, 10).is_ok());
+        // ETH below its conf_depth (12) → reject.
+        assert!(enforce_confirmation_floors(11, 6).is_err());
+        // BTC below its conf_depth (6) → reject.
+        assert!(enforce_confirmation_floors(12, 5).is_err());
+        assert!(enforce_confirmation_floors(12, 0).is_err());
+    }
+
+    /// M9: a leg is only serviced when the configured threshold meets the
+    /// LEG chain's `conf_depth` (BTC 6, LTC 12, DOGE 40, ZEC 10).
+    #[test]
+    fn per_leg_depth_gate() {
+        // BTC default config services a BTC leg.
+        assert!(leg_depth_satisfied(6, ChainId::Btc));
+        // …but NOT a deeper-finality leg at BTC's depth.
+        assert!(!leg_depth_satisfied(6, ChainId::Doge)); // needs 40
+        assert!(!leg_depth_satisfied(6, ChainId::Zec)); // needs 10
+        assert!(!leg_depth_satisfied(6, ChainId::Ltc)); // needs 12
+                                                        // A binary configured for the deeper chain services it.
+        assert!(leg_depth_satisfied(40, ChainId::Doge));
+        assert!(leg_depth_satisfied(10, ChainId::Zec));
     }
 }

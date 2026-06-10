@@ -39,14 +39,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::B256;
 use bitcoin::hashes::Hash;
-use bitcoin::Txid;
+use bitcoin::{BlockHash, Txid};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 /// Status of a broadcast in the registry. Persisted as a discriminator
-/// string in the `SQLite` `status` column (`'pending'`, `'confirmed'`,
-/// `'failed'`); the SQL CHECK constraint pins the allowed values.
+/// string in the `SQLite` `status` column (`'reserved'`, `'pending'`,
+/// `'confirmed'`, `'final'`, `'failed'`); the SQL CHECK constraint pins the
+/// allowed values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BroadcastStatus {
     /// Write-ahead reservation claimed BEFORE the irreversible broadcast
@@ -58,8 +59,18 @@ pub enum BroadcastStatus {
     Reserved,
     /// Transaction broadcast; awaiting confirmations.
     Pending,
-    /// Transaction confirmed at least `MIN_CONFIRMATIONS` deep.
+    /// Transaction confirmed at least `min_confirmations` deep, with the
+    /// confirming `block_hash`/`block_height` recorded. NOT terminal: the
+    /// watcher keeps re-validating a `Confirmed` row every tick (audit M8) —
+    /// a deep re-org that orphans the recorded block demotes it back to
+    /// `Pending` for re-broadcast — until it buries `final_depth` deep and
+    /// graduates to `Final`.
     Confirmed,
+    /// Confirmed `final_depth` blocks deep — beyond any plausible re-org.
+    /// Terminal: the watcher stops re-validating it. Operator cron sweeps
+    /// `Final` rows (the prior "sweep confirmed" contract now targets
+    /// `Final`, since `Confirmed` is still being watched). (audit M8)
+    Final,
     /// Operator-marked terminal failure (e.g., persistent rejection).
     /// The watcher never sets this on its own — only ops tooling does.
     Failed,
@@ -78,6 +89,20 @@ pub struct PendingBroadcast {
     pub amount_sats: u64,
     pub broadcast_at_unix_secs: u64,
     pub last_attempt_unix_secs: u64,
+}
+
+/// A confirmed broadcast the watcher still re-validates against re-orgs
+/// (audit M8). Carries the full [`PendingBroadcast`] (so a demoted entry can
+/// be re-broadcast from the stored `tx_bytes`) plus the block the tx was last
+/// observed confirmed in.
+#[derive(Debug, Clone)]
+pub struct ConfirmedBroadcast {
+    pub entry: PendingBroadcast,
+    /// The block hash the tx was recorded confirmed in. The watcher compares
+    /// this against the chain's CURRENT block for the tx — a mismatch (or an
+    /// unconfirmed status) means the recorded block was re-orged out.
+    pub block_hash: BlockHash,
+    pub block_height: u32,
 }
 
 /// Errors surfaced by registry operations.
@@ -136,9 +161,39 @@ pub trait BroadcastRegistry: Send + Sync {
         now_unix_secs: u64,
     ) -> impl std::future::Future<Output = Result<(), RegistryError>> + Send;
 
-    /// Mark an intent's broadcast confirmed. After this the watcher
-    /// stops polling it; operator sweeps confirmed rows on cron.
+    /// Mark an intent's broadcast confirmed in `block_hash` at
+    /// `block_height` (audit M8 — the block is recorded so the watcher can
+    /// later detect a re-org that orphans it). Pending → Confirmed. Calling
+    /// it again on an already-`Confirmed` row UPDATES the recorded block
+    /// (the tx re-confirmed in a new block after a survived re-org).
     fn mark_confirmed(
+        &self,
+        intent_id: &B256,
+        block_hash: &BlockHash,
+        block_height: u32,
+    ) -> impl std::future::Future<Output = Result<(), RegistryError>> + Send;
+
+    /// All `Confirmed` (NOT yet `Final`) broadcasts, with the block each was
+    /// recorded confirmed in (audit M8). The watcher re-validates these every
+    /// tick against re-org.
+    fn list_confirmed(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Vec<ConfirmedBroadcast>, RegistryError>> + Send;
+
+    /// Demote a `Confirmed` broadcast back to `Pending` after a re-org
+    /// orphaned its recorded block (audit M8): clears the recorded
+    /// `block_hash`/`block_height` and resets `last_attempt_unix_secs` to `0`
+    /// so the next watcher tick treats it as stuck and re-broadcasts the
+    /// stored tx. No-op on a row that is not `Confirmed`.
+    fn mark_pending(
+        &self,
+        intent_id: &B256,
+    ) -> impl std::future::Future<Output = Result<(), RegistryError>> + Send;
+
+    /// Mark a `Confirmed` broadcast `Final` once it is buried `final_depth`
+    /// blocks deep — beyond any plausible re-org (audit M8). Terminal: the
+    /// watcher stops re-validating it. Operator cron sweeps `Final` rows.
+    fn mark_final(
         &self,
         intent_id: &B256,
     ) -> impl std::future::Future<Output = Result<(), RegistryError>> + Send;
@@ -184,9 +239,19 @@ pub struct InMemoryBroadcastRegistry {
     inner: Mutex<InnerState>,
 }
 
+/// In-memory row: the broadcast + its status + (once confirmed) the block it
+/// was recorded confirmed in (audit M8).
+#[derive(Debug, Clone)]
+struct StoredEntry {
+    entry: PendingBroadcast,
+    status: BroadcastStatus,
+    block_hash: Option<BlockHash>,
+    block_height: Option<u32>,
+}
+
 #[derive(Debug, Default)]
 struct InnerState {
-    entries: HashMap<B256, (PendingBroadcast, BroadcastStatus)>,
+    entries: HashMap<B256, StoredEntry>,
 }
 
 impl InMemoryBroadcastRegistry {
@@ -198,11 +263,16 @@ impl InMemoryBroadcastRegistry {
 
 impl BroadcastRegistry for InMemoryBroadcastRegistry {
     async fn register(&self, entry: PendingBroadcast) -> Result<(), RegistryError> {
-        self.inner
-            .lock()
-            .await
-            .entries
-            .insert(entry.intent_id, (entry, BroadcastStatus::Pending));
+        let id = entry.intent_id;
+        self.inner.lock().await.entries.insert(
+            id,
+            StoredEntry {
+                entry,
+                status: BroadcastStatus::Pending,
+                block_hash: None,
+                block_height: None,
+            },
+        );
         Ok(())
     }
 
@@ -213,7 +283,12 @@ impl BroadcastRegistry for InMemoryBroadcastRegistry {
         }
         g.entries.insert(
             *intent_id,
-            (reserved_placeholder(*intent_id), BroadcastStatus::Reserved),
+            StoredEntry {
+                entry: reserved_placeholder(*intent_id),
+                status: BroadcastStatus::Reserved,
+                block_hash: None,
+                block_height: None,
+            },
         );
         Ok(true)
     }
@@ -223,8 +298,8 @@ impl BroadcastRegistry for InMemoryBroadcastRegistry {
         let mut out: Vec<PendingBroadcast> = guard
             .entries
             .values()
-            .filter(|(_, st)| *st == BroadcastStatus::Pending)
-            .map(|(e, _)| e.clone())
+            .filter(|s| s.status == BroadcastStatus::Pending)
+            .map(|s| s.entry.clone())
             .collect();
         out.sort_by_key(|e| e.broadcast_at_unix_secs);
         Ok(out)
@@ -235,15 +310,65 @@ impl BroadcastRegistry for InMemoryBroadcastRegistry {
         intent_id: &B256,
         now_unix_secs: u64,
     ) -> Result<(), RegistryError> {
-        if let Some((entry, _)) = self.inner.lock().await.entries.get_mut(intent_id) {
-            entry.last_attempt_unix_secs = now_unix_secs;
+        if let Some(s) = self.inner.lock().await.entries.get_mut(intent_id) {
+            s.entry.last_attempt_unix_secs = now_unix_secs;
         }
         Ok(())
     }
 
-    async fn mark_confirmed(&self, intent_id: &B256) -> Result<(), RegistryError> {
-        if let Some((_, status)) = self.inner.lock().await.entries.get_mut(intent_id) {
-            *status = BroadcastStatus::Confirmed;
+    async fn mark_confirmed(
+        &self,
+        intent_id: &B256,
+        block_hash: &BlockHash,
+        block_height: u32,
+    ) -> Result<(), RegistryError> {
+        if let Some(s) = self.inner.lock().await.entries.get_mut(intent_id) {
+            s.status = BroadcastStatus::Confirmed;
+            s.block_hash = Some(*block_hash);
+            s.block_height = Some(block_height);
+        }
+        Ok(())
+    }
+
+    async fn list_confirmed(&self) -> Result<Vec<ConfirmedBroadcast>, RegistryError> {
+        let guard = self.inner.lock().await;
+        let mut out = Vec::new();
+        for s in guard.entries.values() {
+            if s.status != BroadcastStatus::Confirmed {
+                continue;
+            }
+            let (Some(block_hash), Some(block_height)) = (s.block_hash, s.block_height) else {
+                return Err(RegistryError::Decode(
+                    "confirmed row missing block_hash/block_height".to_string(),
+                ));
+            };
+            out.push(ConfirmedBroadcast {
+                entry: s.entry.clone(),
+                block_hash,
+                block_height,
+            });
+        }
+        out.sort_by_key(|c| c.entry.broadcast_at_unix_secs);
+        Ok(out)
+    }
+
+    async fn mark_pending(&self, intent_id: &B256) -> Result<(), RegistryError> {
+        if let Some(s) = self.inner.lock().await.entries.get_mut(intent_id) {
+            if s.status == BroadcastStatus::Confirmed {
+                s.status = BroadcastStatus::Pending;
+                s.block_hash = None;
+                s.block_height = None;
+                s.entry.last_attempt_unix_secs = 0;
+            }
+        }
+        Ok(())
+    }
+
+    async fn mark_final(&self, intent_id: &B256) -> Result<(), RegistryError> {
+        if let Some(s) = self.inner.lock().await.entries.get_mut(intent_id) {
+            if s.status == BroadcastStatus::Confirmed {
+                s.status = BroadcastStatus::Final;
+            }
         }
         Ok(())
     }
@@ -255,7 +380,7 @@ impl BroadcastRegistry for InMemoryBroadcastRegistry {
             .await
             .entries
             .values()
-            .filter(|(_, st)| *st == BroadcastStatus::Pending)
+            .filter(|s| s.status == BroadcastStatus::Pending)
             .count())
     }
 
@@ -283,6 +408,20 @@ impl std::fmt::Debug for SqliteBroadcastRegistry {
 /// `query_as::<RawBroadcastRow>` site readable instead of inlining a
 /// 7-tuple type that clippy's `type-complexity` lint rejects.
 type RawBroadcastRow = (Vec<u8>, Vec<u8>, Vec<u8>, String, i64, i64, i64);
+
+/// Raw row shape pulled by `list_confirmed` — the `RawBroadcastRow` columns
+/// plus the recorded `block_hash` (32 bytes) and `block_height` (audit M8).
+type RawConfirmedRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    i64,
+    i64,
+    i64,
+    Vec<u8>,
+    i64,
+);
 
 impl SqliteBroadcastRegistry {
     /// Open a `SQLite` connection at `database_url` and apply migrations.
@@ -330,7 +469,9 @@ impl BroadcastRegistry for SqliteBroadcastRegistry {
                 amount_sats = excluded.amount_sats,
                 broadcast_at_unix_secs = excluded.broadcast_at_unix_secs,
                 last_attempt_unix_secs = excluded.last_attempt_unix_secs,
-                status = 'pending'
+                status = 'pending',
+                block_hash = NULL,
+                block_height = NULL
             ",
         )
         .bind(id_bytes)
@@ -425,12 +566,116 @@ impl BroadcastRegistry for SqliteBroadcastRegistry {
         Ok(())
     }
 
-    async fn mark_confirmed(&self, intent_id: &B256) -> Result<(), RegistryError> {
+    async fn mark_confirmed(
+        &self,
+        intent_id: &B256,
+        block_hash: &BlockHash,
+        block_height: u32,
+    ) -> Result<(), RegistryError> {
         let id_bytes = intent_id.as_slice();
-        sqlx::query("UPDATE broadcasts SET status = 'confirmed' WHERE intent_id = ?")
-            .bind(id_bytes)
-            .execute(&self.pool)
-            .await?;
+        let bh: [u8; 32] = block_hash.to_raw_hash().to_byte_array();
+        let height = i64::from(block_height);
+        sqlx::query(
+            "UPDATE broadcasts SET status = 'confirmed', block_hash = ?, block_height = ?
+             WHERE intent_id = ?",
+        )
+        .bind(&bh[..])
+        .bind(height)
+        .bind(id_bytes)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_confirmed(&self) -> Result<Vec<ConfirmedBroadcast>, RegistryError> {
+        let rows: Vec<RawConfirmedRow> = sqlx::query_as(
+            "SELECT intent_id, txid, tx_bytes, recipient_addr, amount_sats,
+                    broadcast_at_unix_secs, last_attempt_unix_secs, block_hash, block_height
+             FROM broadcasts
+             WHERE status = 'confirmed'
+             ORDER BY broadcast_at_unix_secs ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (
+            id_bytes,
+            txid_bytes,
+            tx_bytes,
+            recipient,
+            amount,
+            broadcast_at,
+            last_attempt,
+            block_hash_bytes,
+            block_height,
+        ) in rows
+        {
+            let id_arr: [u8; 32] = id_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| RegistryError::Decode("intent_id != 32 bytes".to_string()))?;
+            let txid_arr: [u8; 32] = txid_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| RegistryError::Decode("txid != 32 bytes".to_string()))?;
+            let bh_arr: [u8; 32] = block_hash_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| RegistryError::Decode("block_hash != 32 bytes".to_string()))?;
+            let txid =
+                Txid::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(txid_arr));
+            let block_hash =
+                BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array(bh_arr));
+            let amount_u64 = u64::try_from(amount)
+                .map_err(|e| RegistryError::Decode(format!("stored amount negative: {e}")))?;
+            let broadcast_at_u64 = u64::try_from(broadcast_at)
+                .map_err(|e| RegistryError::Decode(format!("stored broadcast_at negative: {e}")))?;
+            let last_attempt_u64 = u64::try_from(last_attempt)
+                .map_err(|e| RegistryError::Decode(format!("stored last_attempt negative: {e}")))?;
+            let block_height_u32 = u32::try_from(block_height).map_err(|e| {
+                RegistryError::Decode(format!("stored block_height out of range: {e}"))
+            })?;
+            out.push(ConfirmedBroadcast {
+                entry: PendingBroadcast {
+                    intent_id: B256::from(id_arr),
+                    txid,
+                    tx_bytes,
+                    recipient_addr: recipient,
+                    amount_sats: amount_u64,
+                    broadcast_at_unix_secs: broadcast_at_u64,
+                    last_attempt_unix_secs: last_attempt_u64,
+                },
+                block_hash,
+                block_height: block_height_u32,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn mark_pending(&self, intent_id: &B256) -> Result<(), RegistryError> {
+        // Only demote a row that is actually Confirmed — guards against a
+        // race demoting a row an operator just marked Failed, and keeps the
+        // transition one-directional from Confirmed.
+        sqlx::query(
+            "UPDATE broadcasts
+             SET status = 'pending', block_hash = NULL, block_height = NULL,
+                 last_attempt_unix_secs = 0
+             WHERE intent_id = ? AND status = 'confirmed'",
+        )
+        .bind(intent_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_final(&self, intent_id: &B256) -> Result<(), RegistryError> {
+        sqlx::query(
+            "UPDATE broadcasts SET status = 'final' WHERE intent_id = ? AND status = 'confirmed'",
+        )
+        .bind(intent_id.as_slice())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -489,6 +734,10 @@ mod tests {
         }
     }
 
+    fn test_block(byte: u8) -> BlockHash {
+        BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([byte; 32]))
+    }
+
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn in_memory_register_list_confirm() {
@@ -504,7 +753,9 @@ mod tests {
         assert_eq!(pending.len(), 2);
         assert_eq!(pending[0].intent_id, id_a, "ordered by broadcast_at ASC");
 
-        r.mark_confirmed(&id_a).await.expect("confirm");
+        r.mark_confirmed(&id_a, &test_block(0xa1), 800_000)
+            .await
+            .expect("confirm");
         assert_eq!(r.pending_count().await.expect("count"), 1);
 
         let pending = r.list_pending().await.expect("list");
@@ -551,7 +802,9 @@ mod tests {
             original.broadcast_at_unix_secs
         );
 
-        r.mark_confirmed(&id).await.expect("confirm");
+        r.mark_confirmed(&id, &test_block(0xb2), 800_000)
+            .await
+            .expect("confirm");
         assert_eq!(r.pending_count().await.expect("count"), 0);
     }
 
@@ -594,7 +847,9 @@ mod tests {
         // entry retained) — has_record covers both pending and confirmed
         // so backfill replay can't double-execute a previously settled
         // intent either.
-        r.mark_confirmed(&id_present).await.expect("confirm");
+        r.mark_confirmed(&id_present, &test_block(0xc3), 800_000)
+            .await
+            .expect("confirm");
         assert!(r.has_record(&id_present).await.expect("post-confirm"));
     }
 
@@ -609,7 +864,9 @@ mod tests {
         r.register(entry(id_present, 100)).await.expect("register");
         assert!(r.has_record(&id_present).await.expect("has"));
         assert!(!r.has_record(&id_absent).await.expect("has"));
-        r.mark_confirmed(&id_present).await.expect("confirm");
+        r.mark_confirmed(&id_present, &test_block(0xc3), 800_000)
+            .await
+            .expect("confirm");
         assert!(r.has_record(&id_present).await.expect("post-confirm"));
     }
 
@@ -671,5 +928,72 @@ mod tests {
         let pending = r.list_pending().await.expect("list");
         assert_eq!(pending[0].last_attempt_unix_secs, 9999);
         assert_eq!(pending[0].broadcast_at_unix_secs, 100, "preserved");
+    }
+
+    /// M8: confirmed → re-confirm (survived reorg, block updated) → demote
+    /// (orphaned) → re-confirm → final. Exercises the new SQL for both impls.
+    async fn run_reorg_lifecycle<R: BroadcastRegistry>(r: &R) {
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let id = b256!("0000000000000000000000000000000000000000000000000000000000000077");
+            r.register(entry(id, 100)).await.expect("register");
+
+            // Confirm in block A; recorded + excluded from pending.
+            r.mark_confirmed(&id, &test_block(0xaa), 800_000)
+                .await
+                .expect("confirm");
+            let confirmed = r.list_confirmed().await.expect("list_confirmed");
+            assert_eq!(confirmed.len(), 1);
+            assert_eq!(confirmed[0].block_hash, test_block(0xaa));
+            assert_eq!(confirmed[0].block_height, 800_000);
+            assert_eq!(r.pending_count().await.expect("pc"), 0);
+
+            // Survived reorg: re-confirm in block B updates the recorded block.
+            r.mark_confirmed(&id, &test_block(0xbb), 800_005)
+                .await
+                .expect("reconfirm");
+            let confirmed = r.list_confirmed().await.expect("list");
+            assert_eq!(confirmed[0].block_hash, test_block(0xbb));
+            assert_eq!(confirmed[0].block_height, 800_005);
+
+            // Orphaned: demote to pending, last_attempt zeroed for re-broadcast.
+            r.mark_pending(&id).await.expect("demote");
+            assert_eq!(r.list_confirmed().await.expect("list").len(), 0);
+            let pending = r.list_pending().await.expect("pending");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].last_attempt_unix_secs, 0);
+
+            // mark_pending on a non-confirmed row is a no-op.
+            r.mark_pending(&id).await.expect("noop demote");
+            assert_eq!(r.list_pending().await.expect("p").len(), 1);
+
+            // Re-confirm, then bury final_depth deep → Final (terminal).
+            r.mark_confirmed(&id, &test_block(0xcc), 800_100)
+                .await
+                .expect("reconfirm2");
+            r.mark_final(&id).await.expect("final");
+            assert_eq!(r.list_confirmed().await.expect("list").len(), 0);
+            assert_eq!(r.pending_count().await.expect("p"), 0);
+            assert!(r.has_record(&id).await.expect("has"));
+
+            // mark_final on a now-Final row is a no-op (only Confirmed → Final).
+            r.mark_final(&id).await.expect("noop final");
+            assert!(r.has_record(&id).await.expect("has"));
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_reorg_lifecycle() {
+        let r = InMemoryBroadcastRegistry::new();
+        run_reorg_lifecycle(&r).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_reorg_lifecycle_matches_in_memory() {
+        let r = SqliteBroadcastRegistry::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_reorg_lifecycle(&r).await;
     }
 }

@@ -19,11 +19,16 @@
 //! - **Shallow reorg** (depth < `min_confirmations`): the entry is still
 //!   `Pending` (it never reached `mark_confirmed`), so the stuck-timeout
 //!   path re-broadcasts it; Bitcoin no-ops if the tx is still in a block.
-//!   NOTE (audit M8): a DEEP reorg of an already-`Confirmed` entry is NOT
-//!   detected — `mark_confirmed` is one-way and `list_pending` no longer
-//!   returns it. That orphan is operator-recoverable (the tx usually
-//!   re-confirms from mempool); block-hash re-validation + a `mark_pending`
-//!   transition is a documented follow-on, not implemented here.
+//!
+//! - **Deep reorg of a `Confirmed` entry** (audit M8): `mark_confirmed`
+//!   records the confirming `block_hash`/`block_height`, and every tick the
+//!   watcher RE-VALIDATES each `Confirmed` row against the chain. If the tx
+//!   is no longer confirmed (its recorded block was orphaned and the tx is
+//!   not in another block), it is demoted back to `Pending` (`mark_pending`,
+//!   which zeroes `last_attempt` so the next tick re-broadcasts it). If it
+//!   re-confirmed in a DIFFERENT block (survived the reorg), the recorded
+//!   block is updated. Once buried `final_depth` deep — beyond any plausible
+//!   reorg — it graduates to terminal `Final` and is no longer re-validated.
 //!
 //! - **Anything else (RPC error, still in mempool, still confirming)**:
 //!   leave for the next tick. Don't re-broadcast without evidence the
@@ -74,12 +79,18 @@ pub struct WatcherConfig {
     /// — far longer than normal mempool retention, short enough that a
     /// dropped tx doesn't sit unaddressed all day.
     pub stuck_timeout: Duration,
-    /// Confirmation depth at which we consider the broadcast settled and
-    /// stop polling. Defaults to BTC `conf_depth` (6) — the protocol's
-    /// finality bar (audit M8/M9). The prior default of 3 declared
-    /// settlement three blocks BELOW finality; the signer cross-check
-    /// policy uses 6 (`BTC_MIN_CONFIRMATIONS`), not 3.
+    /// Confirmation depth at which we consider the broadcast settled (move
+    /// from `Pending` to `Confirmed`). Defaults to BTC `conf_depth` (6) — the
+    /// protocol's finality bar (audit M8/M9). The prior default of 3 declared
+    /// settlement three blocks BELOW finality; the signer cross-check policy
+    /// uses 6 (`BTC_MIN_CONFIRMATIONS`), not 3.
     pub min_confirmations: u32,
+    /// Depth at which a `Confirmed` broadcast is considered FINAL — beyond any
+    /// plausible re-org — and the watcher stops re-validating it (audit M8).
+    /// 100 blocks (~16 h on BTC) is astronomically beyond the deepest observed
+    /// mainnet re-org; until then every `Confirmed` row is re-checked each tick
+    /// so a deep re-org that orphans the payout is caught and re-broadcast.
+    pub final_depth: u32,
 }
 
 impl Default for WatcherConfig {
@@ -88,6 +99,7 @@ impl Default for WatcherConfig {
             interval: Duration::from_secs(60),
             stuck_timeout: Duration::from_secs(3600),
             min_confirmations: 6,
+            final_depth: 100,
         }
     }
 }
@@ -129,25 +141,53 @@ where
     }
 }
 
-/// One pass of the watcher loop. Extracted for testability.
+/// One pass of the watcher loop. Extracted for testability. Processes the
+/// pending set (confirm-or-rebroadcast) and then RE-VALIDATES the confirmed
+/// set against re-org (audit M8).
 async fn tick_once<R, C>(registry: &R, chain: &C, cfg: WatcherConfig) -> Result<(), WatcherError>
 where
     R: BroadcastRegistry,
     C: UtxoChainClient,
 {
-    let pending = registry.list_pending().await?;
-    if pending.is_empty() {
-        return Ok(());
-    }
     let Some(now) = now_unix_secs() else {
         warn!("system clock failure (pre-1970); skipping watcher tick");
         return Ok(());
     };
+    process_pending(registry, chain, cfg, now).await?;
+    revalidate_confirmed(registry, chain, cfg).await?;
+    Ok(())
+}
 
+/// Walk the pending broadcasts: mark deep-enough confirmations `Confirmed`
+/// (recording the confirming block — audit M8), and re-broadcast any tx past
+/// its stuck-timeout.
+async fn process_pending<R, C>(
+    registry: &R,
+    chain: &C,
+    cfg: WatcherConfig,
+    now: u64,
+) -> Result<(), WatcherError>
+where
+    R: BroadcastRegistry,
+    C: UtxoChainClient,
+{
+    let pending = registry.list_pending().await?;
     for entry in pending {
         match chain.get_tx_status(&entry.txid) {
             Ok(status) if status.confirmed && status.confirmations >= cfg.min_confirmations => {
-                if let Err(e) = registry.mark_confirmed(&entry.intent_id).await {
+                let (Some(block_hash), Some(block_height)) =
+                    (status.block_hash, status.block_height)
+                else {
+                    warn!(
+                        intent_id = %entry.intent_id, txid = %entry.txid,
+                        "confirmed but chain returned no block hash/height; deferring mark_confirmed"
+                    );
+                    continue;
+                };
+                if let Err(e) = registry
+                    .mark_confirmed(&entry.intent_id, &block_hash, block_height)
+                    .await
+                {
                     error!(intent_id = %entry.intent_id, error = %e,
                            "mark_confirmed failed; will retry next tick");
                 } else {
@@ -155,7 +195,7 @@ where
                         intent_id = %entry.intent_id,
                         txid = %entry.txid,
                         confirmations = status.confirmations,
-                        "broadcast confirmed; dropping from pending set"
+                        "broadcast confirmed; now re-validated against reorg each tick"
                     );
                 }
             }
@@ -222,6 +262,99 @@ where
             Err(e) => {
                 warn!(intent_id = %entry.intent_id, error = %e,
                       "get_tx_status failed; deferring");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Re-validate each `Confirmed` broadcast against re-org (audit M8). For each
+/// confirmed row the watcher re-queries the chain:
+///
+/// - **Still confirmed, `final_depth` deep** → graduate to terminal `Final`
+///   (stop re-validating; beyond any plausible re-org).
+/// - **Still confirmed in a DIFFERENT block** → the tx survived a re-org in a
+///   new block; update the recorded block, keep watching.
+/// - **No longer confirmed** → the recorded block was orphaned and the tx is
+///   in no block now: demote to `Pending` (`mark_pending` zeroes
+///   `last_attempt`) so the next tick re-broadcasts the stored tx.
+/// - **Same block, still confirming** → no-op; re-validate next tick.
+/// - **RPC error** → defer (acting on a flake would spuriously demote a good
+///   payout).
+async fn revalidate_confirmed<R, C>(
+    registry: &R,
+    chain: &C,
+    cfg: WatcherConfig,
+) -> Result<(), WatcherError>
+where
+    R: BroadcastRegistry,
+    C: UtxoChainClient,
+{
+    let confirmed = registry.list_confirmed().await?;
+    for c in confirmed {
+        match chain.get_tx_status(&c.entry.txid) {
+            Ok(status) if status.confirmed => {
+                if status.confirmations >= cfg.final_depth {
+                    if let Err(e) = registry.mark_final(&c.entry.intent_id).await {
+                        error!(intent_id = %c.entry.intent_id, error = %e,
+                               "mark_final failed; will retry next tick");
+                    } else {
+                        info!(
+                            intent_id = %c.entry.intent_id,
+                            confirmations = status.confirmations,
+                            "broadcast final ({final_depth}+ deep); no longer re-validated",
+                            final_depth = cfg.final_depth
+                        );
+                    }
+                } else if status.block_hash != Some(c.block_hash) {
+                    // Re-confirmed in a different block — survived a re-org.
+                    let (Some(new_hash), Some(new_height)) =
+                        (status.block_hash, status.block_height)
+                    else {
+                        // confirmed but no block hash (Esplora quirk): leave
+                        // the recorded block as-is, re-check next tick.
+                        continue;
+                    };
+                    if let Err(e) = registry
+                        .mark_confirmed(&c.entry.intent_id, &new_hash, new_height)
+                        .await
+                    {
+                        error!(intent_id = %c.entry.intent_id, error = %e,
+                               "reorg re-confirm update failed; will retry next tick");
+                    } else {
+                        warn!(
+                            intent_id = %c.entry.intent_id,
+                            old_block = %c.block_hash,
+                            new_block = %new_hash,
+                            "confirmed tx re-confirmed in a new block (survived reorg)"
+                        );
+                    }
+                }
+                // else: same block, still confirming → no-op.
+            }
+            Ok(_unconfirmed) => {
+                // The recorded confirming block was orphaned and the tx is in
+                // NO block now — the payout disappeared from the canonical
+                // chain. Demote to pending so the next tick re-broadcasts it.
+                if let Err(e) = registry.mark_pending(&c.entry.intent_id).await {
+                    error!(intent_id = %c.entry.intent_id, error = %e,
+                           "mark_pending failed after reorg orphan; will retry next tick");
+                } else {
+                    warn!(
+                        intent_id = %c.entry.intent_id,
+                        txid = %c.entry.txid,
+                        orphaned_block = %c.block_hash,
+                        "REORG: confirmed payout orphaned; demoted to pending for re-broadcast"
+                    );
+                }
+            }
+            Err(UtxoError::Transport(msg)) => {
+                warn!(intent_id = %c.entry.intent_id, error = %msg,
+                      "get_tx_status transport failure during reorg re-validation; deferring");
+            }
+            Err(e) => {
+                warn!(intent_id = %c.entry.intent_id, error = %e,
+                      "get_tx_status failed during reorg re-validation; deferring");
             }
         }
     }
@@ -368,7 +501,7 @@ mod tests {
         registry.register(entry).await.expect("register");
 
         let chain = FakeChain::default();
-        chain.push_status(Ok(UtxoTxStatus {
+        let confirmed = UtxoTxStatus {
             txid,
             confirmed: true,
             block_height: Some(800_000),
@@ -376,19 +509,147 @@ mod tests {
                 bitcoin::hashes::sha256d::Hash::from_byte_array([0xab; 32]),
             )),
             confirmations: 6,
-        }));
+        };
+        // The same status is consumed by BOTH tick passes: process_pending
+        // (→ mark_confirmed) and revalidate_confirmed (→ same block, no-op).
+        chain.push_status(Ok(confirmed.clone()));
+        chain.push_status(Ok(confirmed));
 
         let cfg = WatcherConfig {
             interval: Duration::from_secs(60),
             stuck_timeout: Duration::from_secs(3600),
             min_confirmations: 3,
+            final_depth: 100,
         };
         tick_once(&registry, &chain, cfg).await.expect("tick");
 
-        // After tick: confirmed entry is dropped from pending.
+        // After tick: confirmed entry is dropped from pending and stays
+        // confirmed (same block on re-validation — not demoted, not final).
         assert_eq!(registry.pending_count().await.expect("count"), 0);
+        assert_eq!(registry.list_confirmed().await.expect("confirmed").len(), 1);
         // We did NOT broadcast — only mark_confirmed.
         assert_eq!(chain.broadcast_count(), 0);
+    }
+
+    /// Helper: a confirmed-in-`block` status for `txid` at `confs` depth.
+    fn confirmed_status(txid: Txid, block: [u8; 32], confs: u32) -> UtxoTxStatus {
+        UtxoTxStatus {
+            txid,
+            confirmed: true,
+            block_height: Some(800_000),
+            block_hash: Some(BlockHash::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_byte_array(block),
+            )),
+            confirmations: confs,
+        }
+    }
+
+    /// M8: a confirmed payout whose recorded block is orphaned by a deep
+    /// re-org (the tx is no longer confirmed) is demoted back to pending so
+    /// the next tick re-broadcasts it.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn tick_demotes_orphaned_confirmed_to_pending() {
+        let registry = InMemoryBroadcastRegistry::new();
+        let id = b256!("0000000000000000000000000000000000000000000000000000000000000001");
+        let (entry, txid) = synthetic_pending(id, 100);
+        registry.register(entry).await.expect("register");
+        // Drive it to Confirmed in block 0xaa directly.
+        let block_a =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]));
+        registry
+            .mark_confirmed(&id, &block_a, 800_000)
+            .await
+            .expect("confirm");
+        assert_eq!(registry.list_confirmed().await.expect("c").len(), 1);
+
+        // The chain now reports the tx UNCONFIRMED (its block was orphaned).
+        let chain = FakeChain::default();
+        chain.push_status(Ok(UtxoTxStatus {
+            txid,
+            confirmed: false,
+            block_height: None,
+            block_hash: None,
+            confirmations: 0,
+        }));
+
+        tick_once(&registry, &chain, WatcherConfig::default())
+            .await
+            .expect("tick");
+
+        // Demoted: back in the pending set, no longer confirmed, last_attempt
+        // zeroed so the next tick re-broadcasts it.
+        assert_eq!(registry.list_confirmed().await.expect("c").len(), 0);
+        let pending = registry.list_pending().await.expect("p");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].last_attempt_unix_secs, 0,
+            "reset for re-broadcast"
+        );
+    }
+
+    /// M8: a confirmed payout buried `final_depth` deep graduates to terminal
+    /// `Final` and is no longer re-validated.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn tick_marks_final_when_deep() {
+        let registry = InMemoryBroadcastRegistry::new();
+        let id = b256!("0000000000000000000000000000000000000000000000000000000000000002");
+        let (entry, txid) = synthetic_pending(id, 100);
+        registry.register(entry).await.expect("register");
+        let block_a =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]));
+        registry
+            .mark_confirmed(&id, &block_a, 800_000)
+            .await
+            .expect("confirm");
+
+        let chain = FakeChain::default();
+        // 150 confs ≥ default final_depth (100).
+        chain.push_status(Ok(confirmed_status(txid, [0xaa; 32], 150)));
+
+        tick_once(&registry, &chain, WatcherConfig::default())
+            .await
+            .expect("tick");
+
+        // Final: no longer confirmed (re-validated set), not pending, record
+        // retained (so backfill replay still sees it).
+        assert_eq!(registry.list_confirmed().await.expect("c").len(), 0);
+        assert_eq!(registry.pending_count().await.expect("p"), 0);
+        assert!(registry.has_record(&id).await.expect("has"));
+    }
+
+    /// M8: a confirmed payout re-confirmed in a DIFFERENT block (survived a
+    /// re-org) updates its recorded block and stays confirmed (no demotion).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn tick_updates_block_on_survived_reorg() {
+        let registry = InMemoryBroadcastRegistry::new();
+        let id = b256!("0000000000000000000000000000000000000000000000000000000000000003");
+        let (entry, txid) = synthetic_pending(id, 100);
+        registry.register(entry).await.expect("register");
+        let block_a =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xaa; 32]));
+        registry
+            .mark_confirmed(&id, &block_a, 800_000)
+            .await
+            .expect("confirm");
+
+        let chain = FakeChain::default();
+        // Re-confirmed in a NEW block 0xbb, still shallow (< final_depth).
+        chain.push_status(Ok(confirmed_status(txid, [0xbb; 32], 4)));
+
+        tick_once(&registry, &chain, WatcherConfig::default())
+            .await
+            .expect("tick");
+
+        // Still confirmed, recorded block updated to 0xbb; not demoted.
+        let confirmed = registry.list_confirmed().await.expect("c");
+        assert_eq!(confirmed.len(), 1);
+        let block_b =
+            BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::from_byte_array([0xbb; 32]));
+        assert_eq!(confirmed[0].block_hash, block_b, "recorded block updated");
+        assert_eq!(registry.pending_count().await.expect("p"), 0);
     }
 
     #[tokio::test]

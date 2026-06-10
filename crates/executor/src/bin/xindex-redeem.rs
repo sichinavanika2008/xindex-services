@@ -201,11 +201,17 @@ struct Args {
     #[arg(long, env = "REBROADCAST_STUCK_TIMEOUT_SECS", default_value_t = 3600)]
     rebroadcast_stuck_timeout_secs: u64,
 
-    /// Confirmation depth at which a broadcast is considered settled
-    /// (the watcher stops polling and marks it confirmed). Default 3,
-    /// matching the cross-check policy in `xindex-attest`.
+    /// Confirmation depth at which a broadcast is marked `confirmed` (the
+    /// watcher keeps re-validating it against re-org until `final_depth`).
+    /// Default 6, matching BTC `conf_depth` + the `xindex-attest` policy.
     #[arg(long, env = "REBROADCAST_MIN_CONFIRMATIONS", default_value_t = 6)]
     rebroadcast_min_confirmations: u32,
+
+    /// Depth at which a confirmed broadcast is considered FINAL — beyond any
+    /// plausible re-org — and the watcher stops re-validating it (audit M8).
+    /// Default 100 blocks (~16 h on BTC).
+    #[arg(long, env = "REBROADCAST_FINAL_DEPTH", default_value_t = 100)]
+    rebroadcast_final_depth: u32,
 }
 
 #[tokio::main]
@@ -562,6 +568,7 @@ where
         pending_broadcasts_recovered = pending_at_startup,
         stuck_timeout_secs = args.rebroadcast_stuck_timeout_secs,
         min_confirmations = args.rebroadcast_min_confirmations,
+        final_depth = args.rebroadcast_final_depth,
         "spawning rebroadcast watcher"
     );
     let watcher_registry = Arc::clone(&registry);
@@ -570,6 +577,7 @@ where
         interval: Duration::from_secs(60),
         stuck_timeout: Duration::from_secs(args.rebroadcast_stuck_timeout_secs),
         min_confirmations: args.rebroadcast_min_confirmations,
+        final_depth: args.rebroadcast_final_depth,
     };
     tokio::spawn(async move {
         if let Err(e) = run_watcher(watcher_registry, watcher_chain_clone, watcher_cfg).await {
