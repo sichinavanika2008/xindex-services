@@ -1283,7 +1283,7 @@ pub mod error_codes {
     /// not equivocate. HTTP 409.
     pub const OBSERVER_CERT_CONFLICT: &str = "observer_cert_conflict";
     /// OBSERVER (RA-6): the attestation cross-check has not yet
-    /// produced a terminal outcome for the leg (THORChain swap still
+    /// produced a terminal outcome for the leg (`THORChain` swap still
     /// in flight, confirmations pending, or the executor's dispatch
     /// record is not yet visible). Transient — the relay re-polls.
     /// HTTP 425.

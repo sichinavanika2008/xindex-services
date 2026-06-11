@@ -817,6 +817,7 @@ mod tests {
     /// The CTD-1 core property carries to the cancel path: tampering a
     /// certified field breaks every signature → rejected.
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn acc_tampered_destination_breaks_signatures() {
         let mut proof = signed_acc_proof(|_| {}, &[1, 2, 3]);
         proof.immediate_target_hash = format!("0x{}", "66".repeat(32));
@@ -836,6 +837,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn acc_stale_rejected() {
         let proof = signed_acc_proof(|p| p.vault_resolved_at = NOW - MAX_AGE - 1, &[1, 2, 3]);
         let err = validate_acquire_cancel_proof(&proof, CHAIN_ID, oracle(), &policy(), NOW)

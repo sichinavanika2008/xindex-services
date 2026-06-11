@@ -38,7 +38,7 @@ pub struct LegFacts {
     /// `RedeemDispatched.amount`.
     pub amount: U256,
     /// The contract-built `THORChain` swap memo bytes (trusted from the
-    /// event; the daemon binds the OP_RETURN to its keccak).
+    /// event; the daemon binds the `OP_RETURN` to its keccak).
     pub memo: Vec<u8>,
     /// The user's final payout destination on-chain (the
     /// `RedeemDispatched.destination`, i.e. the `IndexToken` in the
@@ -180,7 +180,7 @@ impl ObserverError {
 /// `MAX_OP_RETURN_BYTES`-equivalent bound applied to the memo at the
 /// observer (the multisig crate enforces the same on the spend side;
 /// duplicated here so a bad event is refused before it ever reaches a
-/// PSBT). THORChain's 80-byte OP_RETURN relay limit.
+/// PSBT). `THORChain`'s 80-byte `OP_RETURN` relay limit.
 const MAX_MEMO_BYTES: usize = 80;
 
 /// One operator's redemption observer.
@@ -306,7 +306,7 @@ where
     /// Asgard inbound, matching the custody daemon's family-specific
     /// bind byte-for-byte:
     /// - UTXO: `keccak256(scriptPubKey)` (psbt.rs `bind_outputs_to_cert`).
-    /// - EVM: `keccak256(20-byte router/vault address)` (evm_safe.rs).
+    /// - EVM: `keccak256(20-byte router/vault address)` (`evm_safe.rs`).
     /// - account string (Cosmos / XRP / TRON):
     ///   `keccak256(address_utf8)` (server.rs `bind_account_send_to_cert`).
     fn immediate_target_hash(&self, asgard_address: &str) -> Result<B256, ObserverError> {

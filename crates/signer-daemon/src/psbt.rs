@@ -1954,7 +1954,7 @@ mod tests {
     }
 
     /// RA-1 on the cancel path: after one swap-back is authorized for a
-    /// cancel_id, a DIFFERENT certificate for the SAME cancel_id is a
+    /// `cancel_id`, a DIFFERENT certificate for the SAME `cancel_id` is a
     /// 409 — one valid ACC ≠ N swap-backs.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
@@ -1997,10 +1997,9 @@ mod tests {
     }
 
     /// An ACC consumed on the cancel path does NOT consume the RIC
-    /// one-shot namespace: a redemption whose redemption_id happens to
-    /// equal a consumed cancel_id still signs (independent arms).
+    /// one-shot namespace: a redemption whose `redemption_id` happens to
+    /// equal a consumed `cancel_id` still signs (independent arms).
     #[tokio::test]
-    #[expect(clippy::expect_used, reason = "test code")]
     async fn acc_one_shot_is_independent_of_ric_one_shot() {
         let (desc, app) = veto_fixture();
         let (spk, _) = dest_spk();
