@@ -17,12 +17,12 @@ use alloy_primitives::{Address, B256};
 use alloy_sol_types::Eip712Domain;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::{
-    AsyncLegDeliveryAttestation, AsyncLegRefundAttestation, Attestation,
+    AcquireCancelCertificate, AsyncLegDeliveryAttestation, AsyncLegRefundAttestation, Attestation,
     RedemptionIntentCertificate,
 };
 use xindex_shared::signer_wire::{
-    AttestationSignRequest, Eip712SignResponse, RedemptionDeliverySignRequest, RefundSignRequest,
-    RicSignRequest,
+    AcquireCancelSignRequest, AttestationSignRequest, Eip712SignResponse,
+    RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
 };
 
 use crate::{HsmBackend, RicSigner, SignerError, SoftwareSigner};
@@ -151,6 +151,38 @@ impl RemoteHsmBackend {
             vault_resolved_at: ric.vaultResolvedAt,
         };
         self.post_sign("/api/v1/sign/eip712-ric", &req)
+    }
+
+    /// CTD-1 Slice C: ask the daemon to certify one mint-cancel
+    /// swap-back (`POST /api/v1/sign/eip712-acc`) — the Acquire-Cancel
+    /// sibling of [`RemoteHsmBackend::sign_ric`]. Same discipline: the
+    /// daemon recomputes the ACC digest from these plaintext fields on
+    /// its own pinned domain and refuses to equivocate per
+    /// `(chain, cancel_id)`.
+    ///
+    /// # Errors
+    /// [`SignerError::Backend`] on transport / HTTP / signer-pin /
+    /// signature-shape failures, incl. the daemon's 409 equivocation
+    /// refusal and 422 stale-resolution rejections.
+    pub fn sign_acc(
+        &self,
+        chain_id: ChainId,
+        acc: &AcquireCancelCertificate,
+    ) -> Result<[u8; 65], SignerError> {
+        let req = AcquireCancelSignRequest {
+            chain_id,
+            cancel_id: format!("{:#x}", acc.cancelId),
+            intent_id: format!("{:#x}", acc.intentId),
+            slot_index: acc.slotIndex.to_string(),
+            asset_id: format!("{:#x}", acc.assetId),
+            amount: acc.amount.to_string(),
+            amount_decimals: acc.amountDecimals,
+            immediate_target_hash: format!("{:#x}", acc.immediateTargetHash),
+            memo_hash: format!("{:#x}", acc.memoHash),
+            final_destination_hash: format!("{:#x}", acc.finalDestinationHash),
+            vault_resolved_at: acc.vaultResolvedAt,
+        };
+        self.post_sign("/api/v1/sign/eip712-acc", &req)
     }
 }
 

@@ -32,9 +32,8 @@ use xindex_multisig::MultisigDescriptor;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{error_codes, ErrorBody, PsbtInputSignRequest, PsbtSignResponse};
 
-use crate::intent::VerifiedIntent;
 use crate::replay::{CheckOutcome, ReplayStore};
-use crate::server::{gate_ric_intent, DaemonState};
+use crate::server::{gate_spend_certificate, CertifiedSpend, DaemonState};
 use crate::web3signer::HsmDigestSigner;
 
 /// Per-chain UTXO signing role configuration. One entry per UTXO chain
@@ -152,16 +151,19 @@ where
         )
     })?;
 
-    // 0. CTD-1 (`DL-CTD-2`): mandatory k-of-n RIC gate. Verifies the
-    //    proof statelessly, binds asset/decimals to this chain, and
-    //    consumes the (chain, redemption, leg) one-shot BEFORE the HSM
-    //    can ever be reached. The output-set bind happens at step 4c
-    //    once the PSBT is decoded.
-    let (cert, _ric_digest) = gate_ric_intent(
+    // 0. CTD-1 (`DL-CTD-2`): mandatory k-of-n certificate gate — a RIC
+    //    (redeem) XOR an ACC (mint-cancel swap-back, Slice C). Both →
+    //    422 ambiguous; neither → 422 required. Either path verifies
+    //    statelessly, binds asset/decimals to this chain, and consumes
+    //    its one-shot (RIC: (chain, redemption, leg); ACC: (chain,
+    //    cancel_id)) BEFORE the HSM can ever be reached. The output-set
+    //    bind happens at step 4c once the PSBT is decoded.
+    let spend = gate_spend_certificate(
         &state.config,
         state.replay.as_ref(),
         req.chain_id,
         req.intent_proof.as_ref(),
+        req.acquire_cancel_proof.as_ref(),
     )
     .await?;
 
@@ -256,8 +258,9 @@ where
     }
 
     // 4c. CTD-1: bind the PSBT's ENTIRE output set to the certified
-    //     intent (exact-set OP_RETURN discipline, RA-3).
-    bind_outputs_to_cert(&psbt, &expected_spk, &cert)?;
+    //     spend (exact-set OP_RETURN discipline, RA-3) — whichever
+    //     certificate kind the gate verified.
+    bind_outputs_to_cert(&psbt, &expected_spk, &spend)?;
 
     // 5. Compute the BIP-143 P2WSH sighash.
     let mut cache = SighashCache::new(&psbt.unsigned_tx);
@@ -443,28 +446,33 @@ fn derive_witness_script(descriptor: &MultisigDescriptor) -> Result<bitcoin::Scr
 }
 
 /// CTD-1 (`DL-CTD-2` / RA-3): bind the PSBT's output set to the
-/// certified intent. Exact-set discipline — every output must be
-/// accounted for:
+/// certified spend — produced by EITHER certificate gate (RIC redeem /
+/// ACC mint-cancel swap-back; the binding discipline is identical).
+/// Exact-set — every output must be accounted for:
 ///
 /// - exactly ONE payout output, identified by
-///   `keccak256(scriptPubKey) == cert.immediate_target_hash` (the
+///   `keccak256(scriptPubKey) == spend.immediate_target_hash` (the
 ///   Asgard inbound the operators independently resolved), paying
-///   exactly `cert.amount` sats;
+///   exactly `spend.amount` sats;
 /// - exactly ONE `OP_RETURN`, zero-value, whose full pushed payload
-///   hashes to `cert.memo_hash` — `THORChain` concatenates ALL
+///   hashes to `spend.memo_hash` — `THORChain` concatenates ALL
 ///   `OP_RETURN`s into the memo, so a second one is memo injection
 ///   (RA-3) regardless of content;
 /// - every other output is change back to our own descriptor P2WSH
 ///   (unconditional now — the M2b floor's change-to-self no longer
 ///   depends on the coordinator pinning a payout).
+///
+/// Mismatches report `spend.mismatch_code` (`intent_mismatch` /
+/// `acquire_cancel_mismatch`) so the coordinator can tell which
+/// certificate kind the spend violated.
 fn bind_outputs_to_cert(
     psbt: &Psbt,
     descriptor_spk: &bitcoin::ScriptBuf,
-    cert: &VerifiedIntent,
+    spend: &CertifiedSpend,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    let want_sats = u64::try_from(cert.amount).map_err(|_| {
+    let want_sats = u64::try_from(spend.amount).map_err(|_| {
         err(
-            error_codes::INTENT_MISMATCH,
+            spend.mismatch_code,
             StatusCode::UNPROCESSABLE_ENTITY,
             "certified amount does not fit u64 sats",
         )
@@ -476,32 +484,32 @@ fn bind_outputs_to_cert(
             op_returns += 1;
             if o.value.to_sat() != 0 {
                 return Err(err(
-                    error_codes::INTENT_MISMATCH,
+                    spend.mismatch_code,
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "OP_RETURN output carries value (memo outputs must be zero-value)",
                 ));
             }
             let payload = op_return_payload(&o.script_pubkey).ok_or_else(|| {
                 err(
-                    error_codes::INTENT_MISMATCH,
+                    spend.mismatch_code,
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "OP_RETURN output pushes no data",
                 )
             })?;
-            if alloy_primitives::keccak256(&payload) != cert.memo_hash {
+            if alloy_primitives::keccak256(&payload) != spend.memo_hash {
                 return Err(err(
-                    error_codes::INTENT_MISMATCH,
+                    spend.mismatch_code,
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "OP_RETURN payload does not hash to the certified memo",
                 ));
             }
         } else if alloy_primitives::keccak256(o.script_pubkey.as_bytes())
-            == cert.immediate_target_hash
+            == spend.immediate_target_hash
         {
             payouts += 1;
             if o.value.to_sat() != want_sats {
                 return Err(err(
-                    error_codes::INTENT_MISMATCH,
+                    spend.mismatch_code,
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!(
                         "payout output pays {} sats, certificate authorizes {want_sats}",
@@ -519,14 +527,14 @@ fn bind_outputs_to_cert(
     }
     if payouts != 1 {
         return Err(err(
-            error_codes::INTENT_MISMATCH,
+            spend.mismatch_code,
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("expected exactly one certified payout output, found {payouts}"),
         ));
     }
     if op_returns != 1 {
         return Err(err(
-            error_codes::INTENT_MISMATCH,
+            spend.mismatch_code,
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("expected exactly one OP_RETURN memo output, found {op_returns} (RA-3)"),
         ));
@@ -1832,5 +1840,191 @@ mod tests {
             body["code"].as_str().expect("code"),
             error_codes::PSBT_UNEXPECTED_OUTPUT
         );
+    }
+
+    /* ---- CTD-1 Slice C: Acquire-Cancel certificate (RIC-XOR-ACC) ---- */
+
+    /// Quorum-signed ACC certifying (recipient, payout, memo) for one
+    /// mint-cancel swap-back on the test daemon's domain.
+    fn acc_proof(
+        recipient: &ScriptBuf,
+        payout_sats: u64,
+        memo: &[u8],
+        cid: u8,
+    ) -> xindex_shared::signer_wire::AcquireCancelProof {
+        crate::test_support::ric::acc_proof_for(
+            31337,
+            Address::repeat_byte(0xab),
+            &crate::test_support::ric::AccSpec {
+                chain: ChainId::Btc,
+                cancel_id: B256::repeat_byte(cid),
+                intent_id: B256::repeat_byte(0xaa),
+                slot_index: 0,
+                amount: alloy_primitives::U256::from(payout_sats),
+                immediate_target: recipient.as_bytes().to_vec(),
+                memo: memo.to_vec(),
+            },
+        )
+    }
+
+    /// Slice C happy path: a k-of-n ACC (NO RIC) authorizes the
+    /// mint-cancel swap-back spend — the path the unconditional RIC
+    /// gate previously bricked.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_authorizes_mint_cancel_swap_back() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xe1u8; 32]));
+        let psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk.clone());
+        let proof = acc_proof(&spk, 99_000, TEST_MEMO, 0x81);
+        let body = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt.serialize()),
+            "input_index": 0,
+            "acquire_cancel_proof": serde_json::to_value(&proof)
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let sig_hex = body["signature"].as_str().expect("signature");
+        let sig_bytes = alloy_primitives::hex::decode(sig_hex).expect("sig hex");
+        assert!(
+            sig_bytes.len() >= 70 && sig_bytes.len() <= 73,
+            "sig len {}",
+            sig_bytes.len()
+        );
+    }
+
+    /// Strict XOR: attaching BOTH a RIC and an ACC is a 422
+    /// `intent_proof_ambiguous` — never a pick-one.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn both_certificates_is_422_ambiguous() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xe2u8; 32]));
+        let psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk.clone());
+        let ric = ric_proof(&spk, 99_000, TEST_MEMO, 0x82);
+        let acc = acc_proof(&spk, 99_000, TEST_MEMO, 0x82);
+        let body = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt.serialize()),
+            "input_index": 0,
+            "intent_proof": serde_json::to_value(&ric).unwrap_or(serde_json::Value::Null),
+            "acquire_cancel_proof": serde_json::to_value(&acc)
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::INTENT_PROOF_AMBIGUOUS
+        );
+    }
+
+    /// The output bind under an ACC reports the ACC-specific mismatch
+    /// code: PSBT pays the certified target a DIFFERENT amount.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_amount_mismatch_is_acquire_cancel_mismatch() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xe3u8; 32]));
+        // PSBT pays 99_000 to the certified target; the ACC authorizes
+        // only 50_000.
+        let psbt = build_test_psbt(&desc, prev_txid, 0, Amount::from_sat(100_000), spk.clone());
+        let proof = acc_proof(&spk, 50_000, TEST_MEMO, 0x83);
+        let body = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt.serialize()),
+            "input_index": 0,
+            "acquire_cancel_proof": serde_json::to_value(&proof)
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(
+            body["code"].as_str().expect("code"),
+            error_codes::ACQUIRE_CANCEL_MISMATCH
+        );
+    }
+
+    /// RA-1 on the cancel path: after one swap-back is authorized for a
+    /// cancel_id, a DIFFERENT certificate for the SAME cancel_id is a
+    /// 409 — one valid ACC ≠ N swap-backs.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_redrive_different_certificate_is_409() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_a =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xe4u8; 32]));
+        let psbt_a = build_test_psbt(&desc, prev_a, 0, Amount::from_sat(100_000), spk.clone());
+        let proof_a = acc_proof(&spk, 99_000, TEST_MEMO, 0x84);
+        let body_a = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt_a.serialize()),
+            "input_index": 0,
+            "acquire_cancel_proof": serde_json::to_value(&proof_a)
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let (status_a, body_a_resp) = post_psbt_body(&app, body_a).await;
+        assert_eq!(status_a, StatusCode::OK, "body: {body_a_resp}");
+
+        // Re-drive: SAME cancel_id (0x84), different certified amount →
+        // a different ACC digest at a consumed one-shot.
+        let prev_b =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xe5u8; 32]));
+        let psbt_b = build_test_psbt(&desc, prev_b, 0, Amount::from_sat(60_000), spk.clone());
+        let proof_b = acc_proof(&spk, 59_000, TEST_MEMO, 0x84);
+        let body_b = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt_b.serialize()),
+            "input_index": 0,
+            "acquire_cancel_proof": serde_json::to_value(&proof_b)
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let (status_b, body_b_resp) = post_psbt_body(&app, body_b).await;
+        assert_eq!(status_b, StatusCode::CONFLICT, "body: {body_b_resp}");
+        assert_eq!(
+            body_b_resp["code"].as_str().expect("code"),
+            error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED
+        );
+    }
+
+    /// An ACC consumed on the cancel path does NOT consume the RIC
+    /// one-shot namespace: a redemption whose redemption_id happens to
+    /// equal a consumed cancel_id still signs (independent arms).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_one_shot_is_independent_of_ric_one_shot() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_a =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xe6u8; 32]));
+        let psbt_a = build_test_psbt(&desc, prev_a, 0, Amount::from_sat(100_000), spk.clone());
+        let acc = acc_proof(&spk, 99_000, TEST_MEMO, 0x85);
+        let body_a = serde_json::json!({
+            "chain_id": "btc",
+            "psbt_base64": B64.encode(psbt_a.serialize()),
+            "input_index": 0,
+            "acquire_cancel_proof": serde_json::to_value(&acc)
+                .unwrap_or(serde_json::Value::Null),
+        });
+        let (status_a, resp_a) = post_psbt_body(&app, body_a).await;
+        assert_eq!(status_a, StatusCode::OK, "body: {resp_a}");
+
+        // A RIC for redemption_id == the consumed cancel_id (0x85): the
+        // arms are separate namespaces, so this still signs.
+        let prev_b =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xe7u8; 32]));
+        let psbt_b = build_test_psbt(&desc, prev_b, 0, Amount::from_sat(100_000), spk.clone());
+        let ric = ric_proof(&spk, 99_000, TEST_MEMO, 0x85);
+        let (status_b, resp_b) = post_psbt(&app, B64.encode(psbt_b.serialize()), 0, &ric).await;
+        assert_eq!(status_b, StatusCode::OK, "body: {resp_b}");
     }
 }

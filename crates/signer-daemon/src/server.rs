@@ -37,12 +37,15 @@ use xindex_shared::eip712::{
     refund_attestation_signing_hash, ric_signing_hash,
 };
 use xindex_shared::signer_wire::{
-    error_codes, AcquireCancelSignRequest, AttestationSignRequest, Eip712SignResponse, ErrorBody,
-    HealthResponse, IntentProof, KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest,
-    RicSignRequest,
+    error_codes, AcquireCancelProof, AcquireCancelSignRequest, AttestationSignRequest,
+    Eip712SignResponse, ErrorBody, HealthResponse, IntentProof, KeysResponse,
+    RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
 };
 
-use crate::intent::{validate_intent_proof, IntentPolicy, VerifiedIntent};
+use crate::intent::{
+    validate_acquire_cancel_proof, validate_intent_proof, IntentError, IntentPolicy,
+    VerifiedCancel, VerifiedIntent,
+};
 
 use std::collections::HashMap;
 
@@ -842,6 +845,189 @@ async fn consume_ric_one_shot<S: ReplayStore>(
         };
     }
     Ok(())
+}
+
+/// CTD-1 Slice C: the common custody-spend binding fields, produced by
+/// EITHER certificate gate — a RIC (redeem) or an ACC (mint-cancel
+/// swap-back). The PSBT handler binds the output set against these
+/// without caring which certificate kind authorized the spend; the
+/// kind-specific verification, asset/decimals binds, and one-shot
+/// consumption all happened inside the respective gate.
+#[derive(Debug, Clone)]
+pub(crate) struct CertifiedSpend {
+    /// Certified spend amount in the chain's native smallest units.
+    pub amount: U256,
+    /// Certified keccak of the immediate spend target (Asgard inbound).
+    pub immediate_target_hash: B256,
+    /// Certified keccak of the exact `THORChain` memo bytes.
+    pub memo_hash: B256,
+    /// Wire error code for an output-bind mismatch under THIS
+    /// certificate kind (`intent_mismatch` / `acquire_cancel_mismatch`)
+    /// so the coordinator can tell which certificate the spend violated.
+    pub mismatch_code: &'static str,
+}
+
+/// Map an [`IntentError`] from the ACC validator onto the ACC-specific
+/// wire codes (the validator itself is certificate-agnostic and reports
+/// the RIC codes by default).
+fn acc_error_code(e: &IntentError) -> &'static str {
+    match e {
+        IntentError::ProofInvalid(_) => error_codes::ACQUIRE_CANCEL_PROOF_INVALID,
+        IntentError::VaultStale(_) => error_codes::ACQUIRE_CANCEL_VAULT_STALE,
+    }
+}
+
+/// CTD-1 Slice C — the Acquire-Cancel custody-spend gate, the
+/// mint-cancel sibling of [`gate_ric_intent`]:
+///
+/// 1. Stateless k-of-n verification ([`validate_acquire_cancel_proof`])
+///    against the same static Set-B whitelist.
+/// 2. Family-agnostic binds: certified asset must be THIS chain's
+///    native asset and `amount_decimals` must equal the registry
+///    decimals (RA-4) — an ACC for one chain can never authorize a
+///    same-amount spend on another.
+/// 3. One-shot CONSUME keyed `(chain, cancel_id)`, recorded BEFORE the
+///    HSM: a same-digest retry passes idempotently, a DIFFERENT
+///    certificate for a consumed cancel is a 409
+///    `acquire_cancel_already_signed`.
+pub(crate) async fn gate_acquire_cancel_intent<S: ReplayStore>(
+    config: &DaemonConfig,
+    replay: &S,
+    chain: ChainId,
+    proof: &AcquireCancelProof,
+) -> Result<(VerifiedCancel, B256), (StatusCode, Json<ErrorBody>)> {
+    let now = u64::try_from(now_unix_secs()).unwrap_or(0);
+    let (cert, digest) = validate_acquire_cancel_proof(
+        proof,
+        config.chain_id,
+        config.verifying_contract,
+        &config.intent_policy,
+        now,
+    )
+    .map_err(|e| unprocessable(acc_error_code(&e), e.to_string()))?;
+    if cert.asset_id != chain.asset_id_hash() {
+        return Err(unprocessable(
+            error_codes::ACQUIRE_CANCEL_MISMATCH,
+            format!(
+                "certified asset id is not chain {chain:?}'s native asset — \
+                 ACC v1 certifies native-asset swap-backs only"
+            ),
+        ));
+    }
+    if cert.amount_decimals != chain.decimals() {
+        return Err(unprocessable(
+            error_codes::ACQUIRE_CANCEL_MISMATCH,
+            format!(
+                "certified amount_decimals {} != chain {chain:?} native decimals {} (RA-4)",
+                cert.amount_decimals,
+                chain.decimals()
+            ),
+        ));
+    }
+    consume_ac_one_shot(replay, chain, &cert, digest).await?;
+    Ok((cert, digest))
+}
+
+/// Slice C mirror of [`consume_ric_one_shot`] keyed `(chain, cancel_id)`:
+/// the row is recorded BEFORE the HSM is consulted — the row IS the
+/// authorization; the PSBT replay table holds the actual signature.
+async fn consume_ac_one_shot<S: ReplayStore>(
+    replay: &S,
+    chain: ChainId,
+    cert: &VerifiedCancel,
+    digest: B256,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    const REDRIVEN: &str = "swap-back for this (chain, cancel_id) was already authorized under a \
+         different certificate";
+    let outcome = replay
+        .check_ac_intent(chain, cert.cancel_id, digest.0)
+        .await
+        .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+    match outcome {
+        CheckOutcome::Idempotent(_) => return Ok(()),
+        CheckOutcome::Conflict { .. } => {
+            return Err(conflict(
+                error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED,
+                REDRIVEN,
+            ));
+        }
+        CheckOutcome::FirstTime => {}
+    }
+    if let Err(e) = replay
+        .record_ac_intent(chain, cert.cancel_id, digest.0, Vec::new(), now_unix_secs())
+        .await
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+        }
+        // Lost a same-cancel race — proceed only if the winner consumed
+        // the SAME certificate.
+        return match replay
+            .check_ac_intent(chain, cert.cancel_id, digest.0)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
+        {
+            CheckOutcome::Idempotent(_) => Ok(()),
+            CheckOutcome::Conflict { .. } => Err(conflict(
+                error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED,
+                REDRIVEN,
+            )),
+            CheckOutcome::FirstTime => Err(internal(
+                error_codes::BAD_REQUEST,
+                "ac one-shot record race left no row",
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// CTD-1 Slice C — the PSBT spend-certificate dispatcher: a RIC
+/// (redeem) XOR an ACC (mint-cancel swap-back).
+///
+/// - BOTH present → 422 `intent_proof_ambiguous` (a redeem and a
+///   cancel are distinct authorizations; an honest coordinator never
+///   attaches both — refusing avoids any pick-the-weaker ambiguity).
+/// - RIC only → [`gate_ric_intent`] (which also covers the
+///   neither-present case with `intent_proof_required`).
+/// - ACC only → [`gate_acquire_cancel_intent`].
+///
+/// Returns the kind-agnostic [`CertifiedSpend`] the PSBT output bind
+/// enforces. Only the PSBT endpoint dispatches both kinds — the other
+/// four custody families have no mint-cancel swap-back path.
+pub(crate) async fn gate_spend_certificate<S: ReplayStore>(
+    config: &DaemonConfig,
+    replay: &S,
+    chain: ChainId,
+    ric: Option<&IntentProof>,
+    acc: Option<&AcquireCancelProof>,
+) -> Result<CertifiedSpend, (StatusCode, Json<ErrorBody>)> {
+    match (ric, acc) {
+        (Some(_), Some(_)) => Err(unprocessable(
+            error_codes::INTENT_PROOF_AMBIGUOUS,
+            "request carries BOTH a RIC and an Acquire-Cancel certificate — exactly one \
+             certificate kind must authorize a custody spend",
+        )),
+        (None, Some(proof)) => {
+            let (cert, _digest) = gate_acquire_cancel_intent(config, replay, chain, proof).await?;
+            Ok(CertifiedSpend {
+                amount: cert.amount,
+                immediate_target_hash: cert.immediate_target_hash,
+                memo_hash: cert.memo_hash,
+                mismatch_code: error_codes::ACQUIRE_CANCEL_MISMATCH,
+            })
+        }
+        // RIC-only AND neither: gate_ric_intent turns `None` into the
+        // typed `intent_proof_required` 422.
+        (ric_only, None) => {
+            let (cert, _digest) = gate_ric_intent(config, replay, chain, ric_only).await?;
+            Ok(CertifiedSpend {
+                amount: cert.amount,
+                immediate_target_hash: cert.immediate_target_hash,
+                memo_hash: cert.memo_hash,
+                mismatch_code: error_codes::INTENT_MISMATCH,
+            })
+        }
+    }
 }
 
 /// CTD-1: bind an account-model send (Cosmos / XRP / TRON) to the

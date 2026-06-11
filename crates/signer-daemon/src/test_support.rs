@@ -465,7 +465,7 @@ pub mod ric {
     use xindex_shared::eip712::{
         attestation_oracle_domain, redemption_intent_certificate, ric_signing_hash,
     };
-    use xindex_shared::signer_wire::IntentProof;
+    use xindex_shared::signer_wire::{AcquireCancelProof, IntentProof};
 
     use crate::intent::IntentPolicy;
 
@@ -553,6 +553,79 @@ pub mod ric {
         IntentProof {
             redemption_id: format!("{:#x}", spec.redemption_id),
             leg_index: spec.leg_index.to_string(),
+            asset_id: format!("{:#x}", spec.chain.asset_id_hash()),
+            amount: spec.amount.to_string(),
+            amount_decimals: spec.chain.decimals(),
+            immediate_target_hash: format!("{immediate_target_hash:#x}"),
+            memo_hash: format!("{memo_hash:#x}"),
+            final_destination_hash: format!("{final_destination_hash:#x}"),
+            vault_resolved_at: now,
+            signatures,
+        }
+    }
+
+    /// CTD-1 Slice C: the certified fields of one test mint-cancel
+    /// swap-back. Same raw-bytes conventions as [`CertSpec`].
+    #[derive(Debug, Clone)]
+    pub struct AccSpec {
+        pub chain: ChainId,
+        pub cancel_id: B256,
+        pub intent_id: B256,
+        pub slot_index: u32,
+        pub amount: U256,
+        pub immediate_target: Vec<u8>,
+        pub memo: Vec<u8>,
+    }
+
+    /// Build + quorum-sign an [`AcquireCancelProof`] over `spec` with
+    /// the SAME deterministic Set-B trio — mirrors [`proof_for`] for
+    /// the Acquire-Cancel sibling certificate.
+    #[expect(clippy::expect_used, reason = "test code")]
+    pub fn acc_proof_for(
+        eth_chain_id: u64,
+        verifying_contract: Address,
+        spec: &AccSpec,
+    ) -> AcquireCancelProof {
+        use xindex_shared::eip712::{acquire_cancel_certificate, acquire_cancel_signing_hash};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let immediate_target_hash = keccak256(&spec.immediate_target);
+        let memo_hash = keccak256(&spec.memo);
+        let final_destination_hash = B256::repeat_byte(0x12);
+        let acc = acquire_cancel_certificate(
+            spec.cancel_id,
+            spec.intent_id,
+            U256::from(spec.slot_index),
+            spec.chain.asset_id_hash(),
+            spec.amount,
+            spec.chain.decimals(),
+            immediate_target_hash,
+            memo_hash,
+            final_destination_hash,
+            now,
+        );
+        let digest = acquire_cancel_signing_hash(
+            &acc,
+            &attestation_oracle_domain(eth_chain_id, verifying_contract),
+        );
+        let signatures = set_b_keys()
+            .iter()
+            .take(2)
+            .map(|(sk, _)| {
+                let (sig, recid) = sk
+                    .sign_prehash_recoverable(digest.as_slice())
+                    .expect("sign");
+                let mut out = [0u8; 65];
+                out[..64].copy_from_slice(sig.to_bytes().as_ref());
+                out[64] = 27 + recid.to_byte();
+                format!("0x{}", alloy_primitives::hex::encode(out))
+            })
+            .collect();
+        AcquireCancelProof {
+            cancel_id: format!("{:#x}", spec.cancel_id),
+            intent_id: format!("{:#x}", spec.intent_id),
+            slot_index: spec.slot_index.to_string(),
             asset_id: format!("{:#x}", spec.chain.asset_id_hash()),
             amount: spec.amount.to_string(),
             amount_decimals: spec.chain.decimals(),
