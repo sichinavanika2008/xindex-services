@@ -25,7 +25,7 @@ use xindex_shared::signer_wire::{
     RicSignRequest,
 };
 
-use crate::{HsmBackend, SignerError, SoftwareSigner};
+use crate::{HsmBackend, RicSigner, SignerError, SoftwareSigner};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
 
@@ -151,6 +151,44 @@ impl RemoteHsmBackend {
             vault_resolved_at: ric.vaultResolvedAt,
         };
         self.post_sign("/api/v1/sign/eip712-ric", &req)
+    }
+}
+
+impl RicSigner for RemoteHsmBackend {
+    fn ric_signer_address(&self) -> Address {
+        self.eth_address
+    }
+
+    fn sign_ric(
+        &self,
+        chain: ChainId,
+        ric: &RedemptionIntentCertificate,
+        _domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError> {
+        // The daemon recomputes the digest on its OWN pinned domain and
+        // refuses to equivocate; we never hand it a domain or digest.
+        RemoteHsmBackend::sign_ric(self, chain, ric)
+    }
+}
+
+impl RicSigner for AnyHsmBackend {
+    fn ric_signer_address(&self) -> Address {
+        match self {
+            Self::Software(s) => RicSigner::ric_signer_address(s),
+            Self::Remote(r) => RicSigner::ric_signer_address(r),
+        }
+    }
+
+    fn sign_ric(
+        &self,
+        chain: ChainId,
+        ric: &RedemptionIntentCertificate,
+        domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError> {
+        match self {
+            Self::Software(s) => RicSigner::sign_ric(s, chain, ric, domain),
+            Self::Remote(r) => RicSigner::sign_ric(r, chain, ric, domain),
+        }
     }
 }
 

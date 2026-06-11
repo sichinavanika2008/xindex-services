@@ -9,7 +9,11 @@
 
 pub mod bindings;
 pub mod erc20;
+pub mod observer;
 pub mod rpc;
 
 pub use erc20::RpcErc20LogClient;
+pub use observer::{
+    InMemoryLegSource, LegFacts, Observer, ObserverConfig, ObserverError, RedeemLegSource,
+};
 pub use rpc::{backoff, is_transient_rpc_error, ConnectAttempt, EndpointError, WsEndpointList};

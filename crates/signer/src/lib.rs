@@ -20,10 +20,12 @@ use alloy::signers::SignerSync;
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::Eip712Domain;
 use thiserror::Error;
+use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::{
     attestation_signing_hash, redemption_attestation_signing_hash, refund_attestation_signing_hash,
-    streamed_settlement_signing_hash, AsyncLegDeliveryAttestation, AsyncLegRefundAttestation,
-    AsyncLegStreamedSettlement, Attestation,
+    ric_signing_hash, streamed_settlement_signing_hash, AsyncLegDeliveryAttestation,
+    AsyncLegRefundAttestation, AsyncLegStreamedSettlement, Attestation,
+    RedemptionIntentCertificate,
 };
 
 /// Errors surfaced by signer operations. Concrete enough that callers
@@ -120,6 +122,51 @@ pub trait HsmBackend {
         attestation: &AsyncLegStreamedSettlement,
     ) -> Result<[u8; 65], SignerError> {
         self.sign_digest(streamed_settlement_signing_hash(attestation, domain))
+    }
+}
+
+/// CTD-1 (`DL-CTD-2` Slice B): a backend that can sign a Redemption
+/// Intent Certificate. Kept SEPARATE from [`HsmBackend`] because the RIC
+/// path is chain-scoped (the production daemon hard-gates Solana legs,
+/// RA-2) and is invoked by the per-operator OBSERVER, not the
+/// attestation coordinator.
+///
+/// Two impls:
+/// - [`RemoteHsmBackend`] (production) forwards the plaintext to its
+///   daemon's `/api/v1/sign/eip712-ric`, which recomputes the digest on
+///   its OWN pinned domain and refuses to equivocate; `domain` is
+///   ignored (the daemon never trusts a caller-supplied domain).
+/// - [`SoftwareSigner`] (dev / tests) computes `ric_signing_hash` over
+///   the supplied `domain` and signs it directly.
+pub trait RicSigner {
+    /// The Set-B signer address this backend certifies with.
+    fn ric_signer_address(&self) -> Address;
+
+    /// Sign `ric` for `chain` over the attestation-oracle `domain`.
+    ///
+    /// # Errors
+    /// [`SignerError::Backend`] on backend / transport / equivocation /
+    /// staleness failure.
+    fn sign_ric(
+        &self,
+        chain: ChainId,
+        ric: &RedemptionIntentCertificate,
+        domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError>;
+}
+
+impl RicSigner for SoftwareSigner {
+    fn ric_signer_address(&self) -> Address {
+        self.inner.address()
+    }
+
+    fn sign_ric(
+        &self,
+        _chain: ChainId,
+        ric: &RedemptionIntentCertificate,
+        domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError> {
+        self.sign_digest(ric_signing_hash(ric, domain))
     }
 }
 

@@ -29,10 +29,21 @@ serde_json.workspace = true
 # Blocking JSON-RPC for the sync `Erc20ArrivalClient` (mirrors how
 # chain-btc's Esplora backs the sync `BitcoinChainClient`).
 reqwest = { workspace = true, features = ["blocking"] }
+# CTD-1 Slice B: the per-operator observer service (xindex-observe-redeem)
+# exposes /api/v1/certify-ric over HTTP — same axum surface the
+# signer-daemon uses.
+axum = { workspace = true, features = ["json"] }
+
+[dev-dependencies]
+wiremock.workspace = true
 
 [[bin]]
 name = "xindex-watch"
 path = "src/bin/xindex-watch.rs"
+
+[[bin]]
+name = "xindex-observe-redeem"
+path = "src/bin/xindex-observe-redeem.rs"
 
 [[bin]]
 name = "xindex-attest"

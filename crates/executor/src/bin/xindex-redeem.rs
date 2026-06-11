@@ -45,6 +45,7 @@ use xindex_chain_eth::bindings::ThorchainAdapter;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::{EsploraClient, UtxoChainClient, UtxoParams};
 use xindex_executor::remote_cosigner::RemoteMultisigCosigner;
+use xindex_executor::ric_collector::{CollectedRic, RicCollector};
 use xindex_executor::{
     decode_redeem_event, now_unix_secs, run_watcher, BroadcastRegistry, InMemoryBroadcastRegistry,
     InProcessExecutor, MultisigCosigner, PendingBroadcast, SqliteBroadcastRegistry, WatcherConfig,
@@ -155,6 +156,23 @@ struct Args {
     /// daemon returning a different pubkey is a hard fail.
     #[arg(long, env = "COSIGNER_PUBKEYS")]
     cosigner_pubkeys: Option<String>,
+
+    /// CTD-1 (`DL-CTD-2` Slice B): comma-separated base URLs of the
+    /// per-operator REDEMPTION OBSERVER services (one per operator,
+    /// e.g. `http://op1.internal:9101,http://op2.internal:9101`). When
+    /// set, the executor collects a k-of-n Redemption Intent
+    /// Certificate from these observers and attaches it to every custody
+    /// spend; the spend pays to the Asgard inbound the observers'
+    /// quorum independently agreed on. REQUIRED for any mainnet path —
+    /// the RPC-free signer daemons REJECT a proof-less spend.
+    #[arg(long, env = "OBSERVER_URLS")]
+    observer_urls: Option<String>,
+
+    /// CTD-1 Slice B: number of agreeing observer certificates required
+    /// to assemble the RIC (the k of the k-of-n Set-B ceremony, e.g. 3
+    /// of 5). Required when `--observer-urls` is set.
+    #[arg(long, env = "INTENT_QUORUM")]
+    intent_quorum: Option<usize>,
 
     /// Fee FLOOR + fallback (sats). The daemon derives the absolute fee
     /// from a live Esplora `/fee-estimates` rate at startup
@@ -464,6 +482,59 @@ fn build_executor(
     }
 }
 
+/// Build the CTD-1 per-operator-observer RIC collector from the CLI.
+/// `None` when `--observer-urls` is unset (dev / software mode). When
+/// set, `--intent-quorum` is REQUIRED and the collector fails closed if
+/// fewer observers than the quorum are configured.
+fn build_ric_collector(args: &Args) -> Result<Option<RicCollector>> {
+    let Some(spec) = args.observer_urls.as_deref() else {
+        return Ok(None);
+    };
+    let quorum = args
+        .intent_quorum
+        .ok_or_else(|| anyhow::anyhow!("--intent-quorum required when --observer-urls is set"))?;
+    let urls: Vec<String> = spec
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let collector =
+        RicCollector::new(urls, quorum).map_err(|e| anyhow::anyhow!("build RIC collector: {e}"))?;
+    info!(
+        quorum,
+        "CTD-1 RIC collector enabled (per-operator observers)"
+    );
+    Ok(Some(collector))
+}
+
+/// Self-resolve the live BTC Asgard inbound vault (dev / software-mode
+/// fallback when no observers are configured). Logs + returns `None` on
+/// halt / absence / query failure / invalid network so the caller skips
+/// the leg. The observer path supersedes this in production.
+async fn resolve_self_btc_asgard(
+    thor: &ThorClient,
+    redemption_id: alloy::primitives::B256,
+) -> Option<String> {
+    match thor.vault_for_chain("BTC").await {
+        Ok(Some(v)) if !v.halted => Some(v.address),
+        Ok(Some(_)) => {
+            error!(redemption_id = %redemption_id,
+                   "THORChain BTC inbound HALTED; skipping (retries on next event)");
+            None
+        }
+        Ok(None) => {
+            error!(redemption_id = %redemption_id,
+                   "THORChain returned no BTC inbound vault; skipping");
+            None
+        }
+        Err(e) => {
+            error!(redemption_id = %redemption_id, error = %e,
+                   "THORChain vault query failed; skipping");
+            None
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single sequential pipeline; splitting fights alloy 0.8's deeply nested fillers generic"
@@ -530,6 +601,19 @@ where
     // (rotates per churn) the reverse deposit is sent to.
     let thor = ThorClient::with_base_url(&args.thornode_url).context("thornode client")?;
 
+    // CTD-1 (`DL-CTD-2` Slice B): the per-operator-observer RIC
+    // collector. `Some` only when `--observer-urls` is configured;
+    // mandatory for any mainnet path (the RPC-free daemons reject a
+    // proof-less custody spend). Built once; cloned-by-ref into the
+    // event loop.
+    let collector = build_ric_collector(&args).context("build RIC collector")?;
+    if collector.is_none() && matches!(args.signer_mode, SignerMode::Remote) {
+        warn!(
+            "REMOTE signer mode with NO --observer-urls: every custody spend will be REJECTED \
+             by the daemons (CTD-1 requires a k-of-n RIC). Configure the per-operator observers."
+        );
+    }
+
     // F2 correlation store (executor writer / signer reader).
     if args.redemption_database_url.is_none() {
         warn!(
@@ -590,7 +674,7 @@ where
     // Errors LOGGED, not propagated — a single bad event never crashes
     // the daemon.
     let process_event = async |ev: ThorchainAdapter::RedeemDispatched| {
-        let task = match decode_redeem_event(&ev) {
+        let mut task = match decode_redeem_event(&ev) {
             Ok(t) => t,
             Err(e) => {
                 error!(redemption_id = %ev.redemptionId, error = %e,
@@ -619,35 +703,50 @@ where
             }
         }
 
-        // Resolve the LIVE BTC Asgard inbound vault. Reject if THORChain
-        // reports it halted or absent — never deposit into a paused
-        // vault (funds would sit unswapped). It'll retry on the next
-        // event / restart backfill.
-        let inbound = match thor.vault_for_chain("BTC").await {
-            Ok(Some(v)) if !v.halted => v,
-            Ok(Some(_)) => {
-                error!(redemption_id = %task.redemption_id,
-                       "THORChain BTC inbound HALTED; skipping (retries on next event)");
-                return;
+        // CTD-1 (`DL-CTD-2` Slice B): when per-operator observers are
+        // configured, collect the k-of-n RIC and pay to the Asgard
+        // inbound the observers' quorum independently agreed on — not a
+        // single coordinator resolution — so the PSBT matches the
+        // certified `immediate_target_hash` the RPC-free daemon binds. A
+        // sub-quorum / split result skips the leg (never a proof-less
+        // custody spend). With NO observers (dev / software mode) we
+        // self-resolve; the daemons reject proof-less spends in remote
+        // mode, so that path is dev-only by construction.
+        let collected: Option<CollectedRic> = match collector.as_ref() {
+            Some(c) => {
+                let stamp = now_unix_secs().unwrap_or(0);
+                match c.collect(chain, task.redemption_id, 0, stamp) {
+                    Ok(cr) => Some(cr),
+                    Err(e) => {
+                        error!(redemption_id = %task.redemption_id, error = %e,
+                               "RIC collection failed; skipping (no proof-less custody spend)");
+                        return;
+                    }
+                }
             }
-            Ok(None) => {
-                error!(redemption_id = %task.redemption_id,
-                       "THORChain returned no BTC inbound vault; skipping");
-                return;
-            }
-            Err(e) => {
-                error!(redemption_id = %task.redemption_id, error = %e,
-                       "THORChain vault query failed; skipping");
-                return;
-            }
+            None => None,
+        };
+        let asgard_str = match &collected {
+            // The observers' agreement gate already refused halted /
+            // split vaults, so a collected target is live by construction.
+            Some(cr) => cr.asgard_address.clone(),
+            None => match resolve_self_btc_asgard(&thor, task.redemption_id).await {
+                Some(addr) => addr,
+                None => return,
+            },
         };
         let Ok(Ok(asgard)) =
-            bitcoin::Address::from_str(&inbound.address).map(|a| a.require_network(network))
+            bitcoin::Address::from_str(&asgard_str).map(|a| a.require_network(network))
         else {
-            error!(redemption_id = %task.redemption_id, addr = %inbound.address,
-                   "THORChain BTC vault address invalid for our network; skipping");
+            error!(redemption_id = %task.redemption_id, addr = %asgard_str,
+                   "Asgard vault address invalid for our network; skipping");
             return;
         };
+        // Attach the collected proof; the cosigners forward it to the
+        // daemons, which REQUIRE + re-verify it before signing.
+        if let Some(cr) = collected {
+            task.intent_proof = Some(cr.proof);
+        }
 
         info!(
             redemption_id = %task.redemption_id,

@@ -24,8 +24,10 @@
 //! types here cover the subset we need; `THORChain`'s full response surface
 //! is much larger.
 
+pub mod agreement;
 pub mod client;
 pub mod types;
 
+pub use agreement::{AgreementError, AsgardAgreement, MIN_AGREEING_SOURCES};
 pub use client::{ThorClient, ThorError};
 pub use types::{InboundAddress, OutboundEntry, Pool, TxResponse};

@@ -824,6 +824,120 @@ pub struct RicSignRequest {
     pub vault_resolved_at: u64,
 }
 
+/// `POST /api/v1/certify-ric` (per-operator OBSERVER service, CTD-1
+/// Slice B — not a signer-daemon endpoint).
+///
+/// The relay/executor's certification TRIGGER. Deliberately carries NO
+/// trusted data beyond leg identity + the shared issuance stamp: the
+/// observer derives every certified field from its OWN sources (the
+/// `RedeemDispatched` event via its own Ethereum RPC; the Asgard
+/// inbound via its own ≥2-source agreement gate) and refuses if its
+/// view disagrees. `vault_resolved_at` exists on the wire because all
+/// k observers must sign ONE identical RIC digest (the Set-B daemon
+/// non-equivocates per leg), and the stamp is the only field not
+/// derivable from shared observable state — the proposer picks it,
+/// every observer clamps it against its own clock, and the Set-B
+/// daemon independently enforces its signing window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverCertifyRequest {
+    /// The leg's native chain (the observer refuses chains it is not
+    /// configured to certify; `sol` is always refused, RA-2).
+    pub chain_id: ChainId,
+    /// `bytes32` redemption id, `0x`-prefixed hex — the on-chain event
+    /// lookup key.
+    pub redemption_id: String,
+    /// `uint256` leg index, decimal string (must fit `u32`).
+    pub leg_index: String,
+    /// Proposed shared issuance stamp (unix seconds). The observer
+    /// clamps `|now - vault_resolved_at|` locally; the Set-B daemon
+    /// enforces its own hardcoded signing window on top.
+    pub vault_resolved_at: u64,
+}
+
+/// Response to [`ObserverCertifyRequest`]: the FULL certified RIC
+/// plaintext (exactly what the observer's Set-B daemon signed) plus
+/// the signature. The relay groups responses by identical plaintext,
+/// dedups by `signer_address`, and assembles the k-of-n
+/// [`IntentProof`]. Nothing here is trusted by the custody daemons —
+/// they re-verify the assembled proof statelessly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverCertifyResponse {
+    /// The certified leg's chain.
+    pub chain_id: ChainId,
+    /// `bytes32` redemption id, hex.
+    pub redemption_id: String,
+    /// `uint256` leg index, decimal string.
+    pub leg_index: String,
+    /// `bytes32` canonical asset id the observer certified, hex.
+    pub asset_id: String,
+    /// `uint256` certified amount (native smallest units), decimal.
+    pub amount: String,
+    /// Decimals pinning the unit of `amount` (RA-4).
+    pub amount_decimals: u8,
+    /// `bytes32` keccak of the immediate spend target, hex.
+    pub immediate_target_hash: String,
+    /// `bytes32` keccak of the exact memo bytes, hex.
+    pub memo_hash: String,
+    /// `bytes32` keccak of the final payout destination, hex.
+    pub final_destination_hash: String,
+    /// The stamp the certificate was issued under. On an idempotent
+    /// re-serve of a previously-issued certificate this is the
+    /// ORIGINAL stamp, not the newly-proposed one.
+    pub vault_resolved_at: u64,
+    /// Plaintext Asgard inbound address the observer resolved (its
+    /// keccak — BTC: of the `scriptPubKey`; account chains: of the
+    /// address string — is `immediate_target_hash`). Convenience for
+    /// the executor's pay-to-certified-target consistency check; not
+    /// trusted by daemons.
+    pub asgard_address: String,
+    /// `0x`-prefixed 65-byte recoverable Set-B signature over the RIC
+    /// EIP-712 digest.
+    pub signature: String,
+    /// `0x`-prefixed address of the observer's Set-B signer.
+    pub signer_address: String,
+}
+
+/// `POST /api/v1/attest-leg` (per-operator OBSERVER service, RA-6).
+///
+/// The relay's attestation poll. The observer runs the delivery/refund
+/// cross-check against its OWN sources (`THORChain` + Ethereum +
+/// native chain) and only on success asks its OWN Set-B daemon for the
+/// attestation signature. A compromised relay can poll all day; it
+/// cannot make an honest observer sign an amount its own cross-check
+/// did not produce.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverAttestRequest {
+    /// `bytes32` redemption id, hex.
+    pub redemption_id: String,
+    /// `uint256` leg index, decimal string (must fit `u32`).
+    pub leg_index: String,
+}
+
+/// Response to [`ObserverAttestRequest`]: which terminal outcome the
+/// observer's own cross-check proved, the amount it verified, and its
+/// Set-B attestation signature over the corresponding typed-data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverAttestResponse {
+    /// `"delivery"` (USDT delivered to the `IndexToken`) or `"refund"`
+    /// (native asset slip-refunded to our custody). Mutually exclusive
+    /// per leg, mirroring the on-chain queue.
+    pub kind: String,
+    /// `bytes32` canonical asset id of the leg, hex.
+    pub asset_id: String,
+    /// `uint256` amount the observer's own cross-check verified
+    /// (delivery: USDT 1e6; refund: native smallest units), decimal.
+    pub amount: String,
+    /// `0x`-prefixed 65-byte attestation signature.
+    pub signature: String,
+    /// `0x`-prefixed address of the observer's Set-B signer.
+    pub signer_address: String,
+}
+
+/// [`ObserverAttestResponse::kind`] for a delivery attestation.
+pub const OBSERVER_ATTEST_KIND_DELIVERY: &str = "delivery";
+/// [`ObserverAttestResponse::kind`] for a refund attestation.
+pub const OBSERVER_ATTEST_KIND_REFUND: &str = "refund";
+
 /// `GET /api/v1/keys`
 ///
 /// Daemon identity — coordinator pins this and checks every response
@@ -1037,6 +1151,43 @@ pub mod error_codes {
     /// mainnet; certifying one would launder the gap behind a k-of-n
     /// signature. HTTP 422.
     pub const RIC_CHAIN_FORBIDDEN: &str = "ric_chain_forbidden";
+    /// OBSERVER (CTD-1 Slice B): this observer is not configured to
+    /// certify the requested chain (unsupported family, or `sol`,
+    /// which is always refused per RA-2). HTTP 422.
+    pub const OBSERVER_CHAIN_UNSUPPORTED: &str = "observer_chain_unsupported";
+    /// OBSERVER: no `RedeemDispatched` event for the requested
+    /// `(redemption_id, leg_index)` is visible on the observer's OWN
+    /// Ethereum RPC — a certification trigger for a leg the chain does
+    /// not show is a forgery attempt (or severe RPC lag). HTTP 404.
+    pub const OBSERVER_EVENT_NOT_FOUND: &str = "observer_event_not_found";
+    /// OBSERVER: the proposed `vault_resolved_at` falls outside the
+    /// observer's local clock window — a stale or future-dated
+    /// issuance stamp. HTTP 422.
+    pub const OBSERVER_STAMP_OUT_OF_WINDOW: &str = "observer_stamp_out_of_window";
+    /// OBSERVER: the diverse-source Asgard agreement gate refused
+    /// (sub-minimum responses, inter-source disagreement, or a halt
+    /// flag). The observer never certifies on a single source's word.
+    /// HTTP 503 (transient — the relay may retry).
+    pub const OBSERVER_ASGARD_UNAVAILABLE: &str = "observer_asgard_unavailable";
+    /// OBSERVER: the on-chain event data failed local validation
+    /// (zero/oversized amount, oversized memo, malformed address) —
+    /// nothing to certify. HTTP 422.
+    pub const OBSERVER_EVENT_INVALID: &str = "observer_event_invalid";
+    /// OBSERVER: this observer's Set-B daemon already certified a
+    /// DIFFERENT certificate for the leg, but the observer's own cert
+    /// store has no record of it (store lost / wiped while the daemon
+    /// remembers). Operator intervention required — the daemon will
+    /// not equivocate. HTTP 409.
+    pub const OBSERVER_CERT_CONFLICT: &str = "observer_cert_conflict";
+    /// OBSERVER (RA-6): the attestation cross-check has not yet
+    /// produced a terminal outcome for the leg (THORChain swap still
+    /// in flight, confirmations pending, or the executor's dispatch
+    /// record is not yet visible). Transient — the relay re-polls.
+    /// HTTP 425.
+    pub const OBSERVER_NOT_READY: &str = "observer_not_ready";
+    /// OBSERVER: the observer's signing backend (its own Set-B daemon)
+    /// refused or was unreachable. HTTP 503.
+    pub const OBSERVER_SIGNER_UNAVAILABLE: &str = "observer_signer_unavailable";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -1591,5 +1742,60 @@ mod tests {
         let s = serde_json::to_string(&r).expect("serialize");
         let back: TronSignResponse = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, r);
+    }
+
+    /// CTD-1 Slice B: the observer-service wire types round-trip JSON.
+    /// The relay/executor and the observer binaries only ever agree
+    /// through these structs.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn observer_wire_types_json_round_trip() {
+        let certify = ObserverCertifyRequest {
+            chain_id: ChainId::Btc,
+            redemption_id: format!("0x{}", "ab".repeat(32)),
+            leg_index: "0".to_string(),
+            vault_resolved_at: 1_750_000_000,
+        };
+        let s = serde_json::to_string(&certify).expect("serialize");
+        let back: ObserverCertifyRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, certify);
+
+        let cert = ObserverCertifyResponse {
+            chain_id: ChainId::Btc,
+            redemption_id: format!("0x{}", "ab".repeat(32)),
+            leg_index: "0".to_string(),
+            asset_id: format!("0x{}", "a1".repeat(32)),
+            amount: "50000000".to_string(),
+            amount_decimals: 8,
+            immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+            memo_hash: format!("0x{}", "ef".repeat(32)),
+            final_destination_hash: format!("0x{}", "12".repeat(32)),
+            vault_resolved_at: 1_750_000_000,
+            asgard_address: "bc1qvault".to_string(),
+            signature: format!("0x{}", "aa".repeat(65)),
+            signer_address: format!("0x{}", "44".repeat(20)),
+        };
+        let s = serde_json::to_string(&cert).expect("serialize");
+        let back: ObserverCertifyResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, cert);
+
+        let attest = ObserverAttestRequest {
+            redemption_id: format!("0x{}", "ab".repeat(32)),
+            leg_index: "0".to_string(),
+        };
+        let s = serde_json::to_string(&attest).expect("serialize");
+        let back: ObserverAttestRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, attest);
+
+        let share = ObserverAttestResponse {
+            kind: OBSERVER_ATTEST_KIND_DELIVERY.to_string(),
+            asset_id: format!("0x{}", "a1".repeat(32)),
+            amount: "70000000".to_string(),
+            signature: format!("0x{}", "bb".repeat(65)),
+            signer_address: format!("0x{}", "44".repeat(20)),
+        };
+        let s = serde_json::to_string(&share).expect("serialize");
+        let back: ObserverAttestResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, share);
     }
 }
