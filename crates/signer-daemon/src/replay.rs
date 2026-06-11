@@ -399,6 +399,53 @@ pub trait ReplayStore: Send + Sync {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// CTD-1 Slice C: ONE-SHOT Acquire-Cancel Certificate pre-flight for the
+    /// MINT-CANCEL BTC swap-back, keyed `(chain_id, cancel_id)`. Sibling of
+    /// [`check_ric_intent`](Self::check_ric_intent) for the cancel path — a
+    /// single valid ACC authorizes exactly ONE swap-back. `cancel_id` is
+    /// unique per `AcquireCancelled`, so no leg/slot sub-key. `payload_hash`
+    /// is the ACC digest: identical retry `Idempotent`, DIFFERENT cert a
+    /// `Conflict`.
+    fn check_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// CTD-1 Slice C: record a consumed ACC one-shot authorization.
+    fn record_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// CTD-1 Slice C — Set-B NON-EQUIVOCATION pre-flight for SIGNING an
+    /// Acquire-Cancel Certificate, keyed `(chain_id, cancel_id)`. SEPARATE
+    /// from the custody-side `*_ac_intent` one-shot (same role split as
+    /// `ric_certs` vs `ric_intents`). Identical retry `Idempotent` (cached
+    /// ACC signature), a DIFFERENT certificate for the same cancel a
+    /// `Conflict` — this daemon refuses to equivocate.
+    fn check_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
+
+    /// CTD-1 Slice C: record a signed Acquire-Cancel Certificate.
+    fn record_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -428,6 +475,12 @@ struct InMemoryInner {
     /// CTD-1 Slice A.7: Set-B signed-certificate key (non-equivocation) —
     /// same tuple shape as `ric_intents` but a SEPARATE namespace.
     ric_certs: HashMap<(&'static str, B256, u32), SignedRecord>,
+    /// CTD-1 Slice C: ACC one-shot key — `(chain_id_str, cancel_id)` (the
+    /// mint-cancel swap-back; `cancel_id` is unique per `AcquireCancelled`).
+    ac_intents: HashMap<(&'static str, B256), SignedRecord>,
+    /// CTD-1 Slice C: Set-B signed-ACC key (non-equivocation) — same tuple
+    /// shape as `ac_intents`, a SEPARATE namespace.
+    ac_certs: HashMap<(&'static str, B256), SignedRecord>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -880,6 +933,86 @@ impl ReplayStore for InMemoryReplayStore {
         let key = (chain_id.thor_asset(), redemption_id, leg_index);
         let mut g = self.inner.lock().await;
         if let std::collections::hash_map::Entry::Vacant(e) = g.ric_certs.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Duplicate)
+        }
+    }
+
+    async fn check_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), cancel_id);
+        let g = self.inner.lock().await;
+        Ok(match g.ac_intents.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), cancel_id);
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.ac_intents.entry(key) {
+            e.insert(SignedRecord {
+                payload_hash,
+                signature,
+                signed_at_unix: now_unix,
+            });
+            Ok(())
+        } else {
+            Err(ReplayError::Duplicate)
+        }
+    }
+
+    async fn check_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), cancel_id);
+        let g = self.inner.lock().await;
+        Ok(match g.ac_certs.get(&key) {
+            None => CheckOutcome::FirstTime,
+            Some(rec) if rec.payload_hash == payload_hash => CheckOutcome::Idempotent(rec.clone()),
+            Some(rec) => CheckOutcome::Conflict {
+                previous_payload_hash: rec.payload_hash,
+                previous_signed_at_unix: rec.signed_at_unix,
+            },
+        })
+    }
+
+    async fn record_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let key = (chain_id.thor_asset(), cancel_id);
+        let mut g = self.inner.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(e) = g.ac_certs.entry(key) {
             e.insert(SignedRecord {
                 payload_hash,
                 signature,
@@ -1658,6 +1791,126 @@ impl ReplayStore for SqliteReplayStore {
         .await;
         Self::map_insert(res)
     }
+
+    async fn check_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM ac_intents
+             WHERE chain_id = ? AND cancel_id = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(cancel_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let res = sqlx::query(
+            "INSERT INTO ac_intents
+                (chain_id, cancel_id, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(cancel_id.as_slice())
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await;
+        Self::map_insert(res)
+    }
+
+    async fn check_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        let row: Option<(Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT payload_hash, signature, signed_at_unix
+             FROM ac_certs
+             WHERE chain_id = ? AND cancel_id = ?",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(cancel_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            None => CheckOutcome::FirstTime,
+            Some((ph, sig, at)) => {
+                let prev_hash: [u8; 32] = ph.as_slice().try_into().map_err(|_| {
+                    ReplayError::Decode("stored payload_hash not 32 bytes".to_string())
+                })?;
+                if prev_hash == payload_hash {
+                    CheckOutcome::Idempotent(SignedRecord {
+                        payload_hash: prev_hash,
+                        signature: sig,
+                        signed_at_unix: at,
+                    })
+                } else {
+                    CheckOutcome::Conflict {
+                        previous_payload_hash: prev_hash,
+                        previous_signed_at_unix: at,
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        let res = sqlx::query(
+            "INSERT INTO ac_certs
+                (chain_id, cancel_id, payload_hash, signature, signed_at_unix)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(chain_id.thor_asset())
+        .bind(cancel_id.as_slice())
+        .bind(payload_hash.as_slice())
+        .bind(&signature)
+        .bind(now_unix)
+        .execute(&self.pool)
+        .await;
+        Self::map_insert(res)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -2334,6 +2587,182 @@ mod tests {
             .await
             .expect("connect");
         run_ric_cert_vs_intent_independence(&store).await;
+    }
+
+    /// CTD-1 Slice C: the ACC custody one-shot — keyed `(chain, cancel_id)`
+    /// (no leg). Idempotent on the same digest, Conflict on a different
+    /// cert for the same cancel, independent across cancel ids + chains.
+    async fn run_ac_intent_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let cid = id1();
+            assert_eq!(
+                store
+                    .check_ac_intent(ChainId::Btc, cid, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_ac_intent(ChainId::Btc, cid, hash_a(), vec![1, 2, 3], 100)
+                .await
+                .expect("record");
+            // Same cancel + same ACC → idempotent.
+            assert!(matches!(
+                store
+                    .check_ac_intent(ChainId::Btc, cid, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1, 2, 3]
+            ));
+            // Same cancel + DIFFERENT ACC (re-drive / forged) → Conflict.
+            assert!(matches!(
+                store
+                    .check_ac_intent(ChainId::Btc, cid, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            // Different cancel id → independent.
+            assert_eq!(
+                store
+                    .check_ac_intent(ChainId::Btc, id2(), hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different chain, same cancel id → independent.
+            assert_eq!(
+                store
+                    .check_ac_intent(ChainId::Ltc, cid, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+        }
+    }
+
+    /// CTD-1 Slice C: the Set-B ACC arm — equivocation refusal on a
+    /// different digest for the same cancel.
+    async fn run_ac_cert_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let cid = id1();
+            store
+                .record_ac_cert(ChainId::Btc, cid, hash_a(), vec![9, 9], 100)
+                .await
+                .expect("record");
+            assert!(matches!(
+                store
+                    .check_ac_cert(ChainId::Btc, cid, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![9, 9]
+            ));
+            assert!(matches!(
+                store
+                    .check_ac_cert(ChainId::Btc, cid, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            assert!(matches!(
+                store
+                    .record_ac_cert(ChainId::Btc, cid, hash_a(), vec![9, 9], 101)
+                    .await,
+                Err(ReplayError::Duplicate)
+            ));
+        }
+    }
+
+    /// CTD-1 Slice C: the ACC cert arm and the ACC custody one-shot are
+    /// SEPARATE namespaces (same role split as RIC) — and the ACC arms
+    /// are independent of the RIC arms for the same id (a redeem and a
+    /// mint-cancel can never consume each other's authorization).
+    async fn run_ac_independence<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let id = id1();
+            store
+                .record_ac_cert(ChainId::Btc, id, hash_a(), vec![1], 100)
+                .await
+                .expect("record ac cert");
+            // The ACC custody one-shot for the same key is untouched.
+            assert_eq!(
+                store
+                    .check_ac_intent(ChainId::Btc, id, hash_a())
+                    .await
+                    .expect("check ac intent"),
+                CheckOutcome::FirstTime
+            );
+            // The RIC arms keyed (chain, id, leg=0) are independent of ACC.
+            assert_eq!(
+                store
+                    .check_ric_intent(ChainId::Btc, id, 0, hash_a())
+                    .await
+                    .expect("check ric intent"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_ac_intent(ChainId::Btc, id, hash_a(), vec![2], 101)
+                .await
+                .expect("record ac intent");
+            assert!(matches!(
+                store
+                    .check_ac_cert(ChainId::Btc, id, hash_a())
+                    .await
+                    .expect("check ac cert"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1]
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_ac_intent_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_ac_intent_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_ac_intent_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_ac_intent_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_ac_cert_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_ac_cert_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_ac_cert_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_ac_cert_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_ac_arms_independent() {
+        let store = InMemoryReplayStore::new();
+        run_ac_independence(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_ac_arms_independent() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_ac_independence(&store).await;
     }
 
     #[tokio::test]

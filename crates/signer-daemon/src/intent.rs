@@ -33,9 +33,10 @@
 
 use alloy_primitives::{Address, PrimitiveSignature, B256, U256};
 use xindex_shared::eip712::{
-    attestation_oracle_domain, redemption_intent_certificate, ric_signing_hash,
+    acquire_cancel_certificate, acquire_cancel_signing_hash, attestation_oracle_domain,
+    redemption_intent_certificate, ric_signing_hash,
 };
-use xindex_shared::signer_wire::{error_codes, IntentProof};
+use xindex_shared::signer_wire::{error_codes, AcquireCancelProof, IntentProof};
 
 /// Clock-skew tolerance for a `vault_resolved_at` in the future. The
 /// observers' clocks are NTP-disciplined; anything beyond this is a
@@ -194,6 +195,98 @@ pub fn validate_intent_proof(
     let signers = verify_signature_set(digest, &proof.signatures, policy)?;
     check_recency(intent.vault_resolved_at, now_unix, policy.ric_max_age_secs)?;
     Ok((VerifiedIntent { signers, ..intent }, digest))
+}
+
+/// The certified, parsed ACC fields a handler binds the mint-cancel
+/// swap-back spend against, plus the distinct whitelisted signers. The
+/// sibling of [`VerifiedIntent`] for the cancel path (`DL-CTD-2` Slice C).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedCancel {
+    /// Certified `bytes32` cancel id (the one-shot replay key).
+    pub cancel_id: B256,
+    /// Certified `bytes32` intent id of the cancelled mint.
+    pub intent_id: B256,
+    /// Certified async slot index (fits the replay-key width).
+    pub slot_index: u32,
+    /// Certified canonical asset id of the swap-back leg.
+    pub asset_id: B256,
+    /// Certified swap-back amount in native smallest units.
+    pub amount: U256,
+    /// Certified decimals pinning `amount`'s unit (RA-4).
+    pub amount_decimals: u8,
+    /// Certified keccak of the immediate spend target (Asgard inbound).
+    pub immediate_target_hash: B256,
+    /// Certified keccak of the exact swap-back memo bytes.
+    pub memo_hash: B256,
+    /// Certified keccak of the final payout destination.
+    pub final_destination_hash: B256,
+    /// Observers' Asgard-resolution time (unix seconds).
+    pub vault_resolved_at: u64,
+    /// Sorted distinct whitelisted signers that signed the ACC digest.
+    pub signers: Vec<Address>,
+}
+
+/// Verify a wire [`AcquireCancelProof`] statelessly and return the
+/// certified fields plus the recomputed ACC digest (the one-shot replay
+/// `payload_hash`). The cancel-path sibling of [`validate_intent_proof`]
+/// — identical strict semantics (digest recomputed on the daemon's
+/// pinned domain, k-of-n distinct whitelisted signers over the ACC
+/// digest, recency), differing only in the certified field set.
+///
+/// # Errors
+/// [`IntentError::ProofInvalid`] on any parse/signature/quorum/policy
+/// failure; [`IntentError::VaultStale`] on a stale/future
+/// `vault_resolved_at`. The handler maps these to the ACC-specific wire
+/// codes (`acquire_cancel_proof_invalid` / `acquire_cancel_vault_stale`).
+pub fn validate_acquire_cancel_proof(
+    proof: &AcquireCancelProof,
+    eth_chain_id: u64,
+    verifying_contract: Address,
+    policy: &IntentPolicy,
+    now_unix: u64,
+) -> Result<(VerifiedCancel, B256), IntentError> {
+    policy
+        .validate()
+        .map_err(|e| IntentError::ProofInvalid(format!("daemon intent policy invalid: {e}")))?;
+    let cancel = parse_cancel_fields(proof)?;
+    let acc = acquire_cancel_certificate(
+        cancel.cancel_id,
+        cancel.intent_id,
+        U256::from(cancel.slot_index),
+        cancel.asset_id,
+        cancel.amount,
+        cancel.amount_decimals,
+        cancel.immediate_target_hash,
+        cancel.memo_hash,
+        cancel.final_destination_hash,
+        cancel.vault_resolved_at,
+    );
+    let domain = attestation_oracle_domain(eth_chain_id, verifying_contract);
+    let digest = acquire_cancel_signing_hash(&acc, &domain);
+    let signers = verify_signature_set(digest, &proof.signatures, policy)?;
+    check_recency(cancel.vault_resolved_at, now_unix, policy.ric_max_age_secs)?;
+    Ok((VerifiedCancel { signers, ..cancel }, digest))
+}
+
+/// Parse the wire ACC proof's string fields into typed values.
+/// `signers` is left empty — filled by the caller after verification.
+fn parse_cancel_fields(proof: &AcquireCancelProof) -> Result<VerifiedCancel, IntentError> {
+    Ok(VerifiedCancel {
+        cancel_id: parse_b256(&proof.cancel_id, "cancel_id")?,
+        intent_id: parse_b256(&proof.intent_id, "intent_id")?,
+        slot_index: parse_u32(&proof.slot_index, "slot_index")?,
+        asset_id: parse_b256(&proof.asset_id, "asset_id")?,
+        amount: parse_u256(&proof.amount, "amount")?,
+        amount_decimals: proof.amount_decimals,
+        immediate_target_hash: parse_b256(&proof.immediate_target_hash, "immediate_target_hash")?,
+        memo_hash: parse_b256(&proof.memo_hash, "memo_hash")?,
+        final_destination_hash: parse_b256(
+            &proof.final_destination_hash,
+            "final_destination_hash",
+        )?,
+        vault_resolved_at: proof.vault_resolved_at,
+        signers: Vec::new(),
+    })
 }
 
 /// Parse the wire proof's string fields into typed values. `signers`
@@ -652,5 +745,101 @@ mod tests {
             .expect_err("zero-quorum policy must fail closed");
         assert_eq!(err.error_code(), error_codes::INTENT_PROOF_INVALID);
         assert!(err.to_string().contains("policy invalid"), "got: {err}");
+    }
+
+    /* ---- CTD-1 Slice C: Acquire-Cancel Certificate validator ---- */
+
+    fn sample_acc_proof() -> AcquireCancelProof {
+        AcquireCancelProof {
+            cancel_id: format!("0x{}", "11".repeat(32)),
+            intent_id: format!("0x{}", "22".repeat(32)),
+            slot_index: "0".to_string(),
+            asset_id: format!("0x{}", "a1".repeat(32)),
+            amount: "50000000".to_string(),
+            amount_decimals: 8,
+            immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+            memo_hash: format!("0x{}", "ef".repeat(32)),
+            final_destination_hash: format!("0x{}", "12".repeat(32)),
+            vault_resolved_at: NOW - 100,
+            signatures: vec![],
+        }
+    }
+
+    /// Independent ACC digest recompute from the proof's literal fields.
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn acc_digest_for(proof: &AcquireCancelProof, chain_id: u64, contract: Address) -> B256 {
+        let acc = acquire_cancel_certificate(
+            b256_of(&proof.cancel_id),
+            b256_of(&proof.intent_id),
+            U256::from_str_radix(&proof.slot_index, 10).expect("slot"),
+            b256_of(&proof.asset_id),
+            U256::from_str_radix(&proof.amount, 10).expect("amount"),
+            proof.amount_decimals,
+            b256_of(&proof.immediate_target_hash),
+            b256_of(&proof.memo_hash),
+            b256_of(&proof.final_destination_hash),
+            proof.vault_resolved_at,
+        );
+        acquire_cancel_signing_hash(&acc, &attestation_oracle_domain(chain_id, contract))
+    }
+
+    fn signed_acc_proof(
+        mutate: impl FnOnce(&mut AcquireCancelProof),
+        seeds: &[u8],
+    ) -> AcquireCancelProof {
+        let mut proof = sample_acc_proof();
+        mutate(&mut proof);
+        let digest = acc_digest_for(&proof, CHAIN_ID, oracle());
+        proof.signatures = seeds
+            .iter()
+            .map(|s| sign_digest(&key_identity(*s).0, digest))
+            .collect();
+        proof
+    }
+
+    /// The ACC validator mirrors the RIC validator: 3-of-5 over the ACC
+    /// digest verifies and returns the certified swap-back fields.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn acc_three_of_five_quorum_passes() {
+        let proof = signed_acc_proof(|_| {}, &[1, 2, 3]);
+        let (cancel, digest) =
+            validate_acquire_cancel_proof(&proof, CHAIN_ID, oracle(), &policy(), NOW)
+                .expect("3-of-5 must verify");
+        assert_eq!(digest, acc_digest_for(&proof, CHAIN_ID, oracle()));
+        assert_eq!(cancel.cancel_id, b256_of(&proof.cancel_id));
+        assert_eq!(cancel.intent_id, b256_of(&proof.intent_id));
+        assert_eq!(cancel.slot_index, 0);
+        assert_eq!(cancel.amount, U256::from(50_000_000_u64));
+        assert_eq!(cancel.signers.len(), 3);
+    }
+
+    /// The CTD-1 core property carries to the cancel path: tampering a
+    /// certified field breaks every signature → rejected.
+    #[test]
+    fn acc_tampered_destination_breaks_signatures() {
+        let mut proof = signed_acc_proof(|_| {}, &[1, 2, 3]);
+        proof.immediate_target_hash = format!("0x{}", "66".repeat(32));
+        let err = validate_acquire_cancel_proof(&proof, CHAIN_ID, oracle(), &policy(), NOW)
+            .expect_err("tamper must reject");
+        assert_eq!(err.error_code(), error_codes::INTENT_PROOF_INVALID);
+    }
+
+    /// A different daemon chain id → different domain → no verify
+    /// (cross-chain replay defence on the cancel path).
+    #[test]
+    fn acc_wrong_domain_chain_id_breaks_signatures() {
+        let proof = signed_acc_proof(|_| {}, &[1, 2, 3]);
+        assert!(
+            validate_acquire_cancel_proof(&proof, 11_155_111, oracle(), &policy(), NOW).is_err()
+        );
+    }
+
+    #[test]
+    fn acc_stale_rejected() {
+        let proof = signed_acc_proof(|p| p.vault_resolved_at = NOW - MAX_AGE - 1, &[1, 2, 3]);
+        let err = validate_acquire_cancel_proof(&proof, CHAIN_ID, oracle(), &policy(), NOW)
+            .expect_err("stale must reject");
+        assert_eq!(err.error_code(), error_codes::INTENT_VAULT_STALE);
     }
 }

@@ -129,6 +129,14 @@ pub struct PsbtInputSignRequest {
     /// than an opaque serde 400 — the daemon REJECTS `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent_proof: Option<IntentProof>,
+    /// CTD-1 Slice C: the k-of-n Acquire-Cancel Certificate proof, the
+    /// SIBLING of `intent_proof` for the MINT-CANCEL BTC swap-back. The
+    /// PSBT gate accepts a RIC XOR an ACC: exactly one of `intent_proof`
+    /// / `acquire_cancel_proof` must be present (both → ambiguous 422,
+    /// neither → `intent_proof_required` 422). Only the BTC psbt path
+    /// carries this (mint-cancel swap-backs are BTC today).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquire_cancel_proof: Option<AcquireCancelProof>,
 }
 
 /// `POST /api/v1/sign/evm-safe-tx`
@@ -824,6 +832,80 @@ pub struct RicSignRequest {
     pub vault_resolved_at: u64,
 }
 
+/// CTD-1 Slice C: k-of-n Acquire-Cancel Certificate proof, the SIBLING
+/// of [`IntentProof`] for the MINT-CANCEL BTC swap-back. Carries the
+/// PLAINTEXT fields of one `AcquireCancelCertificate` ([`crate::eip712`],
+/// the 6th typed-data) plus the Set-B signatures over its EIP-712 digest.
+/// The RPC-free daemon recomputes the digest itself, recovers each
+/// signature, requires >= quorum DISTINCT static-whitelist signers, then
+/// binds the swap-back spend to the certified values. Keyed one-shot by
+/// `(chain, cancel_id)` — `cancel_id` is unique per `AcquireCancelled`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcquireCancelProof {
+    /// `bytes32` cancel id (the `AcquireCancelled` event's unique id),
+    /// `0x`-prefixed hex — the one-shot replay key.
+    pub cancel_id: String,
+    /// `bytes32` intent id of the cancelled mint, hex.
+    pub intent_id: String,
+    /// `uint256` async slot index, decimal string (must fit `u32`).
+    pub slot_index: String,
+    /// `bytes32` canonical asset id of the swap-back leg, hex.
+    pub asset_id: String,
+    /// `uint256` certified swap-back amount in native smallest units
+    /// (sats for BTC), decimal string.
+    pub amount: String,
+    /// Decimals pinning the unit of `amount` to the registry (RA-4).
+    pub amount_decimals: u8,
+    /// `bytes32` keccak of the immediate spend target (Asgard inbound),
+    /// hex.
+    pub immediate_target_hash: String,
+    /// `bytes32` keccak of the exact `THORChain` swap-back memo bytes, hex.
+    pub memo_hash: String,
+    /// `bytes32` keccak of the final payout destination, hex.
+    pub final_destination_hash: String,
+    /// Unix seconds when the observers resolved the Asgard inbound; the
+    /// daemon enforces `now - vault_resolved_at <= ric_max_age` (recency).
+    pub vault_resolved_at: u64,
+    /// The k-of-n Set-B signatures over the ACC EIP-712 digest, each a
+    /// `0x`-prefixed 65-byte recoverable signature.
+    pub signatures: Vec<String>,
+}
+
+/// `POST /api/v1/sign/eip712-acc`
+///
+/// CTD-1 Slice C: Set-B Acquire-Cancel-Certificate signing — the sibling
+/// of [`RicSignRequest`] for the mint-cancel swap-back. The daemon
+/// recomputes the ACC EIP-712 digest from these plaintext fields on its
+/// pinned domain, refuses Solana (`ric_chain_forbidden`, RA-2), refuses
+/// stale/future `vault_resolved_at` at the source, and refuses to
+/// EQUIVOCATE per `(chain, cancel_id)` (a second different cert → 409).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcquireCancelSignRequest {
+    /// The swap-back leg's native chain — replay-key namespace + RA-2
+    /// gate (`sol` refused).
+    pub chain_id: ChainId,
+    /// `bytes32` cancel id, `0x`-prefixed hex.
+    pub cancel_id: String,
+    /// `bytes32` intent id of the cancelled mint, hex.
+    pub intent_id: String,
+    /// `uint256` slot index, decimal string (must fit `u32`).
+    pub slot_index: String,
+    /// `bytes32` canonical asset id, hex.
+    pub asset_id: String,
+    /// `uint256` certified swap-back amount (native smallest units), decimal.
+    pub amount: String,
+    /// Decimals pinning the unit of `amount` (RA-4).
+    pub amount_decimals: u8,
+    /// `bytes32` keccak of the immediate spend target (Asgard inbound), hex.
+    pub immediate_target_hash: String,
+    /// `bytes32` keccak of the exact memo bytes, hex.
+    pub memo_hash: String,
+    /// `bytes32` keccak of the final payout destination, hex.
+    pub final_destination_hash: String,
+    /// Observer's Asgard-resolution time (unix seconds).
+    pub vault_resolved_at: u64,
+}
+
 /// `POST /api/v1/certify-ric` (per-operator OBSERVER service, CTD-1
 /// Slice B — not a signer-daemon endpoint).
 ///
@@ -1151,6 +1233,27 @@ pub mod error_codes {
     /// mainnet; certifying one would launder the gap behind a k-of-n
     /// signature. HTTP 422.
     pub const RIC_CHAIN_FORBIDDEN: &str = "ric_chain_forbidden";
+    /// CTD-1 Slice C: the PSBT request carried BOTH a RIC
+    /// (`intent_proof`) AND an Acquire-Cancel cert (`acquire_cancel_proof`).
+    /// The gate is a strict XOR — a redeem spend and a mint-cancel
+    /// swap-back are distinct certificates; presenting both is a
+    /// malformed/ambiguous request the daemon refuses. HTTP 422.
+    pub const INTENT_PROOF_AMBIGUOUS: &str = "intent_proof_ambiguous";
+    /// CTD-1 Slice C: the attached `AcquireCancelProof` failed stateless
+    /// verification (parse / signature / quorum / policy) — same strict
+    /// semantics as `intent_proof_invalid` for the redeem path. HTTP 422.
+    pub const ACQUIRE_CANCEL_PROOF_INVALID: &str = "acquire_cancel_proof_invalid";
+    /// CTD-1 Slice C: the swap-back spend's destination/amount/memo did
+    /// not `==`-match the ACC's certified values. HTTP 422.
+    pub const ACQUIRE_CANCEL_MISMATCH: &str = "acquire_cancel_mismatch";
+    /// CTD-1 Slice C: the ACC's `vault_resolved_at` is outside the
+    /// daemon's `ric_max_age` window (or future-dated) — the certified
+    /// Asgard inbound may belong to a rotated vault. HTTP 422.
+    pub const ACQUIRE_CANCEL_VAULT_STALE: &str = "acquire_cancel_vault_stale";
+    /// CTD-1 Slice C: the swap-back for this `(chain, cancel_id)` was
+    /// already authorized under a DIFFERENT ACC digest — the one-shot
+    /// rule. Identical retries answered idempotently. HTTP 409.
+    pub const ACQUIRE_CANCEL_ALREADY_SIGNED: &str = "acquire_cancel_already_signed";
     /// OBSERVER (CTD-1 Slice B): this observer is not configured to
     /// certify the requested chain (unsupported family, or `sol`,
     /// which is always refused per RA-2). HTTP 422.
@@ -1263,6 +1366,7 @@ mod tests {
             expected_amount_sats: Some(100_000),
             expected_memo: Some("3d3a4554482e55534454".to_string()),
             intent_proof: None,
+            acquire_cancel_proof: None,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1293,6 +1397,7 @@ mod tests {
                 expected_amount_sats: None,
                 expected_memo: None,
                 intent_proof: None,
+                acquire_cancel_proof: None,
             };
             let s = serde_json::to_string(&req).expect("serialize");
             let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1698,11 +1803,86 @@ mod tests {
                 vault_resolved_at: 1_750_000_000,
                 signatures: vec![format!("0x{}", "ab".repeat(65))],
             }),
+            acquire_cancel_proof: None,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, req);
         assert!(s.contains("intent_proof"));
+    }
+
+    /// CTD-1 Slice C: the PSBT request round-trips an `acquire_cancel_proof`
+    /// (the mint-cancel sibling of `intent_proof`). Skipped on the wire
+    /// when `None`; present + intact when `Some`.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn psbt_request_carries_acquire_cancel_proof() {
+        let req = PsbtInputSignRequest {
+            chain_id: ChainId::Btc,
+            psbt_base64: "cHNidP8BAA==".to_string(),
+            input_index: 0,
+            expected_destination_spk: None,
+            expected_amount_sats: None,
+            expected_memo: None,
+            intent_proof: None,
+            acquire_cancel_proof: Some(AcquireCancelProof {
+                cancel_id: format!("0x{}", "11".repeat(32)),
+                intent_id: format!("0x{}", "22".repeat(32)),
+                slot_index: "0".to_string(),
+                asset_id: format!("0x{}", "a1".repeat(32)),
+                amount: "50000000".to_string(),
+                amount_decimals: 8,
+                immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+                memo_hash: format!("0x{}", "ef".repeat(32)),
+                final_destination_hash: format!("0x{}", "12".repeat(32)),
+                vault_resolved_at: 1_750_000_000,
+                signatures: vec![format!("0x{}", "ab".repeat(65))],
+            }),
+        };
+        let s = serde_json::to_string(&req).expect("serialize");
+        let back: PsbtInputSignRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, req);
+        assert!(s.contains("acquire_cancel_proof"));
+        assert!(!s.contains("\"intent_proof\""));
+    }
+
+    /// CTD-1 Slice C: the ACC wire types round-trip JSON.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn acquire_cancel_wire_types_round_trip() {
+        let proof = AcquireCancelProof {
+            cancel_id: format!("0x{}", "11".repeat(32)),
+            intent_id: format!("0x{}", "22".repeat(32)),
+            slot_index: "1".to_string(),
+            asset_id: format!("0x{}", "a1".repeat(32)),
+            amount: "50000000".to_string(),
+            amount_decimals: 8,
+            immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+            memo_hash: format!("0x{}", "ef".repeat(32)),
+            final_destination_hash: format!("0x{}", "12".repeat(32)),
+            vault_resolved_at: 1_750_000_000,
+            signatures: vec![format!("0x{}", "ab".repeat(65))],
+        };
+        let s = serde_json::to_string(&proof).expect("serialize");
+        let back: AcquireCancelProof = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, proof);
+
+        let req = AcquireCancelSignRequest {
+            chain_id: ChainId::Btc,
+            cancel_id: format!("0x{}", "11".repeat(32)),
+            intent_id: format!("0x{}", "22".repeat(32)),
+            slot_index: "1".to_string(),
+            asset_id: format!("0x{}", "a1".repeat(32)),
+            amount: "50000000".to_string(),
+            amount_decimals: 8,
+            immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+            memo_hash: format!("0x{}", "ef".repeat(32)),
+            final_destination_hash: format!("0x{}", "12".repeat(32)),
+            vault_resolved_at: 1_750_000_000,
+        };
+        let s = serde_json::to_string(&req).expect("serialize");
+        let back: AcquireCancelSignRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, req);
     }
 
     /// CTD-1 Slice A.7: a `RicSignRequest` round-trips JSON for every

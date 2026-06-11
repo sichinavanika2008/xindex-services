@@ -104,6 +104,9 @@ impl MultisigCosigner for RemoteMultisigCosigner {
             expected_amount_sats: expected.map(|e| e.amount_sats),
             expected_memo: expected.map(|e| alloy_primitives::hex::encode(&e.memo)),
             intent_proof: intent_proof.cloned(),
+            // The executor's redeem path never carries a mint-cancel ACC;
+            // the swap-back is dispatched by its own (future) cancel path.
+            acquire_cancel_proof: None,
         };
         let resp = self
             .inner

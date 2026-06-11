@@ -340,6 +340,86 @@ pub fn ric_signing_hash(ric: &RedemptionIntentCertificate, domain: &Eip712Domain
     ric.eip712_signing_hash(domain)
 }
 
+sol! {
+    /// CTD-1 Slice C Acquire-Cancel Certificate (ACC) — the SIXTH
+    /// typed-data on the `attestation_oracle_domain`, **off-chain only**
+    /// (`DL-CTD-2`). A SIBLING of the RIC for the MINT-CANCEL BTC
+    /// swap-back: when a pending mint is cancelled, the BTC the protocol
+    /// already swapped to acquire the basket asset must be swapped BACK,
+    /// a custody spend rooted on the `AcquireCancelled` event — NOT a
+    /// `RedeemDispatched`/RIC. A distinct typehash so an ACC can never
+    /// authorize a redemption spend (nor a RIC a cancel spend); the
+    /// shared PSBT-input gate accepts a RIC XOR an ACC.
+    ///
+    /// Without this, requiring a RIC on the shared psbt-input endpoint
+    /// would either BRICK BTC after every cancelled mint or re-open
+    /// CTD-1 via a no-certificate carve-out. The one-shot key is
+    /// `(chain_id, cancelId)` — `cancelId` is unique per
+    /// `AcquireCancelled`.
+    struct AcquireCancelCertificate {
+        bytes32 cancelId;
+        bytes32 intentId;
+        uint256 slotIndex;
+        bytes32 assetId;
+        uint256 amount;
+        uint8 amountDecimals;
+        bytes32 immediateTargetHash;
+        bytes32 memoHash;
+        bytes32 finalDestinationHash;
+        uint64 vaultResolvedAt;
+    }
+}
+
+/// Verbatim ACC type string. Off-chain only — pinned for cross-operator
+/// consistency (every operator's daemon MUST compute the identical
+/// digest). Sibling of [`RIC_TYPE_STRING`].
+pub const ACQUIRE_CANCEL_TYPE_STRING: &[u8] = b"AcquireCancelCertificate(bytes32 cancelId,bytes32 intentId,uint256 slotIndex,bytes32 assetId,uint256 amount,uint8 amountDecimals,bytes32 immediateTargetHash,bytes32 memoHash,bytes32 finalDestinationHash,uint64 vaultResolvedAt)";
+
+/// `keccak256(ACQUIRE_CANCEL_TYPE_STRING)`.
+#[must_use]
+pub fn acquire_cancel_typehash() -> B256 {
+    keccak256(ACQUIRE_CANCEL_TYPE_STRING)
+}
+
+/// Construct an `AcquireCancelCertificate` from raw fields.
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the ACC binds 10 distinct certified fields; a wrapper struct param would just re-wrap them"
+)]
+pub fn acquire_cancel_certificate(
+    cancel_id: B256,
+    intent_id: B256,
+    slot_index: U256,
+    asset_id: B256,
+    amount: U256,
+    amount_decimals: u8,
+    immediate_target_hash: B256,
+    memo_hash: B256,
+    final_destination_hash: B256,
+    vault_resolved_at: u64,
+) -> AcquireCancelCertificate {
+    AcquireCancelCertificate {
+        cancelId: cancel_id,
+        intentId: intent_id,
+        slotIndex: slot_index,
+        assetId: asset_id,
+        amount,
+        amountDecimals: amount_decimals,
+        immediateTargetHash: immediate_target_hash,
+        memoHash: memo_hash,
+        finalDestinationHash: final_destination_hash,
+        vaultResolvedAt: vault_resolved_at,
+    }
+}
+
+/// EIP-712 signing hash for an `AcquireCancelCertificate`. Reuses
+/// `attestation_oracle_domain`, like the RIC.
+#[must_use]
+pub fn acquire_cancel_signing_hash(acc: &AcquireCancelCertificate, domain: &Eip712Domain) -> B256 {
+    acc.eip712_signing_hash(domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,16 +567,42 @@ mod tests {
         );
     }
 
-    /// The FIVE typehashes MUST be pairwise distinct — the type-level
-    /// mint↔delivery↔refund↔streamed↔RIC separation the design relies on.
+    /// ACC (6th typehash, off-chain only — `DL-CTD-2` Slice C). Sibling
+    /// of the RIC for the mint-cancel BTC swap-back; pinned for
+    /// cross-operator digest consistency. Recompute with
+    /// `cast keccak "<ACQUIRE_CANCEL_TYPE_STRING>"`.
     #[test]
-    fn five_typehashes_pairwise_distinct() {
+    fn acquire_cancel_typehash_pinned_and_macro_consistent() {
+        let pinned = B256::new([
+            0x0e, 0x06, 0x33, 0x49, 0x7f, 0xa5, 0x7c, 0x06, 0x9b, 0xb7, 0xec, 0x8d, 0x0b, 0x1e,
+            0xf3, 0xe0, 0xa4, 0x8d, 0x96, 0xce, 0x4e, 0x85, 0x28, 0x6e, 0x7d, 0x57, 0x96, 0xef,
+            0x16, 0xe2, 0x2a, 0xc1,
+        ]);
+        assert_eq!(
+            acquire_cancel_typehash(),
+            pinned,
+            "ACC type string changed — cross-operator digest drift"
+        );
+        assert_eq!(
+            keccak256(AcquireCancelCertificate::eip712_root_type().as_bytes()),
+            acquire_cancel_typehash(),
+            "sol! macro-derived ACC typehash drifted from ACQUIRE_CANCEL_TYPE_STRING"
+        );
+    }
+
+    /// The SIX typehashes MUST be pairwise distinct — the type-level
+    /// mint↔delivery↔refund↔streamed↔RIC↔ACC separation the design
+    /// relies on (a RIC can never authorize a cancel spend, nor vice
+    /// versa).
+    #[test]
+    fn six_typehashes_pairwise_distinct() {
         let all = [
             attestation_typehash(),
             redemption_attestation_typehash(),
             refund_attestation_typehash(),
             streamed_settlement_typehash(),
             ric_typehash(),
+            acquire_cancel_typehash(),
         ];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {

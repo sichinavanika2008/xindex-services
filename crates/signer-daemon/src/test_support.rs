@@ -402,6 +402,54 @@ impl<S: ReplayStore> ReplayStore for RaceReplayStore<S> {
             )
             .await
     }
+
+    async fn check_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        self.inner
+            .check_ac_intent(chain_id, cancel_id, payload_hash)
+            .await
+    }
+
+    async fn record_ac_intent(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        self.inner
+            .record_ac_intent(chain_id, cancel_id, payload_hash, signature, now_unix)
+            .await
+    }
+
+    async fn check_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+    ) -> Result<CheckOutcome, ReplayError> {
+        self.inner
+            .check_ac_cert(chain_id, cancel_id, payload_hash)
+            .await
+    }
+
+    async fn record_ac_cert(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        cancel_id: B256,
+        payload_hash: [u8; 32],
+        signature: Vec<u8>,
+        now_unix: i64,
+    ) -> Result<(), ReplayError> {
+        self.inner
+            .record_ac_cert(chain_id, cancel_id, payload_hash, signature, now_unix)
+            .await
+    }
 }
 
 /// CTD-1 (`DL-CTD-2`) test fixtures: a deterministic 3-member Set-B

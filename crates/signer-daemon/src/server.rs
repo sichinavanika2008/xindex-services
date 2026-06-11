@@ -31,13 +31,15 @@ use axum::{
     Router,
 };
 use xindex_shared::eip712::{
-    attestation, attestation_oracle_domain, attestation_signing_hash, redemption_attestation,
+    acquire_cancel_certificate, acquire_cancel_signing_hash, attestation,
+    attestation_oracle_domain, attestation_signing_hash, redemption_attestation,
     redemption_attestation_signing_hash, redemption_intent_certificate, refund_attestation,
     refund_attestation_signing_hash, ric_signing_hash,
 };
 use xindex_shared::signer_wire::{
-    error_codes, AttestationSignRequest, Eip712SignResponse, ErrorBody, HealthResponse,
-    IntentProof, KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
+    error_codes, AcquireCancelSignRequest, AttestationSignRequest, Eip712SignResponse, ErrorBody,
+    HealthResponse, IntentProof, KeysResponse, RedemptionDeliverySignRequest, RefundSignRequest,
+    RicSignRequest,
 };
 
 use crate::intent::{validate_intent_proof, IntentPolicy, VerifiedIntent};
@@ -235,7 +237,8 @@ where
             post(handle_redemption_delivery::<S, H>),
         )
         .route("/api/v1/sign/eip712-refund", post(handle_refund::<S, H>))
-        .route("/api/v1/sign/eip712-ric", post(handle_ric_sign::<S, H>));
+        .route("/api/v1/sign/eip712-ric", post(handle_ric_sign::<S, H>))
+        .route("/api/v1/sign/eip712-acc", post(handle_acc_sign::<S, H>));
     if !state.utxo.is_empty() {
         r = r.route("/api/v1/sign/psbt-input", post(handle_psbt_input::<S, H>));
     }
@@ -1024,6 +1027,100 @@ where
         let outcome = state
             .replay
             .check_ric_cert(req.chain_id, redemption_id, leg, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+        return ric_cert_cached(&state.config, outcome).unwrap_or_else(|| {
+            Err(internal(
+                error_codes::BAD_REQUEST,
+                "record race left no row",
+            ))
+        });
+    }
+    Ok(Json(render_signature(&state.config, sig)))
+}
+
+/// CTD-1 Slice C — `POST /api/v1/sign/eip712-acc`.
+///
+/// Set-B certifies one MINT-CANCEL BTC swap-back's spend intent — the
+/// sibling of [`handle_ric_sign`] for the `AcquireCancelled` path. Same
+/// discipline: refuses Solana (RA-2); recomputes the ACC EIP-712 digest
+/// from the plaintext on the daemon's pinned domain; refuses stale/future
+/// `vault_resolved_at` at the source; refuses to EQUIVOCATE — a second,
+/// different certificate for the same `(chain, cancel_id)` is a 409 via
+/// the SEPARATE `ac_certs` arm; M6 recover-verify before record/return.
+async fn handle_acc_sign<S, H>(
+    State(state): State<DaemonState<S, H>>,
+    Json(req): Json<AcquireCancelSignRequest>,
+) -> Result<Json<Eip712SignResponse>, (StatusCode, Json<ErrorBody>)>
+where
+    S: ReplayStore + 'static,
+    H: HsmDigestSigner + 'static,
+{
+    if req.chain_id == ChainId::Sol {
+        return Err(unprocessable(
+            error_codes::RIC_CHAIN_FORBIDDEN,
+            "solana legs are CTD-1 hard-gated (RA-2): no on-chain destination root to certify",
+        ));
+    }
+    let cancel_id = parse_b256(&req.cancel_id, "cancel_id")?;
+    let intent_id = parse_b256(&req.intent_id, "intent_id")?;
+    // Slot index is bound into the certified digest (so a cert for slot 0
+    // can't be replayed onto slot 1) but the ACC replay key is the unique
+    // `cancel_id` alone — no separate slot sub-key.
+    let slot_index = parse_u256(&req.slot_index, "slot_index")?;
+    let asset_id = parse_b256(&req.asset_id, "asset_id")?;
+    let amount = parse_u256(&req.amount, "amount")?;
+    let immediate_target_hash = parse_b256(&req.immediate_target_hash, "immediate_target_hash")?;
+    let memo_hash = parse_b256(&req.memo_hash, "memo_hash")?;
+    let final_destination_hash = parse_b256(&req.final_destination_hash, "final_destination_hash")?;
+    check_ric_sign_recency(req.vault_resolved_at)?;
+
+    let acc = acquire_cancel_certificate(
+        cancel_id,
+        intent_id,
+        slot_index,
+        asset_id,
+        amount,
+        req.amount_decimals,
+        immediate_target_hash,
+        memo_hash,
+        final_destination_hash,
+        req.vault_resolved_at,
+    );
+    let digest = acquire_cancel_signing_hash(&acc, &state.config.domain());
+    let payload_hash: [u8; 32] = digest.0;
+
+    let outcome = state
+        .replay
+        .check_ac_cert(req.chain_id, cancel_id, payload_hash)
+        .await
+        .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+    if let Some(resp) = ric_cert_cached(&state.config, outcome) {
+        return resp;
+    }
+    let sig = state
+        .hsm
+        .sign_digest(state.config.eth_address, digest)
+        .await
+        .map_err(|e| hsm_unavailable(&e))?;
+    recover_verify_signer(&sig, digest, state.config.eth_address)?;
+    if let Err(e) = state
+        .replay
+        .record_ac_cert(
+            req.chain_id,
+            cancel_id,
+            payload_hash,
+            sig.to_vec(),
+            now_unix_secs(),
+        )
+        .await
+    {
+        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+            return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+        }
+        let outcome = state
+            .replay
+            .check_ac_cert(req.chain_id, cancel_id, payload_hash)
             .await
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
         return ric_cert_cached(&state.config, outcome).unwrap_or_else(|| {
