@@ -107,7 +107,13 @@ Derive the account address from the ordered member set + threshold (3):
   `xindex-redeem-cosmos --multisig-address …` self-check at startup.
 - Reference: `gaiad keys add xindex-multisig --multisig
   "<p1>,<p2>,<p3>,<p4>,<p5>" --multisig-threshold 3
-  --pubkey-sort-mode preserve` (or the SDK's default sort — see Step 5).
+  --nosort-pubkeys` (older SDKs: `--pubkey-sort-mode preserve`). The
+  order-preserving flag is **MANDATORY** — confirmed by the P3.3-3
+  byte-match (2026-06-12): the cosmos-sdk DEFAULT sorts members, which
+  yields a DIFFERENT address than our frozen order. Our address
+  derivation, the `TxRaw` `public_keys`, and the `CompactBitArray` bit
+  positions all use the frozen member order, so the on-chain account
+  MUST preserve it.
 
 ### Step 5 — Independent address verification + gaiad byte-match (each party)
 
@@ -123,9 +129,11 @@ Every party independently:
    --generate-only` + `gaiad tx multisign` for the same inputs
    (KNOWN_FINDINGS P3.3-3). A single divergent byte aborts the ceremony.
 
-⚠ If the SDK's default pubkey sort differs from our frozen order, the
-addresses will not match — reconcile the ordering convention here, BEFORE
-funding, and record the chosen convention in the disclosure artefact.
+⚠ The order-preserving flag (Step 4) is mandatory: the cosmos-sdk
+DEFAULT sort produces a different address than our frozen order
+(P3.3-3, cosmjs-confirmed). Without `--nosort-pubkeys` the addresses
+will NOT match — abort and re-run with the flag. Record the
+frozen-order convention in the disclosure artefact.
 
 If ANY check fails, the multisig is repudiated and the ceremony restarts
 from Step 2.

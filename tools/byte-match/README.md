@@ -9,6 +9,7 @@ hand-typed constant).
 |---|---|---|---|
 | `xrp.mjs` | `ripple-binary-codec` 2.8.0 + `ripple-address-codec` 5.0.1 | `xrp-tx` `multisign_encoding_matches_xrpljs_reference` | P4.4-1 |
 | `solana.mjs` | `@sqds/multisig` 2.1.4 (+ `@solana/web3.js` 1.98.4) | `solana-tx` `instruction_data_matches_squads_js` | P-SOL-1 |
+| `cosmos.mjs` | `@cosmjs/amino` 0.39.0 | `cosmos-tx` `canonical_json_is_byte_exact`, `address_matches_cosmjs_reference`, `amino_preimage_matches_cosmjs` | P3.3-3 |
 
 The TRON gate (P-TRON-1) does not use a script here — it pins against
 real TRON-node-serialized vectors vendored in THORChain bifrost

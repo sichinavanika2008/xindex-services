@@ -228,6 +228,15 @@ mod tests {
     /// whitespace, numbers-as-strings, the `MsgSend` wrapped with its amino
     /// type name. Pinning this string is the canonicalization contract —
     /// a single divergent byte makes every member signature invalid.
+    ///
+    /// P3.3-3 byte-match CLOSED (amino sign-bytes): the pinned `expected`
+    /// below is byte-identical to `@cosmjs/amino`'s
+    /// `serializeSignDoc(makeSignDoc(...))` over the same inputs — the
+    /// reference implementation of the cosmos-sdk
+    /// `SIGN_MODE_LEGACY_AMINO_JSON` canonicalization. Regenerate via
+    /// `tools/byte-match/cosmos.mjs`. This closes the security-critical
+    /// half of the gaiad gate (the bytes members actually sign); a live
+    /// `gaiad`/cosmjs `TxRaw` broadcast stays testnet-rehearsal territory.
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
     fn canonical_json_is_byte_exact() {
