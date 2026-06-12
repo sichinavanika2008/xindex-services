@@ -419,7 +419,8 @@ async fn coordinator_to_daemon_psbt_input_signs_with_real_ecdsa_and_finalizes() 
     let psbt_send = psbt.clone();
     let (got_pk, got_sig) = tokio::task::spawn_blocking(move || {
         let cosigner = RemoteMultisigCosigner::new(ChainId::Btc, url_for_sign, btc_pk);
-        cosigner.sign_input(&psbt_send, 0, Some(&expected), Some(&proof))
+        let certificate = xindex_executor::SpendCertificate::Ric(proof);
+        cosigner.sign_input(&psbt_send, 0, Some(&expected), Some(&certificate))
     })
     .await
     .expect("join")

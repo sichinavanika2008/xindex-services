@@ -55,7 +55,7 @@ use bitcoin::{
     TxOut, Witness,
 };
 use xindex_executor::remote_cosigner::RemoteMultisigCosigner;
-use xindex_executor::{ExpectedOutputs, MultisigCosigner};
+use xindex_executor::{ExpectedOutputs, MultisigCosigner, SpendCertificate};
 use xindex_multisig::MultisigDescriptor;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::redemption_intent_certificate;
@@ -298,8 +298,9 @@ async fn custody_sign(
     let psbt = psbt.clone();
     tokio::task::spawn_blocking(move || {
         let cosigner = RemoteMultisigCosigner::new(ChainId::Btc, url, btc_pk);
+        let certificate = SpendCertificate::Ric(proof);
         cosigner
-            .sign_input(&psbt, 0, Some(&expected), Some(&proof))
+            .sign_input(&psbt, 0, Some(&expected), Some(&certificate))
             .map_err(|e| e.to_string())
     })
     .await

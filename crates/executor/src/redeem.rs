@@ -24,7 +24,7 @@ use xindex_multisig::{
     SignError, MAX_OP_RETURN_BYTES,
 };
 use xindex_shared::chain_registry::ChainId;
-use xindex_shared::signer_wire::IntentProof;
+use xindex_shared::signer_wire::{AcquireCancelProof, IntentProof};
 
 /// Errors surfaced during a single redemption execution.
 #[derive(Debug, Error)]
@@ -187,6 +187,19 @@ pub struct ExpectedOutputs {
     pub memo: Vec<u8>,
 }
 
+/// CTD-1: the spend-authorizing certificate attached to a PSBT sign
+/// request — strict XOR, mirroring the daemon's `gate_spend_certificate`:
+/// a redemption leg carries a k-of-n RIC, a mint-cancel swap-back
+/// carries a k-of-n ACC, never both (both → 422 `intent_proof_ambiguous`
+/// daemon-side, so the API does not even allow expressing it).
+#[derive(Debug, Clone)]
+pub enum SpendCertificate {
+    /// Redemption Intent Certificate proof (redeem leg).
+    Ric(IntentProof),
+    /// Acquire-Cancel Certificate proof (mint-cancel swap-back).
+    Acc(AcquireCancelProof),
+}
+
 /// Production trait: K independent signer daemons each hold one HSM-
 /// backed key. **Lands in M5.** [`InProcessExecutor`] is the dev-only
 /// stand-in while the wire protocol + HSM integration are absent.
@@ -200,10 +213,11 @@ pub trait MultisigCosigner: Send + Sync {
     /// audit-M2 output veto (destination `scriptPubKey` / amount / memo);
     /// the daemon refuses unless the PSBT pays it.
     ///
-    /// `intent_proof` is the leg's k-of-n Redemption Intent Certificate
-    /// (CTD-1); the daemon REQUIRES it and binds the spend's outputs to
-    /// the certified destination/amount/memo. `None` is forwarded
-    /// verbatim and refused daemon-side (fail closed).
+    /// `certificate` is the spend's k-of-n authorization (CTD-1): a RIC
+    /// for a redeem leg, an ACC for a mint-cancel swap-back. The daemon
+    /// REQUIRES one and binds the spend's outputs to the certified
+    /// destination/amount/memo. `None` is forwarded verbatim and
+    /// refused daemon-side (fail closed).
     ///
     /// # Errors
     /// Returns the cosigner's transport / HSM / authorization error.
@@ -212,7 +226,7 @@ pub trait MultisigCosigner: Send + Sync {
         psbt: &bitcoin::psbt::Psbt,
         input_index: usize,
         expected: Option<&ExpectedOutputs>,
-        intent_proof: Option<&IntentProof>,
+        certificate: Option<&SpendCertificate>,
     ) -> Result<(bitcoin::PublicKey, bitcoin::ecdsa::Signature), ExecuteError>;
 }
 
@@ -321,11 +335,6 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
     /// registry (which must store the exact tx — rebuilding would risk a
     /// different UTXO/txid).
     ///
-    /// **`vin[0]` invariant:** the sole input is a multisig UTXO, so
-    /// `THORChain`'s `getSender` resolves any slip-refund back to our
-    /// multisig (verify-the-refund depends on this). Asserted by
-    /// `vin0_is_multisig_utxo`.
-    ///
     /// # Errors
     /// Any of the variants in [`ExecuteError`].
     pub fn execute_capturing_tx(
@@ -333,7 +342,38 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
         task: &RedeemTask,
         asgard: &Address,
     ) -> Result<(Txid, Transaction), ExecuteError> {
-        let recipient_value = Self::amount_to_sats(task.amount)?;
+        let certificate = task.intent_proof.clone().map(SpendCertificate::Ric);
+        let (txid, tx) =
+            self.execute_spend(task.amount, &task.memo, asgard, certificate.as_ref())?;
+        info!(
+            redemption_id = %task.redemption_id,
+            %txid,
+            "BTC→Asgard redemption deposit broadcast"
+        );
+        Ok((txid, tx))
+    }
+
+    /// The shared custody-spend core, used by BOTH the redeem path
+    /// (RIC-certified) and the mint-cancel swap-back
+    /// ([`crate::cancel_swap_back`], ACC-certified): select UTXO → build
+    /// PSBT (Asgard out, `OP_RETURN` memo, change-to-self) → collect K
+    /// partial signatures → finalize → broadcast.
+    ///
+    /// **`vin[0]` invariant:** the sole input is a multisig UTXO, so
+    /// `THORChain`'s `getSender` resolves any slip-refund back to our
+    /// multisig (verify-the-refund depends on this). Asserted by
+    /// `vin0_is_multisig_utxo`.
+    ///
+    /// # Errors
+    /// Any of the variants in [`ExecuteError`].
+    pub(crate) fn execute_spend(
+        &self,
+        amount: U256,
+        memo: &[u8],
+        asgard: &Address,
+        certificate: Option<&SpendCertificate>,
+    ) -> Result<(Txid, Transaction), ExecuteError> {
+        let recipient_value = Self::amount_to_sats(amount)?;
         let needed = recipient_value
             .checked_add(Amount::from_sat(self.fee_sats))
             .ok_or_else(|| ExecuteError::InvalidAmount("overflow".to_string()))?;
@@ -389,7 +429,7 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             recipient_value,
             Some(&multisig_address),
             change_value,
-            Some(&task.memo),
+            Some(memo),
             UtxoParams::for_chain(ChainId::Btc).op_return_max,
         )?;
 
@@ -408,20 +448,15 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             }
             SigningBackend::Cosigners(cosigners) => {
                 // audit M2: forward the leg's intended payout (from the
-                // decoded event, not the PSBT) so each daemon vetoes any
-                // spend whose outputs diverge from it.
+                // decoded event / certified plan, not the PSBT) so each
+                // daemon vetoes any spend whose outputs diverge from it.
                 let expected = ExpectedOutputs {
                     destination_spk: asgard.script_pubkey().into_bytes(),
                     amount_sats: recipient_value.to_sat(),
-                    memo: task.memo.clone(),
+                    memo: memo.to_vec(),
                 };
                 for (i, cosigner) in cosigners.iter().take(self.descriptor.threshold).enumerate() {
-                    let (pk, sig) = cosigner.sign_input(
-                        &psbt,
-                        0,
-                        Some(&expected),
-                        task.intent_proof.as_ref(),
-                    )?;
+                    let (pk, sig) = cosigner.sign_input(&psbt, 0, Some(&expected), certificate)?;
                     // Daemon-side already verified the descriptor +
                     // vin[0] invariant + signature recovery. Coordinator
                     // pins per-response pubkey; if it didn't match, the
@@ -439,11 +474,6 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             "vin[0] must be the selected multisig UTXO (THORChain refund-to-sender)"
         );
         let txid = self.chain.broadcast(&tx)?;
-        info!(
-            redemption_id = %task.redemption_id,
-            %txid,
-            "BTC→Asgard redemption deposit broadcast"
-        );
         Ok((txid, tx))
     }
 }

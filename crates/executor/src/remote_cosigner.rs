@@ -18,9 +18,9 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use bitcoin::ecdsa::Signature as BtcEcdsaSig;
 use bitcoin::psbt::Psbt;
 use xindex_shared::chain_registry::ChainId;
-use xindex_shared::signer_wire::{IntentProof, PsbtInputSignRequest, PsbtSignResponse};
+use xindex_shared::signer_wire::{PsbtInputSignRequest, PsbtSignResponse};
 
-use crate::redeem::{ExecuteError, ExpectedOutputs, MultisigCosigner};
+use crate::redeem::{ExecuteError, ExpectedOutputs, MultisigCosigner, SpendCertificate};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -89,12 +89,19 @@ impl MultisigCosigner for RemoteMultisigCosigner {
         psbt: &Psbt,
         input_index: usize,
         expected: Option<&ExpectedOutputs>,
-        intent_proof: Option<&IntentProof>,
+        certificate: Option<&SpendCertificate>,
     ) -> Result<(bitcoin::PublicKey, BtcEcdsaSig), ExecuteError> {
         let bytes = psbt.serialize();
         let idx_u32 = u32::try_from(input_index).map_err(|_| {
             ExecuteError::InvalidMemo(format!("input_index {input_index} > u32::MAX"))
         })?;
+        // Strict XOR onto the wire: the enum makes a both-certificates
+        // request unrepresentable (the daemon would 422 it anyway).
+        let (intent_proof, acquire_cancel_proof) = match certificate {
+            Some(SpendCertificate::Ric(p)) => (Some(p.clone()), None),
+            Some(SpendCertificate::Acc(p)) => (None, Some(p.clone())),
+            None => (None, None),
+        };
         let req = PsbtInputSignRequest {
             chain_id: self.chain_id,
             psbt_base64: B64.encode(&bytes),
@@ -103,10 +110,8 @@ impl MultisigCosigner for RemoteMultisigCosigner {
                 .map(|e| alloy_primitives::hex::encode(&e.destination_spk)),
             expected_amount_sats: expected.map(|e| e.amount_sats),
             expected_memo: expected.map(|e| alloy_primitives::hex::encode(&e.memo)),
-            intent_proof: intent_proof.cloned(),
-            // The executor's redeem path never carries a mint-cancel ACC;
-            // the swap-back is dispatched by its own (future) cancel path.
-            acquire_cancel_proof: None,
+            intent_proof,
+            acquire_cancel_proof,
         };
         let resp = self
             .inner

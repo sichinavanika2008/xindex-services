@@ -16,6 +16,7 @@
 //! with a `MultisigCosigner` trait carrying signer-daemon RPC calls.
 
 pub mod broadcast_registry;
+pub mod cancel_swap_back;
 pub mod cosmos_redeem;
 pub mod evm_redeem;
 pub mod rebroadcast;
@@ -31,12 +32,13 @@ pub use broadcast_registry::{
     now_unix_secs, BroadcastRegistry, BroadcastStatus, InMemoryBroadcastRegistry, PendingBroadcast,
     RegistryError, SqliteBroadcastRegistry,
 };
+pub use cancel_swap_back::SwapBackTask;
 pub use rebroadcast::{run_watcher, WatcherConfig, WatcherError};
 pub use redeem::{
     decode_redeem_event, ExecuteError, ExpectedOutputs, InProcessExecutor, MultisigCosigner,
-    RedeemTask, RedeemTaskSource,
+    RedeemTask, RedeemTaskSource, SpendCertificate,
 };
-pub use ric_collector::{RicCollectError, RicCollector};
+pub use ric_collector::{CollectedAcc, CollectedRic, RicCollectError, RicCollector};
 pub use solana_redeem::{
     SolanaCosigner, SolanaLockTable, SolanaMemberSig, SolanaRedeemConfig, SolanaRedeemError,
     SolanaRedeemExecutor, SolanaRedeemLegOutcome, SolanaRedeemTask,
