@@ -67,6 +67,39 @@ pub fn proof(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    proof_at(
+        eth_chain_id,
+        verifying_contract,
+        chain,
+        rid,
+        leg_index,
+        amount,
+        immediate_target,
+        memo,
+        now,
+    )
+}
+
+/// [`proof`] with an explicit `vault_resolved_at` — Slice D uses this
+/// to exercise the custody daemon's recency gate (stale-RIC refusal and
+/// the Asgard-rotation re-certification path).
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test fixture mirrors the 8 certified inputs + the stamp"
+)]
+pub fn proof_at(
+    eth_chain_id: u64,
+    verifying_contract: Address,
+    chain: ChainId,
+    rid: u8,
+    leg_index: u32,
+    amount: u128,
+    immediate_target: &[u8],
+    memo: &[u8],
+    vault_resolved_at: u64,
+) -> IntentProof {
+    let now = vault_resolved_at;
     let redemption_id = B256::repeat_byte(rid);
     let amount = U256::from(amount);
     let immediate_target_hash = keccak256(immediate_target);
