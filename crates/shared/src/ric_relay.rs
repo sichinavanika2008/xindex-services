@@ -186,6 +186,7 @@ mod tests {
     const POISON: &str = "0x6666666666666666666666666666666666666666666666666666666666666666";
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn three_agreeing_observers_assemble_quorum() {
         let responses = vec![
             resp(1, 0xa1, GOOD),
@@ -198,6 +199,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn exact_quorum_assembles() {
         let responses = vec![resp(1, 0xa1, GOOD), resp(2, 0xa2, GOOD)];
         let proof = assemble_intent_proof(&responses, 2).expect("must assemble");
@@ -205,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn sub_quorum_rejected() {
         let responses = vec![resp(1, 0xa1, GOOD)];
         let err = assemble_intent_proof(&responses, 2).expect_err("must reject");
@@ -221,6 +224,7 @@ mod tests {
     /// A duplicate signer is ONE vote — two responses from signer 1 do
     /// not reach a quorum of 2.
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn duplicate_signer_counts_once() {
         let responses = vec![resp(1, 0xa1, GOOD), resp(1, 0xa9, GOOD)];
         let err = assemble_intent_proof(&responses, 2).expect_err("must reject");
@@ -238,6 +242,7 @@ mod tests {
     /// majority. With 2 honest + 1 poisoned and quorum 2, the honest
     /// group wins and the proof binds the GOOD target.
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn poisoned_minority_does_not_dilute_honest_quorum() {
         let responses = vec![
             resp(1, 0xa1, GOOD),
@@ -252,6 +257,7 @@ mod tests {
     /// A split where NEITHER group reaches quorum fails — two honest on
     /// GOOD vs two on POISON, quorum 3: no agreement.
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn even_split_below_quorum_fails() {
         let responses = vec![
             resp(1, 0xa1, GOOD),
@@ -280,6 +286,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn empty_responses_reject() {
         let err = assemble_intent_proof(&[], 2).expect_err("must reject");
         assert!(matches!(
@@ -295,6 +302,7 @@ mod tests {
     /// Signer-address comparison is case-insensitive — checksummed and
     /// lowercase forms of the same address are ONE signer.
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn signer_dedup_is_case_insensitive() {
         let mut a = resp(1, 0xa1, GOOD);
         a.signer_address = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb".to_string();
