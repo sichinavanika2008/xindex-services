@@ -27,7 +27,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use alloy::eips::BlockNumberOrTag;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;
@@ -42,7 +42,8 @@ use futures_util::StreamExt;
 use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::ThorchainAdapter;
 use xindex_chain_eth::observer::{
-    InMemoryLegSource, LegFacts, Observer, ObserverConfig, ObserverError,
+    AnyHaltSource, HttpHaltSource, InMemoryLegSource, LegFacts, NeverHalted, Observer,
+    ObserverConfig, ObserverError,
 };
 use xindex_chain_thor::{AsgardAgreement, ThorClient};
 use xindex_shared::chain_registry::ChainId;
@@ -128,6 +129,29 @@ struct Args {
     /// Address the certify-ric HTTP service listens on.
     #[arg(long, env = "LISTEN_ADDR", default_value = "127.0.0.1:9101")]
     listen_addr: String,
+
+    /// Deployed `CustodyGuard` address (DL-CTD-E). When set (together
+    /// with --eth-http-url) the observer refuses to certify while the
+    /// on-chain halt is active. Unset = no halt gate (DEV ONLY —
+    /// production MUST set it).
+    #[arg(long, env = "CUSTODY_GUARD_ADDR")]
+    custody_guard: Option<String>,
+
+    /// HTTP(S) Ethereum JSON-RPC used for the halt poll (a plain
+    /// `eth_call`; typically the HTTP port of `ETH_RPC_URL`'s node).
+    #[arg(long, env = "ETH_HTTP_URL")]
+    eth_http_url: Option<String>,
+
+    /// E2 fraud window (DL-CTD-E): legs STRICTLY ABOVE this native
+    /// smallest-unit amount wait `LARGE_SPEND_DELAY_SECS` from first
+    /// observation before this observer certifies (production: ≈2% of
+    /// per-chain custody, decimal). Unset = no fraud window (DEV ONLY).
+    #[arg(long, env = "LARGE_SPEND_THRESHOLD")]
+    large_spend_threshold: Option<String>,
+
+    /// E2 fraud-window delay seconds (production default 1800 = 30 min).
+    #[arg(long, env = "LARGE_SPEND_DELAY_SECS", default_value_t = 1_800)]
+    large_spend_delay_secs: u64,
 }
 
 #[tokio::main]
@@ -199,7 +223,23 @@ fn build_signer(args: &Args) -> Result<AnyHsmBackend> {
 /// event loop writes into.
 #[derive(Clone, Debug)]
 struct ObserverState {
-    observer: Arc<Observer<InMemoryLegSource, AnyHsmBackend>>,
+    observer: Arc<Observer<InMemoryLegSource, AnyHsmBackend, AnyHaltSource>>,
+}
+
+/// Build the DL-CTD-E halt source: both the guard address and the HTTP
+/// RPC, or neither (DEV ONLY, loud).
+fn build_halt_source(args: &Args) -> Result<AnyHaltSource> {
+    match (&args.custody_guard, &args.eth_http_url) {
+        (Some(guard), Some(url)) => {
+            let guard = Address::from_str(guard).context("CUSTODY_GUARD_ADDR invalid")?;
+            Ok(AnyHaltSource::Http(HttpHaltSource::new(url.clone(), guard)))
+        }
+        (None, None) => {
+            warn!("no CustodyGuard halt gate configured — DEV ONLY");
+            Ok(AnyHaltSource::Never(NeverHalted))
+        }
+        _ => anyhow::bail!("CUSTODY_GUARD_ADDR and ETH_HTTP_URL must be set together"),
+    }
 }
 
 #[expect(
@@ -218,6 +258,17 @@ async fn run(args: Args) -> Result<()> {
 
     let agreement = build_agreement(&args.thornode_urls)?;
     let signer = build_signer(&args)?;
+    let halt = build_halt_source(&args)?;
+    let large_spend_threshold = args
+        .large_spend_threshold
+        .as_deref()
+        .map(|s| {
+            U256::from_str_radix(s, 10).context("LARGE_SPEND_THRESHOLD must be a decimal amount")
+        })
+        .transpose()?;
+    if large_spend_threshold.is_none() {
+        warn!("no E2 fraud-window threshold configured — DEV ONLY");
+    }
     let legs = InMemoryLegSource::new();
 
     let ws = WsConnect::new(&args.rpc_url);
@@ -236,10 +287,13 @@ async fn run(args: Args) -> Result<()> {
             oracle,
             btc_network: network,
             stamp_window_secs: args.stamp_window_secs,
+            large_spend_threshold,
+            large_spend_delay_secs: args.large_spend_delay_secs,
         },
         agreement,
         legs.clone(),
         signer,
+        halt,
     ));
     info!(
         %adapter, %oracle, chain = ?chain, eth_chain_id,
@@ -263,6 +317,7 @@ async fn run(args: Args) -> Result<()> {
                     memo: ev.memo.as_bytes().to_vec(),
                     final_destination: ev.destination,
                 },
+                now_unix(),
             );
             info!(redemption_id = %ev.redemptionId, "recorded RedeemDispatched leg facts");
         };
@@ -354,11 +409,14 @@ fn status_for(e: &ObserverError) -> StatusCode {
         ObserverError::EventNotFound { .. } => StatusCode::NOT_FOUND,
         ObserverError::AsgardUnavailable(_)
         | ObserverError::LegSource(_)
-        | ObserverError::SignerUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | ObserverError::SignerUnavailable(_)
+        | ObserverError::HaltUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         ObserverError::ChainUnsupported(_)
         | ObserverError::BadRequest(_)
         | ObserverError::EventInvalid(_)
         | ObserverError::StampOutOfWindow(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        ObserverError::Halted => StatusCode::LOCKED,
+        ObserverError::FraudWindowActive { .. } => StatusCode::TOO_EARLY,
     }
 }
 

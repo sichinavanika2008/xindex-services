@@ -462,6 +462,7 @@ mod tests {
             verifying_contract: Address::ZERO,
             eth_address: Address::ZERO,
             intent_policy: crate::test_support::ric::policy(),
+            cert_volume: crate::server::CertVolumePolicy::unmetered(),
         }
     }
 

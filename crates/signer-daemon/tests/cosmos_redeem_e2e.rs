@@ -130,6 +130,7 @@ async fn spawn_cosmos_daemon(
         verifying_contract: Address::repeat_byte(0xab),
         eth_address: signer_addr,
         intent_policy: ric_common::policy(),
+        cert_volume: xindex_signer_daemon::server::CertVolumePolicy::unmetered(),
     };
     let state = DaemonState::new(cfg, Arc::new(InMemoryReplayStore::new()), Arc::clone(&hsm))
         .with_cosmos(CosmosSignerConfig {

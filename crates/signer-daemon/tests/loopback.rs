@@ -143,6 +143,7 @@ async fn spawn_daemon(
         verifying_contract: Address::repeat_byte(0xab),
         eth_address,
         intent_policy: ric_common::policy(),
+        cert_volume: xindex_signer_daemon::server::CertVolumePolicy::unmetered(),
     };
     let mut state = DaemonState::new(cfg, replay, Arc::clone(&hsm));
     if let Some(btc_cfg) = btc {

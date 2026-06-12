@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use alloy_primitives::{B256, U256};
 
 use crate::replay::{
-    CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayError, ReplayStore,
+    CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayError, ReplayStore, VolumeOutcome,
 };
 
 /// Which signing path the race is simulated on. Every OTHER method
@@ -448,6 +448,18 @@ impl<S: ReplayStore> ReplayStore for RaceReplayStore<S> {
     ) -> Result<(), ReplayError> {
         self.inner
             .record_ac_cert(chain_id, cancel_id, payload_hash, signature, now_unix)
+            .await
+    }
+
+    async fn consume_cert_volume(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        window_start: i64,
+        amount: u128,
+        cap: u128,
+    ) -> Result<VolumeOutcome, ReplayError> {
+        self.inner
+            .consume_cert_volume(chain_id, window_start, amount, cap)
             .await
     }
 }

@@ -1233,6 +1233,12 @@ pub mod error_codes {
     /// mainnet; certifying one would launder the gap behind a k-of-n
     /// signature. HTTP 422.
     pub const RIC_CHAIN_FORBIDDEN: &str = "ric_chain_forbidden";
+    /// CTD-1 Slice E (`DL-CTD-E`): the Set-B per-chain certification
+    /// volume window cap would be exceeded — this daemon refuses to
+    /// certify more custody outflow this window. RIC and ACC signing
+    /// consume from the SAME window (the mint-cancel path cannot
+    /// bypass the breaker). HTTP 422.
+    pub const VOLUME_CAP_EXCEEDED: &str = "volume_cap_exceeded";
     /// CTD-1 Slice C: the PSBT request carried BOTH a RIC
     /// (`intent_proof`) AND an Acquire-Cancel cert (`acquire_cancel_proof`).
     /// The gate is a strict XOR — a redeem spend and a mint-cancel
@@ -1291,6 +1297,21 @@ pub mod error_codes {
     /// OBSERVER: the observer's signing backend (its own Set-B daemon)
     /// refused or was unreachable. HTTP 503.
     pub const OBSERVER_SIGNER_UNAVAILABLE: &str = "observer_signer_unavailable";
+    /// OBSERVER (`DL-CTD-E`): the on-chain `CustodyGuard` halt is
+    /// active — this observer refuses every certification until the
+    /// halt expires or a quorum un-halts. HTTP 423.
+    pub const OBSERVER_HALTED: &str = "observer_halted";
+    /// OBSERVER (`DL-CTD-E` E2): the leg exceeds the operator's
+    /// large-spend threshold and its fraud window (30 min from first
+    /// observation in production) has not elapsed. Transient — the
+    /// relay retries after the window opens; the halt is re-checked on
+    /// every attempt. HTTP 425.
+    pub const OBSERVER_FRAUD_WINDOW: &str = "observer_fraud_window";
+    /// OBSERVER (`DL-CTD-E`): the halt source (the operator's own
+    /// Ethereum RPC reading `CustodyGuard.isHalted()`) failed — the
+    /// observer fails CLOSED rather than certifying with the halt flag
+    /// unknown. HTTP 503.
+    pub const OBSERVER_HALT_UNAVAILABLE: &str = "observer_halt_unavailable";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;

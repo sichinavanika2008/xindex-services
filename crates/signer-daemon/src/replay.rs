@@ -35,6 +35,12 @@ pub enum ReplayError {
     #[error("decode error: {0}")]
     Decode(String),
 
+    /// Optimistic-CAS retries exhausted on a volume-window consume
+    /// (CTD-1 Slice E). Fail closed — the caller refuses the sign; a
+    /// retry sees fresh state.
+    #[error("volume window contention: {0}")]
+    Contention(String),
+
     /// A concurrent request already recorded this exact identity tuple — the
     /// write-side race the `check_*` pre-flight cannot fully close (two
     /// identical requests both observe `FirstTime`, both sign deterministically,
@@ -86,6 +92,18 @@ pub enum CheckOutcome {
         /// When the previous payload was signed.
         previous_signed_at_unix: i64,
     },
+}
+
+/// Outcome of a volume-window consume attempt (CTD-1 Slice E,
+/// `DL-CTD-E`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeOutcome {
+    /// Consumed; `used` is the window's running total INCLUDING this
+    /// amount.
+    Consumed { used: u128 },
+    /// Refused — consuming would exceed the cap. Nothing was recorded;
+    /// the window's stored total is unchanged.
+    Exceeded { attempted: u128, cap: u128 },
 }
 
 /// Distinguishes delivery vs refund on the burn side. The
@@ -446,6 +464,22 @@ pub trait ReplayStore: Send + Sync {
         signature: Vec<u8>,
         now_unix: i64,
     ) -> impl std::future::Future<Output = Result<(), ReplayError>> + Send;
+
+    /// CTD-1 Slice E (`DL-CTD-E`): atomically consume `amount` native
+    /// smallest-units of Set-B CERTIFICATION volume from `chain_id`'s
+    /// fixed window bucket starting at `window_start`, refusing (without
+    /// consuming) when `used + amount` would exceed `cap`. RIC and ACC
+    /// certifications meter into the SAME per-chain window — the
+    /// mint-cancel path must not bypass the breaker. The caller derives
+    /// `window_start` from its configured window length and supplies the
+    /// chain's configured cap; an unmetered chain never reaches this.
+    fn consume_cert_volume(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        window_start: i64,
+        amount: u128,
+        cap: u128,
+    ) -> impl std::future::Future<Output = Result<VolumeOutcome, ReplayError>> + Send;
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -481,6 +515,9 @@ struct InMemoryInner {
     /// CTD-1 Slice C: Set-B signed-ACC key (non-equivocation) — same tuple
     /// shape as `ac_intents`, a SEPARATE namespace.
     ac_certs: HashMap<(&'static str, B256), SignedRecord>,
+    /// CTD-1 Slice E: per-chain certification volume windows —
+    /// `(chain_id_str, window_start) → used` (native smallest units).
+    volume_windows: HashMap<(&'static str, i64), u128>,
 }
 
 /// `InMemoryReplayStore` — dev / test only. Loses every guarantee on
@@ -1022,6 +1059,24 @@ impl ReplayStore for InMemoryReplayStore {
         } else {
             Err(ReplayError::Duplicate)
         }
+    }
+
+    async fn consume_cert_volume(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        window_start: i64,
+        amount: u128,
+        cap: u128,
+    ) -> Result<VolumeOutcome, ReplayError> {
+        let key = (chain_id.thor_asset(), window_start);
+        let mut g = self.inner.lock().await;
+        let used = g.volume_windows.get(&key).copied().unwrap_or(0);
+        let attempted = used.saturating_add(amount);
+        if attempted > cap {
+            return Ok(VolumeOutcome::Exceeded { attempted, cap });
+        }
+        g.volume_windows.insert(key, attempted);
+        Ok(VolumeOutcome::Consumed { used: attempted })
     }
 }
 
@@ -1910,6 +1965,79 @@ impl ReplayStore for SqliteReplayStore {
         .execute(&self.pool)
         .await;
         Self::map_insert(res)
+    }
+
+    async fn consume_cert_volume(
+        &self,
+        chain_id: xindex_shared::chain_registry::ChainId,
+        window_start: i64,
+        amount: u128,
+        cap: u128,
+    ) -> Result<VolumeOutcome, ReplayError> {
+        let chain = chain_id.thor_asset();
+        // Optimistic CAS: SQLite INTEGER is i64 and EVM-leg amounts need
+        // u128, so `used` is a decimal TEXT column mutated read-modify-
+        // write; the WHERE-old-value guard (or the PK on first insert)
+        // makes each attempt atomic. Bounded retries — contention on one
+        // daemon's Set-B endpoint is near-zero in practice; exhaustion
+        // fails CLOSED (the sign is refused, a retry sees fresh state).
+        for _ in 0..4 {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT used FROM volume_windows WHERE chain = ? AND window_start = ?",
+            )
+            .bind(chain)
+            .bind(window_start)
+            .fetch_optional(&self.pool)
+            .await?;
+            let used: u128 = match &row {
+                None => 0,
+                Some((text,)) => text
+                    .parse()
+                    .map_err(|e| ReplayError::Decode(format!("volume used '{text}': {e}")))?,
+            };
+            let attempted = used.saturating_add(amount);
+            if attempted > cap {
+                return Ok(VolumeOutcome::Exceeded { attempted, cap });
+            }
+            let written = match &row {
+                None => {
+                    let res = sqlx::query(
+                        "INSERT INTO volume_windows (chain, window_start, used) VALUES (?, ?, ?)",
+                    )
+                    .bind(chain)
+                    .bind(window_start)
+                    .bind(attempted.to_string())
+                    .execute(&self.pool)
+                    .await;
+                    match res {
+                        Ok(_) => true,
+                        // PK collision: a concurrent consumer won the
+                        // insert race — re-read its row and retry.
+                        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => false,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Some((old,)) => {
+                    let res = sqlx::query(
+                        "UPDATE volume_windows SET used = ?
+                         WHERE chain = ? AND window_start = ? AND used = ?",
+                    )
+                    .bind(attempted.to_string())
+                    .bind(chain)
+                    .bind(window_start)
+                    .bind(old)
+                    .execute(&self.pool)
+                    .await?;
+                    res.rows_affected() == 1
+                }
+            };
+            if written {
+                return Ok(VolumeOutcome::Consumed { used: attempted });
+            }
+        }
+        Err(ReplayError::Contention(
+            "volume window CAS exhausted after 4 attempts".to_string(),
+        ))
     }
 }
 
@@ -2817,5 +2945,114 @@ mod tests {
             .await
             .expect("connect");
         run_psbt_input_lifecycle(&store).await;
+    }
+
+    /// CTD-1 Slice E: the volume window accumulates, refuses over-cap
+    /// WITHOUT consuming, isolates per chain and per bucket, and
+    /// round-trips u128 (EVM wei scale) through storage.
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn run_volume_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        const W0: i64 = 1_000_000;
+        const W1: i64 = 1_086_400;
+        const CAP: u128 = 100;
+
+        let out = store
+            .consume_cert_volume(ChainId::Btc, W0, 60, CAP)
+            .await
+            .expect("fresh window");
+        assert_eq!(out, VolumeOutcome::Consumed { used: 60 });
+
+        let out = store
+            .consume_cert_volume(ChainId::Btc, W0, 40, CAP)
+            .await
+            .expect("accumulate to exact cap");
+        assert_eq!(out, VolumeOutcome::Consumed { used: 100 });
+
+        let out = store
+            .consume_cert_volume(ChainId::Btc, W0, 1, CAP)
+            .await
+            .expect("over-cap probe");
+        assert_eq!(
+            out,
+            VolumeOutcome::Exceeded {
+                attempted: 101,
+                cap: CAP
+            }
+        );
+
+        // The refusal did not consume: a fresh bucket starts at zero and
+        // the W0 bucket still refuses exactly the same way.
+        let out = store
+            .consume_cert_volume(ChainId::Btc, W1, CAP, CAP)
+            .await
+            .expect("next bucket isolated");
+        assert_eq!(out, VolumeOutcome::Consumed { used: CAP });
+        let out = store
+            .consume_cert_volume(ChainId::Btc, W0, 1, CAP)
+            .await
+            .expect("W0 unchanged after refusal");
+        assert_eq!(
+            out,
+            VolumeOutcome::Exceeded {
+                attempted: 101,
+                cap: CAP
+            }
+        );
+
+        // Per-chain isolation at the same bucket.
+        let out = store
+            .consume_cert_volume(ChainId::Ltc, W0, CAP, CAP)
+            .await
+            .expect("chain isolated");
+        assert_eq!(out, VolumeOutcome::Consumed { used: CAP });
+
+        // A single amount above the cap refuses on a fresh window.
+        let out = store
+            .consume_cert_volume(ChainId::Doge, W0, CAP + 1, CAP)
+            .await
+            .expect("oversize single");
+        assert_eq!(
+            out,
+            VolumeOutcome::Exceeded {
+                attempted: CAP + 1,
+                cap: CAP
+            }
+        );
+
+        // u128 territory survives the storage round-trip (EVM wei scale
+        // exceeds i64 — the reason `used` is decimal TEXT in SQLite).
+        let big: u128 = u128::from(u64::MAX) + 7;
+        let out = store
+            .consume_cert_volume(ChainId::Eth, W0, big, big)
+            .await
+            .expect("u128 consume");
+        assert_eq!(out, VolumeOutcome::Consumed { used: big });
+        let out = store
+            .consume_cert_volume(ChainId::Eth, W0, 1, big)
+            .await
+            .expect("u128 over-cap");
+        assert_eq!(
+            out,
+            VolumeOutcome::Exceeded {
+                attempted: big + 1,
+                cap: big
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn in_memory_volume_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_volume_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_volume_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_volume_lifecycle(&store).await;
     }
 }

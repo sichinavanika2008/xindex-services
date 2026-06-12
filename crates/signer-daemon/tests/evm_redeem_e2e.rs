@@ -121,6 +121,7 @@ async fn spawn_evm_daemon(key_hex: &str, safe: Address) -> (String, Address, Arc
         verifying_contract: Address::repeat_byte(0xab),
         eth_address: signer_addr,
         intent_policy: ric_common::policy(),
+        cert_volume: xindex_signer_daemon::server::CertVolumePolicy::unmetered(),
     };
     let replay = Arc::new(InMemoryReplayStore::new());
     let state = DaemonState::new(cfg, replay, Arc::clone(&hsm)).with_evm(EvmSignerConfig {

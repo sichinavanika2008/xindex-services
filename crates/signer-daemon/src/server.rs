@@ -54,7 +54,9 @@ use xindex_shared::chain_registry::ChainId;
 use crate::cosmos_tx::{handle_cosmos_tx, CosmosSignerConfig};
 use crate::evm_safe::{handle_evm_safe_tx, EvmSignerConfig};
 use crate::psbt::{handle_psbt_input, UtxoSignerConfig};
-use crate::replay::{CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore};
+use crate::replay::{
+    CheckOutcome, RedemptionCheckOutcome, RedemptionKind, ReplayStore, VolumeOutcome,
+};
 use crate::solana_tx::{handle_solana_tx, SolSignerConfig};
 use crate::tron_tx::{handle_tron_tx, TronSignerConfig};
 use crate::web3signer::{HsmDigestSigner, HsmError};
@@ -84,11 +86,67 @@ pub struct DaemonConfig {
     /// [`IntentPolicy::validate`] at startup (the gate also fails
     /// closed on a policy that could never verify).
     pub intent_policy: IntentPolicy,
+    /// CTD-1 Slice E (`DL-CTD-E`): per-chain Set-B certification volume
+    /// window policy. RIC and ACC signing consume from ONE per-chain
+    /// window; an over-cap certification is refused 422
+    /// (`volume_cap_exceeded`) before the HSM is touched. MANDATORY
+    /// field — [`CertVolumePolicy::unmetered`] is the explicit dev/test
+    /// opt-out; production MUST cap every served chain (≈10% of
+    /// per-chain custody per 24h, DL-CTD-E). Construction sites call
+    /// [`CertVolumePolicy::validate`] at startup.
+    pub cert_volume: CertVolumePolicy,
 }
 
 impl DaemonConfig {
     fn domain(&self) -> Eip712Domain {
         attestation_oracle_domain(self.chain_id, self.verifying_contract)
+    }
+}
+
+/// CTD-1 Slice E (`DL-CTD-E`): per-chain Set-B certification volume
+/// caps — the containment teeth at the k-of-n floor. Caps are ABSOLUTE
+/// native smallest-unit amounts per fixed `window_secs` bucket; a chain
+/// absent from `caps` is UNMETERED (deploy-safe dev/test default —
+/// production MUST set ≈10% of per-chain custody for every served
+/// chain and re-tune as custody grows). A compromised coordinator that
+/// somehow obtains k-of-n observer cooperation is still bounded to one
+/// window's cap per chain, because each operator's Set-B daemon meters
+/// independently and refuses beyond its cap.
+#[derive(Debug, Clone)]
+pub struct CertVolumePolicy {
+    /// Fixed window bucket length in seconds (production: 86 400).
+    pub window_secs: u64,
+    /// Per-chain cap in native smallest units; absent = unmetered.
+    pub caps: HashMap<ChainId, u128>,
+}
+
+impl CertVolumePolicy {
+    /// No metering on any chain (dev/test default); 24h bucket length.
+    #[must_use]
+    pub fn unmetered() -> Self {
+        Self {
+            window_secs: 86_400,
+            caps: HashMap::new(),
+        }
+    }
+
+    /// Fail-closed startup validation — construction sites call this,
+    /// mirroring [`IntentPolicy::validate`].
+    ///
+    /// # Errors
+    /// `window_secs == 0` (the bucket arithmetic needs a positive
+    /// length) or any cap of `0` (a zero cap can never authorize —
+    /// remove the chain to unmeter instead).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.window_secs == 0 {
+            return Err("cert_volume.window_secs must be > 0".to_string());
+        }
+        if self.caps.values().any(|cap| *cap == 0) {
+            return Err(
+                "cert_volume cap of 0 can never authorize; remove the chain to unmeter".to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1102,6 +1160,53 @@ fn check_ric_sign_recency(vault_resolved_at: u64) -> Result<(), (StatusCode, Jso
     Ok(())
 }
 
+/// CTD-1 Slice E (`DL-CTD-E`): consume Set-B certification volume for
+/// `chain_id` before the HSM is touched. Unmetered chains (no
+/// configured cap) pass through. Runs strictly AFTER the equivocation
+/// pre-flight returns `FirstTime`, so an idempotent retry never
+/// double-consumes. Consume-before-HSM mirrors the RIC one-shot
+/// posture: an HSM failure after consume burns window capacity until
+/// the bucket rolls — fail-closed by design.
+async fn consume_cert_volume_gate<S, H>(
+    state: &DaemonState<S, H>,
+    chain_id: ChainId,
+    amount: U256,
+) -> Result<(), (StatusCode, Json<ErrorBody>)>
+where
+    S: ReplayStore + 'static,
+    H: HsmDigestSigner + 'static,
+{
+    let Some(cap) = state.config.cert_volume.caps.get(&chain_id).copied() else {
+        return Ok(());
+    };
+    let amount = u128::try_from(amount).map_err(|_| {
+        unprocessable(
+            error_codes::VOLUME_CAP_EXCEEDED,
+            "amount exceeds u128 — cannot be metered against the volume window".to_string(),
+        )
+    })?;
+    let now = now_unix_secs();
+    // Validated > 0 at startup; an absurd >i64::MAX config falls back
+    // to the 24h production bucket rather than panicking.
+    let window = i64::try_from(state.config.cert_volume.window_secs).unwrap_or(86_400);
+    let window_start = now - now.rem_euclid(window);
+    match state
+        .replay
+        .consume_cert_volume(chain_id, window_start, amount, cap)
+        .await
+        .map_err(|e| bad(error_codes::BAD_REQUEST, format!("volume db: {e}")))?
+    {
+        VolumeOutcome::Consumed { .. } => Ok(()),
+        VolumeOutcome::Exceeded { attempted, cap } => Err(unprocessable(
+            error_codes::VOLUME_CAP_EXCEEDED,
+            format!(
+                "per-window certification volume cap: attempted {attempted} > cap {cap} \
+                 (window_start {window_start})"
+            ),
+        )),
+    }
+}
+
 /// Signing-endpoint response shape (the same tuple-error type every
 /// handler in this module returns).
 type SignResult = Result<Json<Eip712SignResponse>, (StatusCode, Json<ErrorBody>)>;
@@ -1188,6 +1293,7 @@ where
     if let Some(resp) = ric_cert_cached(&state.config, outcome) {
         return resp;
     }
+    consume_cert_volume_gate(&state, req.chain_id, amount).await?;
     let sig = state
         .hsm
         .sign_digest(state.config.eth_address, digest)
@@ -1284,6 +1390,9 @@ where
     if let Some(resp) = ric_cert_cached(&state.config, outcome) {
         return resp;
     }
+    // Slice E: the mint-cancel swap-back consumes the SAME per-chain
+    // window as redemptions — the cancel path cannot bypass the breaker.
+    consume_cert_volume_gate(&state, req.chain_id, amount).await?;
     let sig = state
         .hsm
         .sign_digest(state.config.eth_address, digest)
@@ -1374,6 +1483,7 @@ mod tests {
             verifying_contract: Address::repeat_byte(0xab),
             eth_address: test_key().address(),
             intent_policy: crate::test_support::ric::policy(),
+            cert_volume: crate::server::CertVolumePolicy::unmetered(),
         }
     }
 
@@ -2166,6 +2276,142 @@ mod tests {
             // path exists for a different method; the daemon doesn't
             // expose this path at all → 404.)
             assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+
+    /// CTD-1 Slice E — Set-B certification volume windows (`DL-CTD-E`).
+    mod volume_tests {
+        use super::*;
+
+        fn fresh_now() -> u64 {
+            u64::try_from(now_unix_secs()).unwrap_or(0)
+        }
+
+        /// State with a BTC cap (native sats per 24h window); all other
+        /// chains unmetered.
+        fn metered_state(
+            cap: u128,
+        ) -> (
+            DaemonState<InMemoryReplayStore, CapturingSigner>,
+            Arc<CapturingSigner>,
+        ) {
+            let mut config = cfg();
+            config.cert_volume.caps.insert(ChainId::Btc, cap);
+            let replay = Arc::new(InMemoryReplayStore::new());
+            let hsm = Arc::new(CapturingSigner::default());
+            (DaemonState::new(config, replay, hsm.clone()), hsm)
+        }
+
+        /// 1-BTC (1e8 sat) RIC body at `leg`.
+        fn ric_body(leg: &str, vault_resolved_at: u64) -> serde_json::Value {
+            serde_json::json!({
+                "chain_id": "btc",
+                "redemption_id": format!("0x{}", "ab".repeat(32)),
+                "leg_index": leg,
+                "asset_id": format!("0x{}", "a1".repeat(32)),
+                "amount": "100000000",
+                "amount_decimals": 8,
+                "immediate_target_hash": format!("0x{}", "cd".repeat(32)),
+                "memo_hash": format!("0x{}", "ef".repeat(32)),
+                "final_destination_hash": format!("0x{}", "12".repeat(32)),
+                "vault_resolved_at": vault_resolved_at,
+            })
+        }
+
+        /// 1-BTC mint-cancel ACC body.
+        fn acc_body(vault_resolved_at: u64) -> serde_json::Value {
+            serde_json::json!({
+                "chain_id": "btc",
+                "cancel_id": format!("0x{}", "77".repeat(32)),
+                "intent_id": format!("0x{}", "88".repeat(32)),
+                "slot_index": "0",
+                "asset_id": format!("0x{}", "a1".repeat(32)),
+                "amount": "100000000",
+                "amount_decimals": 8,
+                "immediate_target_hash": format!("0x{}", "cd".repeat(32)),
+                "memo_hash": format!("0x{}", "ef".repeat(32)),
+                "final_destination_hash": format!("0x{}", "12".repeat(32)),
+                "vault_resolved_at": vault_resolved_at,
+            })
+        }
+
+        /// Over the per-chain window cap → 422 `volume_cap_exceeded`;
+        /// the refused certification never reaches the HSM.
+        #[tokio::test]
+        async fn ric_over_cap_is_422() {
+            let (state, hsm) = metered_state(150_000_000);
+            let app = router(state);
+            let now = fresh_now() - 5;
+            let (s1, b1) = post_json(&app, "/api/v1/sign/eip712-ric", ric_body("1", now)).await;
+            assert_eq!(s1, StatusCode::OK, "body: {b1}");
+            let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", ric_body("2", now)).await;
+            assert_eq!(s2, StatusCode::UNPROCESSABLE_ENTITY, "body: {b2}");
+            assert_eq!(
+                b2["code"].as_str().unwrap_or(""),
+                error_codes::VOLUME_CAP_EXCEEDED
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let calls = hsm.seen.lock().unwrap().len();
+            assert_eq!(calls, 1, "refused certification must not reach the HSM");
+        }
+
+        /// An idempotent retry returns the cached signature WITHOUT
+        /// consuming window capacity a second time.
+        #[tokio::test]
+        async fn idempotent_retry_does_not_double_consume() {
+            let (state, _hsm) = metered_state(100_000_000);
+            let app = router(state);
+            let now = fresh_now() - 5;
+            let body = ric_body("1", now);
+            let (s1, _) = post_json(&app, "/api/v1/sign/eip712-ric", body.clone()).await;
+            assert_eq!(s1, StatusCode::OK);
+            // The window is exactly full; a double-consume would refuse
+            // this identical retry.
+            let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", body).await;
+            assert_eq!(s2, StatusCode::OK, "body: {b2}");
+            // …and a NEW leg is refused — the window really is full.
+            let (s3, b3) = post_json(&app, "/api/v1/sign/eip712-ric", ric_body("2", now)).await;
+            assert_eq!(s3, StatusCode::UNPROCESSABLE_ENTITY, "body: {b3}");
+        }
+
+        /// The mint-cancel ACC consumes the SAME per-chain window — the
+        /// cancel path cannot bypass the breaker.
+        #[tokio::test]
+        async fn acc_consumes_same_window_as_ric() {
+            let (state, _hsm) = metered_state(150_000_000);
+            let app = router(state);
+            let now = fresh_now() - 5;
+            let (s1, b1) = post_json(&app, "/api/v1/sign/eip712-ric", ric_body("1", now)).await;
+            assert_eq!(s1, StatusCode::OK, "body: {b1}");
+            let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-acc", acc_body(now)).await;
+            assert_eq!(s2, StatusCode::UNPROCESSABLE_ENTITY, "body: {b2}");
+            assert_eq!(
+                b2["code"].as_str().unwrap_or(""),
+                error_codes::VOLUME_CAP_EXCEEDED
+            );
+        }
+
+        /// Unmetered chains pass any volume (the dev/test default).
+        #[tokio::test]
+        async fn unmetered_chain_passes() {
+            let (state, _hsm) = build_state();
+            let app = router(state);
+            let now = fresh_now() - 5;
+            let (s1, _) = post_json(&app, "/api/v1/sign/eip712-ric", ric_body("1", now)).await;
+            let (s2, _) = post_json(&app, "/api/v1/sign/eip712-ric", ric_body("2", now)).await;
+            assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+        }
+
+        /// Policy validation fails closed on impossible configs.
+        #[test]
+        fn policy_validation_fails_closed() {
+            assert!(CertVolumePolicy::unmetered().validate().is_ok());
+            let mut zero_window = CertVolumePolicy::unmetered();
+            zero_window.window_secs = 0;
+            assert!(zero_window.validate().is_err());
+            let mut zero_cap = CertVolumePolicy::unmetered();
+            zero_cap.caps.insert(ChainId::Btc, 0);
+            assert!(zero_cap.validate().is_err());
         }
     }
 

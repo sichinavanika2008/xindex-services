@@ -47,13 +47,26 @@ pub struct LegFacts {
     pub final_destination: Address,
 }
 
+/// One observed leg: the facts plus when THIS observer first saw the
+/// `RedeemDispatched` (its own clock). The E2 fraud-window delay
+/// (`DL-CTD-E`) is measured from `observed_at`; first-write-wins in the
+/// leg map means a reorg-replayed event can never reset the clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedLeg {
+    /// The leg facts as first observed.
+    pub facts: LegFacts,
+    /// Unix seconds (this observer's clock) of the FIRST observation.
+    pub observed_at: u64,
+}
+
 /// Source of [`LegFacts`] for a `(redemption_id, leg_index)`. The live
 /// impl scans `RedeemDispatched` logs on the operator's own RPC; tests
 /// inject a fake. AFIT (no `async-trait`) — the observer is generic, so
 /// dispatch is static.
 pub trait RedeemLegSource {
-    /// Return the leg's facts, or `None` if no `RedeemDispatched` for
-    /// `(redemption_id, leg_index)` is visible on this observer's RPC.
+    /// Return the leg's facts + first-observation stamp, or `None` if no
+    /// `RedeemDispatched` for `(redemption_id, leg_index)` is visible on
+    /// this observer's RPC.
     ///
     /// # Errors
     /// Implementation-defined transport / decode failure.
@@ -61,7 +74,7 @@ pub trait RedeemLegSource {
         &self,
         redemption_id: B256,
         leg_index: u32,
-    ) -> impl std::future::Future<Output = Result<Option<LegFacts>, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<Option<ObservedLeg>, String>> + Send;
 }
 
 /// In-memory [`RedeemLegSource`] backed by a shared map the observer's
@@ -72,7 +85,7 @@ pub trait RedeemLegSource {
 /// the event loop — the leg source itself is trivially testable.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryLegSource {
-    facts: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(B256, u32), LegFacts>>>,
+    facts: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<(B256, u32), ObservedLeg>>>,
 }
 
 impl InMemoryLegSource {
@@ -83,12 +96,15 @@ impl InMemoryLegSource {
     }
 
     /// Record a leg's facts (called by the event loop on each
-    /// `RedeemDispatched`). First write wins per `(redemption_id,
-    /// leg_index)`; a re-observation of the same leg is ignored so a
-    /// reorg-replayed event cannot mutate already-certified facts.
-    pub fn insert(&self, redemption_id: B256, leg_index: u32, facts: LegFacts) {
+    /// `RedeemDispatched`) stamped with the observer's own clock. First
+    /// write wins per `(redemption_id, leg_index)`; a re-observation of
+    /// the same leg is ignored, so a reorg-replayed event can neither
+    /// mutate already-certified facts nor reset the E2 fraud-window
+    /// clock.
+    pub fn insert(&self, redemption_id: B256, leg_index: u32, facts: LegFacts, observed_at: u64) {
         if let Ok(mut map) = self.facts.write() {
-            map.entry((redemption_id, leg_index)).or_insert(facts);
+            map.entry((redemption_id, leg_index))
+                .or_insert(ObservedLeg { facts, observed_at });
         }
     }
 }
@@ -98,12 +114,117 @@ impl RedeemLegSource for InMemoryLegSource {
         &self,
         redemption_id: B256,
         leg_index: u32,
-    ) -> Result<Option<LegFacts>, String> {
+    ) -> Result<Option<ObservedLeg>, String> {
         let map = self
             .facts
             .read()
             .map_err(|e| format!("leg map poisoned: {e}"))?;
         Ok(map.get(&(redemption_id, leg_index)).cloned())
+    }
+}
+
+/// Source of the on-chain `CustodyGuard.isHalted()` flag (`DL-CTD-E`),
+/// read via the operator's OWN Ethereum RPC. AFIT, static dispatch —
+/// same shape as [`RedeemLegSource`].
+pub trait HaltSource {
+    /// `Ok(true)` while a halt is active. Errors fail CLOSED at the
+    /// caller — certification is refused rather than skipping the
+    /// halt check.
+    fn is_halted(&self) -> impl std::future::Future<Output = Result<bool, String>> + Send;
+}
+
+/// No halt gate (DEV ONLY — production wires [`HttpHaltSource`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NeverHalted;
+
+impl HaltSource for NeverHalted {
+    async fn is_halted(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+/// Live halt source: a plain JSON-RPC `eth_call` of `isHalted()` on the
+/// deployed `CustodyGuard`, via the operator's own HTTP endpoint.
+/// Deliberately raw JSON-RPC (not an alloy provider) so it stays
+/// generic-free and wiremock-testable.
+#[derive(Debug, Clone)]
+pub struct HttpHaltSource {
+    url: String,
+    guard: Address,
+    client: reqwest::Client,
+}
+
+impl HttpHaltSource {
+    /// Halt source over `url` (HTTP JSON-RPC) for the guard contract.
+    #[must_use]
+    pub fn new(url: String, guard: Address) -> Self {
+        Self {
+            url,
+            guard,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl HaltSource for HttpHaltSource {
+    async fn is_halted(&self) -> Result<bool, String> {
+        let selector = &keccak256(b"isHalted()")[..4];
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [
+                {
+                    "to": format!("{:#x}", self.guard),
+                    "data": format!("0x{}", alloy_primitives::hex::encode(selector)),
+                },
+                "latest"
+            ]
+        });
+        let resp = self
+            .client
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("halt eth_call: {e}"))?;
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("halt eth_call body: {e}"))?;
+        let result = v
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("halt eth_call: no result ({v})"))?;
+        let raw = alloy_primitives::hex::decode(result.trim_start_matches("0x"))
+            .map_err(|e| format!("halt eth_call hex: {e}"))?;
+        // A mis-addressed guard returns `0x` — fail CLOSED, never read
+        // an empty result as "not halted".
+        if raw.len() != 32 {
+            return Err(format!(
+                "halt eth_call: result length {} != 32 (guard mis-addressed?)",
+                raw.len()
+            ));
+        }
+        Ok(raw[31] == 1)
+    }
+}
+
+/// Either-or halt source for binary wiring (mirrors `AnyHsmBackend`).
+#[derive(Debug, Clone)]
+pub enum AnyHaltSource {
+    /// DEV ONLY — no halt gate.
+    Never(NeverHalted),
+    /// Production: the deployed on-chain `CustodyGuard`.
+    Http(HttpHaltSource),
+}
+
+impl HaltSource for AnyHaltSource {
+    async fn is_halted(&self) -> Result<bool, String> {
+        match self {
+            Self::Never(n) => n.is_halted().await,
+            Self::Http(h) => h.is_halted().await,
+        }
     }
 }
 
@@ -127,6 +248,14 @@ pub struct ObserverConfig {
     /// Max absolute skew (seconds) between `now` and a proposed
     /// `vault_resolved_at` the observer will accept.
     pub stamp_window_secs: u64,
+    /// E2 fraud window (`DL-CTD-E`): legs with `amount` STRICTLY ABOVE
+    /// this (native smallest units) wait `large_spend_delay_secs` from
+    /// first observation before this observer certifies. `None`
+    /// disables — DEV ONLY; production sets ≈2% of per-chain custody,
+    /// re-tuned operationally.
+    pub large_spend_threshold: Option<U256>,
+    /// E2 fraud-window delay in seconds (production: 1800 = 30 min).
+    pub large_spend_delay_secs: u64,
 }
 
 /// Why an observer refused to certify. Each maps to a wire error code so
@@ -157,6 +286,23 @@ pub enum ObserverError {
     /// Leg-source RPC failure.
     #[error("leg source: {0}")]
     LegSource(String),
+    /// `DL-CTD-E`: the on-chain `CustodyGuard` halt is active — every
+    /// certification is refused until it expires or a quorum un-halts.
+    #[error("custody halt active")]
+    Halted,
+    /// `DL-CTD-E` E2: the leg exceeds the large-spend threshold and its
+    /// fraud window has not elapsed; retry once `until` passes (the
+    /// halt is re-checked on every attempt).
+    #[error("fraud window active until {until}")]
+    FraudWindowActive {
+        /// Unix seconds when the window opens.
+        until: u64,
+    },
+    /// The halt source (the observer's own Ethereum RPC) failed — the
+    /// observer fails CLOSED rather than certifying with the halt flag
+    /// unknown.
+    #[error("halt source: {0}")]
+    HaltUnavailable(String),
 }
 
 impl ObserverError {
@@ -173,6 +319,9 @@ impl ObserverError {
                 error_codes::OBSERVER_ASGARD_UNAVAILABLE
             }
             Self::SignerUnavailable(_) => error_codes::OBSERVER_SIGNER_UNAVAILABLE,
+            Self::Halted => error_codes::OBSERVER_HALTED,
+            Self::FraudWindowActive { .. } => error_codes::OBSERVER_FRAUD_WINDOW,
+            Self::HaltUnavailable(_) => error_codes::OBSERVER_HALT_UNAVAILABLE,
         }
     }
 }
@@ -185,32 +334,37 @@ const MAX_MEMO_BYTES: usize = 80;
 
 /// One operator's redemption observer.
 #[derive(Debug)]
-pub struct Observer<L, S> {
+pub struct Observer<L, S, G> {
     config: ObserverConfig,
     asgard: xindex_chain_thor::AsgardAgreement,
     legs: L,
     signer: S,
+    halt: G,
 }
 
-impl<L, S> Observer<L, S>
+impl<L, S, G> Observer<L, S, G>
 where
     L: RedeemLegSource,
     S: RicSigner,
+    G: HaltSource,
 {
     /// Build an observer over its leg source, diverse-source Asgard
-    /// gate, and its own Set-B signer.
+    /// gate, its own Set-B signer, and the on-chain halt source
+    /// (`DL-CTD-E`).
     #[must_use]
     pub fn new(
         config: ObserverConfig,
         asgard: xindex_chain_thor::AsgardAgreement,
         legs: L,
         signer: S,
+        halt: G,
     ) -> Self {
         Self {
             config,
             asgard,
             legs,
             signer,
+            halt,
         }
     }
 
@@ -232,6 +386,16 @@ where
                 req.chain_id
             )));
         }
+        // DL-CTD-E: the on-chain operator halt vetoes ALL certifications.
+        // Fail closed — a halt-source failure also refuses.
+        if self
+            .halt
+            .is_halted()
+            .await
+            .map_err(ObserverError::HaltUnavailable)?
+        {
+            return Err(ObserverError::Halted);
+        }
         let redemption_id = parse_b256(&req.redemption_id, "redemption_id")?;
         let leg_index = req
             .leg_index
@@ -239,7 +403,7 @@ where
             .map_err(|e| ObserverError::BadRequest(format!("leg_index: {e}")))?;
         self.check_stamp(req.vault_resolved_at, now_unix)?;
 
-        let facts = self
+        let observed = self
             .legs
             .leg_facts(redemption_id, leg_index)
             .await
@@ -248,7 +412,23 @@ where
                 redemption_id,
                 leg_index,
             })?;
+        let facts = observed.facts;
         validate_facts(&facts)?;
+
+        // DL-CTD-E E2: large spends wait out the fraud window, measured
+        // from FIRST observation on this observer's own clock. A refusal
+        // forces a fresh certify call, so the halt above is re-checked
+        // on every attempt during (and after) the window.
+        if let Some(threshold) = self.config.large_spend_threshold {
+            if facts.amount > threshold {
+                let until = observed
+                    .observed_at
+                    .saturating_add(self.config.large_spend_delay_secs);
+                if now_unix < until {
+                    return Err(ObserverError::FraudWindowActive { until });
+                }
+            }
+        }
 
         let asgard_address = self
             .asgard
@@ -384,7 +564,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use xindex_chain_thor::{AsgardAgreement, ThorClient};
     use xindex_shared::eip712::{ric_signing_hash, RedemptionIntentCertificate};
-    use xindex_signer::SoftwareSigner;
+    use xindex_signer::{HsmBackend, SoftwareSigner};
 
     const NOW: u64 = 1_750_000_000;
     // A real signet/mainnet-form P2WPKH bech32 the bitcoin crate parses.
@@ -392,6 +572,7 @@ mod tests {
 
     struct FakeLegs {
         facts: Option<LegFacts>,
+        observed_at: u64,
     }
 
     impl RedeemLegSource for FakeLegs {
@@ -399,8 +580,11 @@ mod tests {
             &self,
             _redemption_id: B256,
             _leg_index: u32,
-        ) -> Result<Option<LegFacts>, String> {
-            Ok(self.facts.clone())
+        ) -> Result<Option<ObservedLeg>, String> {
+            Ok(self.facts.clone().map(|facts| ObservedLeg {
+                facts,
+                observed_at: self.observed_at,
+            }))
         }
     }
 
@@ -453,6 +637,20 @@ mod tests {
             oracle: oracle(),
             btc_network: Network::Bitcoin,
             stamp_window_secs: 600,
+            large_spend_threshold: None,
+            large_spend_delay_secs: 1_800,
+        }
+    }
+
+    /// DL-CTD-E halt fake: `Some(flag)` answers, `None` errors (RPC
+    /// down) — exercising the fail-closed path.
+    struct FakeHalt {
+        halted: Option<bool>,
+    }
+
+    impl HaltSource for FakeHalt {
+        async fn is_halted(&self) -> Result<bool, String> {
+            self.halted.ok_or_else(|| "halt rpc down".to_string())
         }
     }
 
@@ -486,8 +684,10 @@ mod tests {
             agreement(&[&a, &b]),
             FakeLegs {
                 facts: Some(facts()),
+                observed_at: NOW,
             },
             signer(),
+            NeverHalted,
         );
         let resp = observer
             .certify_ric(&certify_req(), NOW)
@@ -540,8 +740,10 @@ mod tests {
             agreement(&[&a, &b]),
             FakeLegs {
                 facts: Some(facts()),
+                observed_at: NOW,
             },
             signer(),
+            NeverHalted,
         );
         let err = observer
             .certify_ric(&certify_req(), NOW)
@@ -561,8 +763,10 @@ mod tests {
             agreement(&[&a, &b]),
             FakeLegs {
                 facts: Some(facts()),
+                observed_at: NOW,
             },
             signer(),
+            NeverHalted,
         );
         let err = observer
             .certify_ric(&certify_req(), NOW)
@@ -579,8 +783,12 @@ mod tests {
         let observer = Observer::new(
             config(),
             agreement(&[&a, &b]),
-            FakeLegs { facts: None },
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
             signer(),
+            NeverHalted,
         );
         let err = observer
             .certify_ric(&certify_req(), NOW)
@@ -599,8 +807,10 @@ mod tests {
             agreement(&[&a, &b]),
             FakeLegs {
                 facts: Some(facts()),
+                observed_at: NOW,
             },
             signer(),
+            NeverHalted,
         );
         let mut req = certify_req();
         req.chain_id = ChainId::Ltc;
@@ -623,8 +833,10 @@ mod tests {
             agreement(&[&a, &b]),
             FakeLegs {
                 facts: Some(facts()),
+                observed_at: NOW,
             },
             signer(),
+            NeverHalted,
         );
         let mut req = certify_req();
         req.chain_id = ChainId::Sol;
@@ -645,8 +857,10 @@ mod tests {
             agreement(&[&a, &b]),
             FakeLegs {
                 facts: Some(facts()),
+                observed_at: NOW,
             },
             signer(),
+            NeverHalted,
         );
         let mut req = certify_req();
         req.vault_resolved_at = NOW - 601;
@@ -667,14 +881,155 @@ mod tests {
         let observer = Observer::new(
             config(),
             agreement(&[&a, &b]),
-            FakeLegs { facts: Some(f) },
+            FakeLegs {
+                facts: Some(f),
+                observed_at: NOW,
+            },
             signer(),
+            NeverHalted,
         );
         let err = observer
             .certify_ric(&certify_req(), NOW)
             .await
             .expect_err("zero amount invalid");
         assert_eq!(err.error_code(), error_codes::OBSERVER_EVENT_INVALID);
+    }
+
+    /// DL-CTD-E: an active on-chain halt vetoes every certification.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn halted_guard_refuses_certification() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: Some(facts()),
+                observed_at: NOW,
+            },
+            signer(),
+            FakeHalt { halted: Some(true) },
+        );
+        let err = observer
+            .certify_ric(&certify_req(), NOW)
+            .await
+            .expect_err("halt vetoes");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_HALTED);
+    }
+
+    /// DL-CTD-E: a halt-source failure fails CLOSED — the observer
+    /// refuses rather than certifying with the halt flag unknown.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn halt_source_failure_fails_closed() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: Some(facts()),
+                observed_at: NOW,
+            },
+            signer(),
+            FakeHalt { halted: None },
+        );
+        let err = observer
+            .certify_ric(&certify_req(), NOW)
+            .await
+            .expect_err("fail closed");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_HALT_UNAVAILABLE);
+    }
+
+    /// DL-CTD-E E2: a leg above the large-spend threshold is refused
+    /// while its fraud window (measured from FIRST observation) is
+    /// open, with the retry timestamp surfaced.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn large_leg_waits_out_fraud_window() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let mut cfg = config();
+        cfg.large_spend_threshold = Some(U256::from(10_000_000u64));
+        let observed_at = NOW - 100;
+        let observer = Observer::new(
+            cfg,
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: Some(facts()),
+                observed_at,
+            },
+            signer(),
+            FakeHalt {
+                halted: Some(false),
+            },
+        );
+        let err = observer
+            .certify_ric(&certify_req(), NOW)
+            .await
+            .expect_err("window open");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_FRAUD_WINDOW);
+        // The error-code assertion above admits only this variant.
+        let ObserverError::FraudWindowActive { until } = err else {
+            unreachable!()
+        };
+        assert_eq!(until, observed_at + 1_800);
+    }
+
+    /// DL-CTD-E E2: the same large leg certifies once the window has
+    /// elapsed.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn large_leg_certifies_after_fraud_window() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let mut cfg = config();
+        cfg.large_spend_threshold = Some(U256::from(10_000_000u64));
+        let observer = Observer::new(
+            cfg,
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: Some(facts()),
+                observed_at: NOW - 1_801,
+            },
+            signer(),
+            FakeHalt {
+                halted: Some(false),
+            },
+        );
+        let resp = observer
+            .certify_ric(&certify_req(), NOW)
+            .await
+            .expect("window elapsed");
+        assert_eq!(resp.amount, "50000000");
+    }
+
+    /// DL-CTD-E E2: legs AT or below the threshold (strict >) skip the
+    /// fraud window entirely.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn small_leg_skips_fraud_window() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let mut cfg = config();
+        cfg.large_spend_threshold = Some(U256::from(50_000_000u64));
+        let observer = Observer::new(
+            cfg,
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: Some(facts()),
+                observed_at: NOW,
+            },
+            signer(),
+            FakeHalt {
+                halted: Some(false),
+            },
+        );
+        observer
+            .certify_ric(&certify_req(), NOW)
+            .await
+            .expect("at-threshold leg flows instantly");
     }
 
     #[test]
