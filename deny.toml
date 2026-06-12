@@ -23,6 +23,12 @@ ignore = [
     # `derivative` unmaintained — pulled in transitively via alloy. Revisit
     # when alloy migrates to a maintained alternative.
     "RUSTSEC-2024-0388",
+    # `proc-macro-error2` unmaintained (advisory published 2026; author
+    # confirmed). Compile-time proc-macro only, pulled transitively via
+    # alloy's sol! macro chain — same class and same disposition as
+    # `paste`/`derivative` above: no runtime exposure; revisit when alloy
+    # migrates.
+    "RUSTSEC-2026-0173",
     # `lru` 0.12.5 has a Stacked Borrows violation in `IterMut`; alloy-rpc-client
     # uses `lru::LruCache` but does NOT call the affected `iter_mut`. No runtime
     # exposure for our usage; bump alloy when 0.12.6+ ships in their dep tree.
