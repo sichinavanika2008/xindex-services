@@ -334,6 +334,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn rejects_fewer_urls_than_quorum() {
         let err = RicCollector::new(vec!["http://a".to_string()], 2).expect_err("must reject");
         assert!(matches!(
@@ -346,6 +347,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn rejects_zero_quorum() {
         let err = RicCollector::new(vec!["http://a".to_string()], 0).expect_err("must reject");
         assert!(matches!(err, RicCollectError::NotEnoughObservers { .. }));
