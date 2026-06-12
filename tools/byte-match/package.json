@@ -1,0 +1,19 @@
+{
+  "name": "byte-match",
+  "version": "1.0.0",
+  "description": "Reference encoders for the Xindex per-family byte-match gates (P4.4-1 / P-SOL-1).",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@solana/web3.js": "1.98.4",
+    "@sqds/multisig": "2.1.4",
+    "ripple-address-codec": "5.0.1",
+    "ripple-binary-codec": "2.8.0"
+  }
+}

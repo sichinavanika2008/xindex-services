@@ -246,6 +246,59 @@ mod tests {
         );
     }
 
+    /// P-TRON-1 byte-match CLOSED (TRC20 path). SOURCED from a real
+    /// TRON node: `THORChain` bifrost's
+    /// `tron/api/test-tron/triggersmartcontract.json`, a node-serialized
+    /// `TriggerSmartContract`. We assert that our hand-rolled
+    /// `build_usdt_raw_data` reproduces the node's bytes for EVERY field
+    /// a USDT transfer carries: the `type.googleapis.com/protocol.
+    /// TriggerSmartContract` Any type-url, and the inner-message segment
+    /// `owner_address`(1) ‖ `contract_address`(2) ‖ `data`(4) — the
+    /// latter being the full TRC20 `transfer(address,uint256)` call data
+    /// (selector ‖ padded recipient ‖ amount). These segments appear
+    /// byte-identical in our output. The sample additionally carried
+    /// `call_token_value`(5)=10 + `token_id`(6) — i.e. it is a TRC10-
+    /// attached trigger; a plain USDT transfer correctly OMITS both
+    /// (proto-3 defaults), which is the only reason the FULL tx differs.
+    /// The envelope framing (ref-block / expiration / timestamp /
+    /// fee-limit / Contract / `Permission_id`) is byte-proven by the
+    /// native-TRX `trx_txid_matches_thornode_sourced_vector` (shared
+    /// code) + `usdt_raw_data_includes_fee_limit_and_permission`. A live
+    /// `broadcasthex` stays testnet-rehearsal territory (P-TRON-3).
+    #[test]
+    fn usdt_inner_message_matches_thornode_sourced_vector() {
+        let transfer = UsdtTransfer {
+            owner: unhex_n("417946f66d0fc67924da0ac9936183ab3b07c81126"),
+            contract: unhex_n("419e62be7f4f103c36507cb2a753418791b1cdc182"),
+            to_evm20: unhex_n("d148171f1ceeeb40d668c47d70e7e94e67977559"),
+            amount: 100,
+        };
+        let tapos = Tapos {
+            ref_block_bytes: unhex_n("3a27"),
+            ref_block_hash: unhex_n("83ca272ba6030b83"),
+            expiration: 1_581_935_001_000,
+            timestamp: 1_581_934_943_649,
+            fee_limit: 100_000_000,
+            memo: Vec::new(),
+            permission_id: 0,
+        };
+        let raw = hexs(&build_usdt_raw_data(&transfer, &tapos));
+
+        // The Any type-url, byte-identical to the node.
+        assert!(
+            raw.contains("747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e54726967676572536d617274436f6e7472616374"),
+            "TriggerSmartContract Any type-url must match the node"
+        );
+        // The inner TriggerSmartContract owner(1) ‖ contract(2) ‖ data(4)
+        // segment, byte-identical to the node (the full TRC20 call data
+        // is inside `data`). This is the novel TRC20 encoding the native
+        // vector did not cover.
+        assert!(
+            raw.contains("0a15417946f66d0fc67924da0ac9936183ab3b07c811261215419e62be7f4f103c36507cb2a753418791b1cdc1822244a9059cbb000000000000000000000000d148171f1ceeeb40d668c47d70e7e94e679775590000000000000000000000000000000000000000000000000000000000000064"),
+            "TriggerSmartContract owner/contract/data must match the node byte-for-byte"
+        );
+    }
+
     /// The TRC20 selector is `keccak256("transfer(address,uint256)")[..4]`.
     #[test]
     fn trc20_selector_is_keccak_of_signature() {
