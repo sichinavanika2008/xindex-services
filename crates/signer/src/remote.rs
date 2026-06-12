@@ -201,6 +201,17 @@ impl RicSigner for RemoteHsmBackend {
         // refuses to equivocate; we never hand it a domain or digest.
         RemoteHsmBackend::sign_ric(self, chain, ric)
     }
+
+    fn sign_acc(
+        &self,
+        chain: ChainId,
+        acc: &AcquireCancelCertificate,
+        _domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError> {
+        // Same discipline as sign_ric: plaintext to the daemon, never a
+        // domain or digest.
+        RemoteHsmBackend::sign_acc(self, chain, acc)
+    }
 }
 
 impl RicSigner for AnyHsmBackend {
@@ -220,6 +231,18 @@ impl RicSigner for AnyHsmBackend {
         match self {
             Self::Software(s) => RicSigner::sign_ric(s, chain, ric, domain),
             Self::Remote(r) => RicSigner::sign_ric(r, chain, ric, domain),
+        }
+    }
+
+    fn sign_acc(
+        &self,
+        chain: ChainId,
+        acc: &AcquireCancelCertificate,
+        domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError> {
+        match self {
+            Self::Software(s) => RicSigner::sign_acc(s, chain, acc, domain),
+            Self::Remote(r) => RicSigner::sign_acc(r, chain, acc, domain),
         }
     }
 }

@@ -22,7 +22,9 @@
 //! groups, so a poisoned minority cannot reach quorum and a poisoned
 //! plurality still fails the daemon's whitelist/quorum re-check.
 
-use crate::signer_wire::{IntentProof, ObserverCertifyResponse};
+use crate::signer_wire::{
+    AcquireCancelProof, IntentProof, ObserverCertifyAccResponse, ObserverCertifyResponse,
+};
 
 /// Why a set of observer certifications could not be assembled into a
 /// quorum [`IntentProof`].
@@ -148,6 +150,111 @@ fn build_proof(
     IntentProof {
         redemption_id: plaintext.redemption_id.clone(),
         leg_index: plaintext.leg_index.clone(),
+        asset_id: plaintext.asset_id.clone(),
+        amount: plaintext.amount.clone(),
+        amount_decimals: plaintext.amount_decimals,
+        immediate_target_hash: plaintext.immediate_target_hash.clone(),
+        memo_hash: plaintext.memo_hash.clone(),
+        final_destination_hash: plaintext.final_destination_hash.clone(),
+        vault_resolved_at: plaintext.vault_resolved_at,
+        signatures: members.iter().map(|m| m.signature.clone()).collect(),
+    }
+}
+
+/// The certified ACC plaintext (CTD-1 Slice C tail) — the mint-cancel
+/// sibling of [`CertifiedPlaintext`]. Byte-identical across all honest
+/// observers that resolved the same Asgard inbound and pin the same
+/// recovery destination.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CertifiedCancelPlaintext {
+    chain_id: String,
+    cancel_id: String,
+    intent_id: String,
+    slot_index: String,
+    asset_id: String,
+    amount: String,
+    amount_decimals: u8,
+    immediate_target_hash: String,
+    memo_hash: String,
+    final_destination_hash: String,
+    vault_resolved_at: u64,
+}
+
+impl CertifiedCancelPlaintext {
+    fn of(resp: &ObserverCertifyAccResponse) -> Self {
+        Self {
+            chain_id: format!("{:?}", resp.chain_id),
+            cancel_id: resp.cancel_id.clone(),
+            intent_id: resp.intent_id.clone(),
+            slot_index: resp.slot_index.clone(),
+            asset_id: resp.asset_id.clone(),
+            amount: resp.amount.clone(),
+            amount_decimals: resp.amount_decimals,
+            immediate_target_hash: resp.immediate_target_hash.clone(),
+            memo_hash: resp.memo_hash.clone(),
+            final_destination_hash: resp.final_destination_hash.clone(),
+            vault_resolved_at: resp.vault_resolved_at,
+        }
+    }
+}
+
+/// Assemble a quorum [`AcquireCancelProof`] from observer ACC
+/// certifications (CTD-1 Slice C tail) — the mint-cancel sibling of
+/// [`assemble_intent_proof`], with the identical grouping / dedup /
+/// quorum discipline and the identical trust model: the relay performs
+/// NO cryptography; the custody daemon re-verifies the assembled proof
+/// statelessly (`validate_acquire_cancel_proof`).
+///
+/// # Errors
+/// [`RelayAssemblyError::ZeroQuorum`] on `quorum == 0`;
+/// [`RelayAssemblyError::QuorumNotReached`] when no plaintext gathered
+/// `quorum` distinct signers.
+pub fn assemble_acquire_cancel_proof(
+    responses: &[ObserverCertifyAccResponse],
+    quorum: usize,
+) -> Result<AcquireCancelProof, RelayAssemblyError> {
+    if quorum == 0 {
+        return Err(RelayAssemblyError::ZeroQuorum);
+    }
+    let mut groups: Vec<(CertifiedCancelPlaintext, Vec<&ObserverCertifyAccResponse>)> = Vec::new();
+    for resp in responses {
+        let key = CertifiedCancelPlaintext::of(resp);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, members)) => {
+                if !members
+                    .iter()
+                    .any(|m| m.signer_address.eq_ignore_ascii_case(&resp.signer_address))
+                {
+                    members.push(resp);
+                }
+            }
+            None => groups.push((key, vec![resp])),
+        }
+    }
+
+    let mut best_distinct = 0usize;
+    for (plaintext, members) in &groups {
+        best_distinct = best_distinct.max(members.len());
+        if members.len() >= quorum {
+            return Ok(build_cancel_proof(plaintext, members));
+        }
+    }
+    Err(RelayAssemblyError::QuorumNotReached {
+        quorum,
+        best_distinct,
+        groups: groups.len(),
+    })
+}
+
+/// Build the wire [`AcquireCancelProof`] from one agreeing group.
+fn build_cancel_proof(
+    plaintext: &CertifiedCancelPlaintext,
+    members: &[&ObserverCertifyAccResponse],
+) -> AcquireCancelProof {
+    AcquireCancelProof {
+        cancel_id: plaintext.cancel_id.clone(),
+        intent_id: plaintext.intent_id.clone(),
+        slot_index: plaintext.slot_index.clone(),
         asset_id: plaintext.asset_id.clone(),
         amount: plaintext.amount.clone(),
         amount_decimals: plaintext.amount_decimals,
@@ -297,6 +404,78 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn acc_resp(signer: u8, sig: u8, asgard_hash: &str) -> ObserverCertifyAccResponse {
+        ObserverCertifyAccResponse {
+            chain_id: ChainId::Btc,
+            cancel_id: format!("0x{}", "ac".repeat(32)),
+            intent_id: format!("0x{}", "1d".repeat(32)),
+            slot_index: "1".to_string(),
+            asset_id: format!("0x{}", "a1".repeat(32)),
+            amount: "50000000".to_string(),
+            amount_decimals: 8,
+            immediate_target_hash: asgard_hash.to_string(),
+            memo_hash: format!("0x{}", "ef".repeat(32)),
+            final_destination_hash: format!("0x{}", "12".repeat(32)),
+            vault_resolved_at: 1_750_000_000,
+            asgard_address: "bc1qvault".to_string(),
+            signature: format!("0x{}", format!("{sig:02x}").repeat(65)),
+            signer_address: format!("0x{}", format!("{signer:02x}").repeat(20)),
+        }
+    }
+
+    /// CTD-1 Slice C tail: the ACC assembler applies the same grouping /
+    /// dedup / quorum discipline as the RIC assembler.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn acc_quorum_assembles_with_full_plaintext() {
+        let responses = vec![acc_resp(1, 0xa1, GOOD), acc_resp(2, 0xa2, GOOD)];
+        let proof = assemble_acquire_cancel_proof(&responses, 2).expect("must assemble");
+        assert_eq!(proof.signatures.len(), 2);
+        assert_eq!(proof.cancel_id, format!("0x{}", "ac".repeat(32)));
+        assert_eq!(proof.intent_id, format!("0x{}", "1d".repeat(32)));
+        assert_eq!(proof.slot_index, "1");
+        assert_eq!(proof.immediate_target_hash, GOOD);
+    }
+
+    /// A poisoned-target minority lands in its own ACC plaintext group
+    /// and never dilutes the honest quorum.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn acc_poisoned_minority_does_not_dilute() {
+        let responses = vec![
+            acc_resp(1, 0xa1, GOOD),
+            acc_resp(2, 0xa2, GOOD),
+            acc_resp(3, 0xa3, POISON),
+        ];
+        let proof = assemble_acquire_cancel_proof(&responses, 2).expect("honest quorum");
+        assert_eq!(proof.immediate_target_hash, GOOD);
+        assert_eq!(proof.signatures.len(), 2);
+    }
+
+    /// A duplicate ACC signer is ONE vote.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn acc_duplicate_signer_counts_once() {
+        let responses = vec![acc_resp(1, 0xa1, GOOD), acc_resp(1, 0xa9, GOOD)];
+        let err = assemble_acquire_cancel_proof(&responses, 2).expect_err("must reject");
+        assert!(matches!(
+            err,
+            RelayAssemblyError::QuorumNotReached {
+                best_distinct: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn acc_zero_quorum_fails_closed() {
+        let responses = vec![acc_resp(1, 0xa1, GOOD)];
+        assert_eq!(
+            assemble_acquire_cancel_proof(&responses, 0),
+            Err(RelayAssemblyError::ZeroQuorum)
+        );
     }
 
     /// Signer-address comparison is case-insensitive — checksummed and

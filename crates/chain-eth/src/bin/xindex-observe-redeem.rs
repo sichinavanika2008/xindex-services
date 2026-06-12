@@ -3,14 +3,18 @@
 //!
 //! Each of the 5 operators runs ONE instance, alongside its own Set-B
 //! signer daemon. The service:
-//!   1. Watches `RedeemDispatched` on the operator's OWN Ethereum RPC and
-//!      records each leg's facts (amount / memo / final destination) in
-//!      memory.
+//!   1. Watches `RedeemDispatched` AND `AcquireCancelled` on the
+//!      operator's OWN Ethereum RPC and records each leg's / cancel's
+//!      facts in memory.
 //!   2. Exposes `POST /api/v1/certify-ric`: on each request it resolves
 //!      the Asgard inbound from the operator's OWN diverse `THORChain`
 //!      sources (cross-confirmed across ≥2, refinement 1), rebuilds the
 //!      canonical Redemption Intent Certificate from its own observations,
 //!      and asks its OWN Set-B daemon to sign it.
+//!   3. Exposes `POST /api/v1/certify-acc` (Slice C tail): the
+//!      mint-cancel swap-back sibling. The memo's destination is pinned
+//!      to THIS operator's configured recovery address — a compromised
+//!      coordinator cannot steer the swapped-back USDT.
 //!
 //! The relay ([`xindex_executor::RicCollector`]) fans a certify request
 //! out to all operators and assembles the k-of-n proof. A compromised
@@ -42,12 +46,15 @@ use futures_util::StreamExt;
 use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::ThorchainAdapter;
 use xindex_chain_eth::observer::{
-    AnyHaltSource, HttpHaltSource, InMemoryLegSource, LegFacts, NeverHalted, Observer,
+    AnyHaltSource, CancelFacts, HttpHaltSource, InMemoryLegSource, LegFacts, NeverHalted, Observer,
     ObserverConfig, ObserverError,
 };
 use xindex_chain_thor::{AsgardAgreement, ThorClient};
 use xindex_shared::chain_registry::ChainId;
-use xindex_shared::signer_wire::{ErrorBody, ObserverCertifyRequest, ObserverCertifyResponse};
+use xindex_shared::signer_wire::{
+    ErrorBody, ObserverCertifyAccRequest, ObserverCertifyAccResponse, ObserverCertifyRequest,
+    ObserverCertifyResponse,
+};
 use xindex_signer::remote::{AnyHsmBackend, RemoteHsmBackend};
 use xindex_signer::SoftwareSigner;
 
@@ -152,6 +159,18 @@ struct Args {
     /// E2 fraud-window delay seconds (production default 1800 = 30 min).
     #[arg(long, env = "LARGE_SPEND_DELAY_SECS", default_value_t = 1_800)]
     large_spend_delay_secs: u64,
+
+    /// CTD-1 Slice C tail: the ONLY Ethereum destination a mint-cancel
+    /// swap-back memo may pay (the protocol's documented recovery sink —
+    /// ceremony/runbook material). Unset = `certify-acc` disabled; there
+    /// is no safe default destination.
+    #[arg(long, env = "CANCEL_RECOVERY_DEST")]
+    cancel_recovery_dest: Option<String>,
+
+    /// `THORChain` asset string a swap-back memo must target
+    /// (stagenet/testnet rehearsals differ from mainnet).
+    #[arg(long, env = "SWAP_BACK_ASSET", default_value = "ETH.USDT")]
+    swap_back_asset: String,
 }
 
 #[tokio::main]
@@ -269,6 +288,14 @@ async fn run(args: Args) -> Result<()> {
     if large_spend_threshold.is_none() {
         warn!("no E2 fraud-window threshold configured — DEV ONLY");
     }
+    let cancel_recovery_dest = args
+        .cancel_recovery_dest
+        .as_deref()
+        .map(|s| Address::from_str(s).context("CANCEL_RECOVERY_DEST invalid"))
+        .transpose()?;
+    if cancel_recovery_dest.is_none() {
+        warn!("no CANCEL_RECOVERY_DEST configured — certify-acc disabled");
+    }
     let legs = InMemoryLegSource::new();
 
     let ws = WsConnect::new(&args.rpc_url);
@@ -289,6 +316,8 @@ async fn run(args: Args) -> Result<()> {
             stamp_window_secs: args.stamp_window_secs,
             large_spend_threshold,
             large_spend_delay_secs: args.large_spend_delay_secs,
+            cancel_recovery_dest,
+            swap_back_asset: args.swap_back_asset.clone(),
         },
         agreement,
         legs.clone(),
@@ -300,12 +329,14 @@ async fn run(args: Args) -> Result<()> {
         listen = %listen, "xindex-observe-redeem starting"
     );
 
-    // Spawn the RedeemDispatched event loop on the operator's OWN RPC →
-    // leg map. Inlined (not a helper) to dodge alloy 0.8's nested
-    // FillProvider/PubSubFrontend generic that fights `impl Provider`
-    // bounds on standalone helpers — same pattern as `xindex-cancel`.
+    // Spawn the RedeemDispatched + AcquireCancelled event loop on the
+    // operator's OWN RPC → leg/cancel maps. Inlined (not a helper) to
+    // dodge alloy 0.8's nested FillProvider/PubSubFrontend generic that
+    // fights `impl Provider` bounds on standalone helpers — same
+    // pattern as `xindex-cancel`.
     let loop_provider = Arc::clone(&provider);
     let loop_legs = legs.clone();
+    let loop_cancels = observer.cancel_source();
     let from_block = args.from_block;
     tokio::spawn(async move {
         let record = |ev: &ThorchainAdapter::RedeemDispatched| {
@@ -321,23 +352,50 @@ async fn run(args: Args) -> Result<()> {
             );
             info!(redemption_id = %ev.redemptionId, "recorded RedeemDispatched leg facts");
         };
-        let sig = ThorchainAdapter::RedeemDispatched::SIGNATURE_HASH;
+        // A1/A5: the event's `amount` (non-authoritative USDT units) is
+        // deliberately NOT recorded — a swap-back is never sized from it.
+        let record_cancel = |ev: &ThorchainAdapter::AcquireCancelled| {
+            let Ok(slot_index) = u32::try_from(ev.slotIndex) else {
+                warn!(cancel_id = %ev.cancelId, "AcquireCancelled slotIndex exceeds u32");
+                return;
+            };
+            loop_cancels.insert(
+                ev.cancelId,
+                CancelFacts {
+                    intent_id: ev.intentId,
+                    slot_index,
+                },
+                now_unix(),
+            );
+            info!(cancel_id = %ev.cancelId, "recorded AcquireCancelled facts");
+        };
+        let redeem_sig = ThorchainAdapter::RedeemDispatched::SIGNATURE_HASH;
+        let cancel_sig = ThorchainAdapter::AcquireCancelled::SIGNATURE_HASH;
+        let handle_log = |log: &alloy::rpc::types::Log| {
+            if log.topic0() == Some(&redeem_sig) {
+                match log.log_decode::<ThorchainAdapter::RedeemDispatched>() {
+                    Ok(d) => record(&d.inner.data),
+                    Err(e) => warn!(error = %e, "failed to decode RedeemDispatched"),
+                }
+            } else if log.topic0() == Some(&cancel_sig) {
+                match log.log_decode::<ThorchainAdapter::AcquireCancelled>() {
+                    Ok(d) => record_cancel(&d.inner.data),
+                    Err(e) => warn!(error = %e, "failed to decode AcquireCancelled"),
+                }
+            }
+        };
         if from_block > 0 {
             match loop_provider.get_block_number().await {
                 Ok(latest) => {
                     let f = Filter::new()
                         .address(adapter)
-                        .event_signature(sig)
+                        .event_signature(vec![redeem_sig, cancel_sig])
                         .from_block(BlockNumberOrTag::Number(from_block))
                         .to_block(BlockNumberOrTag::Number(latest));
                     match loop_provider.get_logs(&f).await {
                         Ok(logs) => {
                             for log in logs {
-                                if let Ok(d) =
-                                    log.log_decode::<ThorchainAdapter::RedeemDispatched>()
-                                {
-                                    record(&d.inner.data);
-                                }
+                                handle_log(&log);
                             }
                         }
                         Err(e) => error!(error = %e, "observer backfill get_logs failed"),
@@ -346,26 +404,26 @@ async fn run(args: Args) -> Result<()> {
                 Err(e) => error!(error = %e, "observer backfill block number failed"),
             }
         }
-        let filter = Filter::new().address(adapter).event_signature(sig);
+        let filter = Filter::new()
+            .address(adapter)
+            .event_signature(vec![redeem_sig, cancel_sig]);
         match loop_provider.subscribe_logs(&filter).await {
             Ok(sub) => {
                 let mut stream = sub.into_stream();
-                info!("observer subscribed to RedeemDispatched");
+                info!("observer subscribed to RedeemDispatched + AcquireCancelled");
                 while let Some(log) = stream.next().await {
-                    match log.log_decode::<ThorchainAdapter::RedeemDispatched>() {
-                        Ok(d) => record(&d.inner.data),
-                        Err(e) => warn!(error = %e, "failed to decode RedeemDispatched"),
-                    }
+                    handle_log(&log);
                 }
             }
             Err(e) => {
-                error!(error = %e, "observer subscribe failed; certify-ric will 404 new legs");
+                error!(error = %e, "observer subscribe failed; certify will 404 new events");
             }
         }
     });
 
     let app = Router::new()
         .route("/api/v1/certify-ric", post(handle_certify))
+        .route("/api/v1/certify-acc", post(handle_certify_acc))
         .route("/api/v1/health", axum::routing::get(|| async { "ok" }))
         .with_state(ObserverState { observer });
     let listener = tokio::net::TcpListener::bind(listen)
@@ -397,6 +455,29 @@ async fn handle_certify(
     }
 }
 
+/// `POST /api/v1/certify-acc` — resolve + certify one mint-cancel
+/// swap-back from THIS observer's own view (CTD-1 Slice C tail), or
+/// return the typed refusal.
+async fn handle_certify_acc(
+    State(state): State<ObserverState>,
+    Json(req): Json<ObserverCertifyAccRequest>,
+) -> Result<Json<ObserverCertifyAccResponse>, (StatusCode, Json<ErrorBody>)> {
+    let now = now_unix();
+    match state.observer.certify_acc(&req, now).await {
+        Ok(resp) => Ok(Json(resp)),
+        Err(e) => {
+            warn!(error = %e, code = e.error_code(), "certify-acc refused");
+            Err((
+                status_for(&e),
+                Json(ErrorBody {
+                    code: e.error_code().to_string(),
+                    message: e.to_string(),
+                }),
+            ))
+        }
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -406,15 +487,19 @@ fn now_unix() -> u64 {
 /// HTTP status for each observer refusal class.
 fn status_for(e: &ObserverError) -> StatusCode {
     match e {
-        ObserverError::EventNotFound { .. } => StatusCode::NOT_FOUND,
+        ObserverError::EventNotFound { .. } | ObserverError::CancelNotFound { .. } => {
+            StatusCode::NOT_FOUND
+        }
         ObserverError::AsgardUnavailable(_)
         | ObserverError::LegSource(_)
         | ObserverError::SignerUnavailable(_)
-        | ObserverError::HaltUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        | ObserverError::HaltUnavailable(_)
+        | ObserverError::CancelDisabled => StatusCode::SERVICE_UNAVAILABLE,
         ObserverError::ChainUnsupported(_)
         | ObserverError::BadRequest(_)
         | ObserverError::EventInvalid(_)
-        | ObserverError::StampOutOfWindow(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        | ObserverError::StampOutOfWindow(_)
+        | ObserverError::MemoRejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
         ObserverError::Halted => StatusCode::LOCKED,
         ObserverError::FraudWindowActive { .. } => StatusCode::TOO_EARLY,
     }

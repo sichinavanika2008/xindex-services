@@ -26,8 +26,13 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use tracing::warn;
 use xindex_shared::chain_registry::ChainId;
-use xindex_shared::ric_relay::{assemble_intent_proof, RelayAssemblyError};
-use xindex_shared::signer_wire::{IntentProof, ObserverCertifyRequest, ObserverCertifyResponse};
+use xindex_shared::ric_relay::{
+    assemble_acquire_cancel_proof, assemble_intent_proof, RelayAssemblyError,
+};
+use xindex_shared::signer_wire::{
+    AcquireCancelProof, IntentProof, ObserverCertifyAccRequest, ObserverCertifyAccResponse,
+    ObserverCertifyRequest, ObserverCertifyResponse,
+};
 
 /// Default per-observer HTTP timeout. An observer must resolve Asgard
 /// across ≥2 `THORChain` sources before answering, so the budget is
@@ -36,6 +41,10 @@ const DEFAULT_TIMEOUT_SECS: u64 = 20;
 
 /// Path of the per-operator observer's certify endpoint.
 const CERTIFY_PATH: &str = "/api/v1/certify-ric";
+
+/// Path of the per-operator observer's mint-cancel certify endpoint
+/// (CTD-1 Slice C tail).
+const CERTIFY_ACC_PATH: &str = "/api/v1/certify-acc";
 
 /// A successfully collected k-of-n certificate plus the Asgard inbound
 /// the operators agreed on. The executor pays to THIS address (not its
@@ -48,6 +57,18 @@ pub struct CollectedRic {
     pub proof: IntentProof,
     /// The plaintext Asgard inbound address the agreeing observers
     /// resolved (the address whose hash is `proof.immediate_target_hash`).
+    pub asgard_address: String,
+}
+
+/// A successfully collected k-of-n Acquire-Cancel certificate (CTD-1
+/// Slice C tail) — the mint-cancel sibling of [`CollectedRic`], same
+/// pay-to-the-agreed-Asgard discipline.
+#[derive(Debug, Clone)]
+pub struct CollectedAcc {
+    /// The assembled k-of-n proof to attach to the swap-back spend.
+    pub proof: AcquireCancelProof,
+    /// The plaintext Asgard inbound address the agreeing observers
+    /// resolved.
     pub asgard_address: String,
 }
 
@@ -162,6 +183,52 @@ impl RicCollector {
         })
     }
 
+    /// Collect a k-of-n [`AcquireCancelProof`] for one mint-cancel
+    /// swap-back (CTD-1 Slice C tail). The executor proposes the
+    /// swap-back amount and the exact memo; each observer pins the
+    /// memo's destination to ITS OWN configured recovery address and
+    /// derives everything else from its own sources, so a compromised
+    /// collector can fail the round but never steer it.
+    ///
+    /// # Errors
+    /// [`RicCollectError::Assembly`] if fewer than `quorum` observers
+    /// returned certificates agreeing on one plaintext.
+    pub fn collect_acc(
+        &self,
+        chain: ChainId,
+        cancel_id: B256,
+        amount: &str,
+        memo: &str,
+        vault_resolved_at: u64,
+    ) -> Result<CollectedAcc, RicCollectError> {
+        let req = ObserverCertifyAccRequest {
+            chain_id: chain,
+            cancel_id: format!("{cancel_id:#x}"),
+            amount: amount.to_string(),
+            memo: memo.to_string(),
+            vault_resolved_at,
+        };
+        let mut responses: Vec<ObserverCertifyAccResponse> = Vec::new();
+        for url in &self.observer_urls {
+            match self.certify_acc_one(url, &req) {
+                Ok(resp) => responses.push(resp),
+                Err(e) => {
+                    warn!(observer = %url, error = %e, "observer certify-acc failed; skipping");
+                }
+            }
+        }
+        let proof = assemble_acquire_cancel_proof(&responses, self.quorum)?;
+        let asgard_address = responses
+            .iter()
+            .find(|r| r.immediate_target_hash == proof.immediate_target_hash)
+            .map(|r| r.asgard_address.clone())
+            .unwrap_or_default();
+        Ok(CollectedAcc {
+            proof,
+            asgard_address,
+        })
+    }
+
     /// POST one certify request and pin the response. The relay does NOT
     /// verify signatures here (the custody daemon does); it only needs a
     /// well-formed response to feed the assembler.
@@ -186,6 +253,29 @@ impl RicCollector {
             return Err(format!("http {}: {body}", status.as_u16()));
         }
         resp.json::<ObserverCertifyResponse>()
+            .map_err(|e| format!("response json: {e}"))
+    }
+
+    /// POST one certify-acc request and pin the response (no signature
+    /// verification here — the custody daemon re-verifies).
+    fn certify_acc_one(
+        &self,
+        base_url: &str,
+        req: &ObserverCertifyAccRequest,
+    ) -> Result<ObserverCertifyAccResponse, String> {
+        let url = format!("{base_url}{CERTIFY_ACC_PATH}");
+        let resp = self
+            .http
+            .post(&url)
+            .json(req)
+            .send()
+            .map_err(|e| format!("transport: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(format!("http {}: {body}", status.as_u16()));
+        }
+        resp.json::<ObserverCertifyAccResponse>()
             .map_err(|e| format!("response json: {e}"))
     }
 }
@@ -298,6 +388,88 @@ mod tests {
                 ChainId::Btc,
                 rid(),
                 0,
+                1_750_000_000,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("assemble");
+        assert_eq!(collected.proof.signatures.len(), 2);
+    }
+
+    fn acc_cert_body(signer: u8, sig: u8, target: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chain_id": "btc",
+            "cancel_id": format!("0x{}", "ac".repeat(32)),
+            "intent_id": format!("0x{}", "1d".repeat(32)),
+            "slot_index": "1",
+            "asset_id": format!("0x{}", "a1".repeat(32)),
+            "amount": "50000000",
+            "amount_decimals": 8,
+            "immediate_target_hash": target,
+            "memo_hash": format!("0x{}", "ef".repeat(32)),
+            "final_destination_hash": format!("0x{}", "12".repeat(32)),
+            "vault_resolved_at": 1_750_000_000_u64,
+            "asgard_address": "bc1qvault",
+            "signature": format!("0x{}", format!("{sig:02x}").repeat(65)),
+            "signer_address": format!("0x{}", format!("{signer:02x}").repeat(20)),
+        })
+    }
+
+    async fn acc_observer(signer: u8, sig: u8, target: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CERTIFY_ACC_PATH))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(acc_cert_body(signer, sig, target)),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// CTD-1 Slice C tail: collect-acc fans out, assembles k-of-n, and
+    /// surfaces the agreed Asgard — the RIC discipline, ACC flavor.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn collects_acc_quorum_from_agreeing_observers() {
+        let a = acc_observer(1, 0xa1, GOOD).await;
+        let b = acc_observer(2, 0xa2, GOOD).await;
+        let c = acc_observer(3, 0xa3, GOOD).await;
+        let urls = vec![a.uri(), b.uri(), c.uri()];
+        let collected = tokio::task::spawn_blocking(move || {
+            RicCollector::new(urls, 2).expect("collector").collect_acc(
+                ChainId::Btc,
+                alloy_primitives::B256::repeat_byte(0xac),
+                "50000000",
+                "=:ETH.USDT:0x00000000000000000000000000000000000000aa:0",
+                1_750_000_000,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("assemble");
+        assert_eq!(collected.proof.signatures.len(), 3);
+        assert_eq!(collected.proof.immediate_target_hash, GOOD);
+        assert_eq!(collected.proof.cancel_id, format!("0x{}", "ac".repeat(32)));
+        assert_eq!(collected.asgard_address, "bc1qvault");
+    }
+
+    /// One ACC observer down (e.g. its recovery pin refuses), two
+    /// agreeing, quorum 2 → still assembles.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_tolerates_one_refusing_observer_at_quorum() {
+        let a = acc_observer(1, 0xa1, GOOD).await;
+        let b = acc_observer(2, 0xa2, GOOD).await;
+        let c = down_observer().await;
+        let urls = vec![a.uri(), b.uri(), c.uri()];
+        let collected = tokio::task::spawn_blocking(move || {
+            RicCollector::new(urls, 2).expect("collector").collect_acc(
+                ChainId::Btc,
+                alloy_primitives::B256::repeat_byte(0xac),
+                "50000000",
+                "=:ETH.USDT:0x00000000000000000000000000000000000000aa:0",
                 1_750_000_000,
             )
         })

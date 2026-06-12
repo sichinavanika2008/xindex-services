@@ -24,8 +24,13 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 use bitcoin::Network;
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
-use xindex_shared::eip712::{attestation_oracle_domain, redemption_intent_certificate};
-use xindex_shared::signer_wire::{error_codes, ObserverCertifyRequest, ObserverCertifyResponse};
+use xindex_shared::eip712::{
+    acquire_cancel_certificate, attestation_oracle_domain, redemption_intent_certificate,
+};
+use xindex_shared::signer_wire::{
+    error_codes, ObserverCertifyAccRequest, ObserverCertifyAccResponse, ObserverCertifyRequest,
+    ObserverCertifyResponse,
+};
 use xindex_signer::{RicSigner, SignerError};
 
 /// The on-chain facts of one redemption leg, read from the observer's
@@ -120,6 +125,67 @@ impl RedeemLegSource for InMemoryLegSource {
             .read()
             .map_err(|e| format!("leg map poisoned: {e}"))?;
         Ok(map.get(&(redemption_id, leg_index)).cloned())
+    }
+}
+
+/// The on-chain facts of one mint cancellation (CTD-1 Slice C tail),
+/// read from the observer's OWN Ethereum RPC via the `AcquireCancelled`
+/// event. Deliberately EXCLUDES the event's `amount`: it is the
+/// NON-authoritative USDT allocation recomputed at cancel time (Xindex
+/// A1/A5) and must never size a native swap-back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelFacts {
+    /// Intent id of the cancelled mint (`AcquireCancelled.intentId`).
+    pub intent_id: B256,
+    /// Async slot index (`AcquireCancelled.slotIndex`, clamped to `u32`
+    /// at record time — the ACC wire constrains it the same way).
+    pub slot_index: u32,
+}
+
+/// One observed cancellation: the facts plus when THIS observer first
+/// saw the `AcquireCancelled`. The E2 fraud-window delay on the
+/// swap-back is measured from `observed_at`; first-write-wins means a
+/// reorg-replayed event can never reset the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedCancel {
+    /// The cancel facts as first observed.
+    pub facts: CancelFacts,
+    /// Unix seconds (this observer's clock) of the FIRST observation.
+    pub observed_at: u64,
+}
+
+/// In-memory `AcquireCancelled` record keyed by `cancel_id`, populated
+/// by the binary's event loop on the operator's OWN RPC — the cancel
+/// sibling of [`InMemoryLegSource`]. Concrete (no trait): the live impl
+/// IS the in-memory map, and tests insert into it directly.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryCancelSource {
+    facts: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<B256, ObservedCancel>>>,
+}
+
+impl InMemoryCancelSource {
+    /// Empty source — the event loop fills it.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a cancellation's facts (called by the event loop on each
+    /// `AcquireCancelled`) stamped with the observer's own clock. First
+    /// write wins per `cancel_id`.
+    pub fn insert(&self, cancel_id: B256, facts: CancelFacts, observed_at: u64) {
+        if let Ok(mut map) = self.facts.write() {
+            map.entry(cancel_id)
+                .or_insert(ObservedCancel { facts, observed_at });
+        }
+    }
+
+    fn get(&self, cancel_id: B256) -> Result<Option<ObservedCancel>, String> {
+        let map = self
+            .facts
+            .read()
+            .map_err(|e| format!("cancel map poisoned: {e}"))?;
+        Ok(map.get(&cancel_id).copied())
     }
 }
 
@@ -256,6 +322,15 @@ pub struct ObserverConfig {
     pub large_spend_threshold: Option<U256>,
     /// E2 fraud-window delay in seconds (production: 1800 = 30 min).
     pub large_spend_delay_secs: u64,
+    /// CTD-1 Slice C tail: the Ethereum address this operator pins as
+    /// the ONLY destination a mint-cancel swap-back memo may pay (the
+    /// protocol's documented recovery sink — ceremony/runbook material,
+    /// like the volume caps). `None` disables `certify_acc` entirely —
+    /// there is no safe default destination.
+    pub cancel_recovery_dest: Option<Address>,
+    /// CTD-1 Slice C tail: the `THORChain` asset string a swap-back
+    /// memo must target (`ETH.USDT` on mainnet; stagenet differs).
+    pub swap_back_asset: String,
 }
 
 /// Why an observer refused to certify. Each maps to a wire error code so
@@ -303,6 +378,20 @@ pub enum ObserverError {
     /// unknown.
     #[error("halt source: {0}")]
     HaltUnavailable(String),
+    /// No `AcquireCancelled` visible on this observer's own RPC.
+    #[error("no AcquireCancelled for {cancel_id:#x}")]
+    CancelNotFound {
+        /// The requested cancel id.
+        cancel_id: B256,
+    },
+    /// This observer has no mint-cancel recovery destination configured
+    /// — the `certify_acc` path is disabled (operator configuration).
+    #[error("mint-cancel certification disabled: no recovery destination configured")]
+    CancelDisabled,
+    /// The proposed swap-back memo failed the grammar/destination pin —
+    /// the coordinator-steered-destination refusal.
+    #[error("swap-back memo rejected: {0}")]
+    MemoRejected(String),
 }
 
 impl ObserverError {
@@ -312,7 +401,9 @@ impl ObserverError {
         match self {
             Self::ChainUnsupported(_) => error_codes::OBSERVER_CHAIN_UNSUPPORTED,
             Self::BadRequest(_) => error_codes::INTENT_PROOF_INVALID,
-            Self::EventNotFound { .. } => error_codes::OBSERVER_EVENT_NOT_FOUND,
+            Self::EventNotFound { .. } | Self::CancelNotFound { .. } => {
+                error_codes::OBSERVER_EVENT_NOT_FOUND
+            }
             Self::EventInvalid(_) => error_codes::OBSERVER_EVENT_INVALID,
             Self::StampOutOfWindow(_) => error_codes::OBSERVER_STAMP_OUT_OF_WINDOW,
             Self::AsgardUnavailable(_) | Self::LegSource(_) => {
@@ -322,6 +413,8 @@ impl ObserverError {
             Self::Halted => error_codes::OBSERVER_HALTED,
             Self::FraudWindowActive { .. } => error_codes::OBSERVER_FRAUD_WINDOW,
             Self::HaltUnavailable(_) => error_codes::OBSERVER_HALT_UNAVAILABLE,
+            Self::CancelDisabled => error_codes::OBSERVER_CANCEL_DISABLED,
+            Self::MemoRejected(_) => error_codes::OBSERVER_MEMO_REJECTED,
         }
     }
 }
@@ -338,6 +431,7 @@ pub struct Observer<L, S, G> {
     config: ObserverConfig,
     asgard: xindex_chain_thor::AsgardAgreement,
     legs: L,
+    cancels: InMemoryCancelSource,
     signer: S,
     halt: G,
 }
@@ -350,7 +444,8 @@ where
 {
     /// Build an observer over its leg source, diverse-source Asgard
     /// gate, its own Set-B signer, and the on-chain halt source
-    /// (`DL-CTD-E`).
+    /// (`DL-CTD-E`). The mint-cancel record starts empty — the event
+    /// loop writes into the handle [`Observer::cancel_source`] returns.
     #[must_use]
     pub fn new(
         config: ObserverConfig,
@@ -363,9 +458,18 @@ where
             config,
             asgard,
             legs,
+            cancels: InMemoryCancelSource::new(),
             signer,
             halt,
         }
+    }
+
+    /// Shared handle to this observer's `AcquireCancelled` record (the
+    /// maps are `Arc`-backed; the event loop and tests write through
+    /// this clone).
+    #[must_use]
+    pub fn cancel_source(&self) -> InMemoryCancelSource {
+        self.cancels.clone()
     }
 
     /// Independently resolve + certify one redemption leg's custody
@@ -471,6 +575,116 @@ where
         })
     }
 
+    /// Independently resolve + certify one mint-cancel swap-back (CTD-1
+    /// Slice C tail) — the [`Observer::certify_ric`] sibling rooted on
+    /// the `AcquireCancelled` event.
+    ///
+    /// Trust split (see [`ObserverCertifyAccRequest`]): `intent_id` /
+    /// `slot_index` come from this observer's OWN event record, the
+    /// Asgard inbound from its OWN agreement gate, and the memo's
+    /// destination is pinned to its OWN configured recovery address.
+    /// The `amount` is proposer-supplied (the authoritative figure is a
+    /// native-chain fact) and is BOUNDED instead: the E2 fraud window
+    /// delays large values from first cancel observation, and the Set-B
+    /// daemon's per-chain volume window meters the total.
+    ///
+    /// # Errors
+    /// [`ObserverError`] — fails closed on any divergence between this
+    /// observer's view and the request.
+    pub async fn certify_acc(
+        &self,
+        req: &ObserverCertifyAccRequest,
+        now_unix: u64,
+    ) -> Result<ObserverCertifyAccResponse, ObserverError> {
+        if req.chain_id != self.config.chain || req.chain_id == ChainId::Sol {
+            return Err(ObserverError::ChainUnsupported(format!(
+                "{:?}",
+                req.chain_id
+            )));
+        }
+        if self
+            .halt
+            .is_halted()
+            .await
+            .map_err(ObserverError::HaltUnavailable)?
+        {
+            return Err(ObserverError::Halted);
+        }
+        let recovery = self
+            .config
+            .cancel_recovery_dest
+            .ok_or(ObserverError::CancelDisabled)?;
+        let cancel_id = parse_b256(&req.cancel_id, "cancel_id")?;
+        self.check_stamp(req.vault_resolved_at, now_unix)?;
+        let amount = U256::from_str_radix(&req.amount, 10)
+            .map_err(|e| ObserverError::BadRequest(format!("amount: {e}")))?;
+        if amount == U256::ZERO {
+            return Err(ObserverError::BadRequest("zero amount".to_string()));
+        }
+        validate_swap_back_memo(&req.memo, &self.config.swap_back_asset, recovery)?;
+
+        let observed = self
+            .cancels
+            .get(cancel_id)
+            .map_err(ObserverError::LegSource)?
+            .ok_or(ObserverError::CancelNotFound { cancel_id })?;
+
+        // DL-CTD-E E2: a large swap-back waits out the fraud window,
+        // measured from the FIRST observation of the cancel event.
+        if let Some(threshold) = self.config.large_spend_threshold {
+            if amount > threshold {
+                let until = observed
+                    .observed_at
+                    .saturating_add(self.config.large_spend_delay_secs);
+                if now_unix < until {
+                    return Err(ObserverError::FraudWindowActive { until });
+                }
+            }
+        }
+
+        let asgard_address = self
+            .asgard
+            .resolve_agreed(thor_chain_name(self.config.chain))
+            .await
+            .map_err(|e| ObserverError::AsgardUnavailable(e.to_string()))?
+            .address;
+        let immediate_target_hash = self.immediate_target_hash(&asgard_address)?;
+
+        let memo_hash = keccak256(req.memo.as_bytes());
+        let final_destination_hash = keccak256(recovery.as_slice());
+        let acc = acquire_cancel_certificate(
+            cancel_id,
+            observed.facts.intent_id,
+            U256::from(observed.facts.slot_index),
+            self.config.chain.asset_id_hash(),
+            amount,
+            self.config.chain.decimals(),
+            immediate_target_hash,
+            memo_hash,
+            final_destination_hash,
+            req.vault_resolved_at,
+        );
+        let domain = attestation_oracle_domain(self.config.eth_chain_id, self.config.oracle);
+        let sig = self.signer.sign_acc(self.config.chain, &acc, &domain)?;
+
+        Ok(ObserverCertifyAccResponse {
+            chain_id: self.config.chain,
+            cancel_id: format!("{cancel_id:#x}"),
+            intent_id: format!("{:#x}", observed.facts.intent_id),
+            slot_index: observed.facts.slot_index.to_string(),
+            asset_id: format!("{:#x}", self.config.chain.asset_id_hash()),
+            amount: amount.to_string(),
+            amount_decimals: self.config.chain.decimals(),
+            immediate_target_hash: format!("{immediate_target_hash:#x}"),
+            memo_hash: format!("{memo_hash:#x}"),
+            final_destination_hash: format!("{final_destination_hash:#x}"),
+            vault_resolved_at: req.vault_resolved_at,
+            asgard_address,
+            signature: format!("0x{}", alloy_primitives::hex::encode(sig)),
+            signer_address: format!("{:#x}", self.signer.ric_signer_address()),
+        })
+    }
+
     fn check_stamp(&self, stamp: u64, now: u64) -> Result<(), ObserverError> {
         let skew = stamp.abs_diff(now);
         if skew > self.config.stamp_window_secs {
@@ -546,6 +760,49 @@ fn validate_facts(facts: &LegFacts) -> Result<(), ObserverError> {
     Ok(())
 }
 
+/// CTD-1 Slice C tail: enforce the swap-back memo grammar and pin its
+/// destination to THIS operator's configured recovery address. The memo
+/// is proposer-built (the executor needs control of e.g. the limit
+/// field), but a memo that pays anywhere except the pinned recovery
+/// sink is refused — the coordinator cannot steer the swapped-back
+/// USDT. Strict by design: `=:<asset>:<recovery>[:…]`, ≤ 80 bytes.
+fn validate_swap_back_memo(
+    memo: &str,
+    swap_back_asset: &str,
+    recovery: Address,
+) -> Result<(), ObserverError> {
+    if memo.is_empty() {
+        return Err(ObserverError::MemoRejected("empty memo".to_string()));
+    }
+    if memo.len() > MAX_MEMO_BYTES {
+        return Err(ObserverError::MemoRejected(format!(
+            "memo {} bytes > {MAX_MEMO_BYTES}",
+            memo.len()
+        )));
+    }
+    let mut parts = memo.split(':');
+    let tag = parts.next().unwrap_or_default();
+    if tag != "=" && !tag.eq_ignore_ascii_case("SWAP") {
+        return Err(ObserverError::MemoRejected(format!(
+            "not a swap memo (tag {tag:?})"
+        )));
+    }
+    let asset = parts.next().unwrap_or_default();
+    if !asset.eq_ignore_ascii_case(swap_back_asset) {
+        return Err(ObserverError::MemoRejected(format!(
+            "asset {asset:?} != pinned swap-back asset {swap_back_asset:?}"
+        )));
+    }
+    let dest = parts.next().unwrap_or_default();
+    let expected = format!("{recovery:#x}");
+    if !dest.eq_ignore_ascii_case(&expected) {
+        return Err(ObserverError::MemoRejected(format!(
+            "destination {dest:?} != pinned recovery {expected}"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_b256(hex_str: &str, field: &str) -> Result<B256, ObserverError> {
     let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = alloy_primitives::hex::decode(stripped)
@@ -563,7 +820,10 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use xindex_chain_thor::{AsgardAgreement, ThorClient};
-    use xindex_shared::eip712::{ric_signing_hash, RedemptionIntentCertificate};
+    use xindex_shared::eip712::{
+        acquire_cancel_signing_hash, ric_signing_hash, AcquireCancelCertificate,
+        RedemptionIntentCertificate,
+    };
     use xindex_signer::{HsmBackend, SoftwareSigner};
 
     const NOW: u64 = 1_750_000_000;
@@ -630,6 +890,10 @@ mod tests {
         AsgardAgreement::new(clients).expect("two sources")
     }
 
+    fn recovery() -> Address {
+        Address::repeat_byte(0xaa)
+    }
+
     fn config() -> ObserverConfig {
         ObserverConfig {
             chain: ChainId::Btc,
@@ -639,6 +903,8 @@ mod tests {
             stamp_window_secs: 600,
             large_spend_threshold: None,
             large_spend_delay_secs: 1_800,
+            cancel_recovery_dest: Some(recovery()),
+            swap_back_asset: "ETH.USDT".to_string(),
         }
     }
 
@@ -1038,5 +1304,291 @@ mod tests {
         assert_eq!(thor_chain_name(ChainId::Gaia), "GAIA");
         assert_eq!(thor_chain_name(ChainId::Eth), "ETH");
         assert_eq!(thor_chain_name(ChainId::Bsc), "BSC");
+    }
+
+    // ── CTD-1 Slice C tail: certify_acc ────────────────────────────
+
+    const CANCEL_ID: B256 = B256::repeat_byte(0xac);
+    const INTENT_ID: B256 = B256::repeat_byte(0x1d);
+
+    fn swap_back_memo() -> String {
+        format!("=:ETH.USDT:{:#x}:0", recovery())
+    }
+
+    fn acc_req(memo: String) -> ObserverCertifyAccRequest {
+        ObserverCertifyAccRequest {
+            chain_id: ChainId::Btc,
+            cancel_id: format!("{CANCEL_ID:#x}"),
+            amount: "50000000".to_string(),
+            memo,
+            vault_resolved_at: NOW,
+        }
+    }
+
+    fn observed_cancel<L: RedeemLegSource, S: RicSigner, G: HaltSource>(
+        observer: &Observer<L, S, G>,
+        observed_at: u64,
+    ) {
+        observer.cancel_source().insert(
+            CANCEL_ID,
+            CancelFacts {
+                intent_id: INTENT_ID,
+                slot_index: 1,
+            },
+            observed_at,
+        );
+    }
+
+    /// Happy path: the certified ACC binds the observer's OWN event
+    /// record (intent/slot), its OWN Asgard resolution, and its OWN
+    /// pinned recovery destination; the signature recovers to the Set-B
+    /// signer over the independently-rebuilt ACC digest.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_certifies_and_signature_recovers() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        observed_cancel(&observer, NOW);
+        let resp = observer
+            .certify_acc(&acc_req(swap_back_memo()), NOW)
+            .await
+            .expect("must certify");
+
+        assert_eq!(resp.asgard_address, ASGARD_BTC);
+        assert_eq!(resp.intent_id, format!("{INTENT_ID:#x}"));
+        assert_eq!(resp.slot_index, "1");
+        assert_eq!(
+            resp.final_destination_hash,
+            format!("{:#x}", keccak256(recovery().as_slice()))
+        );
+
+        let btc_addr = bitcoin::Address::from_str(ASGARD_BTC)
+            .expect("addr")
+            .require_network(Network::Bitcoin)
+            .expect("net");
+        let expect_target = keccak256(btc_addr.script_pubkey().as_bytes());
+        let acc = AcquireCancelCertificate {
+            cancelId: CANCEL_ID,
+            intentId: INTENT_ID,
+            slotIndex: U256::from(1u64),
+            assetId: ChainId::Btc.asset_id_hash(),
+            amount: U256::from(50_000_000u64),
+            amountDecimals: 8,
+            immediateTargetHash: expect_target,
+            memoHash: keccak256(swap_back_memo().as_bytes()),
+            finalDestinationHash: keccak256(recovery().as_slice()),
+            vaultResolvedAt: NOW,
+        };
+        let digest = acquire_cancel_signing_hash(&acc, &attestation_oracle_domain(1, oracle()));
+        let sig_bytes =
+            alloy_primitives::hex::decode(resp.signature.trim_start_matches("0x")).expect("hex");
+        let sig =
+            alloy_primitives::PrimitiveSignature::try_from(sig_bytes.as_slice()).expect("sig");
+        let recovered = sig.recover_address_from_prehash(&digest).expect("recover");
+        assert_eq!(format!("{recovered:#x}"), resp.signer_address);
+        assert_eq!(recovered, signer().signer_address());
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_unseen_cancel_is_not_found() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        let err = observer
+            .certify_acc(&acc_req(swap_back_memo()), NOW)
+            .await
+            .expect_err("must 404");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_EVENT_NOT_FOUND);
+    }
+
+    /// THE Slice-C teeth: a memo steering the swapped-back USDT to any
+    /// destination except this operator's pinned recovery address is
+    /// refused, regardless of what the coordinator proposes.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_memo_steered_destination_rejected() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        observed_cancel(&observer, NOW);
+        let attacker = format!("=:ETH.USDT:{:#x}:0", Address::repeat_byte(0x66));
+        let err = observer
+            .certify_acc(&acc_req(attacker), NOW)
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_MEMO_REJECTED);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_memo_wrong_asset_rejected() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        observed_cancel(&observer, NOW);
+        let wrong = format!("=:BTC.BTC:{:#x}", recovery());
+        let err = observer
+            .certify_acc(&acc_req(wrong), NOW)
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_MEMO_REJECTED);
+    }
+
+    /// No recovery destination configured ⇒ the ACC path is disabled —
+    /// there is no safe default sink.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_disabled_without_recovery_dest() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let mut cfg = config();
+        cfg.cancel_recovery_dest = None;
+        let observer = Observer::new(
+            cfg,
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        observed_cancel(&observer, NOW);
+        let err = observer
+            .certify_acc(&acc_req(swap_back_memo()), NOW)
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_CANCEL_DISABLED);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_zero_amount_rejected() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        observed_cancel(&observer, NOW);
+        let mut req = acc_req(swap_back_memo());
+        req.amount = "0".to_string();
+        let err = observer
+            .certify_acc(&req, NOW)
+            .await
+            .expect_err("must refuse");
+        assert_eq!(err.error_code(), error_codes::INTENT_PROOF_INVALID);
+    }
+
+    /// DL-CTD-E E2 applies to swap-backs too: a large proposed amount
+    /// waits out the fraud window measured from the FIRST observation
+    /// of the cancel event, then certifies.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_large_swap_back_waits_out_fraud_window() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let mut cfg = config();
+        cfg.large_spend_threshold = Some(U256::from(10_000_000u64));
+        let observer = Observer::new(
+            cfg,
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        let observed_at = NOW - 100;
+        observed_cancel(&observer, observed_at);
+        let err = observer
+            .certify_acc(&acc_req(swap_back_memo()), NOW)
+            .await
+            .expect_err("window open");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_FRAUD_WINDOW);
+        let ObserverError::FraudWindowActive { until } = err else {
+            unreachable!()
+        };
+        assert_eq!(until, observed_at + 1_800);
+
+        // Retry once the window opens — with a FRESH stamp, as a real
+        // re-certify round proposes (the original stamp is now outside
+        // the observer's clock window).
+        let mut later = acc_req(swap_back_memo());
+        later.vault_resolved_at = observed_at + 1_801;
+        observer
+            .certify_acc(&later, observed_at + 1_801)
+            .await
+            .expect("window elapsed");
+    }
+
+    /// DL-CTD-E: an active halt vetoes ACC certification exactly as it
+    /// vetoes RIC certification.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn acc_halted_guard_refuses() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            FakeHalt { halted: Some(true) },
+        );
+        observed_cancel(&observer, NOW);
+        let err = observer
+            .certify_acc(&acc_req(swap_back_memo()), NOW)
+            .await
+            .expect_err("halt vetoes");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_HALTED);
     }
 }

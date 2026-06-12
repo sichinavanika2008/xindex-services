@@ -979,6 +979,90 @@ pub struct ObserverCertifyResponse {
     pub signer_address: String,
 }
 
+/// `POST /api/v1/certify-acc` (per-operator OBSERVER service, CTD-1
+/// Slice C tail — not a signer-daemon endpoint).
+///
+/// The relay/executor's MINT-CANCEL swap-back certification trigger.
+/// Unlike the RIC trigger, two certified fields are genuinely not
+/// derivable from shared Ethereum state and ride the request instead:
+/// - `amount` (native smallest units to swap back) — the authoritative
+///   figure lives on the native chain (the custody UTXO that arrived
+///   for the cancelled mint); `AcquireCancelled.amount` is explicitly
+///   NON-authoritative USDT units (Xindex A1/A5) and `Acquired.amountIn`
+///   is USDT too. The observer bounds it instead of deriving it: the E2
+///   fraud window delays large values and the Set-B daemon's per-chain
+///   volume window (Slice E) meters what certification can move.
+/// - `memo` (the exact swap-back `OP_RETURN` bytes) — built by the
+///   executor, but the observer enforces its grammar and pins the
+///   destination field to ITS OWN configured recovery address, so a
+///   compromised coordinator cannot steer the swapped-back USDT.
+///
+/// Everything else is observer-derived: `intent_id`/`slot_index` from
+/// its own `AcquireCancelled` record, the Asgard inbound from its own
+/// ≥2-source agreement gate, asset/decimals from the chain registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverCertifyAccRequest {
+    /// The swap-back leg's native chain (the observer refuses chains it
+    /// is not configured to certify; `sol` is always refused, RA-2).
+    pub chain_id: ChainId,
+    /// `bytes32` cancel id (the `AcquireCancelled` event's unique id),
+    /// `0x`-prefixed hex — the on-chain event lookup key.
+    pub cancel_id: String,
+    /// Proposed swap-back amount in native smallest units (sats for
+    /// BTC), decimal string. Bounded, not derived — see struct docs.
+    pub amount: String,
+    /// Proposed `THORChain` swap-back memo (exact `OP_RETURN` payload,
+    /// UTF-8). The observer refuses unless it parses as
+    /// `=:<swap-back asset>:<recovery destination>[:…]` with the
+    /// destination equal to the observer's pinned recovery address.
+    pub memo: String,
+    /// Proposed shared issuance stamp (unix seconds), clamped locally
+    /// by each observer; the Set-B daemon enforces its own window.
+    pub vault_resolved_at: u64,
+}
+
+/// Response to [`ObserverCertifyAccRequest`]: the FULL certified ACC
+/// plaintext (exactly what the observer's Set-B daemon signed) plus the
+/// signature. The relay groups responses by identical plaintext, dedups
+/// by `signer_address`, and assembles the k-of-n [`AcquireCancelProof`].
+/// Nothing here is trusted by the custody daemons — they re-verify the
+/// assembled proof statelessly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObserverCertifyAccResponse {
+    /// The certified swap-back leg's chain.
+    pub chain_id: ChainId,
+    /// `bytes32` cancel id, hex — the one-shot replay key.
+    pub cancel_id: String,
+    /// `bytes32` intent id of the cancelled mint (from the observer's
+    /// own `AcquireCancelled` record), hex.
+    pub intent_id: String,
+    /// `uint256` async slot index (observer's own record), decimal.
+    pub slot_index: String,
+    /// `bytes32` canonical asset id the observer certified, hex.
+    pub asset_id: String,
+    /// `uint256` certified amount (native smallest units), decimal.
+    pub amount: String,
+    /// Decimals pinning the unit of `amount` (RA-4).
+    pub amount_decimals: u8,
+    /// `bytes32` keccak of the immediate spend target, hex.
+    pub immediate_target_hash: String,
+    /// `bytes32` keccak of the exact memo bytes, hex.
+    pub memo_hash: String,
+    /// `bytes32` keccak of the pinned recovery destination, hex.
+    pub final_destination_hash: String,
+    /// The stamp the certificate was issued under.
+    pub vault_resolved_at: u64,
+    /// Plaintext Asgard inbound address the observer resolved.
+    /// Convenience for the executor's pay-to-certified-target check;
+    /// not trusted by daemons.
+    pub asgard_address: String,
+    /// `0x`-prefixed 65-byte recoverable Set-B signature over the ACC
+    /// EIP-712 digest.
+    pub signature: String,
+    /// `0x`-prefixed address of the observer's Set-B signer.
+    pub signer_address: String,
+}
+
 /// `POST /api/v1/attest-leg` (per-operator OBSERVER service, RA-6).
 ///
 /// The relay's attestation poll. The observer runs the delivery/refund
@@ -1312,6 +1396,16 @@ pub mod error_codes {
     /// observer fails CLOSED rather than certifying with the halt flag
     /// unknown. HTTP 503.
     pub const OBSERVER_HALT_UNAVAILABLE: &str = "observer_halt_unavailable";
+    /// OBSERVER (CTD-1 Slice C tail): this observer has no mint-cancel
+    /// recovery destination configured, so the `certify-acc` path is
+    /// disabled. Operator configuration, not transient. HTTP 503.
+    pub const OBSERVER_CANCEL_DISABLED: &str = "observer_cancel_disabled";
+    /// OBSERVER (CTD-1 Slice C tail): the proposed swap-back memo
+    /// failed the observer's grammar/destination pin (wrong asset,
+    /// destination ≠ the pinned recovery address, oversize, or
+    /// malformed) — the coordinator-steered-destination refusal.
+    /// HTTP 422.
+    pub const OBSERVER_MEMO_REJECTED: &str = "observer_memo_rejected";
 }
 
 /// HTTP error body. The daemon returns this on any non-2xx response;
@@ -1979,6 +2073,37 @@ mod tests {
         let s = serde_json::to_string(&cert).expect("serialize");
         let back: ObserverCertifyResponse = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(back, cert);
+
+        let acc_certify = ObserverCertifyAccRequest {
+            chain_id: ChainId::Btc,
+            cancel_id: format!("0x{}", "ac".repeat(32)),
+            amount: "50000000".to_string(),
+            memo: "=:ETH.USDT:0x00000000000000000000000000000000000000aa".to_string(),
+            vault_resolved_at: 1_750_000_000,
+        };
+        let s = serde_json::to_string(&acc_certify).expect("serialize");
+        let back: ObserverCertifyAccRequest = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, acc_certify);
+
+        let acc_cert = ObserverCertifyAccResponse {
+            chain_id: ChainId::Btc,
+            cancel_id: format!("0x{}", "ac".repeat(32)),
+            intent_id: format!("0x{}", "1d".repeat(32)),
+            slot_index: "1".to_string(),
+            asset_id: format!("0x{}", "a1".repeat(32)),
+            amount: "50000000".to_string(),
+            amount_decimals: 8,
+            immediate_target_hash: format!("0x{}", "cd".repeat(32)),
+            memo_hash: format!("0x{}", "ef".repeat(32)),
+            final_destination_hash: format!("0x{}", "12".repeat(32)),
+            vault_resolved_at: 1_750_000_000,
+            asgard_address: "bc1qvault".to_string(),
+            signature: format!("0x{}", "aa".repeat(65)),
+            signer_address: format!("0x{}", "44".repeat(20)),
+        };
+        let s = serde_json::to_string(&acc_cert).expect("serialize");
+        let back: ObserverCertifyAccResponse = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, acc_cert);
 
         let attest = ObserverAttestRequest {
             redemption_id: format!("0x{}", "ab".repeat(32)),

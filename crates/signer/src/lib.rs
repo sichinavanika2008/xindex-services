@@ -22,10 +22,10 @@ use alloy_sol_types::Eip712Domain;
 use thiserror::Error;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::{
-    attestation_signing_hash, redemption_attestation_signing_hash, refund_attestation_signing_hash,
-    ric_signing_hash, streamed_settlement_signing_hash, AsyncLegDeliveryAttestation,
-    AsyncLegRefundAttestation, AsyncLegStreamedSettlement, Attestation,
-    RedemptionIntentCertificate,
+    acquire_cancel_signing_hash, attestation_signing_hash, redemption_attestation_signing_hash,
+    refund_attestation_signing_hash, ric_signing_hash, streamed_settlement_signing_hash,
+    AcquireCancelCertificate, AsyncLegDeliveryAttestation, AsyncLegRefundAttestation,
+    AsyncLegStreamedSettlement, Attestation, RedemptionIntentCertificate,
 };
 
 /// Errors surfaced by signer operations. Concrete enough that callers
@@ -153,6 +153,22 @@ pub trait RicSigner {
         ric: &RedemptionIntentCertificate,
         domain: &Eip712Domain,
     ) -> Result<[u8; 65], SignerError>;
+
+    /// Sign `acc` (CTD-1 Slice C: the mint-cancel swap-back sibling of
+    /// [`RicSigner::sign_ric`]) for `chain` over the attestation-oracle
+    /// `domain`. Remote backends forward the plaintext to their daemon's
+    /// `/api/v1/sign/eip712-acc`, which recomputes the digest on its OWN
+    /// pinned domain and refuses to equivocate per `(chain, cancel_id)`.
+    ///
+    /// # Errors
+    /// [`SignerError::Backend`] on backend / transport / equivocation /
+    /// staleness failure.
+    fn sign_acc(
+        &self,
+        chain: ChainId,
+        acc: &AcquireCancelCertificate,
+        domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError>;
 }
 
 impl RicSigner for SoftwareSigner {
@@ -167,6 +183,15 @@ impl RicSigner for SoftwareSigner {
         domain: &Eip712Domain,
     ) -> Result<[u8; 65], SignerError> {
         self.sign_digest(ric_signing_hash(ric, domain))
+    }
+
+    fn sign_acc(
+        &self,
+        _chain: ChainId,
+        acc: &AcquireCancelCertificate,
+        domain: &Eip712Domain,
+    ) -> Result<[u8; 65], SignerError> {
+        self.sign_digest(acquire_cancel_signing_hash(acc, domain))
     }
 }
 
