@@ -1,12 +1,17 @@
 name: Assurance
 
-# Deep, slow assurance (UB checks, mutation testing). Scheduled + manual only
-# so they never block a push, and run on GitHub's runners rather than a local
-# box that thrashes on full-workspace builds.
+# Deep, slow assurance (UB checks, mutation testing). Scheduled + manual, plus
+# a self-test on edits to this file — workflow_dispatch can't reach it while the
+# repo's default branch (main) lacks this workflow, so the push trigger is the
+# only way to exercise it from a feature branch. Runs on GitHub's runners
+# rather than a local box that thrashes on full-workspace builds.
 on:
   schedule:
     - cron: "0 4 * * 1" # Mondays 04:00 UTC
   workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/assurance.yml
 
 permissions:
   contents: read
