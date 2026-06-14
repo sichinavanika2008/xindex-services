@@ -73,5 +73,16 @@ jobs:
       - name: cargo deny
         run: cargo deny check
 
+      # Retry: the advisory-db git clone is occasionally flaky on runners
+      # ("failed to prepare clone"). Three attempts before failing for real.
       - name: cargo audit
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        run: |
+          for attempt in 1 2 3; do
+            if cargo audit --ignore RUSTSEC-2023-0071; then
+              exit 0
+            fi
+            echo "cargo audit attempt $attempt failed; retrying in 15s..."
+            sleep 15
+          done
+          echo "cargo audit failed after 3 attempts" >&2
+          exit 1
