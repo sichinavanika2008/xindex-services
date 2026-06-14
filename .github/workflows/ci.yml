@@ -65,6 +65,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      # Pre-fetch the advisory DB via actions/checkout (system git + token).
+      # cargo-audit's own libgit2 clone fails on runners ("failed to prepare
+      # clone"); a checkout into the default db path lets `audit -n` run
+      # offline. Latest DB HEAD is intended — we want current advisories.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: rustsec/advisory-db
+          ref: main
+          path: advisory-db
+          persist-credentials: false
+
       # Run the tools directly (matches `just gate`'s authoritative ignore)
       # rather than third-party actions, keeping the action surface minimal.
       - name: install cargo-deny + cargo-audit
@@ -73,16 +84,8 @@ jobs:
       - name: cargo deny
         run: cargo deny check
 
-      # Retry: the advisory-db git clone is occasionally flaky on runners
-      # ("failed to prepare clone"). Three attempts before failing for real.
+      # `cargo audit` is the authoritative advisory gate (full Cargo.lock scan;
+      # cargo-deny's feature-resolved graph is NOT a superset — see deny.toml).
+      # -n/--no-fetch uses the pre-fetched DB above.
       - name: cargo audit
-        run: |
-          for attempt in 1 2 3; do
-            if cargo audit --ignore RUSTSEC-2023-0071; then
-              exit 0
-            fi
-            echo "cargo audit attempt $attempt failed; retrying in 15s..."
-            sleep 15
-          done
-          echo "cargo audit failed after 3 attempts" >&2
-          exit 1
+        run: cargo audit --no-fetch --db advisory-db --ignore RUSTSEC-2023-0071
