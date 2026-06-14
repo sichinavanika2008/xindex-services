@@ -45,7 +45,11 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: test
-        run: cargo test --workspace --all-features
+        # No --all-features: matches the authoritative `just gate` (clippy
+        # above keeps --all-features for static coverage). Enabling every
+        # feature at once is not a supported runtime combination and breaks
+        # the swap-back multisig finalize.
+        run: cargo test --workspace
 
   supply-chain:
     name: deny + audit
