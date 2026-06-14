@@ -204,6 +204,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
     fn refuses_single_source_configuration() {
         let err = AsgardAgreement::new(vec![]).expect_err("zero sources must fail");
         assert!(matches!(
@@ -247,7 +248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::expect_used, reason = "test code")]
+    #[expect(clippy::expect_used, clippy::panic, reason = "test code")]
     async fn one_source_down_leaves_sub_minimum_and_refuses() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         // Source b: unroutable port — transport failure.
