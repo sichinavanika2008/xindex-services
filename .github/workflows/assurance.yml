@@ -1,0 +1,63 @@
+name: Assurance
+
+# Deep, slow assurance (UB checks, mutation testing). Scheduled + manual only
+# so they never block a push, and run on GitHub's runners rather than a local
+# box that thrashes on full-workspace builds.
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assurance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  careful:
+    name: cargo-careful (UB + stdlib debug asserts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-careful
+        run: cargo install cargo-careful --locked
+
+      - name: careful test
+        run: cargo careful test --workspace
+
+  mutants:
+    name: cargo-mutants (security-critical crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      # Scoped to the crypto + CTD-1 core (eip712/RIC and the daemon's
+      # intent/psbt gate). Drop the -p flags to run the whole workspace.
+      - name: cargo mutants
+        run: cargo mutants --baseline=skip -p xindex-shared -p xindex-signer-daemon

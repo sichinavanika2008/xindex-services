@@ -1,38 +1,42 @@
 name: CI
+
+# Fast gate: runs on every push and PR (was previously `branches: [main]`,
+# which never fired because there is no `main` branch — CI was dormant).
 on:
-  pull_request:
-    branches: [main]
   push:
-    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   lint-test:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
+    env:
+      # Deny plain rustc warnings here (clippy lints are denied via the
+      # command + workspace lints). Scoped to this job so it can't break the
+      # `cargo install` in the supply-chain job.
+      RUSTFLAGS: "-D warnings"
     steps:
-      # actions/checkout v4.2.2 — re-pin SHA at first push (zizmor flags
-      # tag references; SHAs are immutable). Until then `@v4` is acceptable
-      # for a private workspace pre-mainnet.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -47,30 +51,23 @@ jobs:
     name: deny + audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
-      - uses: rustsec/audit-check@v2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
 
-  careful:
-    name: cargo-careful
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - uses: dtolnay/rust-toolchain@nightly
+      # Run the tools directly (matches `just gate`'s authoritative ignore)
+      # rather than third-party actions, keeping the action surface minimal.
+      - name: install cargo-deny + cargo-audit
+        run: cargo install cargo-deny cargo-audit --locked
 
-      - uses: Swatinem/rust-cache@v2
+      - name: cargo deny
+        run: cargo deny check
 
-      - name: install cargo-careful
-        run: cargo install cargo-careful --locked
-
-      - name: careful test
-        run: cargo careful test --workspace
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
