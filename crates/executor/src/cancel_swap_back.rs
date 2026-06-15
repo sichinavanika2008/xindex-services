@@ -173,13 +173,18 @@ mod tests {
             let secp = Secp256k1::new();
             let mut clone = psbt.clone();
             sign_psbt_input(&mut clone, input_index, &self.sk, &secp)?;
-            let (pk, sig) = clone.inputs[input_index]
+            // Return THIS cosigner's own signature. The executor threads one
+            // accumulating PSBT through every cosigner, so by the time later
+            // cosigners run, `partial_sigs` already holds earlier signers' sigs;
+            // `.iter().next()` would return the lexicographically-smallest
+            // pubkey's sig (an earlier signer's) ~half the time with random
+            // keys, duplicating one signer and leaving `multi(K, …)`
+            // unsatisfiable (CouldNotSatisfy). Key off `self.pk` instead.
+            let sig = *clone.inputs[input_index]
                 .partial_sigs
-                .iter()
-                .next()
-                .map(|(pk, sig)| (*pk, *sig))
-                .expect("partial sig inserted");
-            Ok((pk, sig))
+                .get(&self.pk)
+                .expect("own partial sig inserted");
+            Ok((self.pk, sig))
         }
     }
 
