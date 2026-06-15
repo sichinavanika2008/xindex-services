@@ -667,18 +667,25 @@ fail-closed). **No Critical/High.** Design surfaces confirmed SOUND:
 - **RT-B-LOW mTLS test under-assertion** (`tls.rs`): added cert/key-mismatch →
   err + no-CERTIFICATE-section → `NoPinnedCerts` regression tests.
 
-**Confirmed Medium — scoped production follow-ons (backstopped, no fund loss):**
-- **RT-A-MED price-signer monotonic anti-equivocation guard is in-memory only**
-  (`price_sign.rs` `last_signed`): resets on restart → a same-second re-sign after
-  a restart could produce two differently-priced attestations for one
-  `(asset, timestamp)`. BACKSTOP: on-chain `attestPrice` monotonic check
-  (`timestamp <= prev.updatedAt` reverts) → only one lands (steering-within-band,
-  not forgery). FOLLOW-ON: persist `(asset → last_signed)` in a sqlx store
-  mirroring `BroadcastRegistry`, loaded at startup.
-- **RT-A-MED circulating supply single-sourced** (CoinGecko): k-of-n gives zero
-  diversity; on-chain only rejects `supply==0`. FOLLOW-ON: wire ≥2 supply sources
-  (the `SupplyFeed`+`aggregate_price` plumbing already supports N — only the
-  binary hardcodes one) + an on-chain absolute supply band. NAV input → prioritise.
+**Confirmed Medium — both RESOLVED 2026-06-15 (same session):**
+- **RT-A-MED price-signer monotonic anti-equivocation guard was in-memory only**
+  (resets on restart → a same-second re-sign after a restart could produce two
+  differently-priced attestations for one `(asset, timestamp)`). **FIXED:**
+  `xindex-price-signer` now persists the per-asset last-signed timestamps to a
+  durable `state_file` (atomic write-then-rename), loaded at startup so the guard
+  survives a restart; a CORRUPT state file fails closed (refuse to start, never
+  silently reset). `+last_signed_state_round_trips_and_corrupt_fails_closed`. The
+  on-chain `attestPrice` monotonic check (`timestamp <= prev.updatedAt` reverts)
+  remains the hard backstop for the narrow sign-then-crash-before-persist window.
+- **RT-A-MED "circulating supply single-sourced"** — **DOWNGRADED to INFO after
+  verification (the agent over-rated it).** The red-teamer claimed `supply` is a
+  NAV input; in fact `IndexNavLib.navMintShares:92` reads `(uint256 priceWad,,)`
+  — it DISCARDS the attested supply, and it is the ONLY `quote()` caller. So the
+  attested circulating-supply is **stored but consumed by no on-chain path** → a
+  wrong supply CANNOT misprice a mint (not a fund risk). Separate, honest
+  observation: it is a **phantom attestation** (sourced/signed/guarded/stored,
+  read by nothing) — either wire a real consumer (e.g. market-cap weighting) or
+  stop attesting it. Founder/product decision, not a security fix.
 
 **Accepted (INFO, not vulnerabilities):** the mTLS module is not yet wired into a
 network-serving binary (`router()` served only in tests; the price-signer is a

@@ -48,6 +48,9 @@ struct Config {
     supply_min_venues: usize,
     /// Seconds between observation rounds.
     interval_secs: u64,
+    /// Path to the durable anti-equivocation state file (per-asset last-signed
+    /// timestamps); persists the monotonic guard across restarts.
+    state_file: String,
     binance_base: String,
     coinbase_base: String,
     kraken_base: String,
@@ -72,6 +75,39 @@ fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Load the persisted per-asset last-signed timestamps (the anti-equivocation
+/// guard) so it SURVIVES a producer restart. A missing file is a first run
+/// (empty map); a CORRUPT file fails closed — refuse to start rather than
+/// silently reset the guard and risk signing two prices for one instant.
+fn load_last_signed(path: &str) -> Result<HashMap<B256, u64>, Box<dyn std::error::Error>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(format!("cannot read state file {path}: {e}").into()),
+    };
+    let map: HashMap<String, u64> = serde_json::from_str(&raw)
+        .map_err(|e| format!("corrupt anti-equivocation state {path}: {e} (refusing to start)"))?;
+    let mut out = HashMap::with_capacity(map.len());
+    for (k, v) in map {
+        out.insert(
+            k.parse::<B256>()
+                .map_err(|e| format!("bad asset id '{k}' in state {path}: {e}"))?,
+            v,
+        );
+    }
+    Ok(out)
+}
+
+/// Atomically persist the guard (write a temp file, then rename) so a crash
+/// mid-write cannot corrupt or truncate the state.
+fn save_last_signed(path: &str, map: &HashMap<B256, u64>) -> std::io::Result<()> {
+    let raw: HashMap<String, u64> = map.iter().map(|(k, v)| (format!("{k:#x}"), *v)).collect();
+    let json = serde_json::to_string(&raw).map_err(std::io::Error::other)?;
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[tokio::main]
@@ -116,7 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supply_min_venues: cfg.supply_min_venues,
     };
 
-    let mut last_signed: HashMap<B256, u64> = HashMap::new();
+    // Anti-equivocation guard, loaded from durable state so it survives a
+    // restart (a corrupt state file fails closed inside load_last_signed).
+    let mut last_signed = load_last_signed(&cfg.state_file)?;
     let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs));
     loop {
         tick.tick().await;
@@ -151,6 +189,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match produce_signed_price(&hsm, signer_address, &domain, policy, &input).await {
                 Ok(signed) => {
                     last_signed.insert(*asset_id, now);
+                    // Persist the guard BEFORE emitting, so a restart cannot
+                    // reset it and re-sign a different price at this timestamp.
+                    // The on-chain attestPrice monotonic check backstops the
+                    // narrow sign-then-crash-before-persist window.
+                    if let Err(e) = save_last_signed(&cfg.state_file, &last_signed) {
+                        eprintln!(
+                            "WARN persist anti-equivocation state to {} failed: {e} \
+                             (on-chain monotonic check still backstops)",
+                            cfg.state_file
+                        );
+                    }
                     println!(
                         "{}",
                         serde_json::json!({
@@ -164,5 +213,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("price-sign {asset_id:#x} failed (fail-closed): {e}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G/RT-A-MED: the anti-equivocation guard must persist across restarts and
+    /// fail closed on a corrupt state file (never silently reset).
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn last_signed_state_round_trips_and_corrupt_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "xindex-pricesigner-state-{}.json",
+            std::process::id()
+        ));
+        let p = path.to_str().expect("utf8 path");
+        let _ = std::fs::remove_file(p);
+        // Missing file → empty (first run).
+        assert!(load_last_signed(p).expect("missing-ok").is_empty());
+        // Round-trip a guard entry.
+        let mut m = HashMap::new();
+        m.insert(B256::repeat_byte(0xab), 1_700_000_000_u64);
+        save_last_signed(p, &m).expect("save");
+        assert_eq!(load_last_signed(p).expect("load"), m);
+        // Corrupt state → fail closed (refuse to start), never silently reset.
+        std::fs::write(p, "{ not json").expect("write corrupt");
+        assert!(
+            load_last_signed(p).is_err(),
+            "corrupt state must fail closed"
+        );
+        let _ = std::fs::remove_file(p);
     }
 }
