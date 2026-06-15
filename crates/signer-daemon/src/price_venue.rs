@@ -66,40 +66,53 @@ pub async fn source_quotes(feeds: &[Feed<'_>]) -> Vec<U256> {
 }
 
 /// Parse a decimal price string (`"43000.5"`) into a WAD `U256` (scaled 1e18).
-/// Fractions longer than 18 digits are truncated (sub-wei precision dropped);
-/// negatives / non-numeric / empty inputs error.
 ///
 /// # Errors
 /// [`VenueError::Parse`] on a malformed price.
 pub fn decimal_to_wad(s: &str) -> Result<U256, VenueError> {
+    decimal_to_scaled(s, 18)
+}
+
+/// Parse a decimal string into a `U256` scaled by `10^decimals` (e.g. a price
+/// at 18, or a circulating supply at the token's own decimals). Fractions
+/// longer than `decimals` are truncated (sub-unit precision dropped);
+/// negatives / non-numeric / empty inputs error.
+///
+/// # Errors
+/// [`VenueError::Parse`] on a malformed value.
+pub fn decimal_to_scaled(s: &str, decimals: u8) -> Result<U256, VenueError> {
     let s = s.trim();
     if s.is_empty() || s.starts_with('-') {
-        return Err(VenueError::Parse(format!("invalid price '{s}'")));
+        return Err(VenueError::Parse(format!("invalid value '{s}'")));
     }
     let (int_part, frac_part) = s.split_once('.').unwrap_or((s, ""));
     if int_part.is_empty() && frac_part.is_empty() {
-        return Err(VenueError::Parse(format!("invalid price '{s}'")));
+        return Err(VenueError::Parse(format!("invalid value '{s}'")));
     }
     if !int_part.chars().all(|c| c.is_ascii_digit())
         || !frac_part.chars().all(|c| c.is_ascii_digit())
     {
-        return Err(VenueError::Parse(format!("non-numeric price '{s}'")));
+        return Err(VenueError::Parse(format!("non-numeric value '{s}'")));
     }
+    let d = usize::from(decimals);
     let mut frac = frac_part.to_string();
-    if frac.len() > 18 {
-        frac.truncate(18);
+    if frac.len() > d {
+        frac.truncate(d);
     } else {
-        while frac.len() < 18 {
+        while frac.len() < d {
             frac.push('0');
         }
     }
     let int_str = if int_part.is_empty() { "0" } else { int_part };
     let int_u = U256::from_str_radix(int_str, 10)
         .map_err(|e| VenueError::Parse(format!("int '{int_str}': {e}")))?;
+    let scale = U256::from(10u64).pow(U256::from(d));
+    if frac.is_empty() {
+        return Ok(int_u * scale);
+    }
     let frac_u =
         U256::from_str_radix(&frac, 10).map_err(|e| VenueError::Parse(format!("frac: {e}")))?;
-    let wad = U256::from(10u64).pow(U256::from(18u64));
-    Ok(int_u * wad + frac_u)
+    Ok(int_u * scale + frac_u)
 }
 
 /// Pull a string field from a JSON body via a dotted path, then decimal→WAD.

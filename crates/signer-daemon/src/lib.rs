@@ -29,6 +29,7 @@ pub mod cosmos_tx;
 pub mod evm_safe;
 pub mod intent;
 pub mod price_sign;
+pub mod price_supply;
 pub mod price_venue;
 pub mod psbt;
 pub mod replay;

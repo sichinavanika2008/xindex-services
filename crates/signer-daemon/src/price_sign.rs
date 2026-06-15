@@ -24,10 +24,17 @@ use crate::web3signer::{HsmDigestSigner, HsmError};
 /// Per-signer price policy.
 #[derive(Debug, Clone, Copy)]
 pub struct PricePolicy {
-    /// Minimum independent venues required (fail closed below this).
+    /// Minimum independent PRICE venues required (fail closed below this).
     pub min_venues: usize,
-    /// Maximum deviation from the venue median before a quote is an outlier.
+    /// Maximum deviation from the median before a quote is an outlier (applies
+    /// to both the price and the supply aggregation).
     pub max_deviation_bps: u32,
+    /// Minimum independent SUPPLY sources required. Separate (and typically
+    /// lower) than `min_venues`: far fewer independent circulating-supply feeds
+    /// exist than price venues, and supply is slow-moving + less manipulable,
+    /// so it is additionally backstopped by the on-chain absolute-bounds (L1)
+    /// guard.
+    pub supply_min_venues: usize,
 }
 
 /// One price observation to sign.
@@ -136,6 +143,56 @@ pub async fn sign_observed_price<H: HsmDigestSigner>(
     })
 }
 
+/// Where to source one asset's price + circulating supply for a producer step.
+#[derive(Debug)]
+pub struct ProducerInputs<'a> {
+    /// Registry asset id.
+    pub asset_id: B256,
+    /// Token decimals (scales the sourced circulating supply to raw units).
+    pub decimals: u8,
+    /// Independent price feeds (CEX tickers).
+    pub price_feeds: &'a [crate::price_venue::Feed<'a>],
+    /// Independent circulating-supply feeds.
+    pub supply_feeds: &'a [crate::price_supply::SupplyFeed<'a>],
+    /// Observation time (unix secs); strictly increasing per asset.
+    pub timestamp: u64,
+    /// Last timestamp signed for this asset (monotonic guard).
+    pub last_signed_at: Option<u64>,
+}
+
+/// The full self-driven producer step for one asset: source price + supply from
+/// the configured venues, median each (outlier-rejected, fail-closed), then
+/// sign the resulting `PriceAttestation`. `supply` is medianed here; `price` is
+/// medianed inside [`sign_observed_price`].
+///
+/// # Errors
+/// [`PriceSignError`] — price or supply consensus failure, non-monotonic
+/// timestamp, HSM error, or recover-verify mismatch (all fail-closed).
+pub async fn produce_signed_price<H: HsmDigestSigner>(
+    hsm: &H,
+    signer_address: Address,
+    domain: &Eip712Domain,
+    policy: PricePolicy,
+    input: &ProducerInputs<'_>,
+) -> Result<SignedPrice, PriceSignError> {
+    let price_quotes = crate::price_venue::source_quotes(input.price_feeds).await;
+    let supply_quotes =
+        crate::price_supply::source_supply(input.supply_feeds, input.decimals).await;
+    let supply = aggregate_price(
+        &supply_quotes,
+        policy.supply_min_venues,
+        policy.max_deviation_bps,
+    )?;
+    let obs = PriceObservation {
+        asset_id: input.asset_id,
+        venue_quotes: &price_quotes,
+        supply,
+        timestamp: input.timestamp,
+        last_signed_at: input.last_signed_at,
+    };
+    sign_observed_price(hsm, signer_address, domain, policy, &obs).await
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, clippy::unwrap_used, reason = "test code")]
@@ -179,6 +236,7 @@ mod tests {
         PricePolicy {
             min_venues: 3,
             max_deviation_bps: 5000,
+            supply_min_venues: 1,
         }
     }
 
@@ -244,5 +302,95 @@ mod tests {
             .await
             .expect_err("must reject");
         assert!(matches!(err, PriceSignError::Aggregate(_)));
+    }
+
+    #[derive(Debug)]
+    struct FixedVenue(U256);
+    #[async_trait::async_trait]
+    impl crate::price_venue::PriceVenue for FixedVenue {
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+        async fn fetch_price_wad(
+            &self,
+            _symbol: &str,
+        ) -> Result<U256, crate::price_venue::VenueError> {
+            Ok(self.0)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedSupply(U256);
+    #[async_trait::async_trait]
+    impl crate::price_supply::SupplySource for FixedSupply {
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+        async fn circulating_supply_raw(
+            &self,
+            _id: &str,
+            _decimals: u8,
+        ) -> Result<U256, crate::price_venue::VenueError> {
+            Ok(self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn produce_sources_medians_and_signs() {
+        use crate::price_supply::SupplyFeed;
+        use crate::price_venue::Feed;
+        let (sk, addr) = key_and_addr(7);
+        let hsm = StubHsm { sk };
+        let (p1, p2, p3) = (
+            FixedVenue(U256::from(100u64)),
+            FixedVenue(U256::from(101u64)),
+            FixedVenue(U256::from(102u64)),
+        );
+        let (s1, s2, s3) = (
+            FixedSupply(U256::from(1_000_000u64)),
+            FixedSupply(U256::from(1_000_000u64)),
+            FixedSupply(U256::from(1_000_000u64)),
+        );
+        let price_feeds = [
+            Feed {
+                venue: &p1,
+                symbol: "X",
+            },
+            Feed {
+                venue: &p2,
+                symbol: "X",
+            },
+            Feed {
+                venue: &p3,
+                symbol: "X",
+            },
+        ];
+        let supply_feeds = [
+            SupplyFeed {
+                source: &s1,
+                id: "x",
+            },
+            SupplyFeed {
+                source: &s2,
+                id: "x",
+            },
+            SupplyFeed {
+                source: &s3,
+                id: "x",
+            },
+        ];
+        let input = ProducerInputs {
+            asset_id: B256::repeat_byte(0x11),
+            decimals: 8,
+            price_feeds: &price_feeds,
+            supply_feeds: &supply_feeds,
+            timestamp: 1000,
+            last_signed_at: None,
+        };
+        let signed = produce_signed_price(&hsm, addr, &domain(), policy(), &input)
+            .await
+            .expect("produce");
+        // Signs the MEDIAN price (101) over the median supply.
+        assert_eq!(signed.price_wad, U256::from(101u64));
     }
 }
