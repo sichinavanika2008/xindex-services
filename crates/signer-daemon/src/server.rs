@@ -150,6 +150,29 @@ impl CertVolumePolicy {
         }
         Ok(())
     }
+
+    /// Fail-closed PRODUCTION assertion (workstream F): every `served` chain
+    /// MUST have a positive cap. [`Self::validate`] deliberately PASSES the
+    /// legitimate dev/test UNMETERED mode (empty `caps`); this is the
+    /// production-only invariant it omits — a served chain left unmetered
+    /// leaves the CTD-1 containment teeth (`DL-CTD-E`) OFF, so a production
+    /// daemon must refuse to boot that way.
+    ///
+    /// # Errors
+    /// Propagates [`Self::validate`], then the first `served` chain with no
+    /// positive cap.
+    pub fn assert_metered_for(&self, served: &[ChainId]) -> Result<(), String> {
+        self.validate()?;
+        for chain in served {
+            if self.caps.get(chain).is_none_or(|cap| *cap == 0) {
+                return Err(format!(
+                    "served chain {chain:?} has no positive cert-volume cap — production must \
+                     meter every RIC-gated chain (DL-CTD-E); unmetered is dev/test only"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Runtime state shared across all handler invocations. `S` + `H` are
@@ -231,6 +254,32 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             sol: HashMap::new(),
             tron: HashMap::new(),
         }
+    }
+
+    /// Fail-closed PRODUCTION startup assertion (workstream F). A daemon
+    /// bound to a real HSM MUST refuse to boot with safety features off.
+    /// Composes the individual sanity checks ([`IntentPolicy::validate`] +
+    /// [`CertVolumePolicy::validate`]) with the production-only invariant
+    /// they miss: every RIC-gated chain this daemon signs for is metered
+    /// ([`CertVolumePolicy::assert_metered_for`], `DL-CTD-E`). Solana is
+    /// excluded — RIC-exempt + hard-gated (RA-2). Dev/test harnesses
+    /// (stub HSM + `unmetered()`) do not call this.
+    ///
+    /// # Errors
+    /// The first production-unsafe setting: an invalid `intent_policy`, or a
+    /// served RIC-gated chain with no positive cert-volume cap.
+    pub fn assert_production_safe(&self) -> Result<(), String> {
+        let served: Vec<ChainId> = self
+            .utxo
+            .keys()
+            .chain(self.evm.keys())
+            .chain(self.cosmos.keys())
+            .chain(self.xrp.keys())
+            .chain(self.tron.keys())
+            .copied()
+            .collect();
+        self.config.cert_volume.assert_metered_for(&served)?;
+        self.config.intent_policy.validate()
     }
 
     /// Builder: attach a per-chain UTXO signing role to an existing
@@ -1979,6 +2028,34 @@ mod tests {
             hsm.seen.lock().unwrap().len(),
             1,
             "idempotent retry must not re-sign"
+        );
+    }
+
+    /// F: `validate()` passes the dev/test UNMETERED policy, but the
+    /// production assertion rejects a served chain with no positive cap —
+    /// the CTD-1 containment teeth (DL-CTD-E) must never be off in prod.
+    #[test]
+    fn cert_volume_assert_metered_for_is_production_strict() {
+        use std::collections::HashMap;
+        let unmetered = CertVolumePolicy::unmetered();
+        assert!(
+            unmetered.validate().is_ok(),
+            "unmetered passes dev/test sanity"
+        );
+        assert!(
+            unmetered.assert_metered_for(&[ChainId::Tron]).is_err(),
+            "production rejects an unmetered served chain"
+        );
+        let mut caps = HashMap::new();
+        caps.insert(ChainId::Tron, 1_000_000_u128);
+        let metered = CertVolumePolicy {
+            window_secs: 86_400,
+            caps,
+        };
+        assert!(metered.assert_metered_for(&[ChainId::Tron]).is_ok());
+        assert!(
+            metered.assert_metered_for(&[ChainId::Btc]).is_err(),
+            "a served chain absent from caps is the unmetered footgun — rejected"
         );
     }
 
