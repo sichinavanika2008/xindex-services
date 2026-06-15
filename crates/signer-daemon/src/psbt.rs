@@ -393,7 +393,7 @@ where
         )
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(err(
                 error_codes::BAD_REQUEST,
                 StatusCode::BAD_REQUEST,
@@ -1502,6 +1502,40 @@ mod tests {
             body["code"].as_str().expect("code"),
             error_codes::PSBT_FEE_EXCEEDS_CAP
         );
+    }
+
+    /// Boundary: an implied fee EXACTLY at the per-chain cap is ALLOWED — the
+    /// guard is a strict `>`, so a fee equal to the BTC cap passes while
+    /// `m2b_excessive_fee_is_rejected` covers anything over. The PSBT nets an
+    /// implied fee equal to the cap (`payout + cap` in, `payout` out).
+    #[tokio::test]
+    async fn fee_exactly_at_cap_is_accepted() {
+        let (desc, app) = veto_fixture();
+        let (spk, spk_hex) = dest_spk();
+        let prev_txid =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xc1u8; 32]));
+        let psbt = build_psbt_outputs(
+            &desc,
+            prev_txid,
+            Amount::from_sat(1_070_000),
+            vec![
+                TxOut {
+                    value: Amount::from_sat(70_000),
+                    script_pubkey: spk.clone(),
+                },
+                op_return_out(M2B_MEMO, Amount::ZERO),
+            ],
+        );
+        let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x71);
+        let body = veto_body(
+            &B64.encode(psbt.serialize()),
+            &spk_hex,
+            70_000,
+            &alloy_primitives::hex::encode(M2B_MEMO),
+            &proof,
+        );
+        let (status, body) = post_psbt_body(&app, body).await;
+        assert_eq!(status, StatusCode::OK, "fee == cap must pass: {body}");
     }
 
     /// M2b REJECT: a FUNDED `OP_RETURN` (value > 0) would burn that value

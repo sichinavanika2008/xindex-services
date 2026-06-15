@@ -583,7 +583,7 @@ where
         )
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
         // L10: lost the write race; the winner already recorded. Re-read
@@ -742,7 +742,7 @@ where
         )
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
         // L10: lost the write race; the winner already recorded. Re-read
@@ -882,7 +882,7 @@ async fn consume_ric_one_shot<S: ReplayStore>(
         )
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
         // Lost a same-leg race — proceed only if the winner consumed
@@ -1015,7 +1015,7 @@ async fn consume_ac_one_shot<S: ReplayStore>(
         .record_ac_intent(chain, cert.cancel_id, digest.0, Vec::new(), now_unix_secs())
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
         // Lost a same-cancel race — proceed only if the winner consumed
@@ -1330,7 +1330,7 @@ where
         )
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
         // L10: lost the write race; return the winner's record.
@@ -1428,7 +1428,7 @@ where
         )
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
         let outcome = state
@@ -1594,6 +1594,39 @@ mod tests {
         assert_eq!(window_start_for(600, 600), 600);
         assert_eq!(window_start_for(599, 600), 0);
         assert_eq!(window_start_for(1_200, 600), 1_200);
+    }
+
+    #[test]
+    fn hsm_error_into_response_is_service_unavailable() {
+        // The IntoResponse impl must map an HSM failure to 503, not a default
+        // (200/empty) response that would mask the failure from the caller.
+        let resp = HsmError::Decode("boom".to_string()).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn sol_route_mounts_only_when_configured() {
+        use crate::solana_tx::SolSignerConfig;
+        use xindex_solana_tx::Pubkey;
+        // With a Solana key configured the /sign/solana-tx route must be
+        // mounted (a bad body yields 4xx, not 404). Inverting the
+        // `!state.sol.is_empty()` guard would 404 a configured route.
+        let (state, _hsm) = build_state();
+        let state = state.with_sol(SolSignerConfig {
+            chain: ChainId::Sol,
+            multisig_pda: Pubkey::new([1u8; 32]),
+            vault_index: 0,
+            members: vec![],
+            member_pubkey: Pubkey::new([2u8; 32]),
+            member_seed: [3u8; 32],
+        });
+        let app = router(state);
+        let (status, _) = post_json(&app, "/api/v1/sign/solana-tx", serde_json::json!({})).await;
+        assert_ne!(
+            status,
+            StatusCode::NOT_FOUND,
+            "sol route must be mounted when a sol key is configured"
+        );
     }
 
     #[tokio::test]

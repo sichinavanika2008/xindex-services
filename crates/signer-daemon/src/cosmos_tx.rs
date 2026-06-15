@@ -354,7 +354,7 @@ where
         )
         .await
     {
-        if !matches!(e, crate::replay::ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(err(
                 error_codes::BAD_REQUEST,
                 StatusCode::INTERNAL_SERVER_ERROR,

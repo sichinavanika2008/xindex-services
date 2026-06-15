@@ -54,6 +54,18 @@ pub enum ReplayError {
     Duplicate,
 }
 
+/// Whether a failed `record_*` must propagate as an error, or can be recovered
+/// from. `Duplicate` means a concurrent identical request won the write race
+/// (audit L10): the handler re-reads and returns the winner's cached signature
+/// instead of surfacing a spurious 4xx/5xx. Every other variant is a real
+/// failure that must propagate. Centralized so all twelve signing handlers
+/// share ONE tested copy of the recovery predicate instead of duplicating the
+/// `!matches!(e, Duplicate)` guard each.
+#[must_use]
+pub(crate) fn must_propagate_record_error(e: &ReplayError) -> bool {
+    !matches!(e, ReplayError::Duplicate)
+}
+
 /// One previously-signed record. Returned on an idempotent re-query so
 /// the daemon can hand back the cached signature without touching the
 /// HSM.
@@ -2816,6 +2828,18 @@ mod tests {
             SqliteReplayStore::map_insert(Err(sqlx::Error::RowNotFound)),
             Err(ReplayError::Sqlite(_))
         ));
+    }
+
+    #[test]
+    fn must_propagate_record_error_only_recovers_duplicate() {
+        // The L10 recovery predicate shared by all twelve signing handlers:
+        // ONLY a `Duplicate` (concurrent-write race) is recovered; every other
+        // failure must propagate. Inverting it would either drop real errors or
+        // turn a race-loser's 200 into a spurious 5xx.
+        assert!(!must_propagate_record_error(&ReplayError::Duplicate));
+        assert!(must_propagate_record_error(&ReplayError::Decode(
+            "real failure".to_string()
+        )));
     }
 
     #[tokio::test]

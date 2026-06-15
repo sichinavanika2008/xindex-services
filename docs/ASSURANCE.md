@@ -60,16 +60,13 @@ comparisons that consume the clock stay tested via injectable `now`).
 - `cosmos_tx`: `bind_send_to_cert` native-denom mismatch (CTD bind cannot be a
   no-op). `intent`: `IntentPolicy::validate` quorum == whitelist boundary.
   `solana_tx`: `solana_kind_str`, forbidden-destination (`system_program`) arm.
-
-**Residual — documented, fail-safe, tracked follow-up:** the handler
-race-recovery branches `if !matches!(e, ReplayError::Duplicate)` on the eight
-non-attestation/-psbt paths (redemption, ric/acc sign, ac one-shot, solana,
-tron, xrp, evm-safe). Inverting that `!` makes a concurrent-write race-loser
-receive an error instead of the cached signature (audit **L10** robustness) —
-**fail-safe**: never a fund-loss, replay, or forged-signature path. Closing each
-needs a per-path `RaceReplayStore` variant. Same fail-safe class: the `router`
-sol-route mount guard, `HsmError::into_response`, and `enforce_change_and_fee`'s
-fee == cap boundary (rejecting a fee exactly at cap is over-strict, fail-closed).
+- handler L10 race-recovery: the `if !matches!(e, Duplicate)` guard was
+  duplicated across twelve signing handlers; extracted to one tested
+  `must_propagate_record_error` helper. This removes the eight surviving
+  `delete !` mutants and DRYs the recovery predicate — the attestation + psbt
+  race tests confirm behaviour is unchanged. Same batch: `router` sol-route
+  mount guard, `HsmError::into_response` (503, not a default 200), and
+  `enforce_change_and_fee`'s fee == cap boundary (strict `>`).
 
 **Equivalent / infeasible (won't-fix):**
 

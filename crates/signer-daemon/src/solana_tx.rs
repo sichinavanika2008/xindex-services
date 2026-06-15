@@ -429,7 +429,7 @@ where
         )
         .await
     {
-        if !matches!(e, ReplayError::Duplicate) {
+        if crate::replay::must_propagate_record_error(&e) {
             return Err(replay_err(e));
         }
     }
