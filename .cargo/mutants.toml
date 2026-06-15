@@ -1,0 +1,15 @@
+# cargo-mutants config — https://mutants.rs/
+#
+# `exclude_re` skips UNIVERSAL mutation-testing noise: mutants with no
+# test-observable behavioral contract. It is deliberately minimal — every
+# security-relevant survivor stays VISIBLE so it shows up as a CI annotation
+# and gets triaged in docs/ASSURANCE.md, never silently buried here.
+exclude_re = [
+    # Formatting (Debug/Display) is not a behavioral contract: no test asserts
+    # exact fmt output, so `fmt -> Ok(Default::default())` is unkillable noise.
+    ">::fmt",
+    # Wall-clock source. Tests cannot pin SystemTime::now(); mutating the
+    # helper's return to a constant is a textbook mutation false positive. The
+    # recency/expiry COMPARISONS that consume it stay testable and visible.
+    "now_unix_secs",
+]

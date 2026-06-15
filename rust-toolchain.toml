@@ -1,7 +1,9 @@
 [toolchain]
-# Floats to latest stable. M1 dep tree (alloy 0.8.x → ruint 1.18+) requires
-# 1.90+. Will be re-pinned to a specific version once M1 ships and audits
-# need reproducibility.
-channel = "stable"
+# Pinned for audit reproducibility (2026-06-15). CI mirrors this exact
+# version in the dtolnay toolchain input of .github/workflows/{ci,assurance}.yml
+# (the cargo-careful job overrides to nightly — it needs -Z to build its
+# instrumented sysroot). 1.95.0 clears the M1 dep-tree floor (alloy 0.8.x →
+# ruint 1.18+ need 1.90+). Bump here and in those two workflows together.
+channel = "1.95.0"
 components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
 profile = "minimal"
