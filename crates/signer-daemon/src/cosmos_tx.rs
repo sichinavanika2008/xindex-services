@@ -42,6 +42,7 @@ use crate::web3signer::{HsmDigestSigner, HsmError};
 const fn native_denom(chain: ChainId) -> Option<&'static str> {
     match chain {
         ChainId::Gaia => Some("uatom"),
+        ChainId::Noble => Some("uusdc"),
         _ => None,
     }
 }

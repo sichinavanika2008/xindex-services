@@ -544,6 +544,7 @@ pub fn codec_for_mainnet(chain: ChainId) -> Box<dyn UtxoAddressCodec> {
         | ChainId::Base
         | ChainId::Pol
         | ChainId::Gaia
+        | ChainId::Noble
         | ChainId::Xrp
         | ChainId::Sol
         | ChainId::Tron => {

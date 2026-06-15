@@ -68,6 +68,11 @@ struct Args {
     #[arg(long, default_value = "uatom")]
     denom: String,
 
+    /// Bech32 human-readable prefix for the multisig account address
+    /// (`cosmos` for GAIA, `noble` for Noble).
+    #[arg(long, default_value = "cosmos")]
+    bech32_hrp: String,
+
     /// Fee amount in the micro-unit.
     #[arg(long)]
     fee_amount: u128,
@@ -207,7 +212,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let chain: ChainId = args.chain.parse().map_err(|e| anyhow!("--chain: {e}"))?;
     let members = parse_csv_pubkeys("--member-pubkeys", &args.member_pubkeys)?;
-    let multisig = CosmosMultisig::new(args.threshold, members, "cosmos")
+    let multisig = CosmosMultisig::new(args.threshold, members, args.bech32_hrp.as_str())
         .map_err(|e| anyhow!("multisig descriptor: {e}"))?;
     let derived = multisig
         .account_address()

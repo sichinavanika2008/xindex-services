@@ -57,6 +57,12 @@ pub enum ChainId {
     Pol,
     /// Cosmos Hub (GAIA / ATOM). Cosmos custody family.
     Gaia,
+    /// Noble (NOBLE / USDC). Cosmos custody family — the native-USDC
+    /// issuance app-chain; `THORChain` serves it via the same Cosmos client
+    /// as GAIA. Reuses the `LegacyAminoPubKey` multisig path (bech32 prefix
+    /// `noble`, micro-denom `uusdc`; Noble charges no gas, so the redeem fee
+    /// is `0uusdc`, supplied per-deploy).
+    Noble,
     /// XRP Ledger (XRP). XRP custody family — native `SignerList`
     /// k-of-n multisig.
     Xrp,
@@ -86,6 +92,7 @@ impl fmt::Display for ChainId {
             Self::Base => "base",
             Self::Pol => "pol",
             Self::Gaia => "gaia",
+            Self::Noble => "noble",
             Self::Xrp => "xrp",
             Self::Sol => "sol",
             Self::Tron => "tron",
@@ -122,6 +129,7 @@ impl FromStr for ChainId {
             "base" => Ok(Self::Base),
             "pol" => Ok(Self::Pol),
             "gaia" => Ok(Self::Gaia),
+            "noble" => Ok(Self::Noble),
             "xrp" => Ok(Self::Xrp),
             "sol" => Ok(Self::Sol),
             "tron" => Ok(Self::Tron),
@@ -230,6 +238,7 @@ pub const ALL_CHAINS: &[ChainId] = &[
     ChainId::Base,
     ChainId::Pol,
     ChainId::Gaia,
+    ChainId::Noble,
     ChainId::Xrp,
     ChainId::Sol,
     ChainId::Tron,
@@ -254,6 +263,7 @@ impl ChainId {
             Self::Base => "BASE.ETH",
             Self::Pol => "POL.MATIC",
             Self::Gaia => "GAIA.ATOM",
+            Self::Noble => "NOBLE.USDC",
             Self::Xrp => "XRP.XRP",
             Self::Sol => "SOL.SOL",
             Self::Tron => "TRON.TRX",
@@ -270,7 +280,7 @@ impl ChainId {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => CustodyFamily::Utxo,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => CustodyFamily::Evm,
-            Self::Gaia => CustodyFamily::Cosmos,
+            Self::Gaia | Self::Noble => CustodyFamily::Cosmos,
             Self::Xrp => CustodyFamily::Xrp,
             Self::Sol => CustodyFamily::Solana,
             Self::Tron => CustodyFamily::Tron,
@@ -286,7 +296,7 @@ impl ChainId {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 8,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => 18,
-            Self::Gaia | Self::Xrp | Self::Tron => 6,
+            Self::Gaia | Self::Noble | Self::Xrp | Self::Tron => 6,
             Self::Sol => 9,
         }
     }
@@ -310,7 +320,7 @@ impl ChainId {
     pub const fn scale(self) -> u64 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
-            Self::Gaia | Self::Xrp | Self::Tron => 1_000_000,
+            Self::Gaia | Self::Noble | Self::Xrp | Self::Tron => 1_000_000,
             Self::Sol => 1_000_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 panic!("ChainId::scale() does not fit u64 for the EVM family — use scale_u128()")
@@ -326,7 +336,7 @@ impl ChainId {
     pub const fn scale_u128(self) -> u128 {
         match self {
             Self::Btc | Self::Ltc | Self::Bch | Self::Doge | Self::Zec => 100_000_000,
-            Self::Gaia | Self::Xrp | Self::Tron => 1_000_000,
+            Self::Gaia | Self::Noble | Self::Xrp | Self::Tron => 1_000_000,
             Self::Sol => 1_000_000_000,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => {
                 1_000_000_000_000_000_000
@@ -378,7 +388,7 @@ impl ChainId {
             Self::Avax => 5,
             Self::Base => 30,
             Self::Pol => 64,
-            Self::Gaia => 1,
+            Self::Gaia | Self::Noble => 1,
             Self::Xrp => 1,
             Self::Sol => 1,
             Self::Tron => 19,
@@ -404,6 +414,7 @@ impl ChainId {
             | Self::Base
             | Self::Pol
             | Self::Gaia
+            | Self::Noble
             | Self::Xrp
             | Self::Sol
             | Self::Tron => 0,
@@ -433,6 +444,7 @@ impl ChainId {
             | Self::Base
             | Self::Pol
             | Self::Gaia
+            | Self::Noble
             | Self::Xrp
             | Self::Sol
             | Self::Tron => u64::MAX,
@@ -448,7 +460,7 @@ impl ChainId {
             Self::Btc | Self::Ltc => FeeUnit::PerVbyte,
             Self::Bch | Self::Doge | Self::Zec => FeeUnit::PerByte,
             Self::Eth | Self::Bsc | Self::Avax | Self::Base | Self::Pol => FeeUnit::PerGwei,
-            Self::Gaia => FeeUnit::PerCosmosGas,
+            Self::Gaia | Self::Noble => FeeUnit::PerCosmosGas,
             Self::Xrp => FeeUnit::FlatXrpDrops,
             Self::Sol => FeeUnit::SolanaComputeUnits,
             Self::Tron => FeeUnit::TronResource,
@@ -469,6 +481,7 @@ impl ChainId {
             | Self::Doge
             | Self::Zec
             | Self::Gaia
+            | Self::Noble
             | Self::Xrp
             | Self::Sol
             | Self::Tron => None,
@@ -491,6 +504,7 @@ impl ChainId {
             | Self::Doge
             | Self::Zec
             | Self::Gaia
+            | Self::Noble
             | Self::Xrp
             | Self::Sol
             | Self::Tron => None,
@@ -525,6 +539,7 @@ impl ChainId {
             | Self::Doge
             | Self::Zec
             | Self::Gaia
+            | Self::Noble
             | Self::Xrp
             | Self::Sol
             | Self::Tron => None,
@@ -580,9 +595,24 @@ mod tests {
         assert_eq!(ChainId::Base.thor_asset(), "BASE.ETH");
         assert_eq!(ChainId::Pol.thor_asset(), "POL.MATIC");
         assert_eq!(ChainId::Gaia.thor_asset(), "GAIA.ATOM");
+        assert_eq!(ChainId::Noble.thor_asset(), "NOBLE.USDC");
         assert_eq!(ChainId::Xrp.thor_asset(), "XRP.XRP");
         assert_eq!(ChainId::Sol.thor_asset(), "SOL.SOL");
         assert_eq!(ChainId::Tron.thor_asset(), "TRON.TRX");
+    }
+
+    #[test]
+    fn noble_is_cosmos_family_native_usdc() {
+        // Noble reuses the Cosmos custody family (THORChain serves it via the
+        // gaia client); native USDC is 6-decimal, Tendermint instant finality.
+        let n = ChainId::Noble;
+        assert_eq!(n.thor_asset(), "NOBLE.USDC");
+        assert_eq!(n.custody_family(), CustodyFamily::Cosmos);
+        assert_eq!(n.decimals(), 6);
+        assert_eq!(n.conf_depth(), 1);
+        assert_eq!(n.fee_unit(), FeeUnit::PerCosmosGas);
+        assert_eq!(n.to_string(), "noble");
+        assert_eq!("noble".parse::<ChainId>(), Ok(ChainId::Noble));
     }
 
     #[test]

@@ -93,6 +93,7 @@ impl UtxoParams {
             | ChainId::Base
             | ChainId::Pol
             | ChainId::Gaia
+            | ChainId::Noble
             | ChainId::Xrp
             | ChainId::Sol
             | ChainId::Tron => {
