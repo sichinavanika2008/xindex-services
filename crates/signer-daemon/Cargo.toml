@@ -49,10 +49,21 @@ serde_json.workspace = true
 # Bitcoin PSBT signing path (DL-M5-3 `psbt-input` endpoint).
 bitcoin.workspace = true
 base64 = "0.22"
+# mTLS (DL-M5-5, closes M-R3): pinned-coordinator-cert client auth wrapping
+# the router on the production bind. rustls + tokio-rustls are pinned to the
+# workspace `ring` provider (NOT the aws-lc-rs default) so no second crypto
+# backend is pulled. hyper-util serves the axum router over the TLS stream
+# (the axum low-level-rustls pattern).
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 
 [dev-dependencies]
 wiremock.workspace = true
 tower = "0.5"
+# Self-signed certs for the mTLS handshake test (dev only); pinned to `ring`.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 # k256 (the cosmos/xrp/tron HSM-stub tests + 1.13 low-S) is a non-dev
 # dependency above.
 # End-to-end loopback integration: spin up the real daemon + drive it

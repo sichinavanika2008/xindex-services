@@ -36,6 +36,7 @@ pub mod replay;
 pub mod server;
 mod sig_norm;
 pub mod solana_tx;
+pub mod tls;
 pub mod tron_tx;
 pub mod web3signer;
 pub mod xrp_tx;
