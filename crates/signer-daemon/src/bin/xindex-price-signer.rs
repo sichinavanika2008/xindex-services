@@ -81,6 +81,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: xindex-price-signer <config.json>")?;
     let cfg: Config = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
 
+    // G/red-team RT-A-LOW: the aggregator's outlier rejection needs an ODD
+    // honest anchor. At min_venues == 2 an even survivor set averages the two
+    // middle quotes, so one compromised venue moves the median by (X-P)/2
+    // (bounded only by max_deviation_bps). Require >= 3 price venues so a single
+    // bad venue is always out-voted by an honest majority. Fail closed at boot.
+    if cfg.min_venues < 3 {
+        return Err(format!(
+            "min_venues must be >= 3 for single-venue resistance (got {}); an even \
+             survivor set has no honest anchor",
+            cfg.min_venues
+        )
+        .into());
+    }
+
     let oracle_contract: Address = cfg.oracle_contract.parse()?;
     let signer_address: Address = cfg.signer_address.parse()?;
     let assets: Vec<(B256, &AssetConfig)> = cfg

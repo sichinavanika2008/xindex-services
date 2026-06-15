@@ -106,13 +106,25 @@ pub fn decimal_to_scaled(s: &str, decimals: u8) -> Result<U256, VenueError> {
     let int_str = if int_part.is_empty() { "0" } else { int_part };
     let int_u = U256::from_str_radix(int_str, 10)
         .map_err(|e| VenueError::Parse(format!("int '{int_str}': {e}")))?;
-    let scale = U256::from(10u64).pow(U256::from(d));
+    // Checked arithmetic (G/red-team RT-A-LOW): a compromised venue can return
+    // an arbitrarily large decimal STRING (e.g. ~1e60) that parses in-range,
+    // then silently WRAPS mod 2^256 on the scale multiply to an attacker-chosen
+    // (possibly in-band) value — `U256` `pow`/`*`/`+` are wrapping. Fail closed
+    // on any overflow instead (the value is rejected, not wrapped).
+    let scale = U256::from(10u64)
+        .checked_pow(U256::from(d))
+        .ok_or_else(|| VenueError::Parse(format!("scale 10^{d} overflows U256")))?;
+    let scaled_int = int_u
+        .checked_mul(scale)
+        .ok_or_else(|| VenueError::Parse(format!("value '{s}' overflows U256 when scaled")))?;
     if frac.is_empty() {
-        return Ok(int_u * scale);
+        return Ok(scaled_int);
     }
     let frac_u =
         U256::from_str_radix(&frac, 10).map_err(|e| VenueError::Parse(format!("frac: {e}")))?;
-    Ok(int_u * scale + frac_u)
+    scaled_int
+        .checked_add(frac_u)
+        .ok_or_else(|| VenueError::Parse(format!("value '{s}' overflows U256")))
 }
 
 /// Pull a string field from a JSON body via a dotted path, then decimal→WAD.
@@ -302,6 +314,25 @@ mod tests {
         assert!(decimal_to_wad("-1").is_err());
         assert!(decimal_to_wad("1.2.3").is_err());
         assert!(decimal_to_wad("abc").is_err());
+    }
+
+    /// G/red-team RT-A-LOW: an oversized decimal string must FAIL CLOSED, not
+    /// silently wrap mod 2^256 to an attacker-chosen value.
+    #[test]
+    fn decimal_to_scaled_overflow_fails_closed() {
+        // ~1e60 integer * 1e18 scale wraps in unchecked U256 arithmetic.
+        let huge = "1".to_string() + &"0".repeat(60);
+        assert!(
+            decimal_to_scaled(&huge, 18).is_err(),
+            "oversized value must be rejected, never wrapped"
+        );
+        // A scale exponent that itself overflows 10^d (d > 77) fails closed.
+        assert!(decimal_to_scaled("1", 78).is_err());
+        // A realistic value still scales fine.
+        assert_eq!(
+            decimal_to_scaled("19500000", 8).expect("ok"),
+            U256::from(19_500_000u64) * U256::from(100_000_000u64)
+        );
     }
 
     #[test]

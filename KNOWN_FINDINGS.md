@@ -632,6 +632,65 @@ changes); `cargo deny` bans/licenses/sources ok (the `RUSTSEC-2026-0002`
 `cargo audit` pass (4 pre-existing accepted advisories). Shared `sig_norm`
 helper + `safe-evm` `arithmetic` feature are the only cross-cutting additions.
 
+## Red-team audit — Rust off-chain stack (workstream G, 2026-06-15)
+
+5-agent parallel adversarial red-team of the surfaces built this session
+(threat model: UNTRUSTED coordinator, k-of-n HSM signers, never-blind-sign,
+fail-closed). **No Critical/High.** Design surfaces confirmed SOUND:
+- **CTD-1 RIC gate + per-family destination binding** (`intent.rs`, `server.rs`
+  gates, the 5 family handlers): every custody spend needs a k-of-n RIC/ACC
+  recomputed on the daemon's OWN domain over DISTINCT whitelisted Set-B signers,
+  the spend `==`-bound to the certified destination/amount/memo, one-shot per
+  leg, fail-closed recency + volume; Solana correctly RIC-refused (RA-2). Zero findings.
+- **Daemon trust core** (`replay.rs`/`web3signer.rs`/`sig_norm.rs`/`eip712.rs`):
+  per-leg delivery/refund/streamed mutex exhaustive; recover-verify on ALL 12
+  signing endpoints before record; low-S enforced where the chain rejects high-S;
+  6 custody typehashes pairwise-distinct + domain-bound. No replay/blind-sign/collision.
+- **mTLS** (`tls.rs`): mandatory client auth, pin over the coordinator-cert
+  `RootCertStore` only (no system-CA fallback), fail-closed on empty allowlist /
+  malformed PEM / cert-key mismatch, handshake-before-dispatch, client pins server.
+- **Streaming finality gate** (`chain-thor` + coordinator branch): a partial
+  mid-stream fill cannot settle; 160-vs-128-byte payload hashes can't collide;
+  typehash separation (not the replay key) blocks cross-kind replay.
+
+**Confirmed findings — FIXED + verified (clippy `--all-targets` + tests green):**
+- **RT-A-LOW `decimal_to_scaled` silent overflow wrap** (`price_venue.rs`): an
+  oversized venue decimal STRING wrapped mod 2^256 (ruint `pow`/`*`/`+` wrap) to
+  a possibly-in-band value. FIXED: `checked_pow`/`checked_mul`/`checked_add` →
+  fail-closed `VenueError::Parse`; +`decimal_to_scaled_overflow_fails_closed`.
+- **RT-A-LOW even-survivor median at `min_venues==2`**: a 2-survivor set averages
+  the two middle quotes → one bad venue moves the median (X−P)/2. FIXED: the
+  `xindex-price-signer` binary refuses to boot at `min_venues < 3` (odd anchor).
+- **RT-C-INFO degenerate empty stream read final** (`chain-thor/types.rs`):
+  `count==quantity==0` passed `0>=0`. FIXED: `is_swap_finalised` requires
+  `quantity > 0`; +test.
+- **RT-B-LOW mTLS test under-assertion** (`tls.rs`): added cert/key-mismatch →
+  err + no-CERTIFICATE-section → `NoPinnedCerts` regression tests.
+
+**Confirmed Medium — scoped production follow-ons (backstopped, no fund loss):**
+- **RT-A-MED price-signer monotonic anti-equivocation guard is in-memory only**
+  (`price_sign.rs` `last_signed`): resets on restart → a same-second re-sign after
+  a restart could produce two differently-priced attestations for one
+  `(asset, timestamp)`. BACKSTOP: on-chain `attestPrice` monotonic check
+  (`timestamp <= prev.updatedAt` reverts) → only one lands (steering-within-band,
+  not forgery). FOLLOW-ON: persist `(asset → last_signed)` in a sqlx store
+  mirroring `BroadcastRegistry`, loaded at startup.
+- **RT-A-MED circulating supply single-sourced** (CoinGecko): k-of-n gives zero
+  diversity; on-chain only rejects `supply==0`. FOLLOW-ON: wire ≥2 supply sources
+  (the `SupplyFeed`+`aggregate_price` plumbing already supports N — only the
+  binary hardcodes one) + an on-chain absolute supply band. NAV input → prioritise.
+
+**Accepted (INFO, not vulnerabilities):** the mTLS module is not yet wired into a
+network-serving binary (`router()` served only in tests; the price-signer is a
+stdout producer) — production wires `serve_mtls(listener, server_config(...),
+router(state))`, tracked with the F config templates; BTC PSBT path doesn't
+low-S-normalize the partial (HSM emits low-S; relay handles the final tx —
+symmetry-only); `now_unix()` 0-fallback (on-chain `StaleTimestamp` rejects);
+finality-probe↔cross-check TOCTOU (THORChain finality is monotonic).
+
+G run RUST-ONLY per founder; the Solidity protocol's own red-team was the
+2026-06-14 pass (A–G, `376414e`).
+
 ## When this file gets updated
 
 - New audit pass (internal or external) → add a section

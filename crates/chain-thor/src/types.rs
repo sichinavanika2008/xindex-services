@@ -217,7 +217,10 @@ impl TxStatusResponse {
                 return false;
             }
             if let Some(stream) = &swap.streaming {
-                return stream.count >= stream.quantity;
+                // `quantity > 0` (G/red-team RT-C-INFO): a present-but-degenerate
+                // streaming object (`count == quantity == 0`, e.g. a malformed
+                // upstream) must NOT read as final via `0 >= 0`; defer instead.
+                return stream.quantity > 0 && stream.count >= stream.quantity;
             }
         }
         true

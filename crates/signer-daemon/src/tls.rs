@@ -268,4 +268,33 @@ mod tests {
         // Non-PEM input yields no certs (empty), never a usable chain or a panic.
         assert!(load_cert_chain(b"garbage").unwrap_or_default().is_empty());
     }
+
+    /// 2-B/red-team: a server cert paired with a NON-matching private key must
+    /// fail closed at config build (rustls `with_single_cert` rejects it),
+    /// never produce a serving config with a broken identity.
+    #[test]
+    fn server_config_rejects_mismatched_key() {
+        let server = self_signed("daemon");
+        let other = self_signed("other");
+        let coord = self_signed("coordinator");
+        let pinned = pinned_root_store(std::slice::from_ref(&coord.cert_pem)).expect("pins");
+        let r = server_config(
+            load_cert_chain(&server.cert_pem).expect("chain"),
+            load_private_key(&other.key_pem).expect("key"), // WRONG key for this cert
+            pinned,
+        );
+        assert!(r.is_err(), "cert/key mismatch must be rejected");
+    }
+
+    /// 2-B/red-team: a PEM with no CERTIFICATE section (e.g. a key-only blob)
+    /// yields zero pinned roots → `NoPinnedCerts`, not a silently-empty
+    /// allowlist that would trust no one (or, worse, anyone).
+    #[test]
+    fn pinned_root_store_no_cert_section_fails_closed() {
+        let key_only = self_signed("x").key_pem; // valid PEM, but a KEY not a CERT
+        assert!(matches!(
+            pinned_root_store(std::slice::from_ref(&key_only)),
+            Err(TlsError::NoPinnedCerts)
+        ));
+    }
 }

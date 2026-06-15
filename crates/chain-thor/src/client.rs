@@ -381,6 +381,17 @@ mod tests {
 
         // Empty / missing stages → not final (fail closed).
         assert!(!parse(serde_json::json!({})).is_swap_finalised());
+
+        // Degenerate present-but-empty streaming object (count==quantity==0)
+        // must NOT read final via 0>=0 (G/red-team RT-C-INFO) — defer instead.
+        assert!(
+            !parse(serde_json::json!({"stages": {
+                "swap_status": {"pending": false, "streaming": {"quantity": 0, "count": 0}},
+                "swap_finalised": {"completed": true}
+            }}))
+            .is_swap_finalised(),
+            "a degenerate empty stream must not settle"
+        );
     }
 
     #[tokio::test]
