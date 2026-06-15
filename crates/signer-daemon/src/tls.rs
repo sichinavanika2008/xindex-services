@@ -21,6 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -30,12 +31,9 @@ use tokio_rustls::TlsAcceptor;
 /// Errors building the mTLS configuration or loading key material.
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
-    /// A PEM blob could not be parsed.
+    /// A PEM blob could not be parsed (malformed, or no key section).
     #[error("PEM parse: {0}")]
     Pem(String),
-    /// The private-key PEM contained no key.
-    #[error("no private key in PEM")]
-    NoPrivateKey,
     /// The pinned-client allowlist was empty (fail closed — an empty allowlist
     /// would either trust everyone or no one; both are configuration errors).
     #[error("no pinned client certificates")]
@@ -56,8 +54,7 @@ fn provider() -> Arc<CryptoProvider> {
 /// # Errors
 /// [`TlsError::Pem`] if the PEM is malformed.
 pub fn load_cert_chain(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let mut rd = pem;
-    rustls_pemfile::certs(&mut rd)
+    CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::Pem(e.to_string()))
 }
@@ -65,13 +62,9 @@ pub fn load_cert_chain(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsEr
 /// Parse a single PEM private key (PKCS#8, SEC1, or RSA).
 ///
 /// # Errors
-/// [`TlsError::Pem`] if the PEM is malformed; [`TlsError::NoPrivateKey`] if it
-/// contains no key.
+/// [`TlsError::Pem`] if the PEM is malformed or contains no private key.
 pub fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let mut rd = pem;
-    rustls_pemfile::private_key(&mut rd)
-        .map_err(|e| TlsError::Pem(e.to_string()))?
-        .ok_or(TlsError::NoPrivateKey)
+    PrivateKeyDer::from_pem_slice(pem).map_err(|e| TlsError::Pem(e.to_string()))
 }
 
 /// Build a [`RootCertStore`] from the pinned coordinator certificate PEM(s) —

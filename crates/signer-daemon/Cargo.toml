@@ -56,7 +56,12 @@ base64 = "0.22"
 # (the axum low-level-rustls pattern).
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls-pemfile = "2"
+# PEM loading via rustls-pki-types' always-on `pem` module (the crate rustls
+# already re-exports as `rustls::pki_types`) — NOT the separate `rustls-pemfile`
+# crate, which is unmaintained (RUSTSEC-2025-0134). pki-types is already in the
+# tree, so this pulls no new crate and removes the advisory; `std` (⇒ alloc) is
+# all the pem `PemObject` API needs.
+rustls-pki-types = { version = "1", features = ["std"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 
 [dev-dependencies]
