@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use thiserror::Error;
 
-use crate::types::{InboundAddress, OutboundEntry, Pool, TxResponse};
+use crate::types::{InboundAddress, OutboundEntry, Pool, TxResponse, TxStatusResponse};
 
 /// Maximum response body size accepted from `THORNode` (16 MiB). A
 /// well-behaved `THORNode` response is well under 1 MiB; the 16 MiB cap
@@ -109,6 +109,20 @@ impl ThorClient {
     /// As [`ThorClient::fetch_inbound_addresses`].
     pub async fn tx_status(&self, hash: &str) -> Result<TxResponse, ThorError> {
         let path = format!("/thorchain/tx/{hash}");
+        self.get_json(&path).await
+    }
+
+    /// `GET /thorchain/tx/status/{hash}` — the swap-lifecycle "stages"
+    /// view. Distinct from [`ThorClient::tx_status`] (the observation
+    /// view): this carries `swap_finalised.completed` plus the streaming
+    /// `count` / `quantity`, which the coordinator's streaming-swap
+    /// FINALITY gate ([`TxStatusResponse::is_swap_finalised`]) reads before
+    /// settling a streamed redeem (`STREAM-B2-COORD`).
+    ///
+    /// # Errors
+    /// As [`ThorClient::fetch_inbound_addresses`].
+    pub async fn tx_status_stages(&self, hash: &str) -> Result<TxStatusResponse, ThorError> {
+        let path = format!("/thorchain/tx/status/{hash}");
         self.get_json(&path).await
     }
 
@@ -314,5 +328,79 @@ mod tests {
             result,
             Err(ThorError::Http { status: 503, ref body }) if body.contains("upstream down")
         ));
+    }
+
+    /// STREAM-B2-COORD: the streaming-swap finality gate. A partial
+    /// mid-stream fill (`count < quantity`) must NOT be treated as final
+    /// even if `swap_finalised.completed` is set; only a fully-executed,
+    /// not-pending stream settles. Fail closed on missing signals.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn streaming_finality_gate() {
+        use crate::types::TxStatusResponse;
+        let parse = |v: serde_json::Value| -> TxStatusResponse {
+            serde_json::from_value(v).expect("decode")
+        };
+
+        // Stream fully executed (count == quantity) + finalised + not pending → final.
+        assert!(parse(serde_json::json!({"stages": {
+            "swap_status": {"pending": false, "streaming": {"quantity": 10, "count": 10, "interval": 1}},
+            "swap_finalised": {"completed": true}
+        }}))
+        .is_swap_finalised());
+
+        // Partial mid-stream (count < quantity) → NOT final, even with the flag.
+        assert!(
+            !parse(serde_json::json!({"stages": {
+                "swap_status": {"pending": false, "streaming": {"quantity": 10, "count": 4, "interval": 1}},
+                "swap_finalised": {"completed": true}
+            }}))
+            .is_swap_finalised(),
+            "a partial fill must never settle"
+        );
+
+        // Still pending → not final.
+        assert!(!parse(serde_json::json!({"stages": {
+            "swap_status": {"pending": true, "streaming": {"quantity": 10, "count": 10, "interval": 1}},
+            "swap_finalised": {"completed": true}
+        }}))
+        .is_swap_finalised());
+
+        // swap_finalised not completed → not final.
+        assert!(
+            !parse(serde_json::json!({"stages": {"swap_finalised": {"completed": false}}}))
+                .is_swap_finalised()
+        );
+
+        // Non-streaming swap (no streaming sub-object), finalised → final.
+        assert!(parse(serde_json::json!({"stages": {
+            "swap_status": {"pending": false},
+            "swap_finalised": {"completed": true}
+        }}))
+        .is_swap_finalised());
+
+        // Empty / missing stages → not final (fail closed).
+        assert!(!parse(serde_json::json!({})).is_swap_finalised());
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn tx_status_stages_decodes_and_gates() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "stages": {
+                "inbound_observed": {"completed": true},
+                "swap_status": {"pending": false, "streaming": {"quantity": 5, "count": 5, "interval": 1}},
+                "swap_finalised": {"completed": true}
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/thorchain/tx/status/ABC"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+        let client = ThorClient::with_base_url(server.uri()).expect("client");
+        let resp = client.tx_status_stages("ABC").await.expect("stages");
+        assert!(resp.is_swap_finalised());
     }
 }

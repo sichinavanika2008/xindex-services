@@ -120,3 +120,106 @@ pub struct Pool {
     #[serde(default)]
     pub asset_tor_price: Option<String>,
 }
+
+/// Subset of `GET /thorchain/tx/status/{hash}` — the swap-lifecycle
+/// "stages" view, used for the streaming-swap FINALITY gate.
+///
+/// The observation view (`GET /thorchain/tx/{hash}` → [`TxResponse`]) only
+/// tells us the inbound was observed (`status == "done"`); it carries NO
+/// signal that a STREAMING swap has emitted all of its sub-swaps. A
+/// streaming redeem fills over several blocks, so attesting on the
+/// observation view alone could settle a partial mid-stream fill
+/// (`STREAM-B2-COORD`, the central streaming risk). This view exposes
+/// `swap_finalised.completed` plus the streaming `count` / `quantity`,
+/// which together gate settlement. Only the fields the gate reads are
+/// deserialized; `serde(default)` tolerates the rest of the upstream
+/// schema.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TxStatusResponse {
+    #[serde(default)]
+    pub stages: TxStages,
+}
+
+/// The `stages` object of a `tx/status` response (subset).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TxStages {
+    /// Swap-execution status — carries the `streaming` sub-object while a
+    /// streaming swap is mid-flight.
+    #[serde(default)]
+    pub swap_status: Option<SwapStatus>,
+    /// Whether the (possibly streaming) swap has fully finalised — the
+    /// primary finality signal.
+    #[serde(default)]
+    pub swap_finalised: Option<StageCompleted>,
+}
+
+/// `stages.swap_status` — execution state of the swap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SwapStatus {
+    /// True while the swap (or a remaining sub-swap) is still pending.
+    #[serde(default)]
+    pub pending: bool,
+    /// Present only for streaming swaps — the sub-swap progress counters.
+    #[serde(default)]
+    pub streaming: Option<StreamingStatus>,
+}
+
+/// `stages.swap_status.streaming` — streaming-swap sub-swap progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct StreamingStatus {
+    /// Total sub-swaps requested (the `quantity` of the streaming memo).
+    #[serde(default)]
+    pub quantity: u64,
+    /// Sub-swaps executed so far. The stream is complete when
+    /// `count >= quantity`.
+    #[serde(default)]
+    pub count: u64,
+    /// Blocks between sub-swaps (the streaming `interval`).
+    #[serde(default)]
+    pub interval: u64,
+}
+
+/// A generic `{ "completed": bool }` stage entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct StageCompleted {
+    #[serde(default)]
+    pub completed: bool,
+}
+
+impl TxStatusResponse {
+    /// The streaming-swap FINALITY gate (`STREAM-B2-COORD`).
+    ///
+    /// The coordinator must settle a streamed redeem ONLY once the swap has
+    /// fully finalised — otherwise it would attest a partial mid-stream
+    /// fill and under-credit the user. Returns `true` iff `THORChain`
+    /// reports `swap_finalised.completed` AND, for a streaming swap, every
+    /// requested sub-swap has executed (`count >= quantity`) with nothing
+    /// still `pending`. Fail closed: a missing/false signal, or streaming
+    /// counters that disagree with the finalised flag (`count < quantity`),
+    /// are treated as NOT final so the coordinator retries rather than
+    /// settling short.
+    #[must_use]
+    pub fn is_swap_finalised(&self) -> bool {
+        // Primary signal: THORChain's own finalisation flag.
+        if !self
+            .stages
+            .swap_finalised
+            .as_ref()
+            .is_some_and(|s| s.completed)
+        {
+            return false;
+        }
+        // Defense-in-depth for streaming swaps: confirm nothing is pending
+        // and every sub-swap executed. A partial that momentarily carries a
+        // finalised flag must NOT settle short.
+        if let Some(swap) = &self.stages.swap_status {
+            if swap.pending {
+                return false;
+            }
+            if let Some(stream) = &swap.streaming {
+                return stream.count >= stream.quantity;
+            }
+        }
+        true
+    }
+}

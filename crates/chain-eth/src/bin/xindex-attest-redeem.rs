@@ -38,15 +38,19 @@ use xindex_chain_eth::RpcErc20LogClient;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::EsploraClient;
 use xindex_shared::eip712::{
-    attestation_oracle_domain, redemption_attestation, refund_attestation,
+    attestation_oracle_domain, redemption_attestation, refund_attestation, streamed_settlement,
 };
 use xindex_shared::redemption_dispatch::{AnyRedemptionDispatch, RedemptionDispatchStore};
 use xindex_signer::crosscheck::{
     PassThroughRedemption, PassThroughRefund, RedemptionCrossCheck, RedemptionCrossCheckError,
-    RefundCrossCheck, ThorUtxoRefundPolicy, ThorUtxoToUsdtPolicy,
+    RefundCrossCheck, StreamedOutcome, StreamedSettlementCrossCheck, ThorUtxoRefundPolicy,
+    ThorUtxoStreamedSettlementPolicy, ThorUtxoToUsdtPolicy,
 };
 use xindex_signer::remote::{AnyHsmBackend, RemoteHsmBackend};
-use xindex_signer::{aggregate_redemption_signatures, aggregate_refund_signatures, SoftwareSigner};
+use xindex_signer::{
+    aggregate_redemption_signatures, aggregate_refund_signatures,
+    aggregate_streamed_settlement_signatures, SoftwareSigner,
+};
 
 /// Signer-key backend selection — mirrors `xindex-attest`. `software`
 /// is dev/Anvil; `remote` posts typed signing requests to N signer-
@@ -228,9 +232,21 @@ fn leg_depth_satisfied(configured: u32, leg: xindex_shared::chain_registry::Chai
     configured >= leg.conf_depth()
 }
 
-fn build_cross_checks(
-    args: &Args,
-) -> Result<(Arc<dyn RedemptionCrossCheck>, Arc<dyn RefundCrossCheck>)> {
+/// The streaming-swap finality gate's pair: the combined streamed-settlement
+/// cross-check + a `THORChain` client used to poll `tx/status` for stream
+/// finalisation (`STREAM-B2-COORD`). `None` in pass-through (Anvil) mode —
+/// streaming swaps are a production `THORChain` feature.
+type StreamedGate = (Arc<dyn StreamedSettlementCrossCheck>, ThorClient);
+
+/// The coordinator's three cross-check policies: delivery + refund (the XOR
+/// terminal paths) + the optional streaming finality gate.
+type CrossChecks = (
+    Arc<dyn RedemptionCrossCheck>,
+    Arc<dyn RefundCrossCheck>,
+    Option<StreamedGate>,
+);
+
+fn build_cross_checks(args: &Args) -> Result<CrossChecks> {
     match args.cross_check_mode {
         CrossCheckMode::PassThrough => Ok((
             Arc::new(PassThroughRedemption {
@@ -239,6 +255,8 @@ fn build_cross_checks(
             Arc::new(PassThroughRefund {
                 btc_sats: args.pass_btc_sats,
             }),
+            // No streamed gate in Anvil mode — streaming is production-only.
+            None,
         )),
         CrossCheckMode::ThorBtcUsdt => {
             // M9: refuse a sub-conf_depth confirmation threshold before any
@@ -283,13 +301,32 @@ fn build_cross_checks(
                 args.usdt_tolerance_1e6,
             );
             let refund = ThorUtxoRefundPolicy::new(
-                thor,
+                thor.clone(),
                 EsploraClient::with_url(net, esplora),
-                multisig,
+                multisig.clone(),
                 args.btc_min_confirmations,
                 args.btc_tolerance_sats,
             );
-            Ok((Arc::new(delivery), Arc::new(refund)))
+            // Combined streamed-settlement policy for partial-fill redeems.
+            // Reuses the same THORChain + ETH + BTC observations; uses the
+            // MORE conservative of the two confirmation floors for both legs
+            // (so the USDT arrival is never checked below the ETH conf_depth).
+            let streamed_confs = args.eth_min_confirmations.max(args.btc_min_confirmations);
+            let streamed = ThorUtxoStreamedSettlementPolicy::new(
+                thor.clone(),
+                RpcErc20LogClient::new(http, args.eth_lookback_blocks),
+                EsploraClient::with_url(net, esplora),
+                usdt,
+                multisig,
+                streamed_confs,
+                args.usdt_tolerance_1e6,
+                args.btc_tolerance_sats,
+            );
+            Ok((
+                Arc::new(delivery),
+                Arc::new(refund),
+                Some((Arc::new(streamed), thor)),
+            ))
         }
     }
 }
@@ -344,6 +381,62 @@ fn build_signers(args: &Args) -> Result<Vec<AnyHsmBackend>> {
     }
 }
 
+/// Outcome of the streaming-swap FINALITY gate (`STREAM-B2-COORD`).
+enum StreamedGateResult {
+    /// This inbound is NOT a streaming swap — fall through to the
+    /// delivery-XOR-refund path.
+    NotStreaming,
+    /// A streaming swap that is NOT yet finalised (or whose cross-check is
+    /// not ready) — defer (retry on backfill). NEVER settle a partial
+    /// mid-stream fill.
+    Defer,
+    /// A FULLY-finalised streaming swap — attest this combined on-chain
+    /// outcome via `attestStreamedSettlement`.
+    Settle(StreamedOutcome),
+}
+
+/// Streaming-swap FINALITY gate + combined cross-check (`STREAM-B2-COORD`).
+/// Polls `THORChain`'s `tx/status` stages: a non-streaming inbound returns
+/// [`StreamedGateResult::NotStreaming`]; a streaming swap that has not fully
+/// finalised returns [`StreamedGateResult::Defer`] (the gate — never settle a
+/// partial); a finalised stream returns [`StreamedGateResult::Settle`] with
+/// the cross-checked on-chain outcome.
+async fn try_settle_streamed(
+    thor: &ThorClient,
+    cc: &dyn StreamedSettlementCrossCheck,
+    btc_txid: &str,
+    index_token: Address,
+) -> StreamedGateResult {
+    let stages = match thor.tx_status_stages(btc_txid).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "tx_status_stages failed; falling back to delivery/refund");
+            return StreamedGateResult::NotStreaming;
+        }
+    };
+    let is_streaming = stages
+        .stages
+        .swap_status
+        .as_ref()
+        .and_then(|s| s.streaming.as_ref())
+        .is_some();
+    if !is_streaming {
+        return StreamedGateResult::NotStreaming;
+    }
+    // The gate: never settle a stream that has not fully finalised.
+    if !stages.is_swap_finalised() {
+        info!("streaming swap not yet finalised — deferring settlement (finality gate)");
+        return StreamedGateResult::Defer;
+    }
+    match cc.verify(btc_txid, index_token).await {
+        Ok(outcome) => StreamedGateResult::Settle(outcome),
+        Err(e) => {
+            warn!(error = %e, "streamed cross-check not ready; retry on backfill");
+            StreamedGateResult::Defer
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single sequential pipeline; splitting fights alloy 0.8's nested fillers generic"
@@ -363,7 +456,8 @@ async fn run(args: Args) -> Result<()> {
         );
     }
 
-    let (delivery_cc, refund_cc) = build_cross_checks(&args).context("build cross-checks")?;
+    let (delivery_cc, refund_cc, streamed) =
+        build_cross_checks(&args).context("build cross-checks")?;
     if args.redemption_database_url.is_none() {
         warn!(
             "F2 store IN-MEMORY — a fresh process has NO record of redemptions the executor \
@@ -473,6 +567,63 @@ async fn run(args: Args) -> Result<()> {
                 return;
             }
         };
+
+        // Streaming-swap finality gate (STREAM-B2-COORD): a streaming redeem
+        // can PARTIALLY fill — both a USDT delivery to the IndexToken AND a
+        // native refund to our custody on ONE leg. When THORChain reports
+        // this inbound as a streaming swap, settle the COMBINED outcome via
+        // attestStreamedSettlement — but ONLY once the stream has FULLY
+        // finalised. Attesting mid-stream would settle a partial fill and
+        // under-credit the user; the gate defers until finalisation.
+        if let Some((streamed_cc, thor)) = streamed.as_ref() {
+            match try_settle_streamed(thor, streamed_cc.as_ref(), &btc_txid, index_token).await {
+                // Not a streaming swap — fall through to the delivery/refund XOR.
+                StreamedGateResult::NotStreaming => {}
+                // Streaming, but not yet final / cross-check not ready — defer.
+                StreamedGateResult::Defer => return,
+                // Fully finalised — attest the combined on-chain outcome.
+                StreamedGateResult::Settle(outcome) => {
+                    let delivered = U256::from(outcome.delivered_usdt_1e6);
+                    let refunded = U256::from(outcome.refunded_sats);
+                    let payload =
+                        streamed_settlement(rid, leg_index, asset_id, delivered, refunded);
+                    let backends: Vec<&AnyHsmBackend> =
+                        signers.iter().take(args.threshold).collect();
+                    let sigs = match aggregate_streamed_settlement_signatures(
+                        &backends, &domain, &payload,
+                    ) {
+                        Ok(s) => s.into_iter().map(Bytes::from).collect::<Vec<_>>(),
+                        Err(e) => {
+                            error!(redemption_id = %rid, error = %e,
+                                       "streamed-settlement aggregate failed");
+                            return;
+                        }
+                    };
+                    info!(redemption_id = %rid,
+                          delivered_usdt_1e6 = outcome.delivered_usdt_1e6,
+                          refunded_sats = outcome.refunded_sats,
+                          "posting attestStreamedSettlement()");
+                    match oracle
+                        .attestStreamedSettlement(
+                            rid, leg_index, asset_id, delivered, refunded, sigs,
+                        )
+                        .send()
+                        .await
+                    {
+                        Ok(p) => match p.get_receipt().await {
+                            Ok(r) => info!(redemption_id = %rid, tx = %r.transaction_hash,
+                                           "attestStreamedSettlement confirmed"),
+                            Err(e) => error!(redemption_id = %rid, error = %e,
+                                             "attestStreamedSettlement receipt failed"),
+                        },
+                        Err(e) => error!(redemption_id = %rid, error = %e,
+                                         "attestStreamedSettlement send failed (already \
+                                          settled / paused)"),
+                    }
+                    return;
+                }
+            }
+        }
 
         // Delivery first; the policy returns RefundedInstead if a
         // REFUND outbound is present (mutual exclusion, memo-based).

@@ -82,6 +82,40 @@ pub struct RefundSignRequest {
     pub refunded_amount: String,
 }
 
+/// `POST /api/v1/sign/eip712-streamed-settlement`
+///
+/// Per-leg COMBINED streamed-settlement attestation (re-audit-gated
+/// burn-side streaming). A streaming redeem swap can PARTIALLY fill,
+/// delivering `delivered_usdt` to the `IndexToken` AND refunding
+/// `refunded_native` of the source asset to our custody on ONE leg.
+/// Mirrors `AttestationOracle.ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH` (a
+/// fourth, structurally-distinct typehash); the on-chain queue reads the
+/// resulting `attested && refunded` state as the combined outcome.
+///
+/// The coordinator posts this ONLY after the streaming swap has FULLY
+/// finalised (the finality gate, `STREAM-B2-COORD`) — never a partial
+/// mid-stream fill. Either amount may be zero (a full delivery or a full
+/// refund); the on-chain queue rejects both-zero. The daemon's replay DB
+/// keys on `(redemption_id, leg_index)` with the SAME per-leg mutex: a
+/// `Streamed` settlement excludes a later plain delivery/refund on that
+/// leg and vice versa, and re-signing the leg with a different
+/// `(delivered_usdt, refunded_native)` pair is a `Conflict`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamedSettlementSignRequest {
+    /// `bytes32` redemption id, hex.
+    pub redemption_id: String,
+    /// `uint256` leg index, decimal string.
+    pub leg_index: String,
+    /// `bytes32` canonical asset id of THIS leg, 0x-prefixed hex.
+    pub asset_id: String,
+    /// `uint256` USDT delivered to the `IndexToken` (1e6 on-chain units),
+    /// decimal string. `"0"` for a full refund.
+    pub delivered_usdt: String,
+    /// `uint256` native asset refunded to our custody (smallest units,
+    /// e.g. sats for BTC), decimal string. `"0"` for a full delivery.
+    pub refunded_native: String,
+}
+
 /// `POST /api/v1/sign/psbt-input`
 ///
 /// UTXO-family multisig partial-signature endpoint. The daemon:

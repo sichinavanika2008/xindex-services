@@ -34,12 +34,14 @@ use xindex_shared::eip712::{
     acquire_cancel_certificate, acquire_cancel_signing_hash, attestation,
     attestation_oracle_domain, attestation_signing_hash, redemption_attestation,
     redemption_attestation_signing_hash, redemption_intent_certificate, refund_attestation,
-    refund_attestation_signing_hash, ric_signing_hash,
+    refund_attestation_signing_hash, ric_signing_hash, streamed_settlement,
+    streamed_settlement_signing_hash,
 };
 use xindex_shared::signer_wire::{
     error_codes, AcquireCancelProof, AcquireCancelSignRequest, AttestationSignRequest,
     Eip712SignResponse, ErrorBody, HealthResponse, IntentProof, KeysResponse,
     RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
+    StreamedSettlementSignRequest,
 };
 
 use crate::intent::{
@@ -298,6 +300,10 @@ where
             post(handle_redemption_delivery::<S, H>),
         )
         .route("/api/v1/sign/eip712-refund", post(handle_refund::<S, H>))
+        .route(
+            "/api/v1/sign/eip712-streamed-settlement",
+            post(handle_streamed_settlement::<S, H>),
+        )
         .route("/api/v1/sign/eip712-ric", post(handle_ric_sign::<S, H>))
         .route("/api/v1/sign/eip712-acc", post(handle_acc_sign::<S, H>));
     if !state.utxo.is_empty() {
@@ -521,6 +527,28 @@ fn hash_leg_payload(
     alloy_primitives::keccak256(buf).into()
 }
 
+/// Like [`hash_leg_payload`] but for the COMBINED streamed settlement,
+/// binding BOTH the delivered-USDT and refunded-native amounts so that
+/// re-signing the same leg with a different `(delivered, refunded)` pair
+/// is a `Conflict`. The wider buffer (160 vs 128 bytes) also means a
+/// streamed payload hash can never collide with a plain delivery/refund
+/// payload hash for the same leg/amount.
+fn hash_streamed_payload(
+    redemption_id: B256,
+    leg_index: U256,
+    asset_id: B256,
+    delivered_usdt: U256,
+    refunded_native: U256,
+) -> [u8; 32] {
+    let mut buf = [0u8; 160];
+    buf[..32].copy_from_slice(redemption_id.as_slice());
+    buf[32..64].copy_from_slice(&leg_index.to_be_bytes::<32>());
+    buf[64..96].copy_from_slice(asset_id.as_slice());
+    buf[96..128].copy_from_slice(&delivered_usdt.to_be_bytes::<32>());
+    buf[128..160].copy_from_slice(&refunded_native.to_be_bytes::<32>());
+    alloy_primitives::keccak256(buf).into()
+}
+
 fn render_signature(state: &DaemonConfig, sig: [u8; 65]) -> Eip712SignResponse {
     Eip712SignResponse {
         signature: format!("0x{}", alloy_primitives::hex::encode(sig)),
@@ -674,6 +702,59 @@ where
         || {
             let m = refund_attestation(redemption_id, leg_index, asset_id, refunded_amount);
             refund_attestation_signing_hash(&m, &state.config.domain())
+        },
+    )
+    .await
+}
+
+/// `POST /api/v1/sign/eip712-streamed-settlement` — per-leg COMBINED
+/// streamed settlement (`STREAM-B2-COORD`). Same replay flow as
+/// delivery/refund (the `Streamed` kind shares the per-leg
+/// delivery-XOR-refund-XOR-streamed mutex), but the digest binds BOTH
+/// `delivered_usdt` and `refunded_native` (a partial-fill outcome). The
+/// coordinator only posts this AFTER the streaming swap has finalised; the
+/// daemon signs the structurally-distinct `AsyncLegStreamedSettlement`
+/// typehash, never the delivery or refund one.
+async fn handle_streamed_settlement<S, H>(
+    State(state): State<DaemonState<S, H>>,
+    Json(req): Json<StreamedSettlementSignRequest>,
+) -> Result<Json<Eip712SignResponse>, (StatusCode, Json<ErrorBody>)>
+where
+    S: ReplayStore + 'static,
+    H: HsmDigestSigner + 'static,
+{
+    let redemption_id = parse_b256(&req.redemption_id, "redemption_id")?;
+    let leg_index = parse_u256(&req.leg_index, "leg_index")?;
+    let asset_id = parse_b256(&req.asset_id, "asset_id")?;
+    let delivered_usdt = parse_u256(&req.delivered_usdt, "delivered_usdt")?;
+    let refunded_native = parse_u256(&req.refunded_native, "refunded_native")?;
+    // The combined settlement binds BOTH amounts: re-signing the same leg
+    // with a different (delivered, refunded) pair is a Conflict.
+    let payload_hash = hash_streamed_payload(
+        redemption_id,
+        leg_index,
+        asset_id,
+        delivered_usdt,
+        refunded_native,
+    );
+    let leg = u32::try_from(leg_index)
+        .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
+
+    handle_redemption_common(
+        &state,
+        redemption_id,
+        leg,
+        RedemptionKind::Streamed,
+        payload_hash,
+        || {
+            let m = streamed_settlement(
+                redemption_id,
+                leg_index,
+                asset_id,
+                delivered_usdt,
+                refunded_native,
+            );
+            streamed_settlement_signing_hash(&m, &state.config.domain())
         },
     )
     .await
@@ -1843,6 +1924,62 @@ mod tests {
         #[expect(clippy::unwrap_used, reason = "test code")]
         let seen = hsm.seen.lock().unwrap();
         assert_eq!(seen[0].1, expected_refund);
+    }
+
+    /// STREAM-B2-COORD: the combined streamed-settlement endpoint signs the
+    /// structurally-distinct `AsyncLegStreamedSettlement` digest (NOT the
+    /// delivery/refund one), binds both amounts, and is idempotent.
+    #[tokio::test]
+    #[expect(clippy::unwrap_used, reason = "test code")]
+    async fn streamed_settlement_signs_distinct_typehash_idempotently() {
+        let (state, hsm) = build_state();
+        let app = router(state.clone());
+        let red = B256::repeat_byte(0x66);
+        let asset = B256::repeat_byte(0xa1);
+        let delivered = U256::from(40_000_000u64);
+        let refunded = U256::from(12_345u64);
+        let body = serde_json::json!({
+            "redemption_id": format!("{red:#x}"),
+            "leg_index": "0",
+            "asset_id": format!("{asset:#x}"),
+            "delivered_usdt": delivered.to_string(),
+            "refunded_native": refunded.to_string(),
+        });
+
+        let (status, _) = post_json(
+            &app,
+            "/api/v1/sign/eip712-streamed-settlement",
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The HSM saw the STREAMED digest — distinct from the delivery
+        // digest for the same (id, leg, asset, amount): the 4-way typehash
+        // separation mirrored from the on-chain oracle.
+        let expected = streamed_settlement_signing_hash(
+            &streamed_settlement(red, U256::ZERO, asset, delivered, refunded),
+            &state.config.domain(),
+        );
+        let delivery_digest = redemption_attestation_signing_hash(
+            &redemption_attestation(red, U256::ZERO, asset, delivered),
+            &state.config.domain(),
+        );
+        assert_ne!(
+            expected, delivery_digest,
+            "streamed digest must differ from delivery"
+        );
+        assert_eq!(hsm.seen.lock().unwrap()[0].1, expected);
+
+        // Idempotent re-request returns the cached signature WITHOUT
+        // re-invoking the HSM.
+        let (s2, _) = post_json(&app, "/api/v1/sign/eip712-streamed-settlement", body).await;
+        assert_eq!(s2, StatusCode::OK);
+        assert_eq!(
+            hsm.seen.lock().unwrap().len(),
+            1,
+            "idempotent retry must not re-sign"
+        );
     }
 
     #[tokio::test]
