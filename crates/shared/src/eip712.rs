@@ -420,6 +420,80 @@ pub fn acquire_cancel_signing_hash(acc: &AcquireCancelCertificate, domain: &Eip7
     acc.eip712_signing_hash(domain)
 }
 
+/* -------------------------------------------------------------------------- */
+/*        PRICE ATTESTATION (NAV oracle — k-of-n per-asset price quote)        */
+/* -------------------------------------------------------------------------- */
+
+sol! {
+    /// Per-asset price quote signed by each k-of-n price signer. The on-chain
+    /// `PriceAttestationOracle.attestPrice` recovers the signers from the
+    /// EIP-712 digest of this struct and lands `(priceWad, supply)` for
+    /// `assetId` as the NAV input (after its L1 bounds / L2 Chainlink / L3
+    /// challenge-window guards). `timestamp` is the observation time, strictly
+    /// increasing per asset (anti-replay). A SEPARATE EIP-712 domain (name
+    /// `Xindex PriceAttestationOracle`) and typehash from the mint/redeem
+    /// attestations — a price signature can never verify on a custody path.
+    struct PriceAttestation {
+        bytes32 assetId;
+        uint256 priceWad;
+        uint256 supply;
+        uint256 timestamp;
+    }
+}
+
+/// Verbatim type string. MUST match `PriceAttestationOracle.sol`'s
+/// `PRICE_ATTESTATION_TYPEHASH` source string byte-for-byte.
+pub const PRICE_ATTESTATION_TYPE_STRING: &[u8] =
+    b"PriceAttestation(bytes32 assetId,uint256 priceWad,uint256 supply,uint256 timestamp)";
+
+/// `keccak256(PRICE_ATTESTATION_TYPE_STRING)` — equals
+/// `PriceAttestationOracle.PRICE_ATTESTATION_TYPEHASH` on-chain.
+#[must_use]
+pub fn price_attestation_typehash() -> B256 {
+    keccak256(PRICE_ATTESTATION_TYPE_STRING)
+}
+
+/// EIP-712 domain mirroring `PriceAttestationOracle`'s constructor:
+/// `EIP712("Xindex PriceAttestationOracle", "1")`. DISTINCT from
+/// [`attestation_oracle_domain`] — the price oracle is a separate contract, so
+/// its `verifyingContract` + domain name differ and a price signature is
+/// non-transferable to the mint/redeem attestation path.
+#[must_use]
+pub fn price_oracle_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
+    eip712_domain! {
+        name: "Xindex PriceAttestationOracle",
+        version: "1",
+        chain_id: chain_id,
+        verifying_contract: verifying_contract,
+    }
+}
+
+/// Construct a `PriceAttestation` from raw fields. `timestamp` widens to the
+/// `uint256` the on-chain hash uses (`uint256(timestamp)`); the on-chain
+/// `attestPrice` param is `uint64`.
+#[must_use]
+pub fn price_attestation(
+    asset_id: B256,
+    price_wad: U256,
+    supply: U256,
+    timestamp: u64,
+) -> PriceAttestation {
+    PriceAttestation {
+        assetId: asset_id,
+        priceWad: price_wad,
+        supply,
+        timestamp: U256::from(timestamp),
+    }
+}
+
+/// EIP-712 signing hash for a `PriceAttestation` — the 32-byte digest each
+/// k-of-n price signer signs. Equivalent to the on-chain
+/// `_hashTypedDataV4(keccak256(abi.encode(PRICE_ATTESTATION_TYPEHASH, ...)))`.
+#[must_use]
+pub fn price_attestation_signing_hash(att: &PriceAttestation, domain: &Eip712Domain) -> B256 {
+    att.eip712_signing_hash(domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +684,27 @@ mod tests {
                 assert_ne!(a, b, "typehash collision");
             }
         }
+    }
+
+    /// The price-oracle typehash MUST byte-match the on-chain constant, and be
+    /// distinct from the six custody typehashes (it also lives on a separate
+    /// domain, so a price signature can never recover on a custody path).
+    /// Pinned: `cast keccak "PriceAttestation(bytes32 assetId,uint256 priceWad,uint256 supply,uint256 timestamp)"`.
+    /// Source of truth: `Xindex/src/PriceAttestationOracle.sol`
+    /// `PRICE_ATTESTATION_TYPEHASH`.
+    #[test]
+    fn price_attestation_typehash_matches_solidity_source() {
+        assert_eq!(
+            price_attestation_typehash(),
+            b256!("0x4d3c02568f4c467f395dfac6384daa3f274b9a11899ed5eb2d56ff4b453ebc7e"),
+            "Rust typehash drifted from on-chain PRICE_ATTESTATION_TYPEHASH"
+        );
+        assert_eq!(
+            keccak256(PriceAttestation::eip712_root_type().as_bytes()),
+            price_attestation_typehash(),
+            "sol! macro-derived PriceAttestation typehash drifted"
+        );
+        assert_ne!(price_attestation_typehash(), attestation_typehash());
     }
 
     /// Fixed domain for the golden-digest vectors: chainId 1,
