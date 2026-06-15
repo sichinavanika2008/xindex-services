@@ -457,6 +457,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validate_accepts_quorum_equal_to_whitelist_size() {
+        // A k-of-k policy (quorum == whitelist size, e.g. 3-of-3) is valid —
+        // the `quorum > whitelist.len()` guard must be a strict `>`, not `>=`.
+        let p = IntentPolicy {
+            signer_whitelist: (1..=3).map(|s| key_identity(s).1).collect(),
+            intent_quorum: 3,
+            ric_max_age_secs: MAX_AGE,
+        };
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_quorum_above_whitelist_size() {
+        let p = IntentPolicy {
+            signer_whitelist: (1..=3).map(|s| key_identity(s).1).collect(),
+            intent_quorum: 4,
+            ric_max_age_secs: MAX_AGE,
+        };
+        assert!(p.validate().is_err());
+    }
+
     fn sample_proof() -> IntentProof {
         IntentProof {
             redemption_id: format!("0x{}", "ab".repeat(32)),

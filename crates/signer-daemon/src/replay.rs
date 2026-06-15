@@ -2486,6 +2486,15 @@ mod tests {
                 .await
                 .expect("check");
             assert!(matches!(out, CheckOutcome::Idempotent(rec) if rec.signature == vec![1,2,3]));
+            // Same (chain, owner, txid) key but a DIFFERENT payload (a forged
+            // re-drive at the same identity) → Conflict; the daemon refuses.
+            assert!(matches!(
+                store
+                    .check_tron_tx(ChainId::Tron, owner.clone(), txid, [0x99u8; 32])
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
             // Different txID (a different redemption) → independent FirstTime.
             let other = [0x72u8; 32];
             assert_eq!(
@@ -2588,6 +2597,225 @@ mod tests {
             .await
             .expect("connect");
         run_tron_tx_lifecycle(&store).await;
+    }
+
+    /// Phase 3.2 EVM-Safe tx replay keyed by `(chain, safe_address, nonce)`.
+    /// Same nonce + same payload → idempotent (also proves `record_safe_tx`
+    /// persisted — a no-op record would surface `FirstTime`); same nonce + a
+    /// DIFFERENT payload (a second, divergent Safe tx at the same nonce) →
+    /// Conflict; a different nonce / safe address is independent.
+    async fn run_safe_tx_lifecycle<S: ReplayStore>(store: &S) {
+        use alloy_primitives::Address;
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let safe = Address::repeat_byte(0x5a);
+            assert_eq!(
+                store
+                    .check_safe_tx(ChainId::Eth, safe, 7, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_safe_tx(ChainId::Eth, safe, 7, hash_a(), vec![1, 2, 3], 100)
+                .await
+                .expect("record");
+            assert!(matches!(
+                store
+                    .check_safe_tx(ChainId::Eth, safe, 7, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1, 2, 3]
+            ));
+            // Same nonce + DIFFERENT payload → Conflict.
+            assert!(matches!(
+                store
+                    .check_safe_tx(ChainId::Eth, safe, 7, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            // Different nonce → independent.
+            assert_eq!(
+                store
+                    .check_safe_tx(ChainId::Eth, safe, 8, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different safe address → independent.
+            assert_eq!(
+                store
+                    .check_safe_tx(ChainId::Eth, Address::repeat_byte(0x5b), 7, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+        }
+    }
+
+    /// Cosmos tx replay keyed by `(chain, account_address, sequence)`. Same
+    /// shape as the Safe lifecycle: idempotent retry, conflict on a divergent
+    /// payload at the same sequence, independence across sequence / account.
+    async fn run_cosmos_tx_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let acct = "cosmos1xindexcustodymultisigaccountaddrxxxxx".to_string();
+            assert_eq!(
+                store
+                    .check_cosmos_tx(ChainId::Gaia, acct.clone(), 3, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_cosmos_tx(ChainId::Gaia, acct.clone(), 3, hash_a(), vec![1, 2, 3], 100)
+                .await
+                .expect("record");
+            assert!(matches!(
+                store
+                    .check_cosmos_tx(ChainId::Gaia, acct.clone(), 3, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1, 2, 3]
+            ));
+            // Same sequence + DIFFERENT payload → Conflict.
+            assert!(matches!(
+                store
+                    .check_cosmos_tx(ChainId::Gaia, acct.clone(), 3, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            // Different sequence → independent.
+            assert_eq!(
+                store
+                    .check_cosmos_tx(ChainId::Gaia, acct.clone(), 4, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different account → independent.
+            assert_eq!(
+                store
+                    .check_cosmos_tx(ChainId::Gaia, "cosmos1other".to_string(), 3, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+        }
+    }
+
+    /// XRP tx replay keyed by `(chain, account_address, sequence)`. Same shape
+    /// as the Safe / Cosmos lifecycles.
+    async fn run_xrp_tx_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let acct = "rXindexCustodyMultisigAccountAddrxxxxxxxxxx".to_string();
+            assert_eq!(
+                store
+                    .check_xrp_tx(ChainId::Xrp, acct.clone(), 3, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            store
+                .record_xrp_tx(ChainId::Xrp, acct.clone(), 3, hash_a(), vec![1, 2, 3], 100)
+                .await
+                .expect("record");
+            assert!(matches!(
+                store
+                    .check_xrp_tx(ChainId::Xrp, acct.clone(), 3, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1, 2, 3]
+            ));
+            // Same sequence + DIFFERENT payload → Conflict.
+            assert!(matches!(
+                store
+                    .check_xrp_tx(ChainId::Xrp, acct.clone(), 3, hash_b())
+                    .await
+                    .expect("check"),
+                CheckOutcome::Conflict { .. }
+            ));
+            // Different sequence → independent.
+            assert_eq!(
+                store
+                    .check_xrp_tx(ChainId::Xrp, acct.clone(), 4, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+            // Different account → independent.
+            assert_eq!(
+                store
+                    .check_xrp_tx(ChainId::Xrp, "rOther".to_string(), 3, hash_a())
+                    .await
+                    .expect("check"),
+                CheckOutcome::FirstTime
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_safe_tx_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_safe_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_safe_tx_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_safe_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_cosmos_tx_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_cosmos_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_cosmos_tx_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_cosmos_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_xrp_tx_lifecycle() {
+        let store = InMemoryReplayStore::new();
+        run_xrp_tx_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_xrp_tx_lifecycle_matches_in_memory() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_xrp_tx_lifecycle(&store).await;
+    }
+
+    /// A non-unique-violation driver error must NOT be folded into
+    /// `Duplicate` (which the handler treats as idempotent race recovery) —
+    /// it has to surface as `Sqlite` so a real failure isn't mistaken for a
+    /// concurrent-write loss. Exercises the `is_unique_violation` guard arm
+    /// directly with a synthetic non-database error.
+    #[test]
+    fn map_insert_non_unique_error_propagates_as_sqlite() {
+        assert!(matches!(
+            SqliteReplayStore::map_insert(Err(sqlx::Error::RowNotFound)),
+            Err(ReplayError::Sqlite(_))
+        ));
     }
 
     #[tokio::test]

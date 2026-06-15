@@ -531,6 +531,24 @@ mod tests {
     }
 
     #[test]
+    fn solana_kind_str_maps_each_variant() {
+        assert_eq!(solana_kind_str(SolanaTxKind::Create), "create");
+        assert_eq!(solana_kind_str(SolanaTxKind::Approve), "approve");
+        assert_eq!(solana_kind_str(SolanaTxKind::Execute), "execute");
+    }
+
+    #[test]
+    fn rejects_destination_equal_to_system_program() {
+        // The system program is a forbidden spend target (a redemption must
+        // pay a real user destination, never a program). Exercises the
+        // `|| dest == system_program()` arm of the destination sanity guard.
+        let config = cfg([5; 32]);
+        let req = request(&config, SolanaTxKind::Create, Pubkey::system_program());
+        let (_status, body) = validate_and_sign(&req, &config).expect_err("reject");
+        assert_eq!(body.0.code, error_codes::SOLANA_DEST_NOT_PERMITTED);
+    }
+
+    #[test]
     fn signs_valid_create_approve_execute() {
         let config = cfg([5; 32]);
         let dest = Pubkey::new([0x99; 32]);

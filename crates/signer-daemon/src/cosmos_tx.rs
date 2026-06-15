@@ -452,6 +452,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bind_send_to_cert_rejects_wrong_denom() {
+        // A spend whose denom is not the chain's pinned native denom must be
+        // refused before the account-send bind — a poisoned request cannot
+        // slip a different token under a native-asset certificate.
+        let cert = crate::intent::VerifiedIntent {
+            redemption_id: alloy_primitives::B256::ZERO,
+            leg_index: 0,
+            asset_id: alloy_primitives::B256::ZERO,
+            amount: alloy_primitives::U256::ZERO,
+            amount_decimals: 6,
+            immediate_target_hash: alloy_primitives::B256::ZERO,
+            memo_hash: alloy_primitives::B256::ZERO,
+            final_destination_hash: alloy_primitives::B256::ZERO,
+            vault_resolved_at: 0,
+            signers: vec![],
+        };
+        let res = bind_send_to_cert(ChainId::Gaia, "cosmos1to", "100", "notuatom", "memo", &cert);
+        assert!(res.is_err());
+    }
+
     const ACCOUNT: &str = "cosmos1vault0multisig0account0000000000000000";
 
     fn sample_request(sign_doc_hash: [u8; 32]) -> CosmosTxSignRequest {

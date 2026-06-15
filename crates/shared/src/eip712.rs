@@ -423,6 +423,7 @@ pub fn acquire_cancel_signing_hash(acc: &AcquireCancelCertificate, domain: &Eip7
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::b256;
     use alloy_sol_types::SolValue;
 
     /// The `sol!` macro auto-derives a typehash from the struct definition.
@@ -609,5 +610,127 @@ mod tests {
                 assert_ne!(a, b, "typehash collision");
             }
         }
+    }
+
+    /// Fixed domain for the golden-digest vectors: chainId 1,
+    /// verifyingContract 0xCC..CC. The digests below are the 32 bytes each
+    /// k-of-n signer's HSM actually signs; pinning them locks the FULL
+    /// EIP-712 encoding (domain separator + struct hash + the 0x1901 prefix),
+    /// not just the typehash the other tests cover. A drift here means a
+    /// signature that won't recover to the expected signer on-chain — or, for
+    /// the off-chain RIC/ACC, cross-operator digest divergence. Regenerate by
+    /// temporarily printing the function outputs for these fixed inputs.
+    fn golden_domain() -> Eip712Domain {
+        attestation_oracle_domain(1, Address::repeat_byte(0xCC))
+    }
+
+    #[test]
+    fn attestation_oracle_domain_separator_pinned() {
+        assert_eq!(
+            golden_domain().separator(),
+            b256!("0xc3cbe4ff899fabc043257a4b82dc673b5aef398c5429674c85675413c0fed05d"),
+            "EIP-712 domain separator drifted — every signing hash moves with it"
+        );
+    }
+
+    #[test]
+    fn attestation_signing_hash_golden() {
+        let a = attestation(
+            B256::repeat_byte(0x11),
+            U256::from(7u64),
+            U256::from(1_000_000u64),
+        );
+        assert_eq!(
+            attestation_signing_hash(&a, &golden_domain()),
+            b256!("0x725ef8cb8e8b8366cdb15d2a7fca128d0629bd9e5fb0342f4a3627887d739224"),
+            "mint attestation digest drifted"
+        );
+    }
+
+    #[test]
+    fn redemption_attestation_signing_hash_golden() {
+        let d = redemption_attestation(
+            B256::repeat_byte(0x22),
+            U256::from(3u64),
+            B256::repeat_byte(0x33),
+            U256::from(2_000_000u64),
+        );
+        assert_eq!(
+            redemption_attestation_signing_hash(&d, &golden_domain()),
+            b256!("0xf8e1a0228e8f5c19120e5cb8b2c464c9bddd3c4e81063dc3abfd24fd17106d0e"),
+            "delivery attestation digest drifted"
+        );
+    }
+
+    #[test]
+    fn refund_attestation_signing_hash_golden() {
+        let r = refund_attestation(
+            B256::repeat_byte(0x44),
+            U256::from(1u64),
+            B256::repeat_byte(0x55),
+            U256::from(900_000u64),
+        );
+        assert_eq!(
+            refund_attestation_signing_hash(&r, &golden_domain()),
+            b256!("0xdaf4c0b462ce75f3c20aff96ff82669b5f65d17f13df74c5b731b12c1cd84e1a"),
+            "refund attestation digest drifted"
+        );
+    }
+
+    #[test]
+    fn streamed_settlement_signing_hash_golden() {
+        let s = streamed_settlement(
+            B256::repeat_byte(0x66),
+            U256::from(2u64),
+            B256::repeat_byte(0x77),
+            U256::from(500_000u64),
+            U256::from(400_000u64),
+        );
+        assert_eq!(
+            streamed_settlement_signing_hash(&s, &golden_domain()),
+            b256!("0x03bc753298d69d144eda71e92bc8ebf4de4285d11ce2cc764250e96e9640c374"),
+            "streamed-settlement digest drifted"
+        );
+    }
+
+    #[test]
+    fn ric_signing_hash_golden() {
+        let ric = redemption_intent_certificate(
+            B256::repeat_byte(0x88),
+            U256::from(4u64),
+            B256::repeat_byte(0x99),
+            U256::from(3_000_000u64),
+            8,
+            B256::repeat_byte(0xAA),
+            B256::repeat_byte(0xBB),
+            B256::repeat_byte(0xCC),
+            1_700_000_000,
+        );
+        assert_eq!(
+            ric_signing_hash(&ric, &golden_domain()),
+            b256!("0x734783e8fc35297112da10de93706d7ed917d4a33d9f9e6777f67c92a969ea8c"),
+            "RIC digest drifted — cross-operator divergence"
+        );
+    }
+
+    #[test]
+    fn acquire_cancel_signing_hash_golden() {
+        let acc = acquire_cancel_certificate(
+            B256::repeat_byte(0xDD),
+            B256::repeat_byte(0xEE),
+            U256::from(5u64),
+            B256::repeat_byte(0x12),
+            U256::from(4_000_000u64),
+            6,
+            B256::repeat_byte(0x34),
+            B256::repeat_byte(0x56),
+            B256::repeat_byte(0x78),
+            1_800_000_000,
+        );
+        assert_eq!(
+            acquire_cancel_signing_hash(&acc, &golden_domain()),
+            b256!("0xa4369421bfee1e94bbe986096702c53e97c2835ced0376b462491ca62e907368"),
+            "ACC digest drifted — cross-operator divergence"
+        );
     }
 }

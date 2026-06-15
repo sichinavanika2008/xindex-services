@@ -1141,7 +1141,19 @@ const RIC_SIGN_MAX_AGE_SECS: u64 = 600;
 /// resolution. Future-dating beyond the shared clock-skew tolerance is
 /// refused so a compromised relay cannot mint long-lived certificates.
 fn check_ric_sign_recency(vault_resolved_at: u64) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    let now = u64::try_from(now_unix_secs()).unwrap_or(0);
+    check_ric_sign_recency_at(
+        vault_resolved_at,
+        u64::try_from(now_unix_secs()).unwrap_or(0),
+    )
+}
+
+/// Inner form taking `now` explicitly so the future-skew and max-age boundary
+/// comparisons are deterministically unit-testable; the wrapper above supplies
+/// the wall clock.
+fn check_ric_sign_recency_at(
+    vault_resolved_at: u64,
+    now: u64,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
     if vault_resolved_at > now.saturating_add(crate::intent::RIC_FUTURE_SKEW_TOLERANCE_SECS) {
         return Err(unprocessable(
             error_codes::INTENT_VAULT_STALE,
@@ -1158,6 +1170,12 @@ fn check_ric_sign_recency(vault_resolved_at: u64) -> Result<(), (StatusCode, Jso
         ));
     }
     Ok(())
+}
+
+/// Floor `now` to the start of its `window`-second bucket. Extracted so the
+/// bucket arithmetic is unit-testable without a live clock + `DaemonState`.
+fn window_start_for(now: i64, window: i64) -> i64 {
+    now - now.rem_euclid(window)
 }
 
 /// CTD-1 Slice E (`DL-CTD-E`): consume Set-B certification volume for
@@ -1189,7 +1207,7 @@ where
     // Validated > 0 at startup; an absurd >i64::MAX config falls back
     // to the 24h production bucket rather than panicking.
     let window = i64::try_from(state.config.cert_volume.window_secs).unwrap_or(86_400);
-    let window_start = now - now.rem_euclid(window);
+    let window_start = window_start_for(now, window);
     match state
         .replay
         .consume_cert_volume(chain_id, window_start, amount, cap)
@@ -1520,6 +1538,62 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, v)
+    }
+
+    #[test]
+    fn acc_error_code_maps_each_intent_error() {
+        use crate::intent::IntentError;
+        assert_eq!(
+            acc_error_code(&IntentError::ProofInvalid(String::new())),
+            error_codes::ACQUIRE_CANCEL_PROOF_INVALID
+        );
+        assert_eq!(
+            acc_error_code(&IntentError::VaultStale(String::new())),
+            error_codes::ACQUIRE_CANCEL_VAULT_STALE
+        );
+    }
+
+    #[test]
+    fn hash_leg_payload_binds_all_fields() {
+        let rid = B256::repeat_byte(0x11);
+        let leg = U256::from(2u64);
+        let asset = B256::repeat_byte(0x33);
+        let amount = U256::from(1_000_000u64);
+        // Independent recomputation of the documented 128-byte layout — a
+        // `-> [0; 32]` body or a layout change diverges from this.
+        let mut buf = [0u8; 128];
+        buf[..32].copy_from_slice(rid.as_slice());
+        buf[32..64].copy_from_slice(&leg.to_be_bytes::<32>());
+        buf[64..96].copy_from_slice(asset.as_slice());
+        buf[96..128].copy_from_slice(&amount.to_be_bytes::<32>());
+        let want: [u8; 32] = alloy_primitives::keccak256(buf).into();
+        assert_eq!(hash_leg_payload(rid, leg, asset, amount), want);
+        assert_ne!(want, [0u8; 32]);
+        // Re-signing the same leg with a different amount is a different slot.
+        assert_ne!(
+            hash_leg_payload(rid, leg, asset, U256::from(999u64)),
+            hash_leg_payload(rid, leg, asset, amount)
+        );
+    }
+
+    #[test]
+    fn ric_sign_recency_boundary() {
+        let now = 1_000_000u64;
+        let skew = crate::intent::RIC_FUTURE_SKEW_TOLERANCE_SECS;
+        // Exactly at the future-skew limit is allowed; one second past is not.
+        assert!(check_ric_sign_recency_at(now + skew, now).is_ok());
+        assert!(check_ric_sign_recency_at(now + skew + 1, now).is_err());
+        // Exactly at the max signing age is allowed; one second older is not.
+        assert!(check_ric_sign_recency_at(now - RIC_SIGN_MAX_AGE_SECS, now).is_ok());
+        assert!(check_ric_sign_recency_at(now - RIC_SIGN_MAX_AGE_SECS - 1, now).is_err());
+    }
+
+    #[test]
+    fn window_start_floors_to_bucket() {
+        assert_eq!(window_start_for(1_000, 600), 600);
+        assert_eq!(window_start_for(600, 600), 600);
+        assert_eq!(window_start_for(599, 600), 0);
+        assert_eq!(window_start_for(1_200, 600), 1_200);
     }
 
     #[tokio::test]

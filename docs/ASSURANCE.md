@@ -28,7 +28,54 @@ cargo mutants --baseline=skip -p xindex-shared -p xindex-signer-daemon
 
 CI scopes to the crypto + CTD-1 core (`xindex-shared` = eip712/RIC,
 `xindex-signer-daemon` = intent/psbt gate). Drop the `-p` flags to mutate the
-whole workspace (much longer). CI: `assurance.yml` → `mutants` job.
+whole workspace (much longer). CI: `assurance.yml` → `mutants` job. The job is
+`continue-on-error` (informational): a surviving mutant is a test-coverage
+signal, not a regression, and a from-scratch run is multi-hour. Survivors still
+surface as run annotations; the standing disposition is below.
 
 > 8 GB box note: full-workspace builds thrash; run these in CI or scope to a
 > single crate locally.
+
+### Survivor triage (2026-06-15)
+
+Baseline run: 615 candidates over `xindex-shared` + `xindex-signer-daemon`
+(62 missed / 337 caught / 216 unviable).
+
+**Excluded as universal noise** (`.cargo/mutants.toml`, 615 → 587): `Debug`/
+`Display` `fmt` impls (no test asserts exact format output) and the wall-clock
+`now_unix_secs` helpers (tests cannot pin `SystemTime::now()`; the recency/age
+comparisons that consume the clock stay tested via injectable `now`).
+
+**Closed** (golden vectors / boundary / record-then-check tests):
+
+- `eip712`: the six `*_signing_hash` digests + the domain separator — these are
+  the 32 bytes each k-of-n HSM signs; pinned golden vectors (`-> Default` died).
+- `replay`: `record_*`/`check_*` idempotency **and Conflict** (divergent payload
+  at the same identity) for safe / cosmos / xrp / tron on both the in-memory and
+  Sqlite stores; `map_insert` non-unique-error classification.
+- `server`: `hash_leg_payload` (layout-bound), `check_ric_sign_recency`
+  future-skew + max-age boundaries (refactored to an injectable-`now` inner so
+  the `>` is deterministically testable), `consume_cert_volume_gate` window-bucket
+  arithmetic (extracted to `window_start_for`), `acc_error_code`.
+- `cosmos_tx`: `bind_send_to_cert` native-denom mismatch (CTD bind cannot be a
+  no-op). `intent`: `IntentPolicy::validate` quorum == whitelist boundary.
+  `solana_tx`: `solana_kind_str`, forbidden-destination (`system_program`) arm.
+
+**Residual — documented, fail-safe, tracked follow-up:** the handler
+race-recovery branches `if !matches!(e, ReplayError::Duplicate)` on the eight
+non-attestation/-psbt paths (redemption, ric/acc sign, ac one-shot, solana,
+tron, xrp, evm-safe). Inverting that `!` makes a concurrent-write race-loser
+receive an error instead of the cached signature (audit **L10** robustness) —
+**fail-safe**: never a fund-loss, replay, or forged-signature path. Closing each
+needs a per-path `RaceReplayStore` variant. Same fail-safe class: the `router`
+sol-route mount guard, `HsmError::into_response`, and `enforce_change_and_fee`'s
+fee == cap boundary (rejecting a fee exactly at cap is over-strict, fail-closed).
+
+**Equivalent / infeasible (won't-fix):**
+
+- `validate_and_sign:272` `||`→`&&`: the two clauses (non-Solana family / chain
+  ≠ configured chain) are perfectly correlated over the valid input domain (only
+  one Solana chain exists), so the mutant is provably equivalent.
+- `consume_cert_volume` `is_unique_violation` (×2): the unique-violation arm only
+  fires on a concurrent INSERT race that is unreachable single-threaded (the
+  in-memory test DB is per-connection); would require DB fault injection.
