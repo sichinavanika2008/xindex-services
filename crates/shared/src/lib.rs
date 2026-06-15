@@ -7,6 +7,7 @@
 
 pub mod chain_registry;
 pub mod eip712;
+pub mod price_aggregate;
 pub mod redemption_dispatch;
 pub mod ric_relay;
 pub mod signer_wire;
