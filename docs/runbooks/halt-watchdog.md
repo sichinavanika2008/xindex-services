@@ -86,22 +86,30 @@ proving the binary wires together (args → ≥2-source agreement → ETH provid
 poll loop). Override `THORNODE_URLS` with real endpoints for a live-liveness
 check (expect `Live`).
 
-## Full halt drill (remaining gap)
+## Full halt drill
 
-A full drill — watch a real/mocked THORChain halt actually engage
-`CustodyGuard.halt()` and `createMintIntent` / `checkDispatch` then revert —
-needs:
+`./rehearsal/halt-drill.sh` runs the complete chain end-to-end (after
+`up-onchain.sh`):
 
-1. ✅ the guard deployed + wired + roster set — `up-onchain.sh` now does this
-   via `Xindex/script/DeployCustodyGuard.s.sol` (`CUSTODY_GUARD_ADDR` lands in
-   `onchain.env`); run the watchdog with a roster (Set-B) operator key.
-2. ⛔ a THORNode the drill can toggle into a halted state (a mock serving
-   `/thorchain/inbound_addresses` with `halted: true`, or a real stagenet
-   halt) — still missing.
+1. starts two mock THORNodes (`rehearsal/mock-thornode.py`) serving
+   `/thorchain/inbound_addresses`, live;
+2. starts the watchdog signing as roster operator 0 (the Set-B key in
+   `daemon-0.json`; it funds that EOA for gas);
+3. toggles the halt (`touch $XINDEX_REHEARSAL_DIR/thor-halt` → both mocks report
+   `halted: true`);
+4. the watchdog detects the sustained halt and broadcasts `CustodyGuard.halt()`;
+5. asserts `guard.isHalted() == true` AND that `requireNotHalted()` now reverts
+   — the exact gate `IntentQueue.createMintIntent` hits, so new mint (and burn
+   via `checkDispatch`) fail closed.
 
-Until (2) lands this is a documented gap; the smoke above proves the watchdog
-itself, and the contract-level halt gate is covered by
-`Xindex/test/CustodyGuard.t.sol`.
+```sh
+./rehearsal/up-onchain.sh     # anvil + deploy + guard wired
+./rehearsal/halt-drill.sh     # -> "DRILL PASSED"
+./rehearsal/down.sh
+```
+
+The contract-level halt gate is also covered by `Xindex/test/CustodyGuard.t.sol`;
+a production drill swaps the mocks for a real stagenet halt.
 
 ## Operational notes
 
