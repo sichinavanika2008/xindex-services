@@ -63,6 +63,34 @@ pub enum AgreementError {
     Halted { chain: String, source_idx: usize },
 }
 
+/// Outcome of a halt-specific multi-source poll
+/// ([`AsgardAgreement::poll_chain_halt`]).
+///
+/// Distinct from [`AsgardAgreement::resolve_agreed`], which checks the halt
+/// flags only AFTER an address/router unanimity check and so returns
+/// [`AgreementError::Disagreement`] (never a halt verdict) during a churn
+/// rotation. This poll reads the halt flags DIRECTLY, independent of address
+/// agreement, so a halt landing mid-churn is still seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HaltOutcome {
+    /// ≥[`MIN_AGREEING_SOURCES`] sources returned the chain entry and none
+    /// report any halt/pause flag.
+    Live,
+    /// ≥[`MIN_AGREEING_SOURCES`] sources returned the chain entry and at
+    /// least one reports `halted` / `*_paused`. Carries the first such source
+    /// index for the operator log. ANY responding source's halt flag is
+    /// sufficient (mirrors `resolve_agreed`): a hostile source can force a
+    /// bounded, auto-expiring, quorum-reversible pause, but can never SUPPRESS
+    /// a real halt — the safe direction for a containment trigger.
+    Halted { source_idx: usize },
+    /// Fewer than [`MIN_AGREEING_SOURCES`] sources returned the chain entry,
+    /// so there is no decisive read. NOT a halt trigger — absence of evidence
+    /// is not evidence of a halt, and a total outage already fails closed via
+    /// the on-chain vault-freshness gate and the custody-spend dispatch gate.
+    /// Carries a human-readable reason for the runbook log.
+    Indeterminate { reason: String },
+}
+
 /// A set of independent `THORChain` sources with an all-must-agree
 /// resolution gate. Construct once at startup with the operator's
 /// configured (distinct) endpoints.
@@ -153,6 +181,63 @@ impl AsgardAgreement {
             }
         }
         Ok(first)
+    }
+
+    /// Poll the per-chain halt/pause flags across every configured source,
+    /// INDEPENDENT of the address-agreement check. Drives the per-operator
+    /// halt watchdog (`xindex-halt-watchdog`), which engages the on-chain
+    /// `CustodyGuard.halt()` containment on a sustained halt so new mint and
+    /// burn custody lifecycles fail closed while the chain is paused upstream.
+    ///
+    /// Returns [`HaltOutcome::Halted`] when ≥[`MIN_AGREEING_SOURCES`] sources
+    /// returned the chain entry and ANY reports a halt/pause flag;
+    /// [`HaltOutcome::Live`] when that quorum responded with none halted;
+    /// otherwise [`HaltOutcome::Indeterminate`] (never a halt trigger). Unlike
+    /// [`AsgardAgreement::resolve_agreed`], an address disagreement between
+    /// sources does NOT mask the halt read.
+    pub async fn poll_chain_halt(&self, chain: &str) -> HaltOutcome {
+        let results = join_all(
+            self.clients
+                .iter()
+                .map(|c| async { c.fetch_inbound_addresses().await }),
+        )
+        .await;
+
+        let total = results.len();
+        let mut responded_with_chain: usize = 0;
+        let mut first_halted: Option<usize> = None;
+        let mut failures: Vec<String> = Vec::new();
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(list) => match list.into_iter().find(|e| e.chain == chain) {
+                    Some(entry) => {
+                        responded_with_chain += 1;
+                        if first_halted.is_none()
+                            && (entry.halted
+                                || entry.chain_trading_paused
+                                || entry.global_trading_paused)
+                        {
+                            first_halted = Some(i);
+                        }
+                    }
+                    None => failures.push(format!("source #{i}: no inbound entry for {chain}")),
+                },
+                Err(e) => failures.push(format!("source #{i}: {}", redact_thor_error(&e))),
+            }
+        }
+
+        if responded_with_chain < MIN_AGREEING_SOURCES {
+            return HaltOutcome::Indeterminate {
+                reason: format!(
+                    "only {responded_with_chain} of {total} sources returned a {chain} entry \
+                     (need ≥ {MIN_AGREEING_SOURCES}): {failures:?}"
+                ),
+            };
+        }
+        match first_halted {
+            Some(source_idx) => HaltOutcome::Halted { source_idx },
+            None => HaltOutcome::Live,
+        }
     }
 }
 
@@ -317,5 +402,88 @@ mod tests {
         let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
         let vault = gate.resolve_agreed("BTC").await.expect("must agree");
         assert_eq!(vault.address, "bc1qvault");
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn poll_halt_all_live_when_quorum_clean() {
+        let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let b = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        assert_eq!(gate.poll_chain_halt("BTC").await, HaltOutcome::Live);
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn poll_halt_any_source_halted_triggers() {
+        let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let b = mock_source(serde_json::json!([btc_entry("bc1qvault", true)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        assert!(
+            matches!(
+                gate.poll_chain_halt("BTC").await,
+                HaltOutcome::Halted { .. }
+            ),
+            "any responding source's halt flag must trigger"
+        );
+    }
+
+    /// The reason `poll_chain_halt` exists separately from `resolve_agreed`:
+    /// a halt landing DURING a churn rotation (addresses disagree) must still
+    /// be seen. `resolve_agreed` returns `Disagreement` and never reaches its
+    /// halt check; `poll_chain_halt` reads the flags independently.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn poll_halt_detected_during_address_churn() {
+        let a = mock_source(serde_json::json!([btc_entry("bc1qOLD", true)])).await;
+        let b = mock_source(serde_json::json!([btc_entry("bc1qNEW", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        assert!(
+            matches!(
+                gate.resolve_agreed("BTC").await,
+                Err(AgreementError::Disagreement { .. })
+            ),
+            "resolve_agreed masks the halt behind the address churn"
+        );
+        assert!(
+            matches!(
+                gate.poll_chain_halt("BTC").await,
+                HaltOutcome::Halted { .. }
+            ),
+            "poll_chain_halt sees the halt regardless of the churn"
+        );
+    }
+
+    /// A single responding source (the other down) is below quorum — even if
+    /// it screams HALTED, the verdict is Indeterminate, never a halt trigger:
+    /// one hostile/flaky source must not be able to freeze the protocol.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn poll_halt_sub_quorum_is_indeterminate() {
+        let a = mock_source(serde_json::json!([btc_entry("bc1qvault", true)])).await;
+        let b = ThorClient::with_base_url("http://127.0.0.1:1").expect("client");
+        let gate = AsgardAgreement::new(vec![client_for(&a), b]).expect("two sources");
+        assert!(
+            matches!(
+                gate.poll_chain_halt("BTC").await,
+                HaltOutcome::Indeterminate { .. }
+            ),
+            "sub-quorum read must not trigger a halt"
+        );
+    }
+
+    /// `chain_trading_paused` (not only `halted`) also trips the watchdog.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn poll_halt_chain_trading_paused_triggers() {
+        let mut paused = btc_entry("bc1qvault", false);
+        paused["chain_trading_paused"] = serde_json::json!(true);
+        let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let b = mock_source(serde_json::json!([paused])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        assert!(matches!(
+            gate.poll_chain_halt("BTC").await,
+            HaltOutcome::Halted { .. }
+        ));
     }
 }

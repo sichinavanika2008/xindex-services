@@ -1,4 +1,4 @@
-//! Type-safe Solidity bindings for the four Xindex contracts the off-chain
+//! Type-safe Solidity bindings for the Xindex contracts the off-chain
 //! services interact with on Ethereum. ABIs are vendored at
 //! `crates/shared/abi/` (re-pull via `just sync-abi`).
 //!
@@ -31,6 +31,12 @@ sol!(
     #[sol(rpc)]
     IndexFactory,
     "../shared/abi/IndexFactory.json"
+);
+
+sol!(
+    #[sol(rpc)]
+    CustodyGuard,
+    "../shared/abi/CustodyGuard.json"
 );
 
 #[expect(

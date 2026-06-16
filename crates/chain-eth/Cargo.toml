@@ -52,3 +52,7 @@ path = "src/bin/xindex-attest.rs"
 [[bin]]
 name = "xindex-attest-redeem"
 path = "src/bin/xindex-attest-redeem.rs"
+
+[[bin]]
+name = "xindex-halt-watchdog"
+path = "src/bin/xindex-halt-watchdog.rs"

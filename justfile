@@ -166,6 +166,7 @@ sync-abi:
     cp {{XINDEX}}/out/AttestationOracle.sol/AttestationOracle.json crates/shared/abi/
     cp {{XINDEX}}/out/IndexFactory.sol/IndexFactory.json crates/shared/abi/
     cp {{XINDEX}}/out/ThorchainAdapter.sol/ThorchainAdapter.json crates/shared/abi/
+    cp {{XINDEX}}/out/CustodyGuard.sol/CustodyGuard.json crates/shared/abi/
     @echo "ABIs vendored to crates/shared/abi/"
 
 # Strict gate: matches CI exactly. Run before every commit.
