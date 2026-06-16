@@ -121,6 +121,29 @@ echo "   AttestationOracle: $oracle"
 echo "   ThorchainAdapter:  $adapter"
 echo "   IntentQueue:       $queue"
 
+# 4b. deploy + wire the CTD-1 containment guard (CustodyGuard). Roster = the
+# rehearsal Set-B signers; generous per-24h caps so the guard is transparent to
+# the tiny D1 amounts while still exercising the dispatch/attest metering + the
+# halt gate that xindex-halt-watchdog drives. The deployer still owns the queue
+# here (Phase 2 keeps broadcaster ownership when OWNER is unset), so
+# DeployCustodyGuard wires `setCustodyGuard` directly.
+echo ">> deploy + wire CustodyGuard (roster = Set-B, quorum 3)"
+cg="$(cd "$xindex" &&
+  INTENT_QUEUE="$queue" CUSTODY_OPERATORS="$signers" CUSTODY_QUORUM="3" \
+    BTC_DISPATCH_CAP="10000000000" BTC_ATTEST_CAP="10000000000" \
+    forge script script/DeployCustodyGuard.s.sol \
+    --rpc-url "$rpc" --private-key "$deployer" --broadcast 2>&1)" || {
+  echo "$cg"
+  exit 1
+}
+guard="$(echo "$cg" | grep 'CustodyGuard:' | awk '{print $NF}' | tail -n1)" || true
+[ -n "$guard" ] || {
+  echo "could not extract CustodyGuard address"
+  echo "$cg" | tail -n 30
+  exit 1
+}
+echo "   CustodyGuard:      $guard"
+
 # 5. record the deployed addresses for the observer / coordinator steps.
 cat >"$out/onchain.env" <<EOF
 ATTESTATION_ORACLE_ADDR=$oracle
@@ -129,6 +152,7 @@ INTENT_QUEUE_ADDR=$queue
 INDEX_FACTORY_ADDR=$factory
 USDT_ADDR=$usdt
 THORCHAIN_ROUTER_ADDR=$router
+CUSTODY_GUARD_ADDR=$guard
 ETH_RPC_URL=ws://127.0.0.1:8545
 EOF
 echo ">> wrote $out/onchain.env"

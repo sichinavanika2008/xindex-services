@@ -42,9 +42,12 @@ A total outage already fails closed elsewhere (the on-chain vault-freshness gate
 - `CustodyGuard` **deployed** and **wired** into the `IntentQueue`
   (`IntentQueue.setCustodyGuard(guard)`), with this operator's EOA in the guard
   roster (`CustodyGuard.setOperators`).
-  > ⚠️ As of this writing no deploy script deploys `CustodyGuard` (DL-CTD-E
-  > wiring is the production deploy's job). Until then the watchdog runs and
-  > logs verdicts but has no guard to halt — deploy + wire it first.
+  > Deploy + wire with `Xindex/script/DeployCustodyGuard.s.sol` — it deploys
+  > the guard, sets the roster + per-asset volume caps, and calls
+  > `IntentQueue.setCustodyGuard`. The one-box rehearsal `up-onchain.sh` runs
+  > it automatically and writes `CUSTODY_GUARD_ADDR` to `onchain.env`. Until
+  > the guard is deployed + wired on a given network, the watchdog runs and
+  > logs verdicts but has no guard to halt.
 - This operator's ≥2 distinct THORNode REST endpoints.
 - An ETH RPC (WS) and the operator's roster EOA key.
 
@@ -83,19 +86,22 @@ proving the binary wires together (args → ≥2-source agreement → ETH provid
 poll loop). Override `THORNODE_URLS` with real endpoints for a live-liveness
 check (expect `Live`).
 
-## Full halt drill (gap)
+## Full halt drill (remaining gap)
 
 A full drill — watch a real/mocked THORChain halt actually engage
 `CustodyGuard.halt()` and `createMintIntent` / `checkDispatch` then revert —
-additionally requires (not yet in this harness):
+needs:
 
-1. a deploy script for `CustodyGuard` + `IntentQueue.setCustodyGuard` wiring +
-   the operator EOA in the roster, and
-2. a THORNode the drill can toggle into a halted state (a mock serving
-   `/thorchain/inbound_addresses` with `halted: true`, or a real stagenet halt).
+1. ✅ the guard deployed + wired + roster set — `up-onchain.sh` now does this
+   via `Xindex/script/DeployCustodyGuard.s.sol` (`CUSTODY_GUARD_ADDR` lands in
+   `onchain.env`); run the watchdog with a roster (Set-B) operator key.
+2. ⛔ a THORNode the drill can toggle into a halted state (a mock serving
+   `/thorchain/inbound_addresses` with `halted: true`, or a real stagenet
+   halt) — still missing.
 
-Until (1) and (2) land this is a documented gap; the smoke above proves the
-watchdog itself.
+Until (2) lands this is a documented gap; the smoke above proves the watchdog
+itself, and the contract-level halt gate is covered by
+`Xindex/test/CustodyGuard.t.sol`.
 
 ## Operational notes
 
