@@ -35,6 +35,7 @@ pub mod psbt;
 pub mod replay;
 pub mod server;
 mod sig_norm;
+pub mod soft_hsm;
 pub mod solana_tx;
 pub mod tls;
 pub mod tron_tx;

@@ -39,7 +39,12 @@ async-trait = "0.1"
 sqlx.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+# Daemon binary (`src/main.rs`): application-style error handling + structured
+# JSON logs (matches the sibling `xindex-observe-redeem` bin). Both are
+# workspace deps already in the tree.
+anyhow.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 # HTTP server + client (axum for the daemon endpoints; reqwest for the
 # outbound call to the locally-fronting Web3Signer instance).
 axum = { workspace = true, features = ["json"] }
