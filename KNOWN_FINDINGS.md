@@ -746,8 +746,55 @@ Verification (RUST-004): the consumed-inflow ledger + 1:1 outbound-hash bind lan
 `Any`), `confirm_erc20_arrival_filters_value_confs_and_hash`, and the three RUST-004
 delivery tests (`rust004_inflow_consumed_by_other_leg_is_skipped`,
 `rust004_non_matching_outbound_hash_ignored`, `rust004_empty_out_txs_is_not_ready`), plus
-the Cosmos/XRP/EVM delivery success paths updated for the bind. The disclosed-incomplete
-`concurrency-toctou` Rust sweep remains un-run.
+the Cosmos/XRP/EVM delivery success paths updated for the bind.
+
+### Concurrency / TOCTOU sweep — RAN + CLOSED 2026-06-21
+
+The disclosed-incomplete `concurrency-toctou` review unit (never executed in the original
+2026-06-20 workflow) was run as four parallel adversarial reviewers over every
+concurrency-sensitive surface: (1) signer-daemon (`replay.rs` volume-window CAS, `server.rs`
+one-shot-consume-vs-HSM-sign ordering, per-family `check_*`/`record_*`); (2) executor
+(`{evm,cosmos,xrp,solana}_redeem.rs` per-account mutex maps, `broadcast_registry` H1 dedup,
+`solana_redeem_store` choreography, BTC redeem/rebroadcast/swap-back); (3) shared + relayer
+stores (the new `consumed_inflow` ledger, `redemption_dispatch`, relayer UPSERTs);
+(4) observer + watcher + `crosscheck` concurrent `&self`.
+
+**Result: ZERO fund-critical races. No double-sign-at-the-same-nonce, no one-RIC-into-two-spends,
+no double-credit, no nonce/sequence reuse interleaving was constructible.** The guarantees, verified
+concrete: DB PRIMARY-KEY uniqueness on the record/one-shot `INSERT`s makes the pre-flight `check_*`
+advisory and the `INSERT` the atomic gate (deterministic ECDSA/ed25519 ⇒ a concurrent duplicate
+re-signs identical bytes, second insert hits the PK and re-reads the winner); the per-account
+`Arc<Mutex<()>>` maps do their get-or-insert under one `entry().or_insert_with()` guard (no
+"both create a new mutex" defeat); `broadcast_registry.reserve()` / `solana_redeem_store.reserve()`
+are `INSERT … ON CONFLICT DO NOTHING` (exactly-one-winner); and the **RUST-004 `consume_inflow`
+claim is atomic** in both impls (in-memory: get+insert under one `tokio::sync::Mutex` with no
+intervening `.await`; sqlite: `INSERT OR IGNORE` on PK `(tx_hash, log_index)`, the loser reads the
+committed winner row) — confirming the RUST-004 ledger actually makes each physical inflow
+single-use under concurrency.
+
+Findings — all **Low/Info and fail-closed** (can refuse a legitimate sign, never authorize an
+illegitimate one); recorded, not blocking:
+- **TOCTOU-1 (Low, availability):** `consume_cert_volume` is consumed BEFORE `record_ric_cert`, so two
+  concurrent IDENTICAL RIC/ACC signs both meter the per-chain window for one logical certificate
+  (over-consumption *tightens* the breaker). Fix when revisited: consume on the record-winner path only.
+- **TOCTOU-2 (Low, availability):** the volume-window CAS (4-attempt ceiling) + bare
+  `connect(url)` (sqlx-default rollback journal, no WAL) make the single `(chain, window_start)` row
+  a hot write that can fail-closed (`Contention` → refused sign) under heavy same-window concurrency.
+- **TOCTOU-3 (Info):** the stores connect from bare URLs; the safety-critical write serialization
+  rides on sqlx's default `busy_timeout` (5 s) — correct today, but recommend pinning
+  `busy_timeout` + `journal_mode=WAL` explicitly via `connect_with` so a future URL/option change
+  cannot silently disable it. (Hardening, not a bug — current behavior is correct.)
+- **TOCTOU-4 (Info, not reachable today):** TRON has no per-account lock and no nonce; two drivers
+  straddling a `now_block()` change would build two distinct valid txIDs (no nonce to collide). The
+  TRON binary is a single-leg CLI (no concurrent loop), so unreachable now — a future TRON event-loop
+  driver MUST add a per-owner lock or a daemon `(chain, owner, redemption_id)` one-shot.
+- **TOCTOU-5 (Info):** Solana's `record→Duplicate` branch returns the freshly-signed sig instead of
+  re-reading the winner (benign — deterministic ed25519 ⇒ identical bytes; diverges from the L10
+  re-read pattern used elsewhere). Solana is off-chain-only + RA-2 hard-gated.
+
+No code change applied (no fund-critical bug; the Low/Info items are fail-closed or
+config-hardening where current behavior is already correct). TOCTOU-2/-3 (explicit
+`busy_timeout`/WAL) is the one worthwhile follow-up hardening if a dedicated pass is opened.
 
 ## When this file gets updated
 
