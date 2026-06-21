@@ -77,6 +77,35 @@ fn bind_send_to_cert(
     crate::server::bind_account_send_to_cert(to_address, amount, memo, cert)
 }
 
+/// CTD-1 (RUST-002): bound the Cosmos `Fee.amount` the account pays.
+/// [`bind_send_to_cert`] pins destination/amount/denom/memo but NOT the
+/// fee, and the amino sign-doc carries `fee_amount` verbatim — a
+/// compromised coordinator could otherwise set the fee to ~the whole
+/// account balance (deducted by the `DeductFeeDecorator`) and burn it under
+/// one valid certificate. Reject a fee above the per-chain cap, fail-closed,
+/// before the HSM (mirrors the BTC `enforce_change_and_fee` floor).
+fn enforce_cosmos_fee_cap(
+    chain: ChainId,
+    fee_amount: &str,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let fee: u128 = fee_amount.parse().map_err(|_| {
+        err(
+            error_codes::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
+            format!("fee_amount {fee_amount:?} is not a base-unit integer"),
+        )
+    })?;
+    let cap = u128::from(chain.max_redeem_fee_base_units());
+    if fee > cap {
+        return Err(err(
+            error_codes::COSMOS_FEE_EXCEEDS_CAP,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("fee {fee} exceeds per-chain cap {cap} (base units)"),
+        ));
+    }
+    Ok(())
+}
+
 /// Per-chain Cosmos signing role. One entry per Cosmos chain this daemon
 /// is a multisig member of (no cross-chain key sharing — DL-P3-7).
 #[derive(Debug, Clone)]
@@ -242,6 +271,8 @@ where
         &req.memo,
         &cert,
     )?;
+    // RUST-002: the cert binds the send, never the fee — cap it before the HSM.
+    enforce_cosmos_fee_cap(req.chain_id, &req.fee_amount)?;
 
     // 3. Recompute the amino sign-bytes hash and compare to the claim.
     let doc = CosmosSendSignDoc {
@@ -569,6 +600,35 @@ mod tests {
             .expect_err("err");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.code, error_codes::WRONG_COSMOS_ACCOUNT);
+    }
+
+    /// RUST-002: a fee above the per-chain cap is refused before the HSM,
+    /// even though destination/amount/denom/memo bind cleanly to the cert.
+    /// The Gaia cap is `1_000_000` uatom; the `DeductFeeDecorator` would burn
+    /// this fee from custody, so an uncapped fee drains the account.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn rejects_fee_above_cap() {
+        let (sk, signer, pubkey) = key_identity();
+        let st = state(pubkey, signer, sk);
+        let mut req = sample_request(expected_digest());
+        req.fee_amount = "2000000".to_string();
+        let (status, body) = handle_cosmos_tx(State(st), Json(req))
+            .await
+            .expect_err("fee above cap must be refused");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.code, error_codes::COSMOS_FEE_EXCEEDS_CAP);
+    }
+
+    #[test]
+    fn enforce_cosmos_fee_cap_boundaries() {
+        // Cap (Gaia = 1_000_000 uatom) passes; cap+1 is refused.
+        assert!(enforce_cosmos_fee_cap(ChainId::Gaia, "1000000").is_ok());
+        assert!(enforce_cosmos_fee_cap(ChainId::Gaia, "0").is_ok());
+        assert!(enforce_cosmos_fee_cap(ChainId::Gaia, "1000001").is_err());
+        // A non-numeric fee is malformed input, rejected (never blind-signed).
+        assert!(enforce_cosmos_fee_cap(ChainId::Gaia, "").is_err());
+        assert!(enforce_cosmos_fee_cap(ChainId::Gaia, "0x10").is_err());
     }
 
     #[tokio::test]

@@ -96,6 +96,7 @@ fn decode_transfer_log(
     log: &serde_json::Value,
     tip: u64,
     token: Address,
+    expected_to: Address,
 ) -> Result<Erc20Arrival, Erc20Error> {
     // Client-side emitter re-assert (audit I5): the node-side `address` filter
     // already binds the emitting contract to `token`, but a non-compliant RPC
@@ -108,6 +109,20 @@ fn decode_transfer_log(
     if !log_addr.eq_ignore_ascii_case(&format!("{token:#x}")) {
         return Err(Erc20Error::Rpc(format!(
             "log address {log_addr} != expected token {token:#x}"
+        )));
+    }
+    // Client-side recipient re-assert (RUST-006, mirrors the L6 redeem-side
+    // re-assert): the node-side topic filter already binds the `to` topic, but
+    // a non-compliant RPC could return a Transfer to a different recipient —
+    // never count it as a credit to `expected_to`.
+    let to_topic = log
+        .get("topics")
+        .and_then(|t| t.get(2))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| Erc20Error::Rpc("log missing to topic".into()))?;
+    if !to_topic.eq_ignore_ascii_case(&addr_topic(expected_to)) {
+        return Err(Erc20Error::Rpc(format!(
+            "log to topic {to_topic} != expected {expected_to:#x}"
         )));
     }
     let data = log
@@ -149,7 +164,7 @@ impl Erc20ArrivalClient for RpcErc20LogClient {
             .ok_or_else(|| Erc20Error::Rpc("getLogs result not array".into()))?;
         let mut out = Vec::with_capacity(arr.len());
         for log in arr {
-            out.push(decode_transfer_log(log, tip, token)?);
+            out.push(decode_transfer_log(log, tip, token, to)?);
         }
         Ok(out)
     }
@@ -182,12 +197,14 @@ mod tests {
     fn decode_transfer_log_value_and_confirmations() {
         // 70 USDT (1e6) = 70_000_000 = 0x42c1d80, block 100, tip 105 ⇒ 6 confs.
         let token = Address::from([0x11u8; 20]);
+        let to = Address::from([0x33u8; 20]);
         let log = json!({
             "address": format!("{token:#x}"),
+            "topics": [TRANSFER_TOPIC0, serde_json::Value::Null, addr_topic(to)],
             "data": "0x00000000000000000000000000000000000000000000000000000000042c1d80",
             "blockNumber": "0x64"
         });
-        let a = decode_transfer_log(&log, 105, token).expect("decode");
+        let a = decode_transfer_log(&log, 105, token, to).expect("decode");
         assert_eq!(a.value, 70_000_000);
         assert_eq!(a.confirmations, 6);
     }
@@ -198,13 +215,33 @@ mod tests {
     #[test]
     fn decode_transfer_log_rejects_foreign_token_address() {
         let token = Address::from([0x11u8; 20]);
+        let to = Address::from([0x33u8; 20]);
         let foreign = Address::from([0x22u8; 20]);
         let log = json!({
             "address": format!("{foreign:#x}"),
+            "topics": [TRANSFER_TOPIC0, serde_json::Value::Null, addr_topic(to)],
             "data": "0x00000000000000000000000000000000000000000000000000000000042c1d80",
             "blockNumber": "0x64"
         });
-        assert!(decode_transfer_log(&log, 105, token).is_err());
+        assert!(decode_transfer_log(&log, 105, token, to).is_err());
+    }
+
+    /// RUST-006: a Transfer log to a DIFFERENT recipient (a non-compliant RPC
+    /// ignoring the `to` topic filter) is rejected — mirrors the L6 redeem-side
+    /// re-assert. The emitter address is correct here, so only the `to` pin
+    /// catches it.
+    #[test]
+    fn decode_transfer_log_rejects_foreign_recipient() {
+        let token = Address::from([0x11u8; 20]);
+        let to = Address::from([0x33u8; 20]);
+        let other = Address::from([0x44u8; 20]);
+        let log = json!({
+            "address": format!("{token:#x}"),
+            "topics": [TRANSFER_TOPIC0, serde_json::Value::Null, addr_topic(other)],
+            "data": "0x00000000000000000000000000000000000000000000000000000000042c1d80",
+            "blockNumber": "0x64"
+        });
+        assert!(decode_transfer_log(&log, 105, token, to).is_err());
     }
 
     #[test]

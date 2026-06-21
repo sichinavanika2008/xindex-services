@@ -421,21 +421,35 @@ impl ChainId {
         }
     }
 
-    /// Daemon-side upper bound (sats) on the implied miner fee
-    /// (`Σ inputs − Σ outputs`) of a redemption spend, used by the UTXO
-    /// PSBT signer to bound a fee-burning grief (M2b partial floor): a
-    /// malicious coordinator that omits the change output would otherwise
-    /// burn the entire residue to miners. The honest redemption fee is
-    /// `tx_size × fee_rate` — a few hundred thousand sats even at extreme
-    /// congestion — so these ceilings are deliberately generous and never
-    /// reject an honest spend; they only cap how much can be destroyed.
-    /// **Tighten per-chain at the DL-P3-7 mainnet gate.** `u64::MAX`
-    /// (no cap) for non-UTXO chains, which have their own fee models and
-    /// never reach this path.
+    /// Daemon-side upper bound, in the chain's smallest fee unit, on the
+    /// fee a redemption spend may pay — the cross-family analogue of the
+    /// BTC M2b floor. For UTXO chains it bounds the implied miner fee
+    /// (`Σ inputs − Σ outputs`, unit = sats); for the account families it
+    /// bounds the explicit fee field the spend carries (Cosmos `Fee.amount`
+    /// in the native fee denom, XRP `Fee` in drops). RUST-002: those fees
+    /// are deducted/burned FROM custody and are NOT covered by the CTD-1
+    /// destination/amount/memo binds, so without this cap a compromised
+    /// coordinator could set the fee to ~the whole account balance and
+    /// destroy it under one otherwise-valid certificate. The honest fee is
+    /// tiny in every case, so these ceilings are deliberately generous and
+    /// never reject an honest spend; they only cap how much can be
+    /// destroyed. **Tighten per-chain at the DL-P3-7 mainnet gate.**
+    ///
+    /// `u64::MAX` (no cap) for the EVM-Safe family (gas is paid by the
+    /// submitting EOA, not the Safe — AUD-EVMSAFE-1) and for Solana/TRON
+    /// (no coordinator-chosen, custody-funded fee field: the SOL fee is
+    /// paid by the relayer fee-payer, TRON spends metered bandwidth/energy).
     #[must_use]
-    pub const fn max_redeem_fee_sats(self) -> u64 {
+    pub const fn max_redeem_fee_base_units(self) -> u64 {
         match self {
-            Self::Btc => 1_000_000,
+            // 1e6 of each chain's smallest fee unit — coincident value,
+            // distinct meaning (see the UTXO-vs-account split above). BTC:
+            // 0.01 BTC of implied UTXO miner fee (sats, the M2b floor unit).
+            // Account families (RUST-002): 1 major unit of explicit
+            // custody-funded fee (1 ATOM / 1 USDC / 1 XRP = 1e6 uatom / uusdc
+            // / drops). Far above any honest fee, so an honest spend is never
+            // rejected; it only caps how much one spend can drain.
+            Self::Btc | Self::Gaia | Self::Noble | Self::Xrp => 1_000_000,
             Self::Ltc | Self::Bch | Self::Zec => 5_000_000,
             Self::Doge => 1_000_000_000,
             Self::Eth
@@ -443,9 +457,6 @@ impl ChainId {
             | Self::Avax
             | Self::Base
             | Self::Pol
-            | Self::Gaia
-            | Self::Noble
-            | Self::Xrp
             | Self::Sol
             | Self::Tron => u64::MAX,
         }
@@ -806,22 +817,27 @@ mod tests {
         assert_eq!(ChainId::Tron.op_return_max(), 0);
     }
 
-    /// M2b fee ceiling: a generous per-UTXO-chain bound on the implied
-    /// miner fee (never rejects an honest redeem; caps a fee-burn grief);
-    /// `u64::MAX` (no cap) for non-UTXO chains that never reach the PSBT
-    /// fee check.
+    /// M2b / RUST-002 fee ceiling: a generous per-chain bound on the fee a
+    /// redemption may pay in the chain's smallest unit (never rejects an
+    /// honest redeem; caps a fee-burn grief). Real caps for the UTXO chains
+    /// AND the account families that pay a custody-funded fee (Gaia/Noble in
+    /// uatom/uusdc, XRP in drops); `u64::MAX` (no cap) for EVM-Safe (EOA pays
+    /// gas) and Solana/TRON (no custody-funded fee field).
     #[test]
-    fn max_redeem_fee_sats_per_chain() {
-        assert_eq!(ChainId::Btc.max_redeem_fee_sats(), 1_000_000);
-        assert_eq!(ChainId::Ltc.max_redeem_fee_sats(), 5_000_000);
-        assert_eq!(ChainId::Bch.max_redeem_fee_sats(), 5_000_000);
-        assert_eq!(ChainId::Doge.max_redeem_fee_sats(), 1_000_000_000);
-        assert_eq!(ChainId::Zec.max_redeem_fee_sats(), 5_000_000);
-        assert_eq!(ChainId::Eth.max_redeem_fee_sats(), u64::MAX);
-        assert_eq!(ChainId::Gaia.max_redeem_fee_sats(), u64::MAX);
-        assert_eq!(ChainId::Xrp.max_redeem_fee_sats(), u64::MAX);
-        assert_eq!(ChainId::Sol.max_redeem_fee_sats(), u64::MAX);
-        assert_eq!(ChainId::Tron.max_redeem_fee_sats(), u64::MAX);
+    fn max_redeem_fee_base_units_per_chain() {
+        assert_eq!(ChainId::Btc.max_redeem_fee_base_units(), 1_000_000);
+        assert_eq!(ChainId::Ltc.max_redeem_fee_base_units(), 5_000_000);
+        assert_eq!(ChainId::Bch.max_redeem_fee_base_units(), 5_000_000);
+        assert_eq!(ChainId::Doge.max_redeem_fee_base_units(), 1_000_000_000);
+        assert_eq!(ChainId::Zec.max_redeem_fee_base_units(), 5_000_000);
+        assert_eq!(ChainId::Eth.max_redeem_fee_base_units(), u64::MAX);
+        // RUST-002: account families with a custody-funded fee field, now capped.
+        assert_eq!(ChainId::Gaia.max_redeem_fee_base_units(), 1_000_000);
+        assert_eq!(ChainId::Noble.max_redeem_fee_base_units(), 1_000_000);
+        assert_eq!(ChainId::Xrp.max_redeem_fee_base_units(), 1_000_000);
+        // No custody-funded fee field → no cap.
+        assert_eq!(ChainId::Sol.max_redeem_fee_base_units(), u64::MAX);
+        assert_eq!(ChainId::Tron.max_redeem_fee_base_units(), u64::MAX);
     }
 
     /// Fee unit per `SegWit` availability. BCH/DOGE/ZEC have no

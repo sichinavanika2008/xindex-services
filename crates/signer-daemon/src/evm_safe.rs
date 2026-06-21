@@ -164,7 +164,12 @@ fn parse_operation(op: u8) -> Result<SafeOperation, (StatusCode, Json<ErrorBody>
 ///     Safe TAKEOVER (add an owner / sweep every asset), far beyond a drain;
 ///   - a non-zero `gas_price`/`gas_token`/`refund_receiver` → the Safe pays
 ///     `gasPrice·gasUsed` of `gasToken` to `refundReceiver`, a value-extraction
-///     channel orthogonal to the `to`/`value`/`data` destination.
+///     channel orthogonal to the `to`/`value`/`data` destination;
+///   - a non-zero `safe_tx_gas`/`base_gas` (RUST-007) → fields of the fixed
+///     honest template left unpinned. No direct drain (the value channel above
+///     is already closed by `gasPrice == 0`), but a free `safe_tx_gas` flips the
+///     Safe `GS013` guard so a failed inner call burns the nonce instead of
+///     reverting; pinning both to zero keeps "floor == honest template" total.
 ///
 /// `to`/`value`/`data` remain coordinator-supplied — the destination residual
 /// the RIC fix closes (CTD-1). This floor is the necessary-but-not-sufficient
@@ -180,11 +185,14 @@ fn enforce_evm_safe_floor(tx: &SafeTransaction) -> Result<(), (StatusCode, Json<
     if !tx.gas_price.is_zero()
         || tx.gas_token != Address::ZERO
         || tx.refund_receiver != Address::ZERO
+        || !tx.safe_tx_gas.is_zero()
+        || !tx.base_gas.is_zero()
     {
         return Err(err(
             error_codes::EVM_SAFE_GAS_REFUND_FORBIDDEN,
             StatusCode::UNPROCESSABLE_ENTITY,
-            "gas_price/gas_token/refund_receiver must all be zero (no Safe-side refund in Phase 3.2)",
+            "safe_tx_gas/base_gas/gas_price/gas_token/refund_receiver must all be zero \
+             (the honest redemption template pins every gas field to 0)",
         ));
     }
     Ok(())
@@ -622,6 +630,27 @@ mod tests {
         let mut tx = honest_safe_tx();
         tx.refund_receiver = Address::repeat_byte(0x11);
         let e = enforce_evm_safe_floor(&tx).expect_err("non-zero refund_receiver must be rejected");
+        assert_eq!(e.1.code, error_codes::EVM_SAFE_GAS_REFUND_FORBIDDEN);
+    }
+
+    /// RUST-007: `safe_tx_gas`/`base_gas` are part of the honest fixed
+    /// template (both 0); the floor must reject a coordinator that varies
+    /// them so "floor == honest template" stays total.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn floor_rejects_nonzero_safe_tx_gas() {
+        let mut tx = honest_safe_tx();
+        tx.safe_tx_gas = U256::from(100_000u64);
+        let e = enforce_evm_safe_floor(&tx).expect_err("non-zero safe_tx_gas must be rejected");
+        assert_eq!(e.1.code, error_codes::EVM_SAFE_GAS_REFUND_FORBIDDEN);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn floor_rejects_nonzero_base_gas() {
+        let mut tx = honest_safe_tx();
+        tx.base_gas = U256::from(21_000u64);
+        let e = enforce_evm_safe_floor(&tx).expect_err("non-zero base_gas must be rejected");
         assert_eq!(e.1.code, error_codes::EVM_SAFE_GAS_REFUND_FORBIDDEN);
     }
 }

@@ -623,7 +623,7 @@ fn veto_outputs(
 ///    address, nor burn value through a funded `OP_RETURN` (whose value
 ///    the fee check below would not see as fee).
 /// 2. **Fee cap**: the implied miner fee `Σ inputs − Σ outputs` must be
-///    ≤ [`ChainId::max_redeem_fee_sats`]. Stops the "omit change → residue
+///    ≤ [`ChainId::max_redeem_fee_base_units`]. Stops the "omit change → residue
 ///    burned as fee" grief. Every input must carry a `witness_utxo` or the
 ///    fee cannot be bounded (the single-input redeem path always does).
 ///
@@ -691,7 +691,7 @@ fn enforce_change_and_fee(
             "outputs exceed inputs (negative fee)",
         )
     })?;
-    if fee > req.chain_id.max_redeem_fee_sats() {
+    if fee > req.chain_id.max_redeem_fee_base_units() {
         return Err(err(
             error_codes::PSBT_FEE_EXCEEDS_CAP,
             StatusCode::UNPROCESSABLE_ENTITY,

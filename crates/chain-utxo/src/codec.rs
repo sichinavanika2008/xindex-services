@@ -275,7 +275,7 @@ impl UtxoAddressCodec for LtcCodec {
         })
     }
     fn decode(&self, addr: &str) -> Result<ScriptBuf, CodecError> {
-        let (hrp, _witver, program) =
+        let (hrp, witver, program) =
             bech32::segwit::decode(addr).map_err(|e| CodecError::Decode {
                 chain: ChainId::Ltc,
                 msg: e.to_string(),
@@ -284,6 +284,20 @@ impl UtxoAddressCodec for LtcCodec {
             return Err(CodecError::Decode {
                 chain: ChainId::Ltc,
                 msg: format!("HRP mismatch: expected {}, got {hrp}", self.hrp()),
+            });
+        }
+        // RUST-005: pin witness v0. `bech32::segwit::decode` also accepts v1+
+        // (Taproot `ltc1p…`, bech32m), and a 32-byte v1 program would otherwise
+        // be silently re-encoded as a v0 P2WSH scriptPubKey — the WRONG script
+        // (funds locked / unspendable). Our LTC custody is P2WSH v0; reject any
+        // other version rather than mis-encode it.
+        if witver.to_u8() != 0 {
+            return Err(CodecError::UnsupportedScript {
+                chain: ChainId::Ltc,
+                msg: format!(
+                    "witness v{} unsupported; LTC custody is P2WSH v0",
+                    witver.to_u8()
+                ),
             });
         }
         if program.len() != 32 {
@@ -665,6 +679,24 @@ mod tests {
             .expect("btc encode");
         let err = codec.decode(&btc_addr).unwrap_err();
         assert!(matches!(err, CodecError::Decode { .. }));
+    }
+
+    /// RUST-005: a valid v1 (Taproot) `ltc1p…` address must be REJECTED, not
+    /// silently mis-encoded as a v0 P2WSH script. `bech32::segwit::decode`
+    /// accepts the v1 32-byte program + bech32m checksum; the decode-version
+    /// pin is what refuses it.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn ltc_decode_rejects_taproot_v1() {
+        let codec = LtcCodec::mainnet();
+        let program = [0x42u8; 32];
+        let v1 = bech32::segwit::encode_v1(codec.hrp(), &program).expect("encode v1");
+        assert!(
+            v1.starts_with("ltc1p"),
+            "v1 address should be ltc1p…, got {v1}"
+        );
+        let err = codec.decode(&v1).expect_err("v1 must be rejected");
+        assert!(matches!(err, CodecError::UnsupportedScript { .. }));
     }
 
     // ─── BCH ───────────────────────────────────────────────────────────

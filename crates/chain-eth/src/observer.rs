@@ -762,10 +762,12 @@ fn validate_facts(facts: &LegFacts) -> Result<(), ObserverError> {
 
 /// CTD-1 Slice C tail: enforce the swap-back memo grammar and pin its
 /// destination to THIS operator's configured recovery address. The memo
-/// is proposer-built (the executor needs control of e.g. the limit
-/// field), but a memo that pays anywhere except the pinned recovery
-/// sink is refused — the coordinator cannot steer the swapped-back
-/// USDT. Strict by design: `=:<asset>:<recovery>[:…]`, ≤ 80 bytes.
+/// is proposer-built (the executor needs control of the limit field),
+/// but a memo that pays anywhere except the pinned recovery sink is
+/// refused — the coordinator cannot steer the swapped-back USDT. Strict
+/// AND total (RUST-001): `=:<asset>:<recovery>[:<lim>]` ONLY — at most 4
+/// colon-fields, so no `THORChain` affiliate (field 4 = `THORName`, field 5 =
+/// fee bps) or dex-aggregator (fields 6-8) field can ride along. ≤ 80 bytes.
 fn validate_swap_back_memo(
     memo: &str,
     swap_back_asset: &str,
@@ -798,6 +800,22 @@ fn validate_swap_back_memo(
     if !dest.eq_ignore_ascii_case(&expected) {
         return Err(ObserverError::MemoRejected(format!(
             "destination {dest:?} != pinned recovery {expected}"
+        )));
+    }
+    // RUST-001 (audit 2026-06-20): the grammar is TOTAL, not prefix-only.
+    // Field 3 (LIM / `lim/interval/quantity` stream spec) is executor-
+    // controlled but only affects slippage — it can grief a refund, never
+    // redirect funds. Everything past it CAN steer the swap output away
+    // from the pinned recovery sink: THORChain parses field 4 = affiliate
+    // THORName/address and field 5 = affiliate fee bps capped at 100%
+    // (`constants.MaxBasisPts` = 10_000), plus dex-aggregator fields 6-8. So
+    // `=:ETH.USDT:<recovery>:0:<attacker>:10000` would skim 100% to an
+    // attacker affiliate while the visible destination stays honest. Cap at
+    // 4 colon-fields to make affiliate/dex injection impossible.
+    let _lim = parts.next();
+    if parts.next().is_some() {
+        return Err(ObserverError::MemoRejected(format!(
+            "swap-back memo carries affiliate/dex fields (> 4 colon-fields): {memo:?}"
         )));
     }
     Ok(())
@@ -1446,6 +1464,83 @@ mod tests {
             .await
             .expect_err("must refuse");
         assert_eq!(err.error_code(), error_codes::OBSERVER_MEMO_REJECTED);
+    }
+
+    /// RUST-001 regression (external audit 2026-06-20): a swap-back memo
+    /// whose VISIBLE destination IS the pinned recovery sink but which
+    /// appends a `THORChain` affiliate field —
+    /// `=:ETH.USDT:<recovery>:0:<attacker_thorname>:10000` — must be
+    /// REJECTED. Per `THORNode` `x/thorchain/memo/memo_swap.go` the affiliate
+    /// is field 4 and the fee bps is field 5, capped at
+    /// `constants.MaxBasisPts = 10_000` (= 100%); `THORChain` skims that fee
+    /// from the swap output to the affiliate. Before the fix the validator
+    /// pinned only fields 0-2 and ignored 4+, so a compromised coordinator
+    /// could redirect up to 100% of the recovered USDT with NO operator-key
+    /// compromise (redirectable THEFT, defeating the Slice-C "coordinator
+    /// cannot steer the swapped-back USDT" invariant). The fix caps the memo
+    /// at 4 colon-fields; both the validator and the end-to-end certify path
+    /// now refuse it. Contrast `acc_memo_wrong_asset_rejected`: there the
+    /// destination/asset check fires; here the theft rode the affiliate field.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn rust001_affiliate_skim_memo_rejected() {
+        let a = btc_source(ASGARD_BTC, false).await;
+        let b = btc_source(ASGARD_BTC, false).await;
+        let observer = Observer::new(
+            config(),
+            agreement(&[&a, &b]),
+            FakeLegs {
+                facts: None,
+                observed_at: NOW,
+            },
+            signer(),
+            NeverHalted,
+        );
+        observed_cancel(&observer, NOW);
+
+        let malicious = format!("=:ETH.USDT:{:#x}:0:attacker:10000", recovery());
+        assert!(
+            malicious.len() <= MAX_MEMO_BYTES,
+            "affiliate-skim memo fits the OP_RETURN cap ({} bytes)",
+            malicious.len()
+        );
+
+        // (1) The validator refuses the affiliate-skim memo outright.
+        assert!(
+            validate_swap_back_memo(&malicious, "ETH.USDT", recovery()).is_err(),
+            "validate_swap_back_memo must reject a 100%-affiliate-skim memo"
+        );
+
+        // (2) End-to-end: certify_acc refuses to sign an ACC over it, so the
+        // 100% affiliate skim can never reach a custody daemon.
+        let err = observer
+            .certify_acc(&acc_req(malicious), NOW)
+            .await
+            .expect_err("affiliate-skim memo must be rejected");
+        assert_eq!(err.error_code(), error_codes::OBSERVER_MEMO_REJECTED);
+    }
+
+    /// RUST-001 must NOT over-reject: the executor legitimately controls the
+    /// LIM (field 3), including a streaming `lim/interval/quantity` spec
+    /// (slash-separated, so still ONE colon-field). Both the bare
+    /// `=:<asset>:<recovery>` and a 4-field streaming memo are accepted, while
+    /// a stray 5th colon-field is refused.
+    #[test]
+    fn rust001_lim_and_streaming_memo_accepted() {
+        let no_lim = format!("=:ETH.USDT:{:#x}", recovery());
+        assert!(validate_swap_back_memo(&no_lim, "ETH.USDT", recovery()).is_ok());
+
+        let streamed = format!("=:ETH.USDT:{:#x}:120/3/10", recovery());
+        assert!(
+            validate_swap_back_memo(&streamed, "ETH.USDT", recovery()).is_ok(),
+            "a streaming LIM spec is one colon-field and must be allowed"
+        );
+
+        let extra = format!("=:ETH.USDT:{:#x}:0:", recovery());
+        assert!(
+            validate_swap_back_memo(&extra, "ETH.USDT", recovery()).is_err(),
+            "a 5th colon-field (even empty) must be refused"
+        );
     }
 
     #[tokio::test]

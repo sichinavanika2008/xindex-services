@@ -135,6 +135,27 @@ fn build_payment_body(
     ))
 }
 
+/// CTD-1 (RUST-002): bound the XRP `Fee` (drops) the account pays. The RIC
+/// bind pins destination/amount/memo but NOT the fee, which the ledger
+/// burns from custody — without a cap a compromised coordinator could set
+/// it to ~the whole balance and destroy it under one valid certificate.
+/// Reject a fee above the per-chain cap, fail-closed, before the HSM
+/// (mirrors the BTC `enforce_change_and_fee` floor).
+fn enforce_xrp_fee_cap(
+    chain: ChainId,
+    fee_drops: u64,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    let cap = chain.max_redeem_fee_base_units();
+    if fee_drops > cap {
+        return Err(err(
+            error_codes::XRP_FEE_EXCEEDS_CAP,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("fee {fee_drops} drops exceeds per-chain cap {cap} drops"),
+        ));
+    }
+    Ok(())
+}
+
 fn render(pubkey: [u8; 33], der: &[u8]) -> XrpSignResponse {
     XrpSignResponse {
         pubkey: format!("0x{}", alloy_primitives::hex::encode(pubkey)),
@@ -211,6 +232,8 @@ where
 
     // 3. Re-serialize the canonical Payment body and compare to the claim.
     let (body_inputs, sequence) = build_payment_body(&req)?;
+    // RUST-002: the cert binds the send, never the fee — cap it before the HSM.
+    enforce_xrp_fee_cap(req.chain_id, body_inputs.fee_drops)?;
     let body = serialize_for_multisign(&body_inputs).map_err(|e| bad("payment body", e))?;
     let claimed = {
         let s = req
@@ -497,6 +520,29 @@ mod tests {
         let (status, body) = handle_xrp_tx(State(st), Json(req)).await.expect_err("err");
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(body.code, error_codes::WRONG_XRP_ACCOUNT);
+    }
+
+    /// RUST-002: an XRP `Fee` above the per-chain cap is refused before the
+    /// HSM, even though destination/amount/memo bind cleanly to the cert.
+    /// The Xrp cap is `1_000_000` drops; the ledger burns this fee from
+    /// custody, so an uncapped fee drains the account.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn rejects_fee_above_cap() {
+        let (sk, signer, pubkey) = key_identity(7);
+        let (account, mut req) = sample(pubkey);
+        req.fee_drops = "2000000".to_string();
+        let st = state(account, pubkey, signer, sk);
+        let (status, body) = handle_xrp_tx(State(st), Json(req)).await.expect_err("err");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body.code, error_codes::XRP_FEE_EXCEEDS_CAP);
+    }
+
+    #[test]
+    fn enforce_xrp_fee_cap_boundaries() {
+        assert!(enforce_xrp_fee_cap(ChainId::Xrp, 1_000_000).is_ok());
+        assert!(enforce_xrp_fee_cap(ChainId::Xrp, 0).is_ok());
+        assert!(enforce_xrp_fee_cap(ChainId::Xrp, 1_000_001).is_err());
     }
 
     #[tokio::test]

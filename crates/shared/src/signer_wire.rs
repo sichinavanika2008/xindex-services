@@ -1297,10 +1297,24 @@ pub mod error_codes {
     pub const PSBT_UNEXPECTED_OUTPUT: &str = "psbt_unexpected_output";
     /// Audit M2b (partial floor): the implied miner fee
     /// (`Σ inputs − Σ outputs`) exceeds the per-chain
-    /// `ChainId::max_redeem_fee_sats` ceiling, or an input was missing a
-    /// `witness_utxo` so the fee could not be bounded. Stops a malicious
+    /// `ChainId::max_redeem_fee_base_units` ceiling, or an input was missing
+    /// a `witness_utxo` so the fee could not be bounded. Stops a malicious
     /// coordinator from burning the residue as an unbounded fee. HTTP 422.
     pub const PSBT_FEE_EXCEEDS_CAP: &str = "psbt_fee_exceeds_cap";
+    /// RUST-002: the Cosmos `Fee.amount` on a redemption spend exceeds the
+    /// per-chain `ChainId::max_redeem_fee_base_units` ceiling. The fee is
+    /// deducted from custody by the `DeductFeeDecorator` and is NOT covered
+    /// by the CTD-1 destination/amount/denom/memo binds, so an uncapped fee
+    /// would let a compromised coordinator burn the whole account under one
+    /// valid certificate. HTTP 422.
+    pub const COSMOS_FEE_EXCEEDS_CAP: &str = "cosmos_fee_exceeds_cap";
+    /// RUST-002: the XRP `Fee` (drops) on a redemption spend exceeds the
+    /// per-chain `ChainId::max_redeem_fee_base_units` ceiling. The fee is
+    /// burned from custody by the ledger and is NOT covered by the CTD-1
+    /// destination/amount/memo binds, so an uncapped fee would let a
+    /// compromised coordinator burn the whole account under one valid
+    /// certificate. HTTP 422.
+    pub const XRP_FEE_EXCEEDS_CAP: &str = "xrp_fee_exceeds_cap";
     /// EVM-Safe CTD-1 family floor: the Safe-tx `operation` was
     /// `DelegateCall` (1). An honest redemption always uses `Call` (0); a
     /// `DelegateCall` would execute arbitrary code in the Safe's own
