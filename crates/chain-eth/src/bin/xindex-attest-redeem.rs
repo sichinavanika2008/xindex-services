@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use alloy::signers::local::PrivateKeySigner;
@@ -37,6 +37,7 @@ use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
 use xindex_chain_eth::RpcErc20LogClient;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::EsploraClient;
+use xindex_shared::consumed_inflow::AnyConsumedInflow;
 use xindex_shared::eip712::{
     attestation_oracle_domain, redemption_attestation, refund_attestation, streamed_settlement,
 };
@@ -246,7 +247,7 @@ type CrossChecks = (
     Option<StreamedGate>,
 );
 
-fn build_cross_checks(args: &Args) -> Result<CrossChecks> {
+fn build_cross_checks(args: &Args, store: &Arc<AnyConsumedInflow>) -> Result<CrossChecks> {
     match args.cross_check_mode {
         CrossCheckMode::PassThrough => Ok((
             Arc::new(PassThroughRedemption {
@@ -299,6 +300,7 @@ fn build_cross_checks(args: &Args) -> Result<CrossChecks> {
                 usdt,
                 args.eth_min_confirmations,
                 args.usdt_tolerance_1e6,
+                Arc::clone(store),
             );
             let refund = ThorUtxoRefundPolicy::new(
                 thor.clone(),
@@ -321,6 +323,7 @@ fn build_cross_checks(args: &Args) -> Result<CrossChecks> {
                 streamed_confs,
                 args.usdt_tolerance_1e6,
                 args.btc_tolerance_sats,
+                Arc::clone(store),
             );
             Ok((
                 Arc::new(delivery),
@@ -406,6 +409,8 @@ async fn try_settle_streamed(
     cc: &dyn StreamedSettlementCrossCheck,
     btc_txid: &str,
     index_token: Address,
+    redemption_id: B256,
+    leg_index: u32,
 ) -> StreamedGateResult {
     let stages = match thor.tx_status_stages(btc_txid).await {
         Ok(s) => s,
@@ -428,7 +433,10 @@ async fn try_settle_streamed(
         info!("streaming swap not yet finalised — deferring settlement (finality gate)");
         return StreamedGateResult::Defer;
     }
-    match cc.verify(btc_txid, index_token).await {
+    match cc
+        .verify(btc_txid, index_token, redemption_id, leg_index)
+        .await
+    {
         Ok(outcome) => StreamedGateResult::Settle(outcome),
         Err(e) => {
             warn!(error = %e, "streamed cross-check not ready; retry on backfill");
@@ -461,9 +469,17 @@ async fn run(args: Args) -> Result<()> {
         );
     }
 
+    // RUST-004 consumed-inflow ledger — same sqlite DB as the F2 dispatch
+    // store (REDEMPTION_DATABASE_URL); in-memory in dev. Shared across the
+    // delivery + streamed policies so a physical USDT inflow is credited once.
+    let inflow_store = Arc::new(
+        AnyConsumedInflow::connect(args.redemption_database_url.as_deref())
+            .await
+            .context("connect consumed-inflow ledger")?,
+    );
     let args_cc = args.clone();
     let (delivery_cc, refund_cc, streamed) =
-        tokio::task::spawn_blocking(move || build_cross_checks(&args_cc))
+        tokio::task::spawn_blocking(move || build_cross_checks(&args_cc, &inflow_store))
             .await
             .context("build_cross_checks task")?
             .context("build cross-checks")?;
@@ -585,7 +601,16 @@ async fn run(args: Args) -> Result<()> {
         // finalised. Attesting mid-stream would settle a partial fill and
         // under-credit the user; the gate defers until finalisation.
         if let Some((streamed_cc, thor)) = streamed.as_ref() {
-            match try_settle_streamed(thor, streamed_cc.as_ref(), &btc_txid, index_token).await {
+            match try_settle_streamed(
+                thor,
+                streamed_cc.as_ref(),
+                &btc_txid,
+                index_token,
+                rid,
+                leg_index_u32,
+            )
+            .await
+            {
                 // Not a streaming swap — fall through to the delivery/refund XOR.
                 StreamedGateResult::NotStreaming => {}
                 // Streaming, but not yet final / cross-check not ready — defer.
@@ -646,7 +671,10 @@ async fn run(args: Args) -> Result<()> {
 
         // Delivery first; the policy returns RefundedInstead if a
         // REFUND outbound is present (mutual exclusion, memo-based).
-        match delivery_cc.verify(&btc_txid, index_token).await {
+        match delivery_cc
+            .verify(&btc_txid, index_token, rid, leg_index_u32)
+            .await
+        {
             Ok(usdt_1e6) => {
                 let amount = U256::from(usdt_1e6);
                 let payload = redemption_attestation(rid, leg_index, asset_id, amount);

@@ -6,6 +6,7 @@
 //! (writer) and signer (reader).
 
 pub mod chain_registry;
+pub mod consumed_inflow;
 pub mod eip712;
 pub mod price_aggregate;
 pub mod redemption_dispatch;

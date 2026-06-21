@@ -28,7 +28,9 @@
 //! the "`THORChain` not done yet" path, and the "BTC not confirmed yet"
 //! path without any network access.
 
-use alloy_primitives::Address as EthAddress;
+use std::sync::Arc;
+
+use alloy_primitives::{Address as EthAddress, B256};
 use async_trait::async_trait;
 use bitcoin::{Address, Amount, Network};
 use thiserror::Error;
@@ -36,6 +38,9 @@ use tracing::{info, warn};
 
 use xindex_chain_thor::{ThorClient, ThorError, TxResponse};
 use xindex_chain_utxo::{find_arrival, UtxoChainClient, UtxoError};
+use xindex_shared::consumed_inflow::{
+    AnyConsumedInflow, ConsumedInflowError, ConsumedInflowStore, InflowConsumeOutcome,
+};
 
 /// Errors surfaced by the cross-check.
 #[derive(Debug, Error)]
@@ -276,6 +281,41 @@ pub struct Erc20Arrival {
     pub value: u128,
     /// Confirmation depth of the transfer's log at the current tip.
     pub confirmations: u32,
+    /// Hash of the transaction the `Transfer` log was emitted in. Bound 1:1
+    /// against the `THORChain` OBSERVED outbound hash (RUST-004) so an arrival
+    /// from an unrelated transaction can never be credited.
+    pub transaction_hash: B256,
+    /// Index of the `Transfer` log within its transaction. Together with
+    /// `transaction_hash` it identifies the physical inflow uniquely — a
+    /// batched outbound tx can emit several `Transfer` logs to the same
+    /// address, and each must be consumed by at most one redemption leg.
+    pub log_index: u64,
+}
+
+/// The 1:1 binding context for a consumed ERC20 inflow (RUST-004): which
+/// redemption leg is claiming it, and the `THORChain` OBSERVED outbound hash
+/// the on-chain `Transfer` must originate from.
+#[derive(Debug, Clone, Copy)]
+pub struct InflowBinding {
+    /// On-chain `redemptionId` the cross-check is attesting.
+    pub redemption_id: B256,
+    /// Per-leg index within that redemption.
+    pub leg_index: u32,
+    /// `THORChain` OBSERVED outbound tx hash (from `tx/details` `out_txs`) that
+    /// delivered the USDT. The on-chain `Transfer.transaction_hash` must equal
+    /// this.
+    pub expected_outbound_hash: B256,
+}
+
+/// Error from confirming + consuming an ERC20 inflow (RUST-004): either the
+/// arrival backend ([`Erc20Error`]) or the consumed-inflow ledger
+/// ([`ConsumedInflowError`]) failed.
+#[derive(Debug, Error)]
+pub enum InflowError {
+    #[error("eth arrival error: {0}")]
+    Eth(#[from] Erc20Error),
+    #[error("consumed-inflow ledger error: {0}")]
+    Ledger(#[from] ConsumedInflowError),
 }
 
 /// Error from the ERC20 arrival backend (kept separate from the policy
@@ -306,22 +346,110 @@ pub trait Erc20ArrivalClient: Send + Sync {
     ) -> Result<Vec<Erc20Arrival>, Erc20Error>;
 }
 
-/// Mirror of `find_arrival` for an ERC20 credit: first transfer with
-/// `value ≥ min_value` and `confirmations ≥ min_confs`.
+/// Confirm a USDT inflow AND make it single-use (RUST-004). The first
+/// `Transfer` to `to` that (1) clears `value ≥ min_value`, (2) is at least
+/// `min_confs` deep, (3) was emitted by the `THORChain` OBSERVED outbound tx
+/// (`binding.expected_outbound_hash`), AND (4) is not already consumed by a
+/// DIFFERENT redemption leg is returned — and atomically recorded as
+/// consumed by `binding`'s leg. A physical inflow already claimed by another
+/// leg is skipped; if none qualifies, `Ok(None)`.
 ///
 /// # Errors
-/// Forwards [`Erc20Error`] from the backend.
-pub fn confirm_erc20_arrival<E: Erc20ArrivalClient>(
+/// [`InflowError::Eth`] from the arrival backend; [`InflowError::Ledger`]
+/// from the consumed-inflow store.
+pub async fn confirm_erc20_arrival<E: Erc20ArrivalClient>(
     client: &E,
+    store: &AnyConsumedInflow,
     token: EthAddress,
     to: EthAddress,
     min_value: u128,
     min_confs: u32,
-) -> Result<Option<Erc20Arrival>, Erc20Error> {
-    Ok(client
-        .transfers_to(token, to)?
-        .into_iter()
-        .find(|a| a.value >= min_value && a.confirmations >= min_confs))
+    binding: &InflowBinding,
+) -> Result<Option<Erc20Arrival>, InflowError> {
+    for arrival in client.transfers_to(token, to)? {
+        if arrival.value >= min_value
+            && arrival.confirmations >= min_confs
+            && arrival.transaction_hash == binding.expected_outbound_hash
+            && claim_inflow(store, binding, arrival.transaction_hash, arrival.log_index).await?
+        {
+            return Ok(Some(arrival));
+        }
+    }
+    Ok(None)
+}
+
+/// Try to claim a physical inflow `(tx_hash, log_index)` for `binding`'s leg.
+/// `Ok(true)` = claimed (newly or already by us) → credit it; `Ok(false)` =
+/// a DIFFERENT leg already consumed it → skip (RUST-004 double-credit guard).
+///
+/// # Errors
+/// [`ConsumedInflowError`] if the ledger query fails.
+async fn claim_inflow(
+    store: &AnyConsumedInflow,
+    binding: &InflowBinding,
+    tx_hash: B256,
+    log_index: u64,
+) -> Result<bool, ConsumedInflowError> {
+    match store
+        .consume_inflow(binding.redemption_id, binding.leg_index, tx_hash, log_index)
+        .await?
+    {
+        InflowConsumeOutcome::Consumed | InflowConsumeOutcome::AlreadyByThisLeg => Ok(true),
+        InflowConsumeOutcome::ConflictByOtherLeg {
+            existing_redemption_id,
+            existing_leg_index,
+        } => {
+            warn!(
+                redemption_id = %binding.redemption_id,
+                leg_index = binding.leg_index,
+                %tx_hash,
+                log_index,
+                %existing_redemption_id,
+                existing_leg_index,
+                "USDT inflow already consumed by another redemption leg — skipping (RUST-004)"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Parse a `THORChain` tx id (`Tx.id`: uppercase hex, no `0x`, 64 chars) into a
+/// [`B256`] for comparison with an on-chain `0x`-hex `transaction_hash`. Case-
+/// and prefix-insensitive; `None` if it is not exactly 32 bytes of hex.
+fn parse_thor_hash(s: &str) -> Option<B256> {
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = alloy_primitives::hex::decode(s).ok()?;
+    B256::try_from(bytes.as_slice()).ok()
+}
+
+/// RUST-004: resolve the `THORChain` OBSERVED outbound ETH tx hash that
+/// delivered USDT to `index_token`, from the `tx/details` view (its `out_txs`
+/// carry the on-chain hash; the `tx_status` `actions` are PLANNED outbounds
+/// with none). `Ok(None)` while no observed ETH outbound to `index_token`
+/// exists yet (retry, not fail).
+///
+/// # Errors
+/// Forwards [`ThorError`] from the `tx/details` RPC.
+async fn observed_usdt_outbound_hash(
+    thor: &ThorClient,
+    inbound_hash: &str,
+    index_token: EthAddress,
+) -> Result<Option<B256>, ThorError> {
+    let details = thor.tx_details(inbound_hash).await?;
+    let want = eth_addr_lc(index_token);
+    Ok(details.out_txs.iter().find_map(|o| {
+        if o.chain == "ETH" && o.to_address.to_lowercase() == want {
+            parse_thor_hash(&o.id)
+        } else {
+            None
+        }
+    }))
 }
 
 #[derive(Debug, Error)]
@@ -341,6 +469,18 @@ pub enum RedemptionCrossCheckError {
     /// queue makes the two mutually exclusive).
     #[error("`THORChain` refunded (not delivered) — use the refund path")]
     RefundedInstead,
+    /// The consumed-inflow ledger query failed (RUST-004).
+    #[error("consumed-inflow ledger error: {0}")]
+    Ledger(#[from] ConsumedInflowError),
+}
+
+impl From<InflowError> for RedemptionCrossCheckError {
+    fn from(e: InflowError) -> Self {
+        match e {
+            InflowError::Eth(x) => Self::Eth(x),
+            InflowError::Ledger(x) => Self::Ledger(x),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -363,12 +503,19 @@ pub enum RefundCrossCheckError {
 
 /// Delivery cross-check. Returns the cross-checked **on-chain** USDT
 /// (1e6) the signer should attest — NOT `THORChain`'s figure.
+///
+/// `redemption_id` / `leg_index` identify the on-chain leg being attested;
+/// the policy records the physical USDT inflow it credits against this leg in
+/// the consumed-inflow ledger so no other leg can cite the same inflow
+/// (RUST-004).
 #[async_trait]
 pub trait RedemptionCrossCheck: Send + Sync {
     async fn verify(
         &self,
         btc_txid: &str,
         index_token: EthAddress,
+        redemption_id: B256,
+        leg_index: u32,
     ) -> Result<u128, RedemptionCrossCheckError>;
 }
 
@@ -391,6 +538,8 @@ impl RedemptionCrossCheck for PassThroughRedemption {
         &self,
         _btc_txid: &str,
         _index_token: EthAddress,
+        _redemption_id: B256,
+        _leg_index: u32,
     ) -> Result<u128, RedemptionCrossCheckError> {
         warn!(
             policy = "PassThroughRedemption",
@@ -438,6 +587,11 @@ pub struct ThorUtxoToUsdtPolicy<E: Erc20ArrivalClient> {
     min_confirmations: u32,
     /// Max |thor − on-chain| (in 1e6 USDT) accepted.
     tolerance_1e6: u128,
+    /// Consumed-inflow ledger making each physical USDT delivery single-use
+    /// (RUST-004). Shared across all delivery / streamed policies in the
+    /// process so a delivery and a streamed settlement can never both credit
+    /// the same inflow.
+    store: Arc<AnyConsumedInflow>,
 }
 
 impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorUtxoToUsdtPolicy<E> {
@@ -458,6 +612,7 @@ impl<E: Erc20ArrivalClient> ThorUtxoToUsdtPolicy<E> {
         usdt_token: EthAddress,
         min_confirmations: u32,
         tolerance_1e6: u128,
+        store: Arc<AnyConsumedInflow>,
     ) -> Self {
         Self {
             thor,
@@ -465,6 +620,7 @@ impl<E: Erc20ArrivalClient> ThorUtxoToUsdtPolicy<E> {
             usdt_token,
             min_confirmations,
             tolerance_1e6,
+            store,
         }
     }
 }
@@ -475,6 +631,8 @@ impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorUtxoToUsdtPolicy<E> {
         &self,
         btc_txid: &str,
         index_token: EthAddress,
+        redemption_id: B256,
+        leg_index: u32,
     ) -> Result<u128, RedemptionCrossCheckError> {
         // Step 1 — THORChain.
         let resp = self.thor.tx_status(btc_txid).await?;
@@ -514,15 +672,33 @@ impl<E: Erc20ArrivalClient> RedemptionCrossCheck for ThorUtxoToUsdtPolicy<E> {
                 })?;
         let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
 
-        // Step 2 — Ethereum (authoritative for the attested amount).
+        // RUST-004: bind to the `THORChain` OBSERVED outbound tx hash (tx/details
+        // out_txs), so the credited on-chain Transfer must originate from this
+        // specific delivery — not just any USDT transfer ≥ floor to the
+        // IndexToken. No observed ETH outbound yet ⇒ retry, never sign.
+        let expected_outbound_hash = observed_usdt_outbound_hash(&self.thor, btc_txid, index_token)
+            .await?
+            .ok_or_else(|| RedemptionCrossCheckError::ThorNotReady {
+                reason: "no observed ETH.USDT outbound hash in tx/details yet".to_string(),
+            })?;
+
+        // Step 2 — Ethereum (authoritative for the attested amount). The
+        // arrival is consumed in the ledger so no other leg can cite it.
         let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
         let arrival = confirm_erc20_arrival(
             &self.erc20,
+            &self.store,
             self.usdt_token,
             index_token,
             floor,
             self.min_confirmations,
-        )?
+            &InflowBinding {
+                redemption_id,
+                leg_index,
+                expected_outbound_hash,
+            },
+        )
+        .await?
         .ok_or(RedemptionCrossCheckError::UsdtNotReady {
             need_1e6: thor_1e6,
             confs: self.min_confirmations,
@@ -711,6 +887,18 @@ pub enum StreamedSettlementCrossCheckError {
     /// settle (retry once `THORChain` emits the outbound(s)).
     #[error("streamed settlement has neither a delivery nor a refund yet")]
     NoSettlement,
+    /// The consumed-inflow ledger query failed (RUST-004).
+    #[error("consumed-inflow ledger error: {0}")]
+    Ledger(#[from] ConsumedInflowError),
+}
+
+impl From<InflowError> for StreamedSettlementCrossCheckError {
+    fn from(e: InflowError) -> Self {
+        match e {
+            InflowError::Eth(x) => Self::Eth(x),
+            InflowError::Ledger(x) => Self::Ledger(x),
+        }
+    }
 }
 
 /// Combined streamed-settlement cross-check (re-audit-gated burn-side
@@ -732,6 +920,8 @@ pub trait StreamedSettlementCrossCheck: Send + Sync {
         &self,
         btc_txid: &str,
         index_token: EthAddress,
+        redemption_id: B256,
+        leg_index: u32,
     ) -> Result<StreamedOutcome, StreamedSettlementCrossCheckError>;
 }
 
@@ -749,6 +939,10 @@ pub struct ThorUtxoStreamedSettlementPolicy<E: Erc20ArrivalClient, C: UtxoChainC
     min_confirmations: u32,
     tolerance_1e6: u128,
     tolerance_sats: u64,
+    /// Consumed-inflow ledger (RUST-004), shared with the XOR delivery policy
+    /// so a streamed settlement and a plain delivery can never both credit the
+    /// same physical USDT inflow.
+    store: Arc<AnyConsumedInflow>,
 }
 
 impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> std::fmt::Debug
@@ -771,7 +965,7 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
-        reason = "combined policy threads both the delivery (erc20, usdt_token, tolerance_1e6) and refund (btc, multisig, tolerance_sats) verification params"
+        reason = "combined policy threads both the delivery (erc20, usdt_token, tolerance_1e6) and refund (btc, multisig, tolerance_sats) verification params plus the RUST-004 consumed-inflow ledger"
     )]
     pub fn new(
         thor: ThorClient,
@@ -782,6 +976,7 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
         min_confirmations: u32,
         tolerance_1e6: u128,
         tolerance_sats: u64,
+        store: Arc<AnyConsumedInflow>,
     ) -> Self {
         Self {
             thor,
@@ -792,6 +987,7 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
             min_confirmations,
             tolerance_1e6,
             tolerance_sats,
+            store,
         }
     }
 
@@ -799,10 +995,13 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
     /// (a full refund); `Ok(Some(value_1e6))` once the on-chain arrival is
     /// confirmed; an error while the THOR action is present but the
     /// on-chain USDT is not yet confirmed / mismatched.
-    fn verify_delivery_leg(
+    async fn verify_delivery_leg(
         &self,
         resp: &TxResponse,
+        btc_txid: &str,
         index_token: EthAddress,
+        redemption_id: B256,
+        leg_index: u32,
     ) -> Result<Option<u128>, StreamedSettlementCrossCheckError> {
         let want = eth_addr_lc(index_token);
         let Some(action) = resp.actions.iter().find(|a| {
@@ -818,14 +1017,27 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
             }
         })?;
         let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
+        // RUST-004: bind to the OBSERVED outbound tx hash + consume the inflow.
+        let expected_outbound_hash = observed_usdt_outbound_hash(&self.thor, btc_txid, index_token)
+            .await?
+            .ok_or_else(|| StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "no observed ETH.USDT outbound hash in tx/details yet".to_string(),
+            })?;
         let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
         let arrival = confirm_erc20_arrival(
             &self.erc20,
+            &self.store,
             self.usdt_token,
             index_token,
             floor,
             self.min_confirmations,
-        )?
+            &InflowBinding {
+                redemption_id,
+                leg_index,
+                expected_outbound_hash,
+            },
+        )
+        .await?
         .ok_or(StreamedSettlementCrossCheckError::UsdtNotReady {
             need_1e6: thor_1e6,
             confs: self.min_confirmations,
@@ -905,6 +1117,8 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> StreamedSettlement
         &self,
         btc_txid: &str,
         index_token: EthAddress,
+        redemption_id: B256,
+        leg_index: u32,
     ) -> Result<StreamedOutcome, StreamedSettlementCrossCheckError> {
         let resp = self.thor.tx_status(btc_txid).await?;
         if resp.observed_tx.status != "done" {
@@ -912,7 +1126,9 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> StreamedSettlement
                 reason: format!("observed_tx.status = {}", resp.observed_tx.status),
             });
         }
-        let delivered = self.verify_delivery_leg(&resp, index_token)?;
+        let delivered = self
+            .verify_delivery_leg(&resp, btc_txid, index_token, redemption_id, leg_index)
+            .await?;
         let refunded = self.verify_refund_leg(&resp).await?;
         match (delivered, refunded) {
             (None, None) => Err(StreamedSettlementCrossCheckError::NoSettlement),
@@ -1383,36 +1599,89 @@ mod tests {
         EthAddress::from([0xdau8; 20])
     }
 
-    #[test]
-    fn confirm_erc20_arrival_filters_value_and_confs() {
-        let c = StubErc20::default();
-        #[expect(clippy::expect_used, reason = "test code")]
-        {
-            c.arrivals.lock().expect("lock").extend([
-                Erc20Arrival {
-                    value: 10,
-                    confirmations: 9,
-                }, // too small
-                Erc20Arrival {
-                    value: 100,
-                    confirmations: 1,
-                }, // too shallow
-                Erc20Arrival {
-                    value: 100,
-                    confirmations: 6,
-                }, // ✓
-            ]);
+    /// `THORChain` `Tx.id` form (uppercase hex, no `0x`) of the OBSERVED
+    /// outbound the RUST-004 delivery tests bind to.
+    fn out_hash_hex() -> String {
+        "AB".repeat(32)
+    }
+    /// The same hash as a [`B256`] (what an on-chain `Transfer` would carry).
+    fn out_hash() -> B256 {
+        B256::repeat_byte(0xAB)
+    }
+    /// A test `redemptionId`.
+    fn rid() -> B256 {
+        B256::repeat_byte(0xD1)
+    }
+    /// An [`Erc20Arrival`] carrying the bound outbound hash + log 0 (the
+    /// common single-delivery-per-tx case the success tests exercise).
+    fn arrival(value: u128, confirmations: u32) -> Erc20Arrival {
+        Erc20Arrival {
+            value,
+            confirmations,
+            transaction_hash: out_hash(),
+            log_index: 0,
         }
-        let got = confirm_erc20_arrival(&c, usdt_token(), idx_token(), 100, 6)
+    }
+    /// Fresh in-memory consumed-inflow ledger for a test.
+    async fn mem_store() -> Arc<AnyConsumedInflow> {
+        Arc::new(
+            AnyConsumedInflow::connect(None)
+                .await
+                .unwrap_or_else(|e| unreachable!("in-memory connect: {e}")),
+        )
+    }
+    /// Mount the `tx/details` mock whose single ETH `out_tx` to `eth_to`
+    /// carries [`out_hash_hex`] — the OBSERVED outbound hash the delivery
+    /// cross-check binds the on-chain USDT `Transfer` to (RUST-004).
+    async fn mount_tx_details(server: &wiremock::MockServer, hash: &str, eth_to: EthAddress) {
+        let to_lc = eth_addr_lc(eth_to);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/details/{hash}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "out_txs": [{
+                        "id": out_hash_hex(),
+                        "chain": "ETH",
+                        "to_address": to_lc,
+                        "coins": [{
+                            "asset": "ETH.USDT-0XDAC17F958D2EE523A2206206994597C13D831EC7",
+                            "amount": "7000000000"
+                        }]
+                    }]
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn confirm_erc20_arrival_filters_value_confs_and_hash() {
+        let c = StubErc20::default();
+        c.arrivals.lock().expect("lock").extend([
+            arrival(10, 9),  // too small
+            arrival(100, 1), // too shallow
+            Erc20Arrival {
+                value: 100,
+                confirmations: 6,
+                transaction_hash: B256::repeat_byte(0xCC), // wrong outbound hash
+                log_index: 1,
+            },
+            arrival(100, 6), // ✓ value + confs + bound hash
+        ]);
+        let store = mem_store().await;
+        let binding = InflowBinding {
+            redemption_id: B256::repeat_byte(0x01),
+            leg_index: 0,
+            expected_outbound_hash: out_hash(),
+        };
+        let got = confirm_erc20_arrival(&c, &store, usdt_token(), idx_token(), 100, 6, &binding)
+            .await
             .ok()
             .flatten();
-        assert_eq!(
-            got,
-            Some(Erc20Arrival {
-                value: 100,
-                confirmations: 6
-            })
-        );
+        assert_eq!(got, Some(arrival(100, 6)));
     }
 
     #[tokio::test]
@@ -1420,7 +1689,10 @@ mod tests {
         let r = PassThroughRedemption {
             usdt_1e6: 70_000_000,
         };
-        assert_eq!(r.verify("h", idx_token()).await.ok(), Some(70_000_000));
+        assert_eq!(
+            r.verify("h", idx_token(), rid(), 0).await.ok(),
+            Some(70_000_000)
+        );
         let f = PassThroughRefund {
             btc_sats: 99_990_000,
         };
@@ -1453,15 +1725,138 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_tx_details(&server, "btc-in", idx_token()).await;
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let erc20 = StubErc20::default();
+        erc20
+            .arrivals
+            .lock()
+            .expect("lock")
+            .push(arrival(70_000_000, 6)); // 70 USDT 1e6
+        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0, mem_store().await);
+        let attested = policy
+            .verify("btc-in", idx_token(), rid(), 0)
+            .await
+            .expect("ok");
+        assert_eq!(attested, 70_000_000, "attest the on-chain 1e6 value");
+    }
+
+    /// Mount a standard burn→USDT delivery `tx_status`: `done` + one ETH.USDT
+    /// outbound action of 70 USDT (1e8) to the `IndexToken`.
+    async fn mount_delivery_thor(server: &wiremock::MockServer, hash: &str) {
+        let to_lc = eth_addr_lc(idx_token());
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/thorchain/tx/{hash}")))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "observed_tx": { "tx": { "id": hash, "chain":"BTC",
+                        "from_address":"bc1qour","to_address":"thor-asgard",
+                        "coins":[],"memo":"" }, "status":"done" },
+                    "actions": [{
+                        "chain":"ETH", "to_address": to_lc,
+                        "coin": { "asset":"ETH.USDT-0XDAC17F958D2EE523A2206206994597C13D831EC7",
+                                  "amount":"7000000000" },
+                        "memo":"OUT:", "max_gas":[]
+                    }]
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// RUST-004: a physical inflow already consumed by a DIFFERENT redemption
+    /// leg must NOT be credited again — the second redemption gets
+    /// `UsdtNotReady` (no double-credit, basket stays whole).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn rust004_inflow_consumed_by_other_leg_is_skipped() {
+        let server = wiremock::MockServer::start().await;
+        mount_delivery_thor(&server, "btc-in").await;
+        mount_tx_details(&server, "btc-in", idx_token()).await;
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let erc20 = StubErc20::default();
+        erc20
+            .arrivals
+            .lock()
+            .expect("lock")
+            .push(arrival(70_000_000, 6));
+        let store = mem_store().await;
+        // A different redemption already consumed this exact (tx_hash, log).
+        store
+            .consume_inflow(B256::repeat_byte(0xEE), 0, out_hash(), 0)
+            .await
+            .expect("pre-consume");
+        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0, store);
+        let err = policy
+            .verify("btc-in", idx_token(), rid(), 0)
+            .await
+            .expect_err("must not double-credit a consumed inflow");
+        assert!(
+            matches!(err, RedemptionCrossCheckError::UsdtNotReady { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// RUST-004: an on-chain USDT arrival whose `transaction_hash` is NOT the
+    /// `THORChain` OBSERVED outbound is ignored (an unrelated / decoy transfer
+    /// to the `IndexToken` can never be credited).
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn rust004_non_matching_outbound_hash_ignored() {
+        let server = wiremock::MockServer::start().await;
+        mount_delivery_thor(&server, "btc-in").await;
+        mount_tx_details(&server, "btc-in", idx_token()).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let erc20 = StubErc20::default();
         erc20.arrivals.lock().expect("lock").push(Erc20Arrival {
             value: 70_000_000,
             confirmations: 6,
-        }); // 70 USDT 1e6
-        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0);
-        let attested = policy.verify("btc-in", idx_token()).await.expect("ok");
-        assert_eq!(attested, 70_000_000, "attest the on-chain 1e6 value");
+            transaction_hash: B256::repeat_byte(0xCC), // a different tx
+            log_index: 0,
+        });
+        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0, mem_store().await);
+        let err = policy
+            .verify("btc-in", idx_token(), rid(), 0)
+            .await
+            .expect_err("arrival from an unrelated tx must not be credited");
+        assert!(
+            matches!(err, RedemptionCrossCheckError::UsdtNotReady { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// RUST-004: while `THORChain` has queued the ETH.USDT outbound but its
+    /// `tx/details` `out_txs` is still empty (not yet observed on-chain), the
+    /// cross-check is NOT ready and the signer must retry, never sign.
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn rust004_empty_out_txs_is_not_ready() {
+        let server = wiremock::MockServer::start().await;
+        mount_delivery_thor(&server, "btc-in").await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/tx/details/btc-in"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "out_txs": [] })),
+            )
+            .mount(&server)
+            .await;
+        let thor = ThorClient::with_base_url(server.uri()).expect("thor");
+        let erc20 = StubErc20::default();
+        erc20
+            .arrivals
+            .lock()
+            .expect("lock")
+            .push(arrival(70_000_000, 6));
+        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0, mem_store().await);
+        let err = policy
+            .verify("btc-in", idx_token(), rid(), 0)
+            .await
+            .expect_err("no observed outbound hash yet");
+        assert!(
+            matches!(err, RedemptionCrossCheckError::ThorNotReady { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1485,9 +1880,16 @@ mod tests {
             .mount(&server)
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-        let policy = ThorUtxoToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(
+            thor,
+            StubErc20::default(),
+            usdt_token(),
+            6,
+            0,
+            mem_store().await,
+        );
         let err = policy
-            .verify("btc-in", idx_token())
+            .verify("btc-in", idx_token(), rid(), 0)
             .await
             .expect_err("refund must not attest delivery");
         assert!(matches!(err, RedemptionCrossCheckError::RefundedInstead));
@@ -1570,10 +1972,12 @@ mod tests {
         mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let erc20 = StubErc20::default();
-        erc20.arrivals.lock().expect("lock").push(Erc20Arrival {
-            value: 70_000_000,
-            confirmations: 6,
-        });
+        erc20
+            .arrivals
+            .lock()
+            .expect("lock")
+            .push(arrival(70_000_000, 6));
+        mount_tx_details(&server, "streamed-in", idx_token()).await;
         let btc = StubBtc::default();
         btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid: Txid::from_str(
@@ -1594,8 +1998,12 @@ mod tests {
             1,
             0,
             0,
+            mem_store().await,
         );
-        let outcome = policy.verify("streamed-in", idx_token()).await.expect("ok");
+        let outcome = policy
+            .verify("streamed-in", idx_token(), rid(), 0)
+            .await
+            .expect("ok");
         assert_eq!(
             outcome.delivered_usdt_1e6, 70_000_000,
             "delivered USDT (1e6)"
@@ -1630,10 +2038,12 @@ mod tests {
         mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let erc20 = StubErc20::default();
-        erc20.arrivals.lock().expect("lock").push(Erc20Arrival {
-            value: 90_000_000,
-            confirmations: 6,
-        });
+        erc20
+            .arrivals
+            .lock()
+            .expect("lock")
+            .push(arrival(90_000_000, 6));
+        mount_tx_details(&server, "streamed-in", idx_token()).await;
         let policy = ThorUtxoStreamedSettlementPolicy::new(
             thor,
             erc20,
@@ -1643,8 +2053,12 @@ mod tests {
             1,
             0,
             0,
+            mem_store().await,
         );
-        let outcome = policy.verify("streamed-in", idx_token()).await.expect("ok");
+        let outcome = policy
+            .verify("streamed-in", idx_token(), rid(), 0)
+            .await
+            .expect("ok");
         assert_eq!(outcome.delivered_usdt_1e6, 90_000_000);
         assert_eq!(outcome.refunded_sats, 0, "no refund leg ⇒ zero");
     }
@@ -1677,9 +2091,10 @@ mod tests {
             1,
             0,
             0,
+            mem_store().await,
         );
         let err = policy
-            .verify("streamed-in", idx_token())
+            .verify("streamed-in", idx_token(), rid(), 0)
             .await
             .expect_err("nothing to settle");
         assert!(matches!(
@@ -1743,9 +2158,16 @@ mod tests {
             .mount(&server)
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-        let policy = ThorUtxoToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(
+            thor,
+            StubErc20::default(),
+            usdt_token(),
+            6,
+            0,
+            mem_store().await,
+        );
         let err = policy
-            .verify("btc-in", idx_token())
+            .verify("btc-in", idx_token(), rid(), 0)
             .await
             .expect_err("wrong-asset decoy must not be selected");
         assert!(
@@ -1778,9 +2200,16 @@ mod tests {
             .mount(&server)
             .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-        let policy = ThorUtxoToUsdtPolicy::new(thor, StubErc20::default(), usdt_token(), 6, 0);
+        let policy = ThorUtxoToUsdtPolicy::new(
+            thor,
+            StubErc20::default(),
+            usdt_token(),
+            6,
+            0,
+            mem_store().await,
+        );
         let err = policy
-            .verify("btc-in", idx_token())
+            .verify("btc-in", idx_token(), rid(), 0)
             .await
             .expect_err("wrong-destination decoy must not be selected");
         assert!(
@@ -1820,15 +2249,17 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_tx_details(&server, "btc-in", idx_token()).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let erc20 = StubErc20::default();
-        erc20.arrivals.lock().expect("lock").push(Erc20Arrival {
-            value: 70_000_000,
-            confirmations: 6,
-        });
-        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0);
+        erc20
+            .arrivals
+            .lock()
+            .expect("lock")
+            .push(arrival(70_000_000, 6));
+        let policy = ThorUtxoToUsdtPolicy::new(thor, erc20, usdt_token(), 6, 0, mem_store().await);
         let attested = policy
-            .verify("btc-in", idx_token())
+            .verify("btc-in", idx_token(), rid(), 0)
             .await
             .expect("non-refund BTC + foreign REFUND must not block delivery");
         assert_eq!(attested, 70_000_000);
@@ -2024,15 +2455,17 @@ mod tests {
 )]
 pub mod evm {
     use super::{
-        within, RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
-        RefundCrossCheckError,
+        claim_inflow, observed_usdt_outbound_hash, within, InflowBinding, RedemptionCrossCheck,
+        RedemptionCrossCheckError, RefundCrossCheck, RefundCrossCheckError,
     };
     use alloy_primitives::{Address as EthAddress, B256, U256};
     use async_trait::async_trait;
+    use std::sync::Arc;
     use thiserror::Error;
     use tracing::{info, warn};
     use xindex_chain_evm::{EvmChainClient, EvmChainError, EvmLogEntry, EvmLogFilter};
     use xindex_chain_thor::{ThorClient, ThorError};
+    use xindex_shared::consumed_inflow::{AnyConsumedInflow, ConsumedInflowError};
 
     /// `keccak256("TransferOut(address,address,address,uint256,string)")`.
     /// Topic-0 of THORChain Router v6.1's `TransferOut` event — emitted
@@ -2114,6 +2547,9 @@ pub mod evm {
         /// via the delivery policy.
         #[error("`THORChain` delivered (not refunded) — use the delivery path")]
         DeliveredInstead,
+        /// The consumed-inflow ledger query failed (RUST-004).
+        #[error("consumed-inflow ledger error: {0}")]
+        Ledger(#[from] ConsumedInflowError),
     }
 
     /// One observed `TransferOut` event from a THORChain Router. Used
@@ -2130,6 +2566,8 @@ pub mod evm {
         pub asset: EthAddress,
         /// Tx-hash the event was emitted in.
         pub transaction_hash: B256,
+        /// Index of the log within its block (RUST-004 consumed-inflow key).
+        pub log_index: u64,
         /// Confirmation depth at the current tip.
         pub confirmations: u32,
     }
@@ -2182,20 +2620,29 @@ pub mod evm {
         Ok(None)
     }
 
-    /// Scan an ERC20 token's `Transfer` events for one targeting
-    /// `to_addr` with `value ≥ min_value` and `confirmations ≥
-    /// min_confs`. Used by [`ThorEvmToUsdtPolicy`] for the USDT-arrival
-    /// check on Ethereum.
+    /// Scan an ERC20 token's `Transfer` events for one targeting `to_addr`
+    /// with `value ≥ min_value`, `confirmations ≥ min_confs`, emitted by the
+    /// `THORChain` OBSERVED outbound tx (`binding.expected_outbound_hash`), AND
+    /// not already consumed by a different redemption leg — then mark it
+    /// consumed (RUST-004, parity with [`super::confirm_erc20_arrival`]). Used
+    /// by [`ThorEvmToUsdtPolicy`] for the USDT-arrival check on Ethereum.
     ///
     /// # Errors
-    /// As [`find_router_transfer_out`].
+    /// [`EvmCrossCheckError::Evm`] on RPC failure; [`EvmCrossCheckError::Ledger`]
+    /// if the consumed-inflow store query fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "threads the arrival filter (token, to, min_value, min_confs, lookback) plus the RUST-004 ledger (store) and binding"
+    )]
     pub async fn find_erc20_transfer_to<E: EvmChainClient>(
         client: &E,
+        store: &AnyConsumedInflow,
         token: EthAddress,
         to_addr: EthAddress,
         min_value: u128,
         min_confs: u32,
         lookback_blocks: u64,
+        binding: &InflowBinding,
     ) -> Result<Option<RouterTransferOut>, EvmCrossCheckError> {
         let tip = client.block_number().await?;
         let from_block = tip.saturating_sub(lookback_blocks);
@@ -2211,7 +2658,12 @@ pub mod evm {
         let logs = client.eth_get_logs(filter).await?;
         for log in logs {
             if let Some(decoded) = decode_erc20_transfer(&log, token, to_addr, tip) {
-                if decoded.value_wei >= min_value && decoded.confirmations >= min_confs {
+                if decoded.value_wei >= min_value
+                    && decoded.confirmations >= min_confs
+                    && decoded.transaction_hash == binding.expected_outbound_hash
+                    && claim_inflow(store, binding, decoded.transaction_hash, decoded.log_index)
+                        .await?
+                {
                     return Ok(Some(decoded));
                 }
             }
@@ -2274,6 +2726,7 @@ pub mod evm {
             to,
             asset,
             transaction_hash: log.transaction_hash,
+            log_index: log.log_index,
             confirmations,
         })
     }
@@ -2314,6 +2767,7 @@ pub mod evm {
             // For an ERC20 Transfer the emitting contract IS the token.
             asset: log.address,
             transaction_hash: log.transaction_hash,
+            log_index: log.log_index,
             confirmations,
         })
     }
@@ -2692,6 +3146,9 @@ pub mod evm {
         /// Max |thor − on-chain| in 1e6 USDT units.
         tolerance_1e6: u128,
         lookback_blocks: u64,
+        /// Consumed-inflow ledger making each physical USDT delivery
+        /// single-use (RUST-004).
+        store: Arc<AnyConsumedInflow>,
     }
 
     impl<E: EvmChainClient> std::fmt::Debug for ThorEvmToUsdtPolicy<E> {
@@ -2712,6 +3169,7 @@ pub mod evm {
             min_confirmations: u32,
             tolerance_1e6: u128,
             lookback_blocks: u64,
+            store: Arc<AnyConsumedInflow>,
         ) -> Self {
             Self {
                 thor,
@@ -2720,6 +3178,7 @@ pub mod evm {
                 min_confirmations,
                 tolerance_1e6,
                 lookback_blocks,
+                store,
             }
         }
     }
@@ -2735,6 +3194,8 @@ pub mod evm {
             &self,
             evm_inbound_tx_hash: &str,
             index_token: EthAddress,
+            redemption_id: B256,
+            leg_index: u32,
         ) -> Result<u128, RedemptionCrossCheckError> {
             let resp = self.thor.tx_status(evm_inbound_tx_hash).await?;
             if resp.observed_tx.status != "done" {
@@ -2767,20 +3228,35 @@ pub mod evm {
                 }
             })?;
             let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
+            // RUST-004: bind to the `THORChain` OBSERVED outbound tx hash
+            // (tx/details out_txs) before crediting any USDT arrival.
+            let expected_outbound_hash =
+                observed_usdt_outbound_hash(&self.thor, evm_inbound_tx_hash, index_token)
+                    .await?
+                    .ok_or_else(|| RedemptionCrossCheckError::ThorNotReady {
+                        reason: "no observed ETH.USDT outbound hash in tx/details yet".to_string(),
+                    })?;
             let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
             let arrival = find_erc20_transfer_to(
                 &self.evm,
+                &self.store,
                 self.usdt_token,
                 index_token,
                 floor,
                 self.min_confirmations,
                 self.lookback_blocks,
+                &InflowBinding {
+                    redemption_id,
+                    leg_index,
+                    expected_outbound_hash,
+                },
             )
             .await
             .map_err(|e| match e {
                 EvmCrossCheckError::Evm(inner) => {
                     RedemptionCrossCheckError::Eth(super::Erc20Error::Rpc(format!("{inner}")))
                 }
+                EvmCrossCheckError::Ledger(inner) => RedemptionCrossCheckError::Ledger(inner),
                 other => RedemptionCrossCheckError::ThorNotReady {
                     reason: format!("EVM lookup failed: {other}"),
                 },
@@ -2812,9 +3288,10 @@ pub mod evm {
     mod tests {
         use super::*;
         use alloy_primitives::{Address, Bytes};
-        use std::sync::Mutex;
+        use std::sync::{Arc, Mutex};
         use xindex_chain_evm::{EvmConfirmedReceipt, EvmTransactionSummary};
         use xindex_shared::chain_registry::{ChainId, EvmTxType};
+        use xindex_shared::consumed_inflow::AnyConsumedInflow;
 
         /// In-memory `EvmChainClient` for tests. Holds canned logs +
         /// a current tip; everything else stubbed.
@@ -2921,6 +3398,7 @@ pub mod evm {
                 data: Bytes::from(data),
                 block_number: block,
                 transaction_hash: B256::ZERO,
+                log_index: 0,
             }
         }
 
@@ -2945,12 +3423,29 @@ pub mod evm {
                 ],
                 data: Bytes::from(data.to_vec()),
                 block_number: block,
-                transaction_hash: B256::ZERO,
+                // RUST-004: bind the redeem-side arrival to the observed
+                // outbound hash the success test's tx/details mock advertises.
+                transaction_hash: OUT_HASH,
+                log_index: 0,
             }
         }
 
         const SAFE: Address = Address::new([0xab; 20]);
         const ROUTER: Address = Address::new([0xcd; 20]);
+        /// RUST-004: the observed ETH outbound hash the redeem-to-USDT test
+        /// binds to (matches `erc20_transfer_log` + the tx/details mock).
+        const OUT_HASH: B256 = B256::new([0xAB; 32]);
+
+        fn rid() -> B256 {
+            B256::repeat_byte(0xD1)
+        }
+        async fn mem_store() -> Arc<AnyConsumedInflow> {
+            Arc::new(
+                AnyConsumedInflow::connect(None)
+                    .await
+                    .unwrap_or_else(|e| unreachable!("mem: {e}")),
+            )
+        }
 
         async fn thor_done_responder(action_json: serde_json::Value) -> wiremock::MockServer {
             let server = wiremock::MockServer::start().await;
@@ -3180,6 +3675,18 @@ pub mod evm {
                 "max_gas": []
             }))
             .await;
+            // RUST-004: the observed outbound the redeem-side arrival binds to.
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/thorchain/tx/details/abc"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "out_txs": [{ "id": "AB".repeat(32), "chain": "ETH",
+                            "to_address": it_str,
+                            "coins": [{"asset":"ETH.USDT","amount":"100000000"}] }]
+                    }),
+                ))
+                .mount(&server)
+                .await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let evm = StubEvm::new(ChainId::Eth, 100);
             // 1e8 in THORChain units / 100 = 1e6 = 1,000,000 USDT (1e6).
@@ -3190,8 +3697,11 @@ pub mod evm {
                 1_000_000,
                 95,
             ));
-            let policy = ThorEvmToUsdtPolicy::new(thor, evm, USDT, 3, 0, 1000);
-            let out = policy.verify("abc", INDEX_TOKEN).await.expect("ok");
+            let policy = ThorEvmToUsdtPolicy::new(thor, evm, USDT, 3, 0, 1000, mem_store().await);
+            let out = policy
+                .verify("abc", INDEX_TOKEN, rid(), 0)
+                .await
+                .expect("ok");
             assert_eq!(out, 1_000_000);
         }
 
@@ -3268,6 +3778,7 @@ pub mod evm {
                 data: Bytes::from(data),
                 block_number: 95,
                 transaction_hash: B256::ZERO,
+                log_index: 0,
             });
             // Policy expects native ETH (zero asset) but the event delivered
             // WRONG_ASSET.
@@ -3325,14 +3836,17 @@ pub mod evm {
 )]
 pub mod cosmos {
     use super::{
-        confirm_erc20_arrival, within, Erc20ArrivalClient, RedemptionCrossCheck,
-        RedemptionCrossCheckError, RefundCrossCheck, RefundCrossCheckError,
+        confirm_erc20_arrival, observed_usdt_outbound_hash, within, Erc20ArrivalClient,
+        InflowBinding, RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
+        RefundCrossCheckError,
     };
-    use alloy_primitives::Address as EthAddress;
+    use alloy_primitives::{Address as EthAddress, B256};
     use async_trait::async_trait;
+    use std::sync::Arc;
     use tracing::{info, warn};
     use xindex_chain_cosmos::{CosmosChainClient, CosmosChainError};
     use xindex_chain_thor::ThorClient;
+    use xindex_shared::consumed_inflow::AnyConsumedInflow;
 
     /// THORChain reports every asset in 1e8; native uatom is 1e6 (GAIA), so
     /// a refund's THORChain amount is divided by 100 to compare with the
@@ -3358,6 +3872,9 @@ pub mod cosmos {
         usdt_token: EthAddress,
         min_confirmations: u32,
         tolerance_1e6: u128,
+        /// Consumed-inflow ledger making each physical USDT delivery
+        /// single-use (RUST-004).
+        store: Arc<AnyConsumedInflow>,
     }
 
     impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorCosmosToUsdtPolicy<E> {
@@ -3378,6 +3895,7 @@ pub mod cosmos {
             usdt_token: EthAddress,
             min_confirmations: u32,
             tolerance_1e6: u128,
+            store: Arc<AnyConsumedInflow>,
         ) -> Self {
             Self {
                 thor,
@@ -3385,6 +3903,7 @@ pub mod cosmos {
                 usdt_token,
                 min_confirmations,
                 tolerance_1e6,
+                store,
             }
         }
     }
@@ -3395,6 +3914,8 @@ pub mod cosmos {
             &self,
             cosmos_inbound_hash: &str,
             index_token: EthAddress,
+            redemption_id: B256,
+            leg_index: u32,
         ) -> Result<u128, RedemptionCrossCheckError> {
             let resp = self.thor.tx_status(cosmos_inbound_hash).await?;
             if resp.observed_tx.status != "done" {
@@ -3429,14 +3950,28 @@ pub mod cosmos {
                 }
             })?;
             let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
+            // RUST-004: bind to the OBSERVED outbound tx hash + consume inflow.
+            let expected_outbound_hash =
+                observed_usdt_outbound_hash(&self.thor, cosmos_inbound_hash, index_token)
+                    .await?
+                    .ok_or_else(|| RedemptionCrossCheckError::ThorNotReady {
+                        reason: "no observed ETH.USDT outbound hash in tx/details yet".to_string(),
+                    })?;
             let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
             let arrival = confirm_erc20_arrival(
                 &self.erc20,
+                &self.store,
                 self.usdt_token,
                 index_token,
                 floor,
                 self.min_confirmations,
-            )?
+                &InflowBinding {
+                    redemption_id,
+                    leg_index,
+                    expected_outbound_hash,
+                },
+            )
+            .await?
             .ok_or(RedemptionCrossCheckError::UsdtNotReady {
                 need_1e6: thor_1e6,
                 confs: self.min_confirmations,
@@ -3629,19 +4164,64 @@ pub mod cosmos {
             RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
             RefundCrossCheckError, ThorCosmosRefundPolicy, ThorCosmosToUsdtPolicy,
         };
-        use alloy_primitives::Address as EthAddress;
+        use alloy_primitives::{Address as EthAddress, B256};
         use std::future::ready;
+        use std::sync::Arc;
         use xindex_chain_cosmos::{
             CosmosAccount, CosmosBroadcastOutcome, CosmosChainClient, CosmosChainError,
             CosmosTransfer,
         };
         use xindex_chain_thor::ThorClient;
         use xindex_shared::chain_registry::ChainId;
+        use xindex_shared::consumed_inflow::AnyConsumedInflow;
 
         const INDEX_TOKEN: EthAddress = EthAddress::new([0x11; 20]);
         const USDT: EthAddress = EthAddress::new([0x22; 20]);
         const MULTISIG: &str = "cosmos1vault0multisig";
         const ASGARD: &str = "cosmos1asgard0vault";
+
+        /// RUST-004: the OBSERVED ETH outbound hash the delivery tests bind to.
+        fn out_hash() -> B256 {
+            B256::repeat_byte(0xAB)
+        }
+        /// A test `redemptionId`.
+        fn rid() -> B256 {
+            B256::repeat_byte(0xD1)
+        }
+        /// An [`Erc20Arrival`] carrying the bound outbound hash + log 0.
+        fn arrival(value: u128, confirmations: u32) -> Erc20Arrival {
+            Erc20Arrival {
+                value,
+                confirmations,
+                transaction_hash: out_hash(),
+                log_index: 0,
+            }
+        }
+        /// Fresh in-memory consumed-inflow ledger.
+        async fn mem_store() -> Arc<AnyConsumedInflow> {
+            Arc::new(
+                AnyConsumedInflow::connect(None)
+                    .await
+                    .unwrap_or_else(|e| unreachable!("mem: {e}")),
+            )
+        }
+        /// Mock `tx/details` with an observed ETH `out_tx` to `eth_to` carrying
+        /// [`out_hash`] (RUST-004 1:1 inflow bind).
+        async fn mount_tx_details(server: &wiremock::MockServer, hash: &str, eth_to: EthAddress) {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/thorchain/tx/details/{hash}"
+                )))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "out_txs": [{ "id": "AB".repeat(32), "chain": "ETH",
+                            "to_address": format!("{eth_to:#x}"),
+                            "coins": [{"asset":"ETH.USDT-0XDAC","amount":"100000000"}] }]
+                    }),
+                ))
+                .mount(server)
+                .await;
+        }
 
         /// In-memory ERC20 arrival backend.
         #[derive(Default)]
@@ -3876,17 +4456,15 @@ pub mod cosmos {
                     "memo": "OUT:gaia-in", "max_gas": [] }]),
             )
             .await;
+            mount_tx_details(&server, "gaia-in", INDEX_TOKEN).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             // 1e8 / 100 = 1e6 USDT, and the same lands on-chain.
             let erc20 = StubErc20 {
-                arrivals: vec![Erc20Arrival {
-                    value: 1_000_000,
-                    confirmations: 5,
-                }],
+                arrivals: vec![arrival(1_000_000, 5)],
             };
-            let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
+            let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0, mem_store().await);
             let out = policy
-                .verify("gaia-in", INDEX_TOKEN)
+                .verify("gaia-in", INDEX_TOKEN, rid(), 0)
                 .await
                 .expect("delivery ok");
             assert_eq!(out, 1_000_000);
@@ -3905,9 +4483,16 @@ pub mod cosmos {
             )
             .await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-            let policy = ThorCosmosToUsdtPolicy::new(thor, StubErc20::default(), USDT, 3, 0);
+            let policy = ThorCosmosToUsdtPolicy::new(
+                thor,
+                StubErc20::default(),
+                USDT,
+                3,
+                0,
+                mem_store().await,
+            );
             let err = policy
-                .verify("gaia-in", INDEX_TOKEN)
+                .verify("gaia-in", INDEX_TOKEN, rid(), 0)
                 .await
                 .expect_err("must reject");
             assert!(
@@ -3929,17 +4514,15 @@ pub mod cosmos {
                     "memo": "OUT:gaia-in", "max_gas": [] }]),
             )
             .await;
+            mount_tx_details(&server, "gaia-in", INDEX_TOKEN).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             // THORChain says 1e6; on-chain shows more, tolerance 0 → mismatch.
             let erc20 = StubErc20 {
-                arrivals: vec![Erc20Arrival {
-                    value: 1_100_000,
-                    confirmations: 5,
-                }],
+                arrivals: vec![arrival(1_100_000, 5)],
             };
-            let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
+            let policy = ThorCosmosToUsdtPolicy::new(thor, erc20, USDT, 3, 0, mem_store().await);
             let err = policy
-                .verify("gaia-in", INDEX_TOKEN)
+                .verify("gaia-in", INDEX_TOKEN, rid(), 0)
                 .await
                 .expect_err("must reject");
             assert!(
@@ -3968,14 +4551,17 @@ pub mod cosmos {
 )]
 pub mod xrp {
     use super::{
-        confirm_erc20_arrival, within, Erc20ArrivalClient, RedemptionCrossCheck,
-        RedemptionCrossCheckError, RefundCrossCheck, RefundCrossCheckError,
+        confirm_erc20_arrival, observed_usdt_outbound_hash, within, Erc20ArrivalClient,
+        InflowBinding, RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
+        RefundCrossCheckError,
     };
-    use alloy_primitives::Address as EthAddress;
+    use alloy_primitives::{Address as EthAddress, B256};
     use async_trait::async_trait;
+    use std::sync::Arc;
     use tracing::{info, warn};
     use xindex_chain_thor::ThorClient;
     use xindex_chain_xrp::{XrpChainClient, XrpChainError};
+    use xindex_shared::consumed_inflow::AnyConsumedInflow;
 
     /// THORChain reports every asset in 1e8; native XRP is 1e6 (drops), so
     /// a refund's THORChain amount is divided by 100 to compare with the
@@ -3999,6 +4585,9 @@ pub mod xrp {
         usdt_token: EthAddress,
         min_confirmations: u32,
         tolerance_1e6: u128,
+        /// Consumed-inflow ledger making each physical USDT delivery
+        /// single-use (RUST-004).
+        store: Arc<AnyConsumedInflow>,
     }
 
     impl<E: Erc20ArrivalClient> std::fmt::Debug for ThorXrpToUsdtPolicy<E> {
@@ -4019,6 +4608,7 @@ pub mod xrp {
             usdt_token: EthAddress,
             min_confirmations: u32,
             tolerance_1e6: u128,
+            store: Arc<AnyConsumedInflow>,
         ) -> Self {
             Self {
                 thor,
@@ -4026,6 +4616,7 @@ pub mod xrp {
                 usdt_token,
                 min_confirmations,
                 tolerance_1e6,
+                store,
             }
         }
     }
@@ -4036,6 +4627,8 @@ pub mod xrp {
             &self,
             xrp_inbound_hash: &str,
             index_token: EthAddress,
+            redemption_id: B256,
+            leg_index: u32,
         ) -> Result<u128, RedemptionCrossCheckError> {
             let resp = self.thor.tx_status(xrp_inbound_hash).await?;
             if resp.observed_tx.status != "done" {
@@ -4070,14 +4663,28 @@ pub mod xrp {
                 }
             })?;
             let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
+            // RUST-004: bind to the OBSERVED outbound tx hash + consume inflow.
+            let expected_outbound_hash =
+                observed_usdt_outbound_hash(&self.thor, xrp_inbound_hash, index_token)
+                    .await?
+                    .ok_or_else(|| RedemptionCrossCheckError::ThorNotReady {
+                        reason: "no observed ETH.USDT outbound hash in tx/details yet".to_string(),
+                    })?;
             let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
             let arrival = confirm_erc20_arrival(
                 &self.erc20,
+                &self.store,
                 self.usdt_token,
                 index_token,
                 floor,
                 self.min_confirmations,
-            )?
+                &InflowBinding {
+                    redemption_id,
+                    leg_index,
+                    expected_outbound_hash,
+                },
+            )
+            .await?
             .ok_or(RedemptionCrossCheckError::UsdtNotReady {
                 need_1e6: thor_1e6,
                 confs: self.min_confirmations,
@@ -4266,18 +4873,63 @@ pub mod xrp {
             RedemptionCrossCheck, RedemptionCrossCheckError, RefundCrossCheck,
             RefundCrossCheckError, ThorXrpRefundPolicy, ThorXrpToUsdtPolicy,
         };
-        use alloy_primitives::Address as EthAddress;
+        use alloy_primitives::{Address as EthAddress, B256};
         use std::future::ready;
+        use std::sync::Arc;
         use xindex_chain_thor::ThorClient;
         use xindex_chain_xrp::{
             XrpAccount, XrpChainClient, XrpChainError, XrpSubmitOutcome, XrpTransfer,
         };
         use xindex_shared::chain_registry::ChainId;
+        use xindex_shared::consumed_inflow::AnyConsumedInflow;
 
         const INDEX_TOKEN: EthAddress = EthAddress::new([0x11; 20]);
         const USDT: EthAddress = EthAddress::new([0x22; 20]);
         const MULTISIG: &str = "rVaultMultisig00000000000000000000";
         const ASGARD: &str = "rAsgardVault000000000000000000000";
+
+        /// RUST-004: the OBSERVED ETH outbound hash the delivery tests bind to.
+        fn out_hash() -> B256 {
+            B256::repeat_byte(0xAB)
+        }
+        /// A test `redemptionId`.
+        fn rid() -> B256 {
+            B256::repeat_byte(0xD1)
+        }
+        /// An [`Erc20Arrival`] carrying the bound outbound hash + log 0.
+        fn arrival(value: u128, confirmations: u32) -> Erc20Arrival {
+            Erc20Arrival {
+                value,
+                confirmations,
+                transaction_hash: out_hash(),
+                log_index: 0,
+            }
+        }
+        /// Fresh in-memory consumed-inflow ledger.
+        async fn mem_store() -> Arc<AnyConsumedInflow> {
+            Arc::new(
+                AnyConsumedInflow::connect(None)
+                    .await
+                    .unwrap_or_else(|e| unreachable!("mem: {e}")),
+            )
+        }
+        /// Mock `tx/details` with an observed ETH `out_tx` to `eth_to` carrying
+        /// [`out_hash`] (RUST-004 1:1 inflow bind).
+        async fn mount_tx_details(server: &wiremock::MockServer, hash: &str, eth_to: EthAddress) {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(format!(
+                    "/thorchain/tx/details/{hash}"
+                )))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "out_txs": [{ "id": "AB".repeat(32), "chain": "ETH",
+                            "to_address": format!("{eth_to:#x}"),
+                            "coins": [{"asset":"ETH.USDT-0XDAC","amount":"100000000"}] }]
+                    }),
+                ))
+                .mount(server)
+                .await;
+        }
 
         #[derive(Default)]
         struct StubErc20 {
@@ -4479,16 +5131,14 @@ pub mod xrp {
                     "coin": {"asset": "ETH.USDT", "amount": "70000000"}, "memo": "", "max_gas": [] }]),
             )
             .await;
+            mount_tx_details(&server, "xrp-in", INDEX_TOKEN).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
             let erc20 = StubErc20 {
-                arrivals: vec![Erc20Arrival {
-                    value: 700_000,
-                    confirmations: 5,
-                }],
+                arrivals: vec![arrival(700_000, 5)],
             };
-            let policy = ThorXrpToUsdtPolicy::new(thor, erc20, USDT, 3, 0);
+            let policy = ThorXrpToUsdtPolicy::new(thor, erc20, USDT, 3, 0, mem_store().await);
             let out = policy
-                .verify("xrp-in", INDEX_TOKEN)
+                .verify("xrp-in", INDEX_TOKEN, rid(), 0)
                 .await
                 .expect("delivery ok");
             assert_eq!(out, 700_000);
@@ -4500,9 +5150,10 @@ pub mod xrp {
             let server = wiremock::MockServer::start().await;
             mount_tx(&server, "xrp-in", refund_action()).await;
             let thor = ThorClient::with_base_url(server.uri()).expect("thor");
-            let policy = ThorXrpToUsdtPolicy::new(thor, StubErc20::default(), USDT, 3, 0);
+            let policy =
+                ThorXrpToUsdtPolicy::new(thor, StubErc20::default(), USDT, 3, 0, mem_store().await);
             let err = policy
-                .verify("xrp-in", INDEX_TOKEN)
+                .verify("xrp-in", INDEX_TOKEN, rid(), 0)
                 .await
                 .expect_err("must reject");
             assert!(

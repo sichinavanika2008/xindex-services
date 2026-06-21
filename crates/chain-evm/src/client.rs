@@ -56,6 +56,9 @@ pub struct EvmLogEntry {
     pub block_number: u64,
     /// Tx-hash within that block.
     pub transaction_hash: B256,
+    /// Index of this log within the block. Together with `transaction_hash`
+    /// it identifies a physical log uniquely (RUST-004 consumed-inflow ledger).
+    pub log_index: u64,
 }
 
 /// Confirmed-receipt subset chain-evm consumers care about. Smaller
@@ -411,6 +414,7 @@ where
                 data: l.inner.data.data.clone(),
                 block_number: l.block_number.unwrap_or(0),
                 transaction_hash: l.transaction_hash.unwrap_or(B256::ZERO),
+                log_index: l.log_index.unwrap_or(0),
             })
             .collect())
     }
@@ -467,6 +471,7 @@ where
                                 data: l.inner.data.data.clone(),
                                 block_number: l.block_number.unwrap_or(0),
                                 transaction_hash: l.transaction_hash.unwrap_or(B256::ZERO),
+                                log_index: l.log_index.unwrap_or(0),
                             })
                             .collect(),
                     });

@@ -96,6 +96,38 @@ pub struct TxOutAction {
     pub max_gas: Vec<Coin>,
 }
 
+/// One OBSERVED outbound in `GET /thorchain/tx/details/{hash}` →
+/// `out_txs`. Unlike [`TxOutAction`] (the PLANNED outbound in the
+/// observation view, which carries no hash), this is the outbound
+/// `THORChain`'s validators have observed confirmed on the destination
+/// chain, so `id` is its real on-chain hash — for an ETH.USDT delivery,
+/// the Ethereum tx hash that emitted the USDT `Transfer`. RUST-004 binds
+/// the on-chain `Transfer.transaction_hash` to this 1:1. Every field is
+/// `serde(default)` so a partially-populated entry (e.g. observed but not
+/// yet hashed) deserializes and is simply skipped by the matcher.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OutboundTx {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub chain: String,
+    #[serde(default)]
+    pub to_address: String,
+    #[serde(default)]
+    pub coins: Vec<Coin>,
+}
+
+/// Subset of `GET /thorchain/tx/details/{hash}` — the richer details view
+/// whose `out_txs` expose the OBSERVED outbound on-chain hash(es). The
+/// observation view ([`TxResponse`], `GET /thorchain/tx/{hash}`) only
+/// lists PLANNED outbound `actions` with no hash, so RUST-004's 1:1
+/// inflow bind reads this view instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TxDetailsResponse {
+    #[serde(default)]
+    pub out_txs: Vec<OutboundTx>,
+}
+
 /// One entry in `GET /thorchain/queue/outbound`. Not yet broadcast on
 /// the destination chain — useful for relayers detecting partner-side
 /// stalls.

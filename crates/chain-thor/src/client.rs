@@ -10,7 +10,9 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use thiserror::Error;
 
-use crate::types::{InboundAddress, OutboundEntry, Pool, TxResponse, TxStatusResponse};
+use crate::types::{
+    InboundAddress, OutboundEntry, Pool, TxDetailsResponse, TxResponse, TxStatusResponse,
+};
 
 /// Maximum response body size accepted from `THORNode` (16 MiB). A
 /// well-behaved `THORNode` response is well under 1 MiB; the 16 MiB cap
@@ -109,6 +111,20 @@ impl ThorClient {
     /// As [`ThorClient::fetch_inbound_addresses`].
     pub async fn tx_status(&self, hash: &str) -> Result<TxResponse, ThorError> {
         let path = format!("/thorchain/tx/{hash}");
+        self.get_json(&path).await
+    }
+
+    /// `GET /thorchain/tx/details/{hash}` — the richer details view whose
+    /// `out_txs` carry the OBSERVED outbound on-chain hash(es). The
+    /// observation view ([`ThorClient::tx_status`]) only lists PLANNED
+    /// outbound actions with no hash; RUST-004 reads this view to bind the
+    /// delivered USDT `Transfer.transaction_hash` to the specific
+    /// `THORChain` outbound 1:1.
+    ///
+    /// # Errors
+    /// As [`ThorClient::fetch_inbound_addresses`].
+    pub async fn tx_details(&self, hash: &str) -> Result<TxDetailsResponse, ThorError> {
+        let path = format!("/thorchain/tx/details/{hash}");
         self.get_json(&path).await
     }
 

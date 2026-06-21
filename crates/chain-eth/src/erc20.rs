@@ -14,7 +14,9 @@
 //! low-frequency signer path. Uses `reqwest::blocking` rather than
 //! pulling a full async provider through the sync boundary.
 
-use alloy_primitives::{Address, U256};
+use std::str::FromStr;
+
+use alloy_primitives::{Address, B256, U256};
 use serde_json::json;
 use xindex_signer::crosscheck::{Erc20Arrival, Erc20ArrivalClient, Erc20Error};
 
@@ -141,9 +143,25 @@ fn decode_transfer_log(
     let block = parse_hex_u64(block)?;
     let confirmations =
         u32::try_from(tip.saturating_sub(block).saturating_add(1)).unwrap_or(u32::MAX);
+    // RUST-004: carry the physical inflow identity (transaction_hash,
+    // log_index) so the cross-check can bind it 1:1 to the THORChain outbound
+    // and consume it exactly once.
+    let tx_hash_str = log
+        .get("transactionHash")
+        .and_then(|h| h.as_str())
+        .ok_or_else(|| Erc20Error::Rpc("log missing transactionHash".into()))?;
+    let transaction_hash = B256::from_str(tx_hash_str)
+        .map_err(|e| Erc20Error::Rpc(format!("bad transactionHash '{tx_hash_str}': {e}")))?;
+    let log_index_str = log
+        .get("logIndex")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| Erc20Error::Rpc("log missing logIndex".into()))?;
+    let log_index = parse_hex_u64(log_index_str)?;
     Ok(Erc20Arrival {
         value,
         confirmations,
+        transaction_hash,
+        log_index,
     })
 }
 
@@ -202,11 +220,15 @@ mod tests {
             "address": format!("{token:#x}"),
             "topics": [TRANSFER_TOPIC0, serde_json::Value::Null, addr_topic(to)],
             "data": "0x00000000000000000000000000000000000000000000000000000000042c1d80",
-            "blockNumber": "0x64"
+            "blockNumber": "0x64",
+            "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "logIndex": "0x5"
         });
         let a = decode_transfer_log(&log, 105, token, to).expect("decode");
         assert_eq!(a.value, 70_000_000);
         assert_eq!(a.confirmations, 6);
+        assert_eq!(a.transaction_hash, B256::repeat_byte(0x11));
+        assert_eq!(a.log_index, 5);
     }
 
     /// I5: a Transfer log whose emitting contract is NOT the expected token
