@@ -65,7 +65,7 @@ use xindex_multisig::MultisigDescriptor;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::redemption_dispatch::{AnyRedemptionDispatch, RedemptionDispatchStore};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about = "Xindex redemption executor (M3)")]
 struct Args {
     /// WebSocket Ethereum RPC endpoint. Anvil default is `ws://127.0.0.1:8545`;
@@ -574,28 +574,43 @@ where
     // + stuck-tx re-broadcast). Both point at the same URL; the cost is
     // a second HTTP connection pool, far cheaper than refactoring
     // InProcessExecutor to share an `Arc<C>` with the watcher.
-    let executor_chain =
-        EsploraClient::for_chain(UtxoParams::for_chain(chain), network, &args.esplora_url);
-
-    // Live Esplora fee estimate (L-R5); floor + cap + fallback handled
-    // inside `resolve_fee_sats`. Extracted so `run` stays inside the
-    // line budget.
-    let fee_sats = resolve_fee_sats(&executor_chain, &args);
-    let executor = build_executor(
-        &args,
-        chain,
-        descriptor.clone(),
-        &pubkeys,
-        executor_chain,
-        network,
-        fee_sats,
-    )
-    .context("build executor")?;
-    let watcher_chain = Arc::new(EsploraClient::for_chain(
-        UtxoParams::for_chain(chain),
-        network,
-        &args.esplora_url,
-    ));
+    // EsploraClient + the remote cosigners are `reqwest::blocking` clients;
+    // constructing them (and the fee probe, which calls Esplora) on a runtime
+    // worker thread panics — reqwest's blocking builder spawns + drops a
+    // temporary runtime, and dropping a runtime inside an async context is
+    // forbidden. Build them on a blocking thread.
+    let (executor, watcher_chain) = {
+        let a = args.clone();
+        let descriptor = descriptor.clone();
+        let pubkeys = pubkeys.clone();
+        tokio::task::spawn_blocking(move || {
+            let executor_chain =
+                EsploraClient::for_chain(UtxoParams::for_chain(chain), network, &a.esplora_url);
+            // Live Esplora fee estimate (L-R5); floor + cap + fallback are
+            // handled inside `resolve_fee_sats`.
+            let fee_sats = resolve_fee_sats(&executor_chain, &a);
+            let executor = build_executor(
+                &a,
+                chain,
+                descriptor,
+                &pubkeys,
+                executor_chain,
+                network,
+                fee_sats,
+            )
+            .context("build executor")?;
+            let watcher_chain = Arc::new(EsploraClient::for_chain(
+                UtxoParams::for_chain(chain),
+                network,
+                &a.esplora_url,
+            ));
+            anyhow::Ok((executor, watcher_chain))
+        })
+        .await
+        .context("build executor task")??
+    };
+    // Shared so each event's blocking spend can run on its own blocking thread.
+    let executor = std::sync::Arc::new(executor);
 
     // THORChain client — resolves the live BTC Asgard inbound vault
     // (rotates per churn) the reverse deposit is sent to.
@@ -606,7 +621,14 @@ where
     // mandatory for any mainnet path (the RPC-free daemons reject a
     // proof-less custody spend). Built once; cloned-by-ref into the
     // event loop.
-    let collector = build_ric_collector(&args).context("build RIC collector")?;
+    // The RIC collector also holds a `reqwest::blocking` client — build it
+    // off the runtime worker thread for the same reason as the executor.
+    let collector = {
+        let a = args.clone();
+        tokio::task::spawn_blocking(move || build_ric_collector(&a))
+            .await
+            .context("build RIC collector task")??
+    };
     if collector.is_none() && matches!(args.signer_mode, SignerMode::Remote) {
         warn!(
             "REMOTE signer mode with NO --observer-urls: every custody spend will be REJECTED \
@@ -715,11 +737,20 @@ where
         let collected: Option<CollectedRic> = match collector.as_ref() {
             Some(c) => {
                 let stamp = now_unix_secs().unwrap_or(0);
-                match c.collect(chain, task.redemption_id, 0, stamp) {
-                    Ok(cr) => Some(cr),
-                    Err(e) => {
+                // RicCollector is a reqwest::blocking client — collect on a
+                // blocking thread, not this async worker.
+                let c = c.clone();
+                let rid = task.redemption_id;
+                match tokio::task::spawn_blocking(move || c.collect(chain, rid, 0, stamp)).await {
+                    Ok(Ok(cr)) => Some(cr),
+                    Ok(Err(e)) => {
                         error!(redemption_id = %task.redemption_id, error = %e,
                                "RIC collection failed; skipping (no proof-less custody spend)");
+                        return;
+                    }
+                    Err(e) => {
+                        error!(redemption_id = %task.redemption_id, error = %e,
+                               "RIC collection task panicked; skipping");
                         return;
                     }
                 }
@@ -775,7 +806,23 @@ where
                 return;
             }
         }
-        match executor.execute_capturing_tx(&task, &asgard) {
+        // The executor (Esplora + cosigners) is reqwest::blocking — run the
+        // spend on a blocking thread; return task/asgard for the async
+        // registry + F2 bookkeeping below.
+        let executor = std::sync::Arc::clone(&executor);
+        let (exec_result, task, asgard) = match tokio::task::spawn_blocking(move || {
+            let r = executor.execute_capturing_tx(&task, &asgard);
+            (r, task, asgard)
+        })
+        .await
+        {
+            Ok(triple) => triple,
+            Err(e) => {
+                error!(error = %e, "execute task panicked; skipping event");
+                return;
+            }
+        };
+        match exec_result {
             Ok((txid, tx)) => {
                 info!(redemption_id = %task.redemption_id, %txid, "BTC→Asgard broadcast");
                 let tx_bytes = bitcoin::consensus::serialize(&tx);

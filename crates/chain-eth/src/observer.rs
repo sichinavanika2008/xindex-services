@@ -432,7 +432,7 @@ pub struct Observer<L, S, G> {
     asgard: xindex_chain_thor::AsgardAgreement,
     legs: L,
     cancels: InMemoryCancelSource,
-    signer: S,
+    signer: std::sync::Arc<S>,
     halt: G,
 }
 
@@ -459,7 +459,7 @@ where
             asgard,
             legs,
             cancels: InMemoryCancelSource::new(),
-            signer,
+            signer: std::sync::Arc::new(signer),
             halt,
         }
     }
@@ -483,7 +483,10 @@ where
         &self,
         req: &ObserverCertifyRequest,
         now_unix: u64,
-    ) -> Result<ObserverCertifyResponse, ObserverError> {
+    ) -> Result<ObserverCertifyResponse, ObserverError>
+    where
+        S: Send + Sync + 'static,
+    {
         if req.chain_id != self.config.chain || req.chain_id == ChainId::Sol {
             return Err(ObserverError::ChainUnsupported(format!(
                 "{:?}",
@@ -556,7 +559,15 @@ where
             req.vault_resolved_at,
         );
         let domain = attestation_oracle_domain(self.config.eth_chain_id, self.config.oracle);
-        let sig = self.signer.sign_ric(self.config.chain, &ric, &domain)?;
+        // The Set-B signer is a reqwest::blocking client — run its call on a
+        // blocking thread, not this async worker (a blocking reqwest call on a
+        // runtime worker panics dropping reqwest's temp runtime). spawn_blocking
+        // works on both multi-thread and current-thread (test) runtimes.
+        let chain = self.config.chain;
+        let signer = std::sync::Arc::clone(&self.signer);
+        let sig = tokio::task::spawn_blocking(move || signer.sign_ric(chain, &ric, &domain))
+            .await
+            .map_err(|e| SignerError::Backend(format!("sign_ric task: {e}")))??;
 
         Ok(ObserverCertifyResponse {
             chain_id: self.config.chain,
@@ -595,7 +606,10 @@ where
         &self,
         req: &ObserverCertifyAccRequest,
         now_unix: u64,
-    ) -> Result<ObserverCertifyAccResponse, ObserverError> {
+    ) -> Result<ObserverCertifyAccResponse, ObserverError>
+    where
+        S: Send + Sync + 'static,
+    {
         if req.chain_id != self.config.chain || req.chain_id == ChainId::Sol {
             return Err(ObserverError::ChainUnsupported(format!(
                 "{:?}",
@@ -665,7 +679,12 @@ where
             req.vault_resolved_at,
         );
         let domain = attestation_oracle_domain(self.config.eth_chain_id, self.config.oracle);
-        let sig = self.signer.sign_acc(self.config.chain, &acc, &domain)?;
+        // See certify_ric: run the reqwest::blocking signer off the async worker.
+        let chain = self.config.chain;
+        let signer = std::sync::Arc::clone(&self.signer);
+        let sig = tokio::task::spawn_blocking(move || signer.sign_acc(chain, &acc, &domain))
+            .await
+            .map_err(|e| SignerError::Backend(format!("sign_acc task: {e}")))??;
 
         Ok(ObserverCertifyAccResponse {
             chain_id: self.config.chain,

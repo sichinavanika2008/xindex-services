@@ -57,7 +57,7 @@ enum CrossCheckMode {
     ThorBtc,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about = "Xindex k-of-n attestation signer + poster (M2)")]
 struct Args {
     /// WebSocket RPC endpoint (Anvil default `ws://127.0.0.1:8545`).
@@ -237,7 +237,19 @@ async fn run(args: Args) -> Result<()> {
     let attestation_oracle = Address::from_str(&args.attestation_oracle)
         .context("ATTESTATION_ORACLE_ADDR must be a 20-byte hex address")?;
 
-    let signers: Vec<AnyHsmBackend> = build_signers(&args)?;
+    // build_signers (remote mode) constructs reqwest::blocking clients — build
+    // them on a blocking thread, off the async worker (reqwest's blocking
+    // builder spawns+drops a temp runtime; dropping a runtime in an async
+    // context panics). Arc so each event's signing task borrows them on its
+    // own blocking thread.
+    let signers: std::sync::Arc<Vec<AnyHsmBackend>> = {
+        let a = args.clone();
+        std::sync::Arc::new(
+            tokio::task::spawn_blocking(move || build_signers(&a))
+                .await
+                .context("build_signers task")??,
+        )
+    };
     if signers.len() < args.threshold {
         anyhow::bail!(
             "fewer signer backends ({}) than threshold ({})",
@@ -357,13 +369,29 @@ async fn run(args: Args) -> Result<()> {
         let slot_idx: usize = 0;
         let slot_index_u256 = alloy_primitives::U256::from(slot_idx);
         let attestation_payload = attestation(intent_id, slot_index_u256, expected_amount);
-        let backends: Vec<&AnyHsmBackend> = signers.iter().take(args.threshold).collect();
-        let sigs = match aggregate_signatures(&backends, &domain, &attestation_payload) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(intent_id = %intent_id, slot_index = slot_idx, error = %e,
-                       "aggregate failed; skipping slot");
-                return;
+        // aggregate_signatures calls the (reqwest::blocking) signers — run it
+        // on a blocking thread, off the async worker.
+        let sigs = {
+            let signers = std::sync::Arc::clone(&signers);
+            let threshold = args.threshold;
+            let domain = domain.clone();
+            match tokio::task::spawn_blocking(move || {
+                let backends: Vec<&AnyHsmBackend> = signers.iter().take(threshold).collect();
+                aggregate_signatures(&backends, &domain, &attestation_payload)
+            })
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    error!(intent_id = %intent_id, slot_index = slot_idx, error = %e,
+                           "aggregate failed; skipping slot");
+                    return;
+                }
+                Err(e) => {
+                    error!(intent_id = %intent_id, slot_index = slot_idx, error = %e,
+                           "aggregate task panicked; skipping slot");
+                    return;
+                }
             }
         };
         let sig_bytes: Vec<Bytes> = sigs.into_iter().map(Bytes::from).collect();
@@ -371,7 +399,7 @@ async fn run(args: Args) -> Result<()> {
             intent_id = %intent_id,
             slot_index = slot_idx,
             attested_amount = %expected_amount,
-            signers = backends.len(),
+            signers = args.threshold,
             "posting attest()"
         );
         let pending = match oracle

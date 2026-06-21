@@ -66,7 +66,7 @@ enum SignerMode {
     Remote,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     version,
     about = "Xindex per-operator redemption observer (CTD-1 Slice B)"
@@ -276,7 +276,19 @@ async fn run(args: Args) -> Result<()> {
     let listen: SocketAddr = args.listen_addr.parse().context("LISTEN_ADDR invalid")?;
 
     let agreement = build_agreement(&args.thornode_urls)?;
-    let signer = build_signer(&args)?;
+    // `build_signer` (remote mode) constructs a `reqwest::blocking` client,
+    // which must NOT be built on a runtime worker thread: reqwest's blocking
+    // builder spawns + drops a temporary runtime, and dropping a runtime
+    // inside an async context panics ("Cannot drop a runtime in a context
+    // where blocking is not allowed"). Build it on a blocking thread — the
+    // same discipline the library's tests use. (Software mode has no blocking
+    // client; building it here is harmless.)
+    let signer = {
+        let a = args.clone();
+        tokio::task::spawn_blocking(move || build_signer(&a))
+            .await
+            .context("build_signer task")??
+    };
     let halt = build_halt_source(&args)?;
     let large_spend_threshold = args
         .large_spend_threshold

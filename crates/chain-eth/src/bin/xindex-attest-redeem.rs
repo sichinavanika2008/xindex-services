@@ -69,7 +69,7 @@ enum CrossCheckMode {
     ThorBtcUsdt,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version, about = "Xindex redemption attestation poster")]
 struct Args {
     /// WebSocket RPC (events + tx submission). Anvil: <ws://127.0.0.1:8545>.
@@ -447,7 +447,12 @@ async fn run(args: Args) -> Result<()> {
     let attestation_oracle =
         Address::from_str(&args.attestation_oracle).context("ATTESTATION_ORACLE_ADDR invalid")?;
 
-    let signers: Vec<AnyHsmBackend> = build_signers(&args)?;
+    let args_signers = args.clone();
+    let signers: Arc<Vec<AnyHsmBackend>> = Arc::new(
+        tokio::task::spawn_blocking(move || build_signers(&args_signers))
+            .await
+            .context("build_signers task")??,
+    );
     if signers.len() < args.threshold {
         anyhow::bail!(
             "fewer signer backends ({}) than threshold ({})",
@@ -456,8 +461,12 @@ async fn run(args: Args) -> Result<()> {
         );
     }
 
+    let args_cc = args.clone();
     let (delivery_cc, refund_cc, streamed) =
-        build_cross_checks(&args).context("build cross-checks")?;
+        tokio::task::spawn_blocking(move || build_cross_checks(&args_cc))
+            .await
+            .context("build_cross_checks task")?
+            .context("build cross-checks")?;
     if args.redemption_database_url.is_none() {
         warn!(
             "F2 store IN-MEMORY — a fresh process has NO record of redemptions the executor \
@@ -587,15 +596,25 @@ async fn run(args: Args) -> Result<()> {
                     let refunded = U256::from(outcome.refunded_sats);
                     let payload =
                         streamed_settlement(rid, leg_index, asset_id, delivered, refunded);
-                    let backends: Vec<&AnyHsmBackend> =
-                        signers.iter().take(args.threshold).collect();
-                    let sigs = match aggregate_streamed_settlement_signatures(
-                        &backends, &domain, &payload,
-                    ) {
-                        Ok(s) => s.into_iter().map(Bytes::from).collect::<Vec<_>>(),
-                        Err(e) => {
+                    let signers_c = Arc::clone(&signers);
+                    let threshold = args.threshold;
+                    let domain_c = domain.clone();
+                    let agg = tokio::task::spawn_blocking(move || {
+                        let backends: Vec<&AnyHsmBackend> =
+                            signers_c.iter().take(threshold).collect();
+                        aggregate_streamed_settlement_signatures(&backends, &domain_c, &payload)
+                    })
+                    .await;
+                    let sigs = match agg {
+                        Ok(Ok(s)) => s.into_iter().map(Bytes::from).collect::<Vec<_>>(),
+                        Ok(Err(e)) => {
                             error!(redemption_id = %rid, error = %e,
                                        "streamed-settlement aggregate failed");
+                            return;
+                        }
+                        Err(e) => {
+                            error!(redemption_id = %rid, error = %e,
+                                       "streamed-settlement aggregate task panicked");
                             return;
                         }
                     };
@@ -631,11 +650,23 @@ async fn run(args: Args) -> Result<()> {
             Ok(usdt_1e6) => {
                 let amount = U256::from(usdt_1e6);
                 let payload = redemption_attestation(rid, leg_index, asset_id, amount);
-                let backends: Vec<&AnyHsmBackend> = signers.iter().take(args.threshold).collect();
-                let sigs = match aggregate_redemption_signatures(&backends, &domain, &payload) {
-                    Ok(s) => s.into_iter().map(Bytes::from).collect::<Vec<_>>(),
-                    Err(e) => {
+                let signers_c = Arc::clone(&signers);
+                let threshold = args.threshold;
+                let domain_c = domain.clone();
+                let agg = tokio::task::spawn_blocking(move || {
+                    let backends: Vec<&AnyHsmBackend> = signers_c.iter().take(threshold).collect();
+                    aggregate_redemption_signatures(&backends, &domain_c, &payload)
+                })
+                .await;
+                let sigs = match agg {
+                    Ok(Ok(s)) => s.into_iter().map(Bytes::from).collect::<Vec<_>>(),
+                    Ok(Err(e)) => {
                         error!(redemption_id = %rid, error = %e, "redemption aggregate failed");
+                        return;
+                    }
+                    Err(e) => {
+                        error!(redemption_id = %rid, error = %e,
+                                   "redemption aggregate task panicked");
                         return;
                     }
                 };
@@ -661,13 +692,25 @@ async fn run(args: Args) -> Result<()> {
                     Ok(btc_sats) => {
                         let amount = U256::from(btc_sats);
                         let payload = refund_attestation(rid, leg_index, asset_id, amount);
-                        let backends: Vec<&AnyHsmBackend> =
-                            signers.iter().take(args.threshold).collect();
-                        let sigs = match aggregate_refund_signatures(&backends, &domain, &payload) {
-                            Ok(s) => s.into_iter().map(Bytes::from).collect::<Vec<_>>(),
-                            Err(e) => {
+                        let signers_c = Arc::clone(&signers);
+                        let threshold = args.threshold;
+                        let domain_c = domain.clone();
+                        let agg = tokio::task::spawn_blocking(move || {
+                            let backends: Vec<&AnyHsmBackend> =
+                                signers_c.iter().take(threshold).collect();
+                            aggregate_refund_signatures(&backends, &domain_c, &payload)
+                        })
+                        .await;
+                        let sigs = match agg {
+                            Ok(Ok(s)) => s.into_iter().map(Bytes::from).collect::<Vec<_>>(),
+                            Ok(Err(e)) => {
                                 error!(redemption_id = %rid, error = %e,
                                            "refund aggregate failed");
+                                return;
+                            }
+                            Err(e) => {
+                                error!(redemption_id = %rid, error = %e,
+                                           "refund aggregate task panicked");
                                 return;
                             }
                         };
