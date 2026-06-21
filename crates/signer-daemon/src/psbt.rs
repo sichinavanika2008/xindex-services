@@ -151,23 +151,12 @@ where
         )
     })?;
 
-    // 0. CTD-1 (`DL-CTD-2`): mandatory k-of-n certificate gate — a RIC
-    //    (redeem) XOR an ACC (mint-cancel swap-back, Slice C). Both →
-    //    422 ambiguous; neither → 422 required. Either path verifies
-    //    statelessly, binds asset/decimals to this chain, and consumes
-    //    its one-shot (RIC: (chain, redemption, leg); ACC: (chain,
-    //    cancel_id)) BEFORE the HSM can ever be reached. The output-set
-    //    bind happens at step 4c once the PSBT is decoded.
-    let spend = gate_spend_certificate(
-        &state.config,
-        state.replay.as_ref(),
-        req.chain_id,
-        req.intent_proof.as_ref(),
-        req.acquire_cancel_proof.as_ref(),
-    )
-    .await?;
-
-    // 1. Decode PSBT.
+    // 0. Decode the PSBT up front: its unsigned-tx txid is the RUST-003
+    //    one-shot spend identity passed to the certificate gate below. A
+    //    re-drive of the same certificate into a SECOND, distinct tx has a
+    //    different txid → a 409; a multi-input redemption that signs further
+    //    inputs of the SAME tx shares the txid and proceeds (the output-set
+    //    bind + per-input replay key handle those).
     let raw = B64.decode(req.psbt_base64.as_bytes()).map_err(|e| {
         err(
             error_codes::INVALID_PSBT,
@@ -182,6 +171,24 @@ where
             format!("psbt deserialize: {e}"),
         )
     })?;
+    let unsigned_txid = psbt.unsigned_tx.compute_txid().to_byte_array();
+
+    // 1. CTD-1 (`DL-CTD-2`): mandatory k-of-n certificate gate — a RIC
+    //    (redeem) XOR an ACC (mint-cancel swap-back, Slice C). Both →
+    //    422 ambiguous; neither → 422 required. Either path verifies
+    //    statelessly, binds asset/decimals to this chain, and consumes
+    //    its one-shot (RIC: (chain, redemption, leg); ACC: (chain,
+    //    cancel_id)) BEFORE the HSM can ever be reached. The output-set
+    //    bind happens at step 4c.
+    let spend = gate_spend_certificate(
+        &state.config,
+        state.replay.as_ref(),
+        req.chain_id,
+        req.intent_proof.as_ref(),
+        req.acquire_cancel_proof.as_ref(),
+        &unsigned_txid,
+    )
+    .await?;
 
     let idx = req.input_index as usize;
     if idx >= psbt.inputs.len() {
@@ -894,6 +901,57 @@ mod tests {
             script_pubkey: prev_spk,
         });
         psbt.inputs[0].witness_script = Some(witness_script);
+        psbt
+    }
+
+    /// Two-input variant of [`build_test_psbt`]: ONE tx that spends two of
+    /// the daemon's own multisig UTXOs to a single payout. Each input is
+    /// independently signable via its `input_index`. Used to prove the
+    /// RUST-003 one-shot binds the unsigned-tx txid (constant across the
+    /// inputs of ONE tx), so a legitimate multi-input redemption signs
+    /// every input under a single RIC — a per-input outpoint identity
+    /// would have 409'd the second input.
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn build_test_psbt_2in(
+        descriptor: &MultisigDescriptor,
+        prev0: bitcoin::Txid,
+        prev1: bitcoin::Txid,
+        value_each: Amount,
+        recipient_script: ScriptBuf,
+    ) -> Psbt {
+        let witness_script = derive_witness_script(descriptor).expect("ws");
+        let address = descriptor.address(Network::Bitcoin).expect("addr");
+        let prev_spk = address.script_pubkey();
+        let push = bitcoin::script::PushBytesBuf::try_from(TEST_MEMO.to_vec()).expect("push");
+        let mk_in = |txid| TxIn {
+            previous_output: OutPoint { txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![mk_in(prev0), mk_in(prev1)],
+            output: vec![
+                TxOut {
+                    value: value_each - Amount::from_sat(1_000),
+                    script_pubkey: recipient_script,
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::new_op_return(push),
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("psbt");
+        for input in &mut psbt.inputs {
+            input.witness_utxo = Some(TxOut {
+                value: value_each,
+                script_pubkey: prev_spk.clone(),
+            });
+            input.witness_script = Some(witness_script.clone());
+        }
         psbt
     }
 
@@ -2061,5 +2119,61 @@ mod tests {
         let ric = ric_proof(&spk, 99_000, TEST_MEMO, 0x85);
         let (status_b, resp_b) = post_psbt(&app, B64.encode(psbt_b.serialize()), 0, &ric).await;
         assert_eq!(status_b, StatusCode::OK, "body: {resp_b}");
+    }
+
+    /// RUST-003 (BTC) — the one-shot binds the unsigned-tx TXID, not a
+    /// per-input outpoint, so a legitimate MULTI-INPUT redemption (ONE tx
+    /// spending two of our UTXOs) signs every input under a single RIC.
+    /// Input 0 records the txid; input 1 of the SAME tx re-presents the
+    /// matching identity and signs. A per-input outpoint identity would
+    /// have 409'd input 1.
+    #[tokio::test]
+    async fn multi_input_one_tx_signs_every_input_under_one_ric() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev0 =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xf0u8; 32]));
+        let prev1 =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xf1u8; 32]));
+        let psbt = build_test_psbt_2in(&desc, prev0, prev1, Amount::from_sat(100_000), spk.clone());
+        let psbt_b64 = B64.encode(psbt.serialize());
+        let ric = ric_proof(&spk, 99_000, TEST_MEMO, 0x90);
+        let (s0, b0) = post_psbt(&app, psbt_b64.clone(), 0, &ric).await;
+        assert_eq!(s0, StatusCode::OK, "input 0: {b0}");
+        let (s1, b1) = post_psbt(&app, psbt_b64, 1, &ric).await;
+        assert_eq!(s1, StatusCode::OK, "input 1 of the SAME tx must sign: {b1}");
+    }
+
+    /// RUST-003 (BTC / CTD-E-R1) — a re-drive of the SAME RIC into a
+    /// DIFFERENT tx (a second payout spending a different UTXO → different
+    /// unsigned-tx txid) is a 409 `intent_already_signed`. Contrast the
+    /// multi-input case above (same txid → signs) and
+    /// `acc_redrive_different_certificate_is_409` (different certificate).
+    #[tokio::test]
+    async fn redrive_same_ric_different_tx_is_409() {
+        let (desc, app) = veto_fixture();
+        let (spk, _) = dest_spk();
+        let prev_a =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xf2u8; 32]));
+        let psbt_a = build_test_psbt(&desc, prev_a, 0, Amount::from_sat(100_000), spk.clone());
+        let ric = ric_proof(&spk, 99_000, TEST_MEMO, 0x91);
+        let (sa, ba) = post_psbt(&app, B64.encode(psbt_a.serialize()), 0, &ric).await;
+        assert_eq!(sa, StatusCode::OK, "first tx: {ba}");
+
+        // SAME RIC (0x91 — same amount/memo/dest → same digest), a DIFFERENT
+        // tx spending a different UTXO → a different unsigned-tx txid → 409.
+        let prev_b =
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([0xf3u8; 32]));
+        let psbt_b = build_test_psbt(&desc, prev_b, 0, Amount::from_sat(100_000), spk.clone());
+        let (sb, bb) = post_psbt(&app, B64.encode(psbt_b.serialize()), 0, &ric).await;
+        assert_eq!(
+            sb,
+            StatusCode::CONFLICT,
+            "re-drive into a different tx: {bb}"
+        );
+        assert_eq!(
+            bb["code"].as_str().unwrap_or(""),
+            error_codes::INTENT_ALREADY_SIGNED
+        );
     }
 }

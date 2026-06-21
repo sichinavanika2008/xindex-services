@@ -923,19 +923,29 @@ where
 ///    legs only, so a BTC certificate can never authorize an LTC spend
 ///    of the same numeric amount) and `amount_decimals` must equal the
 ///    registry decimals (RA-4, like-for-like — never rescaled).
-/// 4. One-shot CONSUME (RA-1), recorded BEFORE the HSM: a same-digest
-///    retry passes idempotently (the family replay arm dedups the tx
-///    signature), a DIFFERENT certificate for a consumed leg is a 409
-///    `intent_already_signed`, and a post-record HSM failure cannot
-///    brick the leg (a retry with the SAME certificate proceeds).
+/// 4. One-shot CONSUME (RA-1 / RUST-003), recorded BEFORE the HSM: the
+///    first consumed `spend_identity` (the family value bound into the
+///    signed tx) is stored alongside the cert digest. A retry with the
+///    SAME certificate AND the same spend passes idempotently, a
+///    DIFFERENT certificate for the leg is a 409 `intent_already_signed`,
+///    and a re-DRIVE of the same certificate into a DIFFERENT spend
+///    (an account family whose sequence/nonce has advanced, a second tx)
+///    is likewise refused. A post-record HSM failure cannot brick the
+///    leg (a retry with the same certificate + spend proceeds).
 ///
 /// The caller still binds the certified destination/amount/memo to the
-/// family-specific tx shape — that part cannot be shared.
+/// family-specific tx shape — that part cannot be shared. It also passes
+/// `spend_identity`: the family value (cosmos/xrp `sequence`, tron txID,
+/// evm-safe `nonce`, btc unsigned-tx txid) that distinguishes one
+/// on-chain spend from another and is itself bound into the signed tx, so
+/// a coordinator cannot present one identity and broadcast a different
+/// spend.
 pub(crate) async fn gate_ric_intent<S: ReplayStore>(
     config: &DaemonConfig,
     replay: &S,
     chain: ChainId,
     proof: Option<&IntentProof>,
+    spend_identity: &[u8],
 ) -> Result<(VerifiedIntent, B256), (StatusCode, Json<ErrorBody>)> {
     let proof = proof.ok_or_else(|| {
         unprocessable(
@@ -971,33 +981,58 @@ pub(crate) async fn gate_ric_intent<S: ReplayStore>(
             ),
         ));
     }
-    consume_ric_one_shot(replay, chain, &cert, digest).await?;
+    consume_ric_one_shot(replay, chain, &cert, digest, spend_identity).await?;
     Ok((cert, digest))
 }
 
-/// RA-1: consume the `(chain, redemptionId, legIndex)` one-shot. The
-/// row is recorded BEFORE the HSM is consulted — the row IS the
-/// authorization; the family replay table holds the actual signature
-/// (the stored signature here is empty by design).
+/// RA-1 / RUST-003: consume the `(chain, redemptionId, legIndex)`
+/// one-shot. The row is recorded BEFORE the HSM is consulted — the row IS
+/// the authorization. The one-shot table's `signature` BLOB (unused by
+/// design — the family replay table holds the actual signature) is
+/// repurposed to store the FIRST-consumed `spend_identity`: the family
+/// value bound into the signed tx that distinguishes one spend from the
+/// next (cosmos/xrp `sequence`, tron txID, evm-safe `nonce`, btc
+/// unsigned-tx txid).
+///
+/// On a same-certificate (`Idempotent`) retry the presented identity must
+/// MATCH the stored one: an honest re-presentation — an HSM-failure retry,
+/// or a multi-input BTC redemption signing another input of the SAME tx
+/// (same txid) — shares the identity and proceeds; a re-DRIVE of the same
+/// certificate into a DIFFERENT spend (an account family whose sequence
+/// has advanced after the first spend confirmed, a second BTC tx) is a 409.
+/// This closes the RA-1 / CTD-E-R1 gap the digest-only check missed: an
+/// account daemon would otherwise re-sign the same RIC at sequence N+1,
+/// N+2 … for the full amount each time.
 async fn consume_ric_one_shot<S: ReplayStore>(
     replay: &S,
     chain: ChainId,
     cert: &VerifiedIntent,
     digest: B256,
+    spend_identity: &[u8],
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    const REDRIVEN: &str =
+    const REDRIVEN_CERT: &str =
         "custody spend for this (chain, redemption, leg) was already authorized under a \
          different certificate";
+    const REDRIVEN_SPEND: &str =
+        "this certificate already authorized a DIFFERENT custody spend for the leg \
+         (same RIC, advanced sequence/nonce or a different tx) — refusing the re-drive";
     let outcome = replay
         .check_ric_intent(chain, cert.redemption_id, cert.leg_index, digest.0)
         .await
         .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
     match outcome {
-        // Same certificate retried — the family replay arm dedups the
-        // actual tx signature; nothing to consume twice.
-        CheckOutcome::Idempotent(_) => return Ok(()),
+        // Same certificate retried — allowed ONLY if it re-presents the
+        // SAME spend identity (RUST-003); a different spend under the same
+        // cert is a re-drive across the advancing family replay key.
+        CheckOutcome::Idempotent(rec) => {
+            return if rec.signature.as_slice() == spend_identity {
+                Ok(())
+            } else {
+                Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_SPEND))
+            };
+        }
         CheckOutcome::Conflict { .. } => {
-            return Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN));
+            return Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_CERT));
         }
         CheckOutcome::FirstTime => {}
     }
@@ -1007,7 +1042,7 @@ async fn consume_ric_one_shot<S: ReplayStore>(
             cert.redemption_id,
             cert.leg_index,
             digest.0,
-            Vec::new(),
+            spend_identity.to_vec(),
             now_unix_secs(),
         )
         .await
@@ -1015,16 +1050,19 @@ async fn consume_ric_one_shot<S: ReplayStore>(
         if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
-        // Lost a same-leg race — proceed only if the winner consumed
-        // the SAME certificate.
+        // Lost a same-leg race — proceed only if the winner consumed the
+        // SAME certificate AND the SAME spend identity.
         return match replay
             .check_ric_intent(chain, cert.redemption_id, cert.leg_index, digest.0)
             .await
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
         {
-            CheckOutcome::Idempotent(_) => Ok(()),
+            CheckOutcome::Idempotent(rec) if rec.signature.as_slice() == spend_identity => Ok(()),
+            CheckOutcome::Idempotent(_) => {
+                Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_SPEND))
+            }
             CheckOutcome::Conflict { .. } => {
-                Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN))
+                Err(conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_CERT))
             }
             CheckOutcome::FirstTime => Err(internal(
                 error_codes::BAD_REQUEST,
@@ -1075,14 +1113,16 @@ fn acc_error_code(e: &IntentError) -> &'static str {
 ///    decimals (RA-4) — an ACC for one chain can never authorize a
 ///    same-amount spend on another.
 /// 3. One-shot CONSUME keyed `(chain, cancel_id)`, recorded BEFORE the
-///    HSM: a same-digest retry passes idempotently, a DIFFERENT
-///    certificate for a consumed cancel is a 409
-///    `acquire_cancel_already_signed`.
+///    HSM: a retry with the SAME certificate AND the same `spend_identity`
+///    passes idempotently, a DIFFERENT certificate for a consumed cancel
+///    is a 409 `acquire_cancel_already_signed`, and a re-DRIVE of the same
+///    ACC into a DIFFERENT swap-back spend is likewise refused (RUST-003).
 pub(crate) async fn gate_acquire_cancel_intent<S: ReplayStore>(
     config: &DaemonConfig,
     replay: &S,
     chain: ChainId,
     proof: &AcquireCancelProof,
+    spend_identity: &[u8],
 ) -> Result<(VerifiedCancel, B256), (StatusCode, Json<ErrorBody>)> {
     let now = u64::try_from(now_unix_secs()).unwrap_or(0);
     let (cert, digest) = validate_acquire_cancel_proof(
@@ -1112,53 +1152,80 @@ pub(crate) async fn gate_acquire_cancel_intent<S: ReplayStore>(
             ),
         ));
     }
-    consume_ac_one_shot(replay, chain, &cert, digest).await?;
+    consume_ac_one_shot(replay, chain, &cert, digest, spend_identity).await?;
     Ok((cert, digest))
 }
 
 /// Slice C mirror of [`consume_ric_one_shot`] keyed `(chain, cancel_id)`:
 /// the row is recorded BEFORE the HSM is consulted — the row IS the
-/// authorization; the PSBT replay table holds the actual signature.
+/// authorization; the PSBT replay table holds the actual signature. The
+/// one-shot's `signature` BLOB stores the first-consumed `spend_identity`
+/// (RUST-003), so a same-ACC retry must re-present the same swap-back spend
+/// (the BTC unsigned-tx txid); a re-drive into a different tx is a 409.
 async fn consume_ac_one_shot<S: ReplayStore>(
     replay: &S,
     chain: ChainId,
     cert: &VerifiedCancel,
     digest: B256,
+    spend_identity: &[u8],
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    const REDRIVEN: &str = "swap-back for this (chain, cancel_id) was already authorized under a \
+    const REDRIVEN_CERT: &str =
+        "swap-back for this (chain, cancel_id) was already authorized under a \
          different certificate";
+    const REDRIVEN_SPEND: &str =
+        "this acquire-cancel certificate already authorized a DIFFERENT swap-back spend \
+         (same ACC, different tx) — refusing the re-drive";
     let outcome = replay
         .check_ac_intent(chain, cert.cancel_id, digest.0)
         .await
         .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
     match outcome {
-        CheckOutcome::Idempotent(_) => return Ok(()),
+        CheckOutcome::Idempotent(rec) => {
+            return if rec.signature.as_slice() == spend_identity {
+                Ok(())
+            } else {
+                Err(conflict(
+                    error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED,
+                    REDRIVEN_SPEND,
+                ))
+            };
+        }
         CheckOutcome::Conflict { .. } => {
             return Err(conflict(
                 error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED,
-                REDRIVEN,
+                REDRIVEN_CERT,
             ));
         }
         CheckOutcome::FirstTime => {}
     }
     if let Err(e) = replay
-        .record_ac_intent(chain, cert.cancel_id, digest.0, Vec::new(), now_unix_secs())
+        .record_ac_intent(
+            chain,
+            cert.cancel_id,
+            digest.0,
+            spend_identity.to_vec(),
+            now_unix_secs(),
+        )
         .await
     {
         if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
         // Lost a same-cancel race — proceed only if the winner consumed
-        // the SAME certificate.
+        // the SAME certificate AND the SAME spend identity.
         return match replay
             .check_ac_intent(chain, cert.cancel_id, digest.0)
             .await
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
         {
-            CheckOutcome::Idempotent(_) => Ok(()),
+            CheckOutcome::Idempotent(rec) if rec.signature.as_slice() == spend_identity => Ok(()),
+            CheckOutcome::Idempotent(_) => Err(conflict(
+                error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED,
+                REDRIVEN_SPEND,
+            )),
             CheckOutcome::Conflict { .. } => Err(conflict(
                 error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED,
-                REDRIVEN,
+                REDRIVEN_CERT,
             )),
             CheckOutcome::FirstTime => Err(internal(
                 error_codes::BAD_REQUEST,
@@ -1188,6 +1255,7 @@ pub(crate) async fn gate_spend_certificate<S: ReplayStore>(
     chain: ChainId,
     ric: Option<&IntentProof>,
     acc: Option<&AcquireCancelProof>,
+    spend_identity: &[u8],
 ) -> Result<CertifiedSpend, (StatusCode, Json<ErrorBody>)> {
     match (ric, acc) {
         (Some(_), Some(_)) => Err(unprocessable(
@@ -1196,7 +1264,8 @@ pub(crate) async fn gate_spend_certificate<S: ReplayStore>(
              certificate kind must authorize a custody spend",
         )),
         (None, Some(proof)) => {
-            let (cert, _digest) = gate_acquire_cancel_intent(config, replay, chain, proof).await?;
+            let (cert, _digest) =
+                gate_acquire_cancel_intent(config, replay, chain, proof, spend_identity).await?;
             Ok(CertifiedSpend {
                 amount: cert.amount,
                 immediate_target_hash: cert.immediate_target_hash,
@@ -1207,7 +1276,8 @@ pub(crate) async fn gate_spend_certificate<S: ReplayStore>(
         // RIC-only AND neither: gate_ric_intent turns `None` into the
         // typed `intent_proof_required` 422.
         (ric_only, None) => {
-            let (cert, _digest) = gate_ric_intent(config, replay, chain, ric_only).await?;
+            let (cert, _digest) =
+                gate_ric_intent(config, replay, chain, ric_only, spend_identity).await?;
             Ok(CertifiedSpend {
                 amount: cert.amount,
                 immediate_target_hash: cert.immediate_target_hash,
@@ -2563,6 +2633,68 @@ mod tests {
             #[expect(clippy::unwrap_used, reason = "test code")]
             let seen = hsm.seen.lock().unwrap();
             assert_eq!(seen.len(), 1, "second spend never reaches the HSM");
+        }
+
+        /// RUST-003: a re-drive of the SAME certificate into a DIFFERENT
+        /// spend — the Safe nonce advanced from 0 to 1 after the first
+        /// execution, with a correctly recomputed `safe_tx_hash` — is a 409
+        /// `intent_already_signed`. The one-shot binds the first-consumed
+        /// spend identity (the nonce), so one valid RIC cannot become a
+        /// second payout at nonce N+1. (Contrast
+        /// `redriven_leg_with_different_cert_is_409`, the DIFFERENT-cert
+        /// Conflict path; here the certificate is byte-identical.)
+        #[tokio::test]
+        async fn redriven_leg_same_cert_advanced_nonce_is_409() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            // First spend: nonce 0, certificate C.
+            let (_, req1) = build_request(ChainId::Eth, ETH_SAFE, 0, "redrive-spend");
+            let (s1, _) = post_json(
+                &app,
+                "/api/v1/sign/evm-safe-tx",
+                serde_json::to_value(&req1).unwrap_or(serde_json::Value::Null),
+            )
+            .await;
+            assert_eq!(s1, StatusCode::OK);
+
+            // SAME memo → SAME redemption/leg/amount → SAME RIC digest C, but
+            // the Safe nonce has advanced to 1 (a genuinely different on-chain
+            // spend). Same cert, different spend identity → 409, not a 2nd payout.
+            let (_, req2) = build_request(ChainId::Eth, ETH_SAFE, 1, "redrive-spend");
+            let (s2, b2) = post_json(
+                &app,
+                "/api/v1/sign/evm-safe-tx",
+                serde_json::to_value(&req2).unwrap_or(serde_json::Value::Null),
+            )
+            .await;
+            assert_eq!(s2, StatusCode::CONFLICT, "body: {b2}");
+            assert_eq!(
+                b2["code"].as_str().unwrap_or(""),
+                error_codes::INTENT_ALREADY_SIGNED
+            );
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "the re-driven spend never reaches the HSM");
+        }
+
+        /// RUST-003 must NOT break a legitimate retry: re-posting the SAME
+        /// request (same certificate AND same nonce — an HSM-failure or
+        /// network retry) stays idempotent, returns the cached signature,
+        /// and never re-invokes the HSM. Guards against the identity check
+        /// over-rejecting honest re-presentations.
+        #[tokio::test]
+        async fn same_cert_same_nonce_retry_is_idempotent() {
+            let (state, hsm) = evm_state();
+            let app = router(state);
+            let (_, req) = build_request(ChainId::Eth, ETH_SAFE, 0, "retry");
+            let body = serde_json::to_value(&req).unwrap_or(serde_json::Value::Null);
+            let (s1, _) = post_json(&app, "/api/v1/sign/evm-safe-tx", body.clone()).await;
+            assert_eq!(s1, StatusCode::OK);
+            let (s2, _) = post_json(&app, "/api/v1/sign/evm-safe-tx", body).await;
+            assert_eq!(s2, StatusCode::OK, "identical retry is idempotent");
+            #[expect(clippy::unwrap_used, reason = "test code")]
+            let seen = hsm.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "idempotent retry does not re-invoke the HSM");
         }
 
         /// The EVM route is NOT registered when `state.evm` is empty.

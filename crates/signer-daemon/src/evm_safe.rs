@@ -369,6 +369,10 @@ where
         state.replay.as_ref(),
         req.chain_id,
         req.intent_proof.as_ref(),
+        // RUST-003 one-shot spend identity: the Safe `nonce`, bound into the
+        // SafeTx EIP-712 reassembled below. The Safe nonce advances on every
+        // execution, so a re-drive must use a higher nonce → a 409.
+        req.nonce.as_bytes(),
     )
     .await?;
 

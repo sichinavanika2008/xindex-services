@@ -261,6 +261,10 @@ where
         state.replay.as_ref(),
         req.chain_id,
         req.intent_proof.as_ref(),
+        // RUST-003 one-shot spend identity: the account `sequence`, bound into
+        // the amino sign-bytes recomputed below. A re-drive of this RIC after the
+        // first spend confirms must advance the sequence → a 409, not a 2nd spend.
+        req.sequence.as_bytes(),
     )
     .await?;
     bind_send_to_cert(

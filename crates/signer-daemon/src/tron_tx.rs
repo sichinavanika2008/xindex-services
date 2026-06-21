@@ -256,6 +256,10 @@ where
         state.replay.as_ref(),
         req.chain_id,
         req.intent_proof.as_ref(),
+        // RUST-003 one-shot spend identity: the tx `txid`, verified below to equal
+        // sha256(rebuilt raw_data) — so it IS the spend. A re-drive is a different
+        // tx (different ref-block/expiration) → a different txid → a 409.
+        req.txid.as_bytes(),
     )
     .await?;
     if req.asset != TronAssetKind::Trx {

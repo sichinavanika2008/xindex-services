@@ -14,11 +14,15 @@
 -- forged/rotated cert). SEPARATE table from `ric_intents` so the redeem and
 -- mint-cancel one-shots can never collide.
 
+-- Same cancel_id + same digest + the SAME first-consumed spend identity (the
+-- BTC unsigned-tx txid) -> idempotent; same digest + a DIFFERENT swap-back tx
+-- (RUST-003) -> 409. The `signature` BLOB is repurposed to store that identity.
 CREATE TABLE IF NOT EXISTS ac_intents (
     chain_id TEXT NOT NULL,
     cancel_id BLOB NOT NULL,         -- 32 bytes
     payload_hash BLOB NOT NULL,      -- 32-byte ACC digest
-    signature BLOB NOT NULL,
+    signature BLOB NOT NULL,         -- RUST-003: first-consumed spend identity
+                                     -- (btc unsigned-tx txid), NOT a signature
     signed_at_unix INTEGER NOT NULL,
     PRIMARY KEY (chain_id, cancel_id)
 );

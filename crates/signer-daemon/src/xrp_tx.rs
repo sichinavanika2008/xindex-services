@@ -226,6 +226,10 @@ where
         state.replay.as_ref(),
         req.chain_id,
         req.intent_proof.as_ref(),
+        // RUST-003 one-shot spend identity: the account `sequence`, bound into
+        // the Payment body re-serialized below. A re-drive must advance the
+        // sequence → a 409, not a second swap.
+        req.sequence.as_bytes(),
     )
     .await?;
     bind_account_send_to_cert(&req.destination, &req.amount_drops, &req.memo, &cert)?;
