@@ -7,4 +7,6 @@
 //! spend binders are being relocated here from the daemon as they are
 //! decoupled from its HTTP (`axum`) layer.
 
+pub mod btc_bind;
+pub mod gates;
 pub mod replay;

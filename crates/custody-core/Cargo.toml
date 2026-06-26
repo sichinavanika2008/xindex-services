@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 xindex-shared.workspace = true
 alloy-primitives.workspace = true
+bitcoin.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
