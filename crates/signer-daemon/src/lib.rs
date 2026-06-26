@@ -27,7 +27,7 @@
 
 pub mod cosmos_tx;
 pub mod evm_safe;
-pub mod intent;
+pub use xindex_shared::intent;
 pub mod price_sign;
 pub mod price_supply;
 pub mod price_venue;

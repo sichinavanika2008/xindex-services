@@ -10,7 +10,12 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-alloy-primitives.workspace = true
+# `k256` feature: the RIC/ACC verifier (`intent` module) recovers signer
+# addresses via `Signature::recover_address_from_prehash` (production path,
+# not just tests). The workspace base enables no alloy-primitives features,
+# so the recovery API must be turned on here explicitly — it was previously
+# available to `intent` only via the daemon's transitive feature unification.
+alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-sol-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -20,3 +25,7 @@ tokio.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# RIC/ACC verifier unit tests (`intent` module) sign test digests with a
+# secp256k1 key. k256 is the workspace secp256k1 crate used across the
+# signing crates; here it is test-only.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
