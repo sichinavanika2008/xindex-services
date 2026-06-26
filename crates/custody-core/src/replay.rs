@@ -62,7 +62,7 @@ pub enum ReplayError {
 /// share ONE tested copy of the recovery predicate instead of duplicating the
 /// `!matches!(e, Duplicate)` guard each.
 #[must_use]
-pub(crate) fn must_propagate_record_error(e: &ReplayError) -> bool {
+pub fn must_propagate_record_error(e: &ReplayError) -> bool {
     !matches!(e, ReplayError::Duplicate)
 }
 

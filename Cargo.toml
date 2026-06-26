@@ -90,6 +90,7 @@ bs58 = "0.5"
 base64 = "0.22"
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
+xindex-custody-core = { path = "crates/custody-core" }
 xindex-cosmos-tx = { path = "crates/cosmos-tx" }
 xindex-xrp-tx = { path = "crates/xrp-tx" }
 xindex-solana-tx = { path = "crates/solana-tx" }

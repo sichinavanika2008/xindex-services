@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 xindex-shared.workspace = true
+xindex-custody-core.workspace = true
 xindex-multisig.workspace = true
 # V5: Safe v1.4.1 EIP-712 digest recompute path. The daemon never
 # blind-signs a coordinator-supplied hash — it rebuilds from the ABI

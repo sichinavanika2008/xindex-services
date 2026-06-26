@@ -32,7 +32,7 @@ pub mod price_sign;
 pub mod price_supply;
 pub mod price_venue;
 pub mod psbt;
-pub mod replay;
+pub use xindex_custody_core::replay;
 pub mod server;
 mod sig_norm;
 pub mod soft_hsm;
