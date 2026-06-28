@@ -1,5 +1,6 @@
 //! The Cobo v2 REST client.
 
+use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::CoboSigner;
@@ -10,6 +11,29 @@ use crate::CoboError;
 pub const COBO_API_DEV: &str = "https://api.dev.cobo.com";
 /// Cobo production host.
 pub const COBO_API_PROD: &str = "https://api.cobo.com";
+
+/// The Cobo v2 calls the executor's EVM redeem reroute uses, as a trait so the
+/// executor can be tested against a stub without live HTTP. Implemented by
+/// [`CoboClient`]. AFIT + `Send`, static dispatch.
+pub trait CoboApi: Send + Sync {
+    /// `POST /v2/transactions/contract_call`.
+    fn contract_call(
+        &self,
+        params: &ContractCallParams,
+    ) -> impl Future<Output = Result<CreatedTransaction, CoboError>> + Send;
+
+    /// `POST /v2/transactions/{id}/sign_and_broadcast`.
+    fn sign_and_broadcast(
+        &self,
+        transaction_id: &str,
+    ) -> impl Future<Output = Result<CreatedTransaction, CoboError>> + Send;
+
+    /// `GET /v2/transactions/{id}`.
+    fn get_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> impl Future<Output = Result<TransactionDetail, CoboError>> + Send;
+}
 
 /// A minimal Cobo v2 client for the EVM redeem reroute. Every request is
 /// Ed25519-signed via [`CoboSigner`].
@@ -90,14 +114,13 @@ impl CoboClient {
             })
         }
     }
+}
 
-    /// `POST /v2/transactions/contract_call` — build a contract-call tx. Use
-    /// `transaction_process_type = "BuildOnly"` so signing is deferred to
-    /// [`Self::sign_and_broadcast`] (where the TSS Node fires our callback).
-    ///
-    /// # Errors
-    /// [`CoboError`] on transport, a non-2xx response, or a decode failure.
-    pub async fn contract_call(
+impl CoboApi for CoboClient {
+    /// Build a contract-call tx. Use `transaction_process_type = "BuildOnly"`
+    /// so signing is deferred to [`CoboApi::sign_and_broadcast`] (where the TSS
+    /// Node fires our callback).
+    async fn contract_call(
         &self,
         params: &ContractCallParams,
     ) -> Result<CreatedTransaction, CoboError> {
@@ -113,12 +136,9 @@ impl CoboClient {
             .map_err(|e| CoboError::Decode(format!("contract_call response: {e}")))
     }
 
-    /// `POST /v2/transactions/{id}/sign_and_broadcast` — sign + broadcast a
-    /// `Built` tx. The TSS Node signs here, so our callback gates the spend.
-    ///
-    /// # Errors
-    /// [`CoboError`] on transport, a non-2xx response, or a decode failure.
-    pub async fn sign_and_broadcast(
+    /// Sign + broadcast a `Built` tx. The TSS Node signs here, so our callback
+    /// gates the spend.
+    async fn sign_and_broadcast(
         &self,
         transaction_id: &str,
     ) -> Result<CreatedTransaction, CoboError> {
@@ -128,14 +148,8 @@ impl CoboClient {
             .map_err(|e| CoboError::Decode(format!("sign_and_broadcast response: {e}")))
     }
 
-    /// `GET /v2/transactions/{id}` — fetch a transaction's status / hash.
-    ///
-    /// # Errors
-    /// [`CoboError`] on transport, a non-2xx response, or a decode failure.
-    pub async fn get_transaction(
-        &self,
-        transaction_id: &str,
-    ) -> Result<TransactionDetail, CoboError> {
+    /// Fetch a transaction's status / hash.
+    async fn get_transaction(&self, transaction_id: &str) -> Result<TransactionDetail, CoboError> {
         let path = format!("/v2/transactions/{transaction_id}");
         let text = self.send(reqwest::Method::GET, &path, None).await?;
         serde_json::from_str(&text)

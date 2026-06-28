@@ -17,6 +17,10 @@ xindex-chain-utxo.workspace = true
 xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
 xindex-safe-evm.workspace = true
+# Cobo MPC custody EVM redeem reroute (DL-CUSTODY-COBO-1): the shared
+# bind-prepare store + the Cobo v2 REST client.
+xindex-custody-core.workspace = true
+xindex-cobo-client.workspace = true
 # C7: Cosmos redeem leg — builds the MsgSend sign-doc + TxRaw and reads
 # account/sequence from the Cosmos chain.
 xindex-chain-cosmos.workspace = true

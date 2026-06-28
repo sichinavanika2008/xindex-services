@@ -20,7 +20,7 @@ pub mod client;
 pub mod types;
 
 pub use auth::CoboSigner;
-pub use client::{CoboClient, COBO_API_DEV, COBO_API_PROD};
+pub use client::{CoboApi, CoboClient, COBO_API_DEV, COBO_API_PROD};
 
 /// A Cobo client failure.
 #[derive(Debug, thiserror::Error)]
