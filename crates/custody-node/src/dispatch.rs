@@ -18,8 +18,8 @@ use crate::account::{decide_account_send, AccountSend};
 use crate::btc::decide_redeem_spend;
 use crate::cobo_types::{CallbackRequest, CallbackResponse};
 use crate::evm::{decide_evm_deposit, EvmDeposit};
-use crate::prepare::{PrepareStore, PreparedSpend};
 use crate::Decision;
+use xindex_custody_core::prepare::{PrepareStore, PreparedSpend};
 
 /// Decide a Cobo TSS-Node callback. Looks up the prepared spend by
 /// `request_id`, runs the family decision core, maps to APPROVE/REJECT.
@@ -120,8 +120,8 @@ mod tests {
     use xindex_shared::thorchain_router::depositWithExpiryCall;
 
     use crate::cobo_types::CallbackRequest;
-    use crate::prepare::{EvmPrepared, InMemoryPrepareStore, PreparedSpend};
     use crate::test_support::{oracle, policy, signed_ric, CHAIN_ID, NOW};
+    use xindex_custody_core::prepare::{EvmPrepared, InMemoryPrepareStore, PreparedSpend};
 
     const CHAIN: ChainId = ChainId::Eth;
     const AMOUNT: u128 = 1_000_000_000_000_000_000;
@@ -274,8 +274,8 @@ mod tests {
 
     #[tokio::test]
     async fn btc_without_custody_spk_rejects() {
-        use crate::prepare::BindContext;
         use bitcoin::{absolute::LockTime, transaction::Version, Transaction};
+        use xindex_custody_core::prepare::BindContext;
         let policy = policy();
         let prepare = InMemoryPrepareStore::new();
         #[expect(clippy::expect_used, reason = "test code")]

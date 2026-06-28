@@ -39,8 +39,8 @@ pub enum PrepareError {
     Decode(String),
 }
 
-/// The unsigned BTC spend + its authorizing certificate. Consumed by
-/// [`crate::btc::decide_redeem_spend`].
+/// The unsigned BTC spend + its authorizing certificate. Consumed by the BTC
+/// decision core (`decide_redeem_spend`) in `xindex-custody-node`.
 #[derive(Debug, Clone)]
 pub struct BindContext {
     /// Custody chain of the spend.
@@ -54,7 +54,7 @@ pub struct BindContext {
 }
 
 /// The unsigned EVM `Router.depositWithExpiry` call + its RIC. Owned mirror of
-/// [`crate::evm::EvmDeposit`].
+/// the EVM decision core's `EvmDeposit` (in `xindex-custody-node`).
 #[derive(Debug, Clone)]
 pub struct EvmPrepared {
     /// EVM chain this spend settles on.
@@ -72,7 +72,7 @@ pub struct EvmPrepared {
 }
 
 /// The unsigned account-model send (Cosmos / XRP / TRON) + its RIC. Owned
-/// mirror of [`crate::account::AccountSend`].
+/// mirror of the account decision core's `AccountSend` (in `xindex-custody-node`).
 #[derive(Debug, Clone)]
 pub struct AccountPrepared {
     /// Account-model chain this send settles on.

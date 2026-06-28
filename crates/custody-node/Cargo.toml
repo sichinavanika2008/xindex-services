@@ -22,9 +22,6 @@ tokio.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# Production prepare store (shared executor <-> callback). Mirrors the
-# `xindex-custody-core` replay store's sqlite setup.
-sqlx.workspace = true
 # Cobo TSS-Node callback transport.
 # jsonwebtoken pinned to the 9.x line ON PURPOSE: 9.x is `ring`-backed (the
 # crypto backend the workspace already standardizes on via rustls/reqwest),

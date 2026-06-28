@@ -18,7 +18,7 @@ use xindex_shared::intent::IntentPolicy;
 use crate::cobo_types::CallbackResponse;
 use crate::dispatch::decide_callback;
 use crate::jwt::JwtKeys;
-use crate::prepare::PrepareStore;
+use xindex_custody_core::prepare::PrepareStore;
 
 /// Shared callback config + keys + stores. Cheap to clone (Arcs + a small
 /// owned policy), as axum requires per request.
@@ -169,8 +169,8 @@ mod tests {
     use xindex_shared::chain_registry::ChainId;
     use xindex_shared::thorchain_router::depositWithExpiryCall;
 
-    use crate::prepare::{EvmPrepared, InMemoryPrepareStore, PreparedSpend};
     use crate::test_support::{oracle, policy, signed_ric, CHAIN_ID, NOW};
+    use xindex_custody_core::prepare::{EvmPrepared, InMemoryPrepareStore, PreparedSpend};
 
     const NODE_PRIV: &str = include_str!("../testdata/test_node_priv.pem");
     const NODE_PUB: &str = include_str!("../testdata/test_node_pub.pem");

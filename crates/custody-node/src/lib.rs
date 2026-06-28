@@ -24,7 +24,6 @@ pub mod cobo_types;
 pub mod dispatch;
 pub mod evm;
 pub mod jwt;
-pub mod prepare;
 pub mod server;
 
 #[cfg(test)]

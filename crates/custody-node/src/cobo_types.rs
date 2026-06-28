@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 pub struct CallbackRequest {
     /// The unique request id Cobo echoes from our transfer submission — our
-    /// correlation key into the [`crate::prepare::PrepareStore`].
+    /// correlation key into the [`xindex_custody_core::prepare::PrepareStore`].
     #[serde(alias = "requestId", alias = "id", alias = "request_id")]
     pub request_id: String,
     /// The request kind (`KeyGen` / `KeySign` / `KeyReshare`). Encoding (int vs

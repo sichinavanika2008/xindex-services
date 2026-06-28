@@ -10,4 +10,5 @@
 pub mod btc_bind;
 pub mod evm_bind;
 pub mod gates;
+pub mod prepare;
 pub mod replay;

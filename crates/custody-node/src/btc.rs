@@ -14,8 +14,8 @@ use xindex_custody_core::btc_bind::bind_outputs_to_cert;
 use xindex_custody_core::gates::{gate_spend_certificate, CustodyConfig};
 use xindex_custody_core::replay::ReplayStore;
 
-use crate::prepare::BindContext;
 use crate::Decision;
+use xindex_custody_core::prepare::BindContext;
 
 /// Decide a BTC redeem (or mint-cancel swap-back) spend: k-of-n RIC/ACC
 /// verification + one-shot consume ([`gate_spend_certificate`]) then the
