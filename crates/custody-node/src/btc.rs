@@ -3,10 +3,10 @@
 //! Given a prepared [`BindContext`] (the unsigned PSBT + its k-of-n
 //! certificate), verify the certificate and bind the PSBT's output set to it;
 //! APPROVE only if both pass, else a fail-closed [`Decision::Reject`]. The
-//! input-sighash ↔ Fireblocks `rawMessage` tie-in and the wire adapter land at
-//! Slice 0; this function is address-type-independent (it inspects outputs +
-//! the certificate, the security anchor — the RIC is k-of-n signed
-//! independently of the coordinator that supplied the PSBT).
+//! input-sighash ↔ Cobo callback-request tie-in and the wire adapter land with
+//! the Cobo dev-env reconciliation; this function is address-type-independent
+//! (it inspects outputs + the certificate, the security anchor — the RIC is
+//! k-of-n signed independently of the coordinator that supplied the PSBT).
 
 use bitcoin::hashes::Hash;
 
@@ -44,10 +44,18 @@ pub async fn decide_redeem_spend<S: ReplayStore>(
     .await
     {
         Ok(c) => c,
-        Err(r) => return Decision::Reject { code: r.code, message: r.message },
+        Err(r) => {
+            return Decision::Reject {
+                code: r.code,
+                message: r.message,
+            }
+        }
     };
     if let Err(r) = bind_outputs_to_cert(&ctx.psbt, custody_spk, &cert) {
-        return Decision::Reject { code: r.code, message: r.message };
+        return Decision::Reject {
+            code: r.code,
+            message: r.message,
+        };
     }
     Decision::Approve
 }
@@ -96,12 +104,18 @@ mod tests {
     }
 
     fn out(value: u64, script_pubkey: ScriptBuf) -> TxOut {
-        TxOut { value: Amount::from_sat(value), script_pubkey }
+        TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey,
+        }
     }
 
     fn dummy_input() -> TxIn {
         TxIn {
-            previous_output: OutPoint { txid: Txid::all_zeros(), vout: 0 },
+            previous_output: OutPoint {
+                txid: Txid::all_zeros(),
+                vout: 0,
+            },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::new(),
@@ -140,7 +154,9 @@ mod tests {
 
     #[expect(clippy::expect_used, reason = "test code")]
     fn sign_digest(sk: &SigningKey, digest: B256) -> String {
-        let (sig, recid) = sk.sign_prehash_recoverable(digest.as_slice()).expect("sign");
+        let (sig, recid) = sk
+            .sign_prehash_recoverable(digest.as_slice())
+            .expect("sign");
         let mut o = [0u8; 65];
         o[..64].copy_from_slice(sig.to_bytes().as_ref());
         o[64] = 27 + recid.to_byte();
@@ -180,7 +196,10 @@ mod tests {
             vra,
         );
         let digest = ric_signing_hash(&ric, &attestation_oracle_domain(CHAIN_ID, oracle()));
-        let signatures = seeds.iter().map(|s| sign_digest(&key_identity(*s).0, digest)).collect();
+        let signatures = seeds
+            .iter()
+            .map(|s| sign_digest(&key_identity(*s).0, digest))
+            .collect();
         IntentProof {
             redemption_id: hex32(redemption_id),
             leg_index: "0".to_string(),
@@ -196,7 +215,12 @@ mod tests {
     }
 
     fn ctx(psbt: Psbt, ric: IntentProof) -> BindContext {
-        BindContext { chain: ChainId::Btc, psbt, ric: Some(ric), acc: None }
+        BindContext {
+            chain: ChainId::Btc,
+            psbt,
+            ric: Some(ric),
+            acc: None,
+        }
     }
 
     fn is_reject(d: &Decision) -> bool {
@@ -212,7 +236,10 @@ mod tests {
             verifying_contract: oracle(),
             intent_policy: &policy,
         };
-        let c = ctx(honest_psbt(&payout, &custody, CHANGE_SATS), signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]));
+        let c = ctx(
+            honest_psbt(&payout, &custody, CHANGE_SATS),
+            signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]),
+        );
         let replay = InMemoryReplayStore::new();
         let d = decide_redeem_spend(&c, &replay, config, &custody, NOW).await;
         assert_eq!(d, Decision::Approve);
@@ -235,7 +262,9 @@ mod tests {
         ]);
         let c = ctx(psbt, signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]));
         let replay = InMemoryReplayStore::new();
-        assert!(is_reject(&decide_redeem_spend(&c, &replay, config, &custody, NOW).await));
+        assert!(is_reject(
+            &decide_redeem_spend(&c, &replay, config, &custody, NOW).await
+        ));
     }
 
     #[tokio::test]
@@ -248,9 +277,14 @@ mod tests {
             intent_policy: &policy,
         };
         // Seed 9 is not in the 1..=5 whitelist → the whole proof rejects.
-        let c = ctx(honest_psbt(&payout, &custody, CHANGE_SATS), signed_ric(&payout, AMOUNT_SATS, &[1, 2, 9]));
+        let c = ctx(
+            honest_psbt(&payout, &custody, CHANGE_SATS),
+            signed_ric(&payout, AMOUNT_SATS, &[1, 2, 9]),
+        );
         let replay = InMemoryReplayStore::new();
-        assert!(is_reject(&decide_redeem_spend(&c, &replay, config, &custody, NOW).await));
+        assert!(is_reject(
+            &decide_redeem_spend(&c, &replay, config, &custody, NOW).await
+        ));
     }
 
     #[tokio::test]
@@ -271,7 +305,9 @@ mod tests {
         ]);
         let c = ctx(psbt, signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]));
         let replay = InMemoryReplayStore::new();
-        assert!(is_reject(&decide_redeem_spend(&c, &replay, config, &custody, NOW).await));
+        assert!(is_reject(
+            &decide_redeem_spend(&c, &replay, config, &custody, NOW).await
+        ));
     }
 
     #[tokio::test]
@@ -291,7 +327,9 @@ mod tests {
         ]);
         let c = ctx(psbt, signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]));
         let replay = InMemoryReplayStore::new();
-        assert!(is_reject(&decide_redeem_spend(&c, &replay, config, &custody, NOW).await));
+        assert!(is_reject(
+            &decide_redeem_spend(&c, &replay, config, &custody, NOW).await
+        ));
     }
 
     #[tokio::test]
@@ -309,9 +347,14 @@ mod tests {
         let ric = signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]);
 
         let first = ctx(honest_psbt(&payout, &custody, CHANGE_SATS), ric.clone());
-        assert_eq!(decide_redeem_spend(&first, &replay, config, &custody, NOW).await, Decision::Approve);
+        assert_eq!(
+            decide_redeem_spend(&first, &replay, config, &custody, NOW).await,
+            Decision::Approve
+        );
 
         let second = ctx(honest_psbt(&payout, &custody, CHANGE_SATS + 1), ric);
-        assert!(is_reject(&decide_redeem_spend(&second, &replay, config, &custody, NOW).await));
+        assert!(is_reject(
+            &decide_redeem_spend(&second, &replay, config, &custody, NOW).await
+        ));
     }
 }
