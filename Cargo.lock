@@ -5693,6 +5693,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-cobo-client"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "ed25519-dalek",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "xindex-cosmos-tx"
 version = "0.0.1"
 dependencies = [
