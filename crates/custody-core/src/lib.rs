@@ -8,5 +8,6 @@
 //! decoupled from its HTTP (`axum`) layer.
 
 pub mod btc_bind;
+pub mod evm_bind;
 pub mod gates;
 pub mod replay;
