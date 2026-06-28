@@ -8,9 +8,13 @@
 //! of the prepared spend — that is W3 dev-env reconciliation. Until then this
 //! binary refuses to start without `--dev`, so it can only be used for
 //! rehearsal, never against real Cobo funds. (Mirrors the `SoftwareHsm` /
-//! DL-REHEARSAL-1 gating.) It also uses an in-memory prepare store: the real
-//! flow needs a sqlite store SHARED with the executor process — that lands
-//! with W2.
+//! DL-REHEARSAL-1 gating.)
+//!
+//! The prepare store backend is selected by `--db`: without it, a process-local
+//! in-memory store (single-process rehearsal); with it, the
+//! [`SqlitePrepareStore`] over a DB file SHARED with the executor process — the
+//! real cross-process flow, since the executor `put`s the unsigned spend and
+//! this callback `get`s it to gate the TSS-Node signature.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,7 +27,7 @@ use tokio::net::TcpListener;
 use xindex_custody_core::replay::InMemoryReplayStore;
 use xindex_shared::intent::IntentPolicy;
 
-use xindex_custody_core::prepare::InMemoryPrepareStore;
+use xindex_custody_core::prepare::{InMemoryPrepareStore, PrepareStore, SqlitePrepareStore};
 use xindex_custody_node::jwt::JwtKeys;
 use xindex_custody_node::server::{router, CallbackState};
 
@@ -45,6 +49,12 @@ struct Args {
     /// JSON config file (chain id, oracle, Set-B policy, optional BTC spk).
     #[arg(long)]
     config: String,
+    /// Shared sqlite URL for the bind-prepare store (e.g.
+    /// `sqlite:///var/lib/xindex/prepare.db`). The executor `put`s prepared
+    /// spends here; this callback `get`s them to gate the signature. Omit for a
+    /// process-local in-memory store (single-process rehearsal only).
+    #[arg(long)]
+    db: Option<String>,
     /// REQUIRED in W1 — dev/rehearsal mode. Production is gated until the W3
     /// `request_detail`↔sighash cross-check lands.
     #[arg(long)]
@@ -100,6 +110,40 @@ fn load_btc_spk(cfg: &FileConfig) -> Result<Option<ScriptBuf>> {
     }
 }
 
+/// Store-independent callback wiring, resolved before the prepare backend is
+/// chosen.
+struct ServeConfig {
+    jwt: JwtKeys,
+    chain_id: u64,
+    verifying_contract: Address,
+    intent_policy: IntentPolicy,
+    btc_custody_spk: Option<ScriptBuf>,
+}
+
+/// Build the [`CallbackState`] over `prepare` and serve until shutdown. Generic
+/// over the prepare store so `main` picks in-memory (rehearsal) or sqlite
+/// (shared with the executor) without duplicating the serve loop. The replay /
+/// one-shot store stays in-memory until its own shared-backend wiring lands.
+async fn serve<P: PrepareStore + 'static>(
+    cfg: ServeConfig,
+    prepare: Arc<P>,
+    listener: TcpListener,
+) -> Result<()> {
+    let state = CallbackState {
+        jwt: Arc::new(cfg.jwt),
+        prepare,
+        replay: Arc::new(InMemoryReplayStore::new()),
+        chain_id: cfg.chain_id,
+        verifying_contract: cfg.verifying_contract,
+        intent_policy: cfg.intent_policy,
+        btc_custody_spk: cfg.btc_custody_spk,
+    };
+    axum::serve(listener, router(state))
+        .await
+        .context("serve")?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -122,27 +166,33 @@ async fn main() -> Result<()> {
     let cfg: FileConfig = serde_json::from_str(&cfg_bytes).context("parse config json")?;
     let verifying_contract =
         Address::from_str(&cfg.verifying_contract).context("bad verifying_contract")?;
-    let intent_policy = load_intent_policy(&cfg)?;
-    let btc_custody_spk = load_btc_spk(&cfg)?;
-
-    let state = CallbackState {
-        jwt: Arc::new(jwt),
-        prepare: Arc::new(InMemoryPrepareStore::new()),
-        replay: Arc::new(InMemoryReplayStore::new()),
+    let serve_cfg = ServeConfig {
+        jwt,
         chain_id: cfg.chain_id,
         verifying_contract,
-        intent_policy,
-        btc_custody_spk,
+        intent_policy: load_intent_policy(&cfg)?,
+        btc_custody_spk: load_btc_spk(&cfg)?,
     };
 
     let listener = TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("bind {}", args.bind))?;
-    tracing::info!(bind = %args.bind, "xindex-custody-callback (W1 dev) listening on /v1/check");
-    axum::serve(listener, router(state))
-        .await
-        .context("serve")?;
-    Ok(())
+
+    if let Some(url) = &args.db {
+        let prepare = Arc::new(
+            SqlitePrepareStore::connect(url)
+                .await
+                .map_err(|e| anyhow::anyhow!("prepare store {url}: {e}"))?,
+        );
+        tracing::info!(bind = %args.bind, db = %url,
+            "xindex-custody-callback (W1 dev, sqlite store) listening on /v1/check");
+        serve(serve_cfg, prepare, listener).await
+    } else {
+        let prepare = Arc::new(InMemoryPrepareStore::new());
+        tracing::info!(bind = %args.bind,
+            "xindex-custody-callback (W1 dev, in-memory store) listening on /v1/check");
+        serve(serve_cfg, prepare, listener).await
+    }
 }
 
 #[cfg(test)]
