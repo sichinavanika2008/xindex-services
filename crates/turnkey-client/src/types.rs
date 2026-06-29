@@ -68,6 +68,10 @@ pub struct Activity {
     /// The result, present once `COMPLETED`.
     #[serde(default)]
     pub result: Option<ActivityResult>,
+    /// The original request intent — carries the parameters the activity was
+    /// created with (the approver reads the signed `payload` from here).
+    #[serde(default)]
+    pub intent: Option<ActivityIntent>,
 }
 
 impl Activity {
@@ -77,6 +81,49 @@ impl Activity {
     pub fn sign_result(&self) -> Option<&SignRawPayloadResult> {
         self.result.as_ref()?.sign_raw_payload_result.as_ref()
     }
+
+    /// The payload (hex) this activity is signing — the approver's correlation
+    /// key into the prepare store (the sighash we computed and submitted).
+    /// `None` if this is not a `SIGN_RAW_PAYLOAD` activity.
+    #[must_use]
+    pub fn signed_payload(&self) -> Option<&str> {
+        Some(
+            self.intent
+                .as_ref()?
+                .sign_raw_payload_intent_v2
+                .as_ref()?
+                .payload
+                .as_str(),
+        )
+    }
+}
+
+/// The `activity.intent` union (only the variant we consume is modelled).
+/// RECONCILE AT DEV-ENV: the exact intent field name (`signRawPayloadIntentV2`)
+/// is pinned from Turnkey's docs — confirm against a captured activity.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityIntent {
+    /// Present for a `SIGN_RAW_PAYLOAD` activity — the parameters it signs.
+    #[serde(default)]
+    pub sign_raw_payload_intent_v2: Option<SignRawPayloadIntent>,
+}
+
+/// The `SIGN_RAW_PAYLOAD` request parameters as echoed back on the activity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignRawPayloadIntent {
+    /// The signing key selector.
+    #[serde(default)]
+    pub sign_with: String,
+    /// The payload being signed (hex) — our sighash / prepare-store key.
+    pub payload: String,
+    /// Payload encoding.
+    #[serde(default)]
+    pub encoding: String,
+    /// Hash function.
+    #[serde(default)]
+    pub hash_function: String,
 }
 
 /// The `activity.result` union (only the variants we consume are modelled).
@@ -247,5 +294,32 @@ mod tests {
             v: "00".to_string(),
         };
         assert!(bad.rsv().is_err());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn signed_payload_extracted_from_intent() {
+        let body = serde_json::json!({
+            "id": "act-1",
+            "status": "ACTIVITY_STATUS_CONSENSUS_NEEDED",
+            "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+            "fingerprint": "fp-1",
+            "intent": { "signRawPayloadIntentV2": {
+                "signWith": "0xkey", "payload": "0xdeadbeef",
+                "encoding": "PAYLOAD_ENCODING_HEXADECIMAL", "hashFunction": "HASH_FUNCTION_NO_OP"
+            }}
+        });
+        let a: Activity = serde_json::from_value(body).expect("activity");
+        assert_eq!(a.signed_payload(), Some("0xdeadbeef"));
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn signed_payload_none_without_intent() {
+        let body = serde_json::json!({
+            "id": "act-1", "status": "ACTIVITY_STATUS_PENDING", "fingerprint": "fp-1"
+        });
+        let a: Activity = serde_json::from_value(body).expect("activity");
+        assert_eq!(a.signed_payload(), None);
     }
 }

@@ -17,6 +17,7 @@
 //! against the real Turnkey dev-env and layered on top.
 
 pub mod account;
+pub mod approver;
 pub mod btc;
 pub mod dispatch;
 pub mod evm;

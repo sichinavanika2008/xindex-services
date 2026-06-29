@@ -9,12 +9,24 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "xindex-turnkey-approver"
+path = "src/bin/xindex-turnkey-approver.rs"
+
 [dependencies]
 xindex-custody-core.workspace = true
 xindex-shared.workspace = true
+xindex-turnkey-client.workspace = true
 alloy-primitives.workspace = true
 bitcoin.workspace = true
 tokio.workspace = true
+# Approver-watcher binary (xindex-turnkey-approver): CLI + config + logging.
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Sign test RIC/ACC digests with a secp256k1 key (same pattern as the

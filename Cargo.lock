@@ -5724,11 +5724,18 @@ version = "0.0.1"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
+ "anyhow",
  "bitcoin",
+ "clap",
  "k256",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
  "xindex-custody-core",
  "xindex-shared",
+ "xindex-turnkey-client",
 ]
 
 [[package]]
