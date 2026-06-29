@@ -38,7 +38,7 @@ use bitcoin::{
 use thiserror::Error;
 use tracing::{debug, info};
 
-use xindex_chain_utxo::{UtxoChainClient, UtxoEntry, UtxoError, UtxoParams};
+use xindex_chain_utxo::{UtxoEntry, UtxoParams};
 use xindex_custody_core::prepare::{BindContext, PrepareStore, PreparedSpend};
 use xindex_shared::chain_registry::ChainId;
 use xindex_turnkey_client::{Activity, SignRawPayloadParams, TurnkeyApi};
@@ -67,9 +67,6 @@ pub enum TurnkeyBtcError {
         /// Total available across all custody UTXOs.
         available_sats: u64,
     },
-    /// Bitcoin chain access failed.
-    #[error("bitcoin chain error: {0}")]
-    Chain(#[from] UtxoError),
     /// Failed to persist the prepared spend (the approver would then have no
     /// context and fail-close, so we abort BEFORE submitting to Turnkey).
     #[error("prepare store: {0}")]
@@ -126,16 +123,20 @@ pub struct TurnkeyBtcRedeemConfig {
     pub poll_max_attempts: u32,
 }
 
-/// Turnkey BTC redeem executor. The executor builds + assembles + broadcasts;
-/// Turnkey signs the sighash, gated by the approver-watcher.
-pub struct TurnkeyBtcRedeemExecutor<T, C, P> {
+/// Turnkey BTC redeem executor. The executor builds + signs (via Turnkey, gated
+/// by the approver) + assembles the witness, and RETURNS the signed tx for the
+/// caller to broadcast. It performs NO chain I/O itself: UTXO selection is pure
+/// (over the caller-supplied set) and broadcast is the caller's job — the
+/// blocking Esplora client (`reqwest::blocking`) must not be driven from this
+/// async path (the binary wraps fetch + broadcast in `spawn_blocking`). Mirrors
+/// [`crate::turnkey_evm_redeem`], which likewise returns rather than submits.
+pub struct TurnkeyBtcRedeemExecutor<T, P> {
     config: TurnkeyBtcRedeemConfig,
     turnkey: Arc<T>,
-    chain: C,
     prepare: Arc<P>,
 }
 
-impl<T, C, P> std::fmt::Debug for TurnkeyBtcRedeemExecutor<T, C, P> {
+impl<T, P> std::fmt::Debug for TurnkeyBtcRedeemExecutor<T, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TurnkeyBtcRedeemExecutor")
             .field("config", &self.config)
@@ -150,20 +151,22 @@ pub struct TurnkeyBtcRedeemOutcome {
     pub dispatch_id: B256,
     /// Originating redemption id (attestation correlation).
     pub redemption_id: B256,
-    /// The broadcast transaction id.
+    /// The signed transaction id (its computed txid).
     pub txid: Txid,
+    /// The signed, broadcastable transaction. The caller broadcasts it via
+    /// `UtxoChainClient::broadcast` (on a blocking thread).
+    pub signed_tx: Transaction,
     /// The Turnkey signing activity id.
     pub activity_id: String,
 }
 
-impl<T: TurnkeyApi, C: UtxoChainClient, P: PrepareStore> TurnkeyBtcRedeemExecutor<T, C, P> {
+impl<T: TurnkeyApi, P: PrepareStore> TurnkeyBtcRedeemExecutor<T, P> {
     /// Construct.
     #[must_use]
-    pub fn new(config: TurnkeyBtcRedeemConfig, turnkey: Arc<T>, chain: C, prepare: Arc<P>) -> Self {
+    pub fn new(config: TurnkeyBtcRedeemConfig, turnkey: Arc<T>, prepare: Arc<P>) -> Self {
         Self {
             config,
             turnkey,
-            chain,
             prepare,
         }
     }
@@ -174,11 +177,15 @@ impl<T: TurnkeyApi, C: UtxoChainClient, P: PrepareStore> TurnkeyBtcRedeemExecuto
         &self.config
     }
 
-    /// Execute one BTC redeem leg through Turnkey: select UTXO → build spend →
-    /// sighash → prepare → sign (gated) → assemble witness → broadcast.
+    /// Execute one BTC redeem leg through Turnkey: select UTXO (from the
+    /// caller-supplied set) → build spend → sighash → prepare → sign (gated) →
+    /// assemble witness → RETURN the signed tx (caller broadcasts).
     ///
     /// `asgard` is the `THORChain` BTC inbound vault, resolved live by the
-    /// caller (rejected upstream if the registry is stale / halted).
+    /// caller (rejected upstream if the registry is stale / halted). `utxos` is
+    /// the custody address's confirmed UTXO set — the caller fetches it via the
+    /// (blocking) Esplora client on a blocking thread and passes it in, so this
+    /// async path performs no blocking chain I/O.
     ///
     /// # Errors
     /// Any [`TurnkeyBtcError`] variant.
@@ -186,6 +193,7 @@ impl<T: TurnkeyApi, C: UtxoChainClient, P: PrepareStore> TurnkeyBtcRedeemExecuto
         &self,
         task: &RedeemTask,
         asgard: &Address,
+        utxos: &[UtxoEntry],
     ) -> Result<TurnkeyBtcRedeemOutcome, TurnkeyBtcError> {
         let params = UtxoParams::for_chain(self.config.chain);
         if task.memo.len() > params.op_return_max {
@@ -196,8 +204,7 @@ impl<T: TurnkeyApi, C: UtxoChainClient, P: PrepareStore> TurnkeyBtcRedeemExecuto
             .checked_add(Amount::from_sat(self.config.fee_sats))
             .ok_or_else(|| TurnkeyBtcError::InvalidAmount("fee overflow".to_string()))?;
 
-        let utxos = self.chain.get_address_utxos(&self.config.custody_address)?;
-        let selected = select_utxo(&utxos, needed)?;
+        let selected = select_utxo(utxos, needed)?;
 
         let dust = Amount::from_sat(params.dust_sats);
         let raw_change = selected.value.checked_sub(needed).unwrap_or(Amount::ZERO);
@@ -268,17 +275,18 @@ impl<T: TurnkeyApi, C: UtxoChainClient, P: PrepareStore> TurnkeyBtcRedeemExecuto
         let witness = assemble_p2wpkh_witness(r, s, &self.config.custody_pubkey)?;
         let mut tx = psbt.unsigned_tx.clone();
         tx.input[0].witness = witness;
-        let txid = self.chain.broadcast(&tx)?;
+        let txid = tx.compute_txid();
         info!(
             redemption_id = %task.redemption_id,
             %txid,
             activity = %completed.id,
-            "BTC→Asgard redemption deposit broadcast (Turnkey)"
+            "BTC→Asgard redemption deposit signed (Turnkey); ready to broadcast"
         );
         Ok(TurnkeyBtcRedeemOutcome {
             dispatch_id: task.dispatch_id,
             redemption_id: task.redemption_id,
             txid,
+            signed_tx: tx,
             activity_id: completed.id,
         })
     }
@@ -441,7 +449,6 @@ mod tests {
     use super::*;
     use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
     use bitcoin::Network;
-    use std::sync::Mutex;
     use xindex_turnkey_client::TurnkeyError;
 
     /// Stub Turnkey: `sign_raw_payload` returns `on_sign`; `get_activity`
@@ -466,35 +473,6 @@ mod tests {
         }
         async fn reject_activity(&self, _fingerprint: &str) -> Result<Activity, TurnkeyError> {
             Err(TurnkeyError::Http("stub: reject unused".into()))
-        }
-    }
-
-    /// Fake UTXO chain: one spendable UTXO; records broadcasts.
-    #[derive(Default)]
-    struct FakeBtc {
-        utxos: Mutex<Vec<UtxoEntry>>,
-        broadcasts: Mutex<Vec<Transaction>>,
-    }
-
-    impl UtxoChainClient for FakeBtc {
-        #[expect(clippy::expect_used, reason = "test code")]
-        fn get_address_utxos(&self, _addr: &Address) -> Result<Vec<UtxoEntry>, UtxoError> {
-            Ok(self.utxos.lock().expect("lock").clone())
-        }
-        fn get_tx_status(
-            &self,
-            _txid: &Txid,
-        ) -> Result<xindex_chain_utxo::UtxoTxStatus, UtxoError> {
-            Err(UtxoError::Upstream("unused".to_string()))
-        }
-        fn get_tip_height(&self) -> Result<u32, UtxoError> {
-            Err(UtxoError::Upstream("unused".to_string()))
-        }
-        #[expect(clippy::expect_used, reason = "test code")]
-        fn broadcast(&self, tx: &Transaction) -> Result<Txid, UtxoError> {
-            let txid = tx.compute_txid();
-            self.broadcasts.lock().expect("lock").push(tx.clone());
-            Ok(txid)
         }
     }
 
@@ -536,19 +514,15 @@ mod tests {
         addr
     }
 
-    fn fake_btc() -> FakeBtc {
-        let f = FakeBtc::default();
-        #[expect(clippy::expect_used, reason = "test code")]
-        let mut u = f.utxos.lock().expect("lock");
-        u.push(UtxoEntry {
+    /// One spendable 200k-sat custody UTXO (the caller-supplied set).
+    fn utxos() -> Vec<UtxoEntry> {
+        vec![UtxoEntry {
             txid: Txid::from_byte_array([0xab; 32]),
             vout: 0,
             value: Amount::from_sat(200_000),
             confirmations: 6,
             block_hash: None,
-        });
-        drop(u);
-        f
+        }]
     }
 
     /// An activity carrying a valid `(r,s)` signature result.
@@ -575,49 +549,56 @@ mod tests {
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
-    async fn happy_path_prepares_signs_and_broadcasts() {
+    async fn happy_path_signs_and_returns_tx() {
         let turnkey = Arc::new(StubTurnkey {
             on_sign: completed_with_sig(),
             on_get: completed_with_sig(),
         });
         let prepare = Arc::new(xindex_custody_core::prepare::InMemoryPrepareStore::new());
-        let exec =
-            TurnkeyBtcRedeemExecutor::new(config(), turnkey, fake_btc(), Arc::clone(&prepare));
-        let outcome = exec.execute_leg(&task(), &asgard()).await.expect("leg");
+        let exec = TurnkeyBtcRedeemExecutor::new(config(), turnkey, Arc::clone(&prepare));
+        let outcome = exec
+            .execute_leg(&task(), &asgard(), &utxos())
+            .await
+            .expect("leg");
         assert_eq!(outcome.activity_id, "act-1");
         assert_eq!(outcome.dispatch_id, B256::repeat_byte(0xd1));
+        // The returned tx is signed: input[0]'s witness carries [sig, pubkey].
+        assert_eq!(outcome.signed_tx.input.len(), 1);
+        assert_eq!(outcome.signed_tx.input[0].witness.len(), 2);
+        assert_eq!(outcome.signed_tx.compute_txid(), outcome.txid);
     }
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
-    async fn consensus_then_completed_broadcasts() {
+    async fn consensus_then_completed_returns_tx() {
         let turnkey = Arc::new(StubTurnkey {
             on_sign: status_activity("ACTIVITY_STATUS_CONSENSUS_NEEDED"),
             on_get: completed_with_sig(),
         });
         let prepare = Arc::new(xindex_custody_core::prepare::InMemoryPrepareStore::new());
-        let exec = TurnkeyBtcRedeemExecutor::new(config(), turnkey, fake_btc(), prepare);
-        let outcome = exec.execute_leg(&task(), &asgard()).await.expect("leg");
+        let exec = TurnkeyBtcRedeemExecutor::new(config(), turnkey, prepare);
+        let outcome = exec
+            .execute_leg(&task(), &asgard(), &utxos())
+            .await
+            .expect("leg");
         assert_eq!(outcome.activity_id, "act-1");
+        assert_eq!(outcome.signed_tx.input[0].witness.len(), 2);
     }
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
-    async fn rejected_activity_does_not_broadcast() {
-        let chain = fake_btc();
+    async fn rejected_activity_yields_no_tx() {
         let turnkey = Arc::new(StubTurnkey {
             on_sign: status_activity("ACTIVITY_STATUS_CONSENSUS_NEEDED"),
             on_get: status_activity("ACTIVITY_STATUS_REJECTED"),
         });
         let prepare = Arc::new(xindex_custody_core::prepare::InMemoryPrepareStore::new());
-        // Build the executor with a chain whose broadcasts we can inspect.
-        let exec = TurnkeyBtcRedeemExecutor::new(config(), turnkey, chain, prepare);
+        let exec = TurnkeyBtcRedeemExecutor::new(config(), turnkey, prepare);
         let err = exec
-            .execute_leg(&task(), &asgard())
+            .execute_leg(&task(), &asgard(), &utxos())
             .await
             .expect_err("rejected");
         assert!(matches!(err, TurnkeyBtcError::Rejected { .. }));
-        assert!(exec.chain.broadcasts.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
@@ -629,10 +610,13 @@ mod tests {
             on_get: completed_with_sig(),
         });
         let prepare = Arc::new(xindex_custody_core::prepare::InMemoryPrepareStore::new());
-        let exec = TurnkeyBtcRedeemExecutor::new(config(), turnkey, fake_btc(), prepare);
+        let exec = TurnkeyBtcRedeemExecutor::new(config(), turnkey, prepare);
         let mut big = task();
         big.amount = U256::from(1_000_000u64);
-        let err = exec.execute_leg(&big, &asgard()).await.expect_err("funds");
+        let err = exec
+            .execute_leg(&big, &asgard(), &utxos())
+            .await
+            .expect_err("funds");
         assert!(matches!(err, TurnkeyBtcError::InsufficientFunds { .. }));
     }
 }
