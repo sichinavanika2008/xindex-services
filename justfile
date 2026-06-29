@@ -176,9 +176,17 @@ sync-abi:
 # transitive in its lockfile entry even with `default-features = false`
 # + sqlite-only features. We do not compile mysql; the vulnerable code
 # is not reachable. No upstream fix available. Documented in deny.toml.
+#
+# `--ignore RUSTSEC-2026-0185`: quinn-proto remote memory-exhaustion DoS
+# (newly published 2026). quinn/quinn-proto/quinn-udp are lockfile-only
+# entries via an optional HTTP/3 feature our reqwest config
+# (`json,rustls-tls,stream`) does NOT enable — `cargo tree -i quinn-proto`
+# prints nothing, i.e. it is not in the compiled graph and the DoS path is
+# not reachable. Same class/disposition as the rsa entry above. Revisit when
+# the upstream dep bumps quinn ≥ the patched release.
 gate:
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --workspace
     cargo deny check
-    cargo audit --ignore RUSTSEC-2023-0071
+    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0185
