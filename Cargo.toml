@@ -97,7 +97,6 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
 xindex-custody-core = { path = "crates/custody-core" }
-xindex-cobo-client = { path = "crates/cobo-client" }
 xindex-turnkey-client = { path = "crates/turnkey-client" }
 xindex-cosmos-tx = { path = "crates/cosmos-tx" }
 xindex-xrp-tx = { path = "crates/xrp-tx" }

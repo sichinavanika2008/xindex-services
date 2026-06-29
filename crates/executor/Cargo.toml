@@ -17,10 +17,9 @@ xindex-chain-utxo.workspace = true
 xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
 xindex-safe-evm.workspace = true
-# Cobo MPC custody EVM redeem reroute (DL-CUSTODY-COBO-1): the shared
-# bind-prepare store + the Cobo v2 REST client.
+# Shared custody substrate (DL-CUSTODY-TURNKEY-1): the bind-prepare store
+# the executor `put`s unsigned spends into, gated by the approver-watcher.
 xindex-custody-core.workspace = true
-xindex-cobo-client.workspace = true
 # Turnkey custody redeem reroute (DL-CUSTODY-TURNKEY-1): the Turnkey REST
 # client (raw P-256 signer). The executor builds the tx + sighash, Turnkey
 # signs, the executor assembles + broadcasts.

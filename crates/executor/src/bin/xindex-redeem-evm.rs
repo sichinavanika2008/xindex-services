@@ -10,11 +10,12 @@
 //! Two mutually-exclusive subcommands select the custody backend:
 //!
 //! - `safe` — the Safe v1.4.1 + 3-of-5 cosigner-fleet flow ([`EvmRedeemExecutor`]).
-//! - `cobo` — the Cobo MPC single-sig contract-call flow (`DL-CUSTODY-COBO-1`,
-//!   [`CoboEvmRedeemExecutor`]). The EVM custody key is a single-sig MPC
-//!   address, so a leg is one `BuildOnly` contract-call gated by our TSS-Node
-//!   callback; the unsigned spend is staged in a [`SqlitePrepareStore`] file
-//!   shared with the `xindex-custody-callback` process.
+//! - `turnkey` — the Turnkey single-key flow (`DL-CUSTODY-TURNKEY-1`,
+//!   [`TurnkeyEvmRedeemExecutor`]). The EVM custody key is a single enclave
+//!   EOA; the executor builds the tx + Turnkey signs the hash (gated by the
+//!   approver-watcher) + assembles the raw signed tx, and this binary submits
+//!   it. The unsigned spend is staged in a [`SqlitePrepareStore`] file shared
+//!   with the `xindex-turnkey-approver` process.
 //!
 //! ## v1 scope
 //!
@@ -36,19 +37,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use tracing::info;
-use xindex_chain_evm::{AlloyEvmChainClient, EvmTxFee};
-use xindex_cobo_client::{CoboClient, CoboSigner, COBO_API_DEV};
+use xindex_chain_evm::{AlloyEvmChainClient, EvmChainClient, EvmTxFee};
 use xindex_custody_core::prepare::SqlitePrepareStore;
-use xindex_executor::cobo_evm_redeem::{CoboEvmRedeemConfig, CoboEvmRedeemExecutor};
 use xindex_executor::evm_redeem::{
     EvmCosigner, EvmRedeemConfig, EvmRedeemExecutor, EvmRedeemTask, SafeLockTable,
 };
+use xindex_executor::turnkey_evm_redeem::{TurnkeyEvmRedeemConfig, TurnkeyEvmRedeemExecutor};
 use xindex_shared::chain_registry::ChainId;
+use xindex_turnkey_client::{TurnkeyClient, TurnkeyStamper, TURNKEY_API_BASE};
 
 /// CLI for a single EVM redeem leg. Production wraps this in a
 /// long-running daemon (V9-era follow-up).
@@ -64,8 +65,8 @@ struct Cli {
 enum Backend {
     /// Safe v1.4.1 + 3-of-5 cosigner-fleet flow.
     Safe(SafeArgs),
-    /// Cobo MPC single-sig contract-call flow (DL-CUSTODY-COBO-1).
-    Cobo(CoboArgs),
+    /// Turnkey single-key flow (DL-CUSTODY-TURNKEY-1).
+    Turnkey(TurnkeyEvmArgs),
 }
 
 /// Arguments for the Safe-backed redeem leg.
@@ -142,43 +143,70 @@ struct SafeArgs {
     amount_wei: String,
 }
 
-/// Arguments for the Cobo MPC-backed redeem leg. The Cobo API secret is read
-/// from the `COBO_API_SECRET` environment variable (hex 32-byte Ed25519 key) —
-/// never an argv flag.
+/// Arguments for the Turnkey-backed EVM redeem leg. The Turnkey API P-256
+/// private key is read from the `XINDEX_TURNKEY_API_KEY` environment variable
+/// (hex) — never an argv flag.
 #[derive(Debug, ClapArgs)]
-struct CoboArgs {
+struct TurnkeyEvmArgs {
     /// Destination EVM chain (eth / bsc / avax / base / pol).
     #[arg(long)]
     chain: String,
 
-    /// Cobo MPC wallet id (org-controlled) to spend from.
+    /// The Turnkey custody EOA address on `chain` — the `from` of the signed
+    /// tx, whose account nonce this binary fetches.
     #[arg(long)]
-    wallet_id: String,
+    custody_address: String,
 
-    /// Our Cobo MPC address on `chain` (the contract-call source).
+    /// The Turnkey `signWith` selector (private-key id / wallet-account address)
+    /// for the custody key.
     #[arg(long)]
-    mpc_address: String,
+    sign_with: String,
+
+    /// The Turnkey custody sub-organization id.
+    #[arg(long)]
+    organization_id: String,
 
     /// Current THORChain Asgard vault address on `chain`. Operator refreshes
     /// from `inbound_addresses` before each run.
     #[arg(long)]
     vault: String,
 
+    /// HTTPS RPC URL for `chain` (nonce fetch + raw-tx submit).
+    #[arg(long)]
+    rpc_url: String,
+
     /// Shared sqlite URL for the bind-prepare store (e.g.
-    /// `sqlite:///var/lib/xindex/prepare.db`). The `xindex-custody-callback`
-    /// process reads the same DB to gate the TSS-Node signature.
+    /// `sqlite:///var/lib/xindex/prepare.db`). The `xindex-turnkey-approver`
+    /// process reads the same DB to gate the signature.
     #[arg(long)]
     db: String,
 
-    /// Cobo API host. Defaults to the dev-env; pass the prod host for mainnet.
-    #[arg(long, default_value_t = COBO_API_DEV.to_string())]
-    cobo_host: String,
+    /// Turnkey API host. Defaults to the production API; the dev-env is a
+    /// sub-org on the same host.
+    #[arg(long, default_value_t = TURNKEY_API_BASE.to_string())]
+    turnkey_host: String,
+
+    /// Gas budget (units) for the tx.
+    #[arg(long, default_value_t = 300_000)]
+    gas_limit: u64,
+
+    /// EIP-1559 `max_fee_per_gas` (wei).
+    #[arg(long, default_value_t = 0)]
+    max_fee_per_gas: u128,
+
+    /// EIP-1559 `max_priority_fee_per_gas` (wei).
+    #[arg(long, default_value_t = 0)]
+    max_priority_fee_per_gas: u128,
+
+    /// Legacy `gas_price` (wei). Used only on BSC (DL-P3.2-4).
+    #[arg(long, default_value_t = 0)]
+    gas_price: u128,
 
     /// `depositWithExpiry` expiry, seconds from now.
     #[arg(long, default_value_t = 7200)]
     expiry_offset_secs: u64,
 
-    /// Seconds between Cobo transaction-status polls.
+    /// Seconds between Turnkey activity-status polls.
     #[arg(long, default_value_t = 5)]
     poll_interval_secs: u64,
 
@@ -186,8 +214,7 @@ struct CoboArgs {
     #[arg(long, default_value_t = 60)]
     poll_max_attempts: u32,
 
-    /// Originating dispatch id (32-byte hex). Becomes the Cobo `request_id` =
-    /// the prepare-store key + idempotency key. Defaults to zero for a manual
+    /// Originating dispatch id (32-byte hex). Defaults to zero for a manual
     /// drive; pass a distinct id per re-drive.
     #[arg(
         long,
@@ -206,7 +233,7 @@ struct CoboArgs {
     #[arg(long)]
     memo: String,
 
-    /// Native amount in wei the MPC wallet is redeeming.
+    /// Native amount in wei the custody key is redeeming.
     #[arg(long)]
     amount_wei: String,
 }
@@ -377,7 +404,7 @@ async fn main() -> Result<()> {
 
     match Cli::parse().backend {
         Backend::Safe(args) => run_safe(args).await,
-        Backend::Cobo(args) => run_cobo(args).await,
+        Backend::Turnkey(args) => run_turnkey(args).await,
     }
 }
 
@@ -492,44 +519,61 @@ async fn run_safe(args: SafeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Drive a single Cobo MPC-backed redeem leg: stage the unsigned spend in the
-/// shared prepare store, submit a `BuildOnly` contract-call, then
-/// sign-and-broadcast (firing our TSS-Node callback) and poll to confirmation.
-async fn run_cobo(args: CoboArgs) -> Result<()> {
+/// Drive a single Turnkey-backed EVM redeem leg: stage the unsigned spend in
+/// the shared prepare store, sign the tx hash via Turnkey (gated by the
+/// approver-watcher), assemble the raw signed tx, and submit it.
+async fn run_turnkey(args: TurnkeyEvmArgs) -> Result<()> {
     let chain = parse_chain(&args.chain)?;
-    let mpc_address = parse_addr("--mpc-address", &args.mpc_address)?;
+    let custody_address = parse_addr("--custody-address", &args.custody_address)?;
     let vault = parse_addr("--vault", &args.vault)?;
     let dispatch_id = parse_b256("--dispatch-id", &args.dispatch_id)?;
     let redemption_id = parse_b256("--redemption-id", &args.redemption_id)?;
     let amount_wei =
         U256::from_str_radix(&args.amount_wei, 10).context("--amount-wei: bad decimal")?;
 
-    // The Cobo API secret stays out of argv — read it from the environment.
-    let secret = std::env::var("COBO_API_SECRET").context(
-        "COBO_API_SECRET (hex 32-byte Ed25519 API secret) must be set for --backend cobo",
+    // The Turnkey API P-256 key stays out of argv — read it from the env.
+    let api_key = std::env::var("XINDEX_TURNKEY_API_KEY").context(
+        "XINDEX_TURNKEY_API_KEY (hex P-256 private key) must be set for --backend turnkey",
     )?;
-    let signer = CoboSigner::from_hex(&secret).map_err(|e| anyhow!("cobo signer: {e}"))?;
-    let cobo =
-        Arc::new(CoboClient::new(args.cobo_host, signer).map_err(|e| anyhow!("cobo client: {e}"))?);
+    let stamper = TurnkeyStamper::from_hex(&api_key).map_err(|e| anyhow!("turnkey key: {e}"))?;
+    let turnkey = Arc::new(
+        TurnkeyClient::new(&args.turnkey_host, &args.organization_id, stamper)
+            .map_err(|e| anyhow!("turnkey client: {e}"))?,
+    );
 
     // Shared bind-prepare store: the executor `put`s the unsigned spend here;
-    // the callback process `get`s the same DB file to gate the signature.
+    // the approver process `get`s the same DB file to gate the signature.
     let prepare = Arc::new(
         SqlitePrepareStore::connect(&args.db)
             .await
             .map_err(|e| anyhow!("prepare store {}: {e}", args.db))?,
     );
 
-    let config = CoboEvmRedeemConfig {
-        chain,
-        wallet_id: args.wallet_id,
-        mpc_address,
-        vault,
+    // Provider for the custody EOA nonce + raw-tx submit.
+    let provider = ProviderBuilder::new()
+        .on_http(args.rpc_url.parse().context("--rpc-url")?)
+        .boxed();
+    let evm = AlloyEvmChainClient::new(chain, Arc::new(provider))
+        .map_err(|e| anyhow!("AlloyEvmChainClient::new: {e}"))?;
+    let nonce = evm
+        .provider()
+        .get_transaction_count(custody_address)
+        .await
+        .context("get_transaction_count")?;
+
+    let fee = EvmTxFee {
+        gas_limit: args.gas_limit,
+        max_fee_per_gas: args.max_fee_per_gas,
+        max_priority_fee_per_gas: args.max_priority_fee_per_gas,
+        gas_price: args.gas_price,
+    };
+    let config = TurnkeyEvmRedeemConfig {
+        sign_with: args.sign_with,
         expiry_offset_secs: args.expiry_offset_secs,
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         poll_max_attempts: args.poll_max_attempts,
     };
-    let executor = CoboEvmRedeemExecutor::new(config, cobo, prepare);
+    let executor = TurnkeyEvmRedeemExecutor::new(config, turnkey, prepare);
 
     let task = EvmRedeemTask {
         dispatch_id,
@@ -538,25 +582,30 @@ async fn run_cobo(args: CoboArgs) -> Result<()> {
         memo: args.memo,
         amount_wei,
         // CTD-1: the RIC is supplied by the observer/relay (Slice B); None
-        // fail-closes at the callback (decide_evm_deposit is RIC-only).
+        // fail-closes at the approver (decide_evm_deposit is RIC-only).
         intent_proof: None,
     };
-    info!(?chain, ?mpc_address, ?amount_wei, "cobo execute_leg start");
+    info!(
+        ?chain,
+        ?custody_address,
+        nonce,
+        ?amount_wei,
+        "turnkey EVM execute_leg start"
+    );
     let outcome = executor
-        .execute_leg(&task)
+        .execute_leg(&task, vault, nonce, fee)
         .await
         .map_err(|e| anyhow!("execute_leg: {e}"))?;
 
-    info!(
-        cobo_transaction_id = %outcome.cobo_transaction_id,
-        transaction_hash = outcome.transaction_hash.as_deref().unwrap_or("(none)"),
-        "cobo EVM redeem leg complete"
-    );
-    println!("cobo_transaction_id: {}", outcome.cobo_transaction_id);
-    println!(
-        "transaction_hash: {}",
-        outcome.transaction_hash.as_deref().unwrap_or("")
-    );
+    // Submit the raw signed tx the executor assembled.
+    let tx_hash = evm
+        .submit_raw(outcome.raw_tx)
+        .await
+        .map_err(|e| anyhow!("submit_raw: {e}"))?;
+    info!(activity = %outcome.activity_id, %tx_hash, "turnkey EVM redeem leg broadcast");
+    println!("signing_hash: {:#x}", outcome.signing_hash);
+    println!("activity_id: {}", outcome.activity_id);
+    println!("tx_hash: {tx_hash:#x}");
 
     Ok(())
 }

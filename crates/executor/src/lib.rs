@@ -17,7 +17,6 @@
 
 pub mod broadcast_registry;
 pub mod cancel_swap_back;
-pub mod cobo_evm_redeem;
 pub mod cosmos_redeem;
 pub mod evm_redeem;
 pub mod rebroadcast;
