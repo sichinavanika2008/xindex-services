@@ -45,16 +45,32 @@ pub struct GateRejection {
 
 impl GateRejection {
     pub(crate) fn bad(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), class: RejectionClass::BadRequest }
+        Self {
+            code,
+            message: message.into(),
+            class: RejectionClass::BadRequest,
+        }
     }
     pub(crate) fn conflict(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), class: RejectionClass::Conflict }
+        Self {
+            code,
+            message: message.into(),
+            class: RejectionClass::Conflict,
+        }
     }
     pub(crate) fn unprocessable(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), class: RejectionClass::Unprocessable }
+        Self {
+            code,
+            message: message.into(),
+            class: RejectionClass::Unprocessable,
+        }
     }
     pub(crate) fn internal(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), class: RejectionClass::Internal }
+        Self {
+            code,
+            message: message.into(),
+            class: RejectionClass::Internal,
+        }
     }
 }
 
@@ -181,11 +197,17 @@ async fn consume_ric_one_shot<S: ReplayStore>(
             return if rec.signature.as_slice() == spend_identity {
                 Ok(())
             } else {
-                Err(GateRejection::conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_SPEND))
+                Err(GateRejection::conflict(
+                    error_codes::INTENT_ALREADY_SIGNED,
+                    REDRIVEN_SPEND,
+                ))
             };
         }
         CheckOutcome::Conflict { .. } => {
-            return Err(GateRejection::conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_CERT));
+            return Err(GateRejection::conflict(
+                error_codes::INTENT_ALREADY_SIGNED,
+                REDRIVEN_CERT,
+            ));
         }
         CheckOutcome::FirstTime => {}
     }
@@ -201,7 +223,10 @@ async fn consume_ric_one_shot<S: ReplayStore>(
         .await
     {
         if must_propagate_record_error(&e) {
-            return Err(GateRejection::bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+            return Err(GateRejection::bad(
+                error_codes::BAD_REQUEST,
+                format!("replay record: {e}"),
+            ));
         }
         return match replay
             .check_ric_intent(chain, cert.redemption_id, cert.leg_index, digest.0)
@@ -209,12 +234,14 @@ async fn consume_ric_one_shot<S: ReplayStore>(
             .map_err(|e| GateRejection::bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
         {
             CheckOutcome::Idempotent(rec) if rec.signature.as_slice() == spend_identity => Ok(()),
-            CheckOutcome::Idempotent(_) => {
-                Err(GateRejection::conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_SPEND))
-            }
-            CheckOutcome::Conflict { .. } => {
-                Err(GateRejection::conflict(error_codes::INTENT_ALREADY_SIGNED, REDRIVEN_CERT))
-            }
+            CheckOutcome::Idempotent(_) => Err(GateRejection::conflict(
+                error_codes::INTENT_ALREADY_SIGNED,
+                REDRIVEN_SPEND,
+            )),
+            CheckOutcome::Conflict { .. } => Err(GateRejection::conflict(
+                error_codes::INTENT_ALREADY_SIGNED,
+                REDRIVEN_CERT,
+            )),
             CheckOutcome::FirstTime => Err(GateRejection::internal(
                 error_codes::BAD_REQUEST,
                 "ric one-shot record race left no row",
@@ -296,7 +323,10 @@ async fn consume_ac_one_shot<S: ReplayStore>(
             return if rec.signature.as_slice() == spend_identity {
                 Ok(())
             } else {
-                Err(GateRejection::conflict(error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED, REDRIVEN_SPEND))
+                Err(GateRejection::conflict(
+                    error_codes::ACQUIRE_CANCEL_ALREADY_SIGNED,
+                    REDRIVEN_SPEND,
+                ))
             };
         }
         CheckOutcome::Conflict { .. } => {
@@ -308,11 +338,20 @@ async fn consume_ac_one_shot<S: ReplayStore>(
         CheckOutcome::FirstTime => {}
     }
     if let Err(e) = replay
-        .record_ac_intent(chain, cert.cancel_id, digest.0, spend_identity.to_vec(), now_unix)
+        .record_ac_intent(
+            chain,
+            cert.cancel_id,
+            digest.0,
+            spend_identity.to_vec(),
+            now_unix,
+        )
         .await
     {
         if must_propagate_record_error(&e) {
-            return Err(GateRejection::bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
+            return Err(GateRejection::bad(
+                error_codes::BAD_REQUEST,
+                format!("replay record: {e}"),
+            ));
         }
         return match replay
             .check_ac_intent(chain, cert.cancel_id, digest.0)
@@ -402,7 +441,10 @@ pub fn bind_account_send_to_cert(
         ));
     }
     let amount = U256::from_str_radix(amount_dec, 10).map_err(|e| {
-        GateRejection::unprocessable(error_codes::INTENT_MISMATCH, format!("amount: bad decimal: {e}"))
+        GateRejection::unprocessable(
+            error_codes::INTENT_MISMATCH,
+            format!("amount: bad decimal: {e}"),
+        )
     })?;
     if amount != cert.amount {
         return Err(GateRejection::unprocessable(

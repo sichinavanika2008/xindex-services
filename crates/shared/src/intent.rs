@@ -31,12 +31,12 @@
 //! and the `==`-binding of request fields to certified values lives in
 //! each handler, where the family-specific spend shape is known.
 
-use alloy_primitives::{Address, PrimitiveSignature, B256, U256};
 use crate::eip712::{
     acquire_cancel_certificate, acquire_cancel_signing_hash, attestation_oracle_domain,
     redemption_intent_certificate, ric_signing_hash,
 };
 use crate::signer_wire::{error_codes, AcquireCancelProof, IntentProof};
+use alloy_primitives::{Address, PrimitiveSignature, B256, U256};
 
 /// Clock-skew tolerance for a `vault_resolved_at` in the future. The
 /// observers' clocks are NTP-disciplined; anything beyond this is a

@@ -27,7 +27,10 @@ pub fn bind_outputs_to_cert(
     spend: &CertifiedSpend,
 ) -> Result<(), GateRejection> {
     let want_sats = u64::try_from(spend.amount).map_err(|_| {
-        GateRejection::unprocessable(spend.mismatch_code, "certified amount does not fit u64 sats")
+        GateRejection::unprocessable(
+            spend.mismatch_code,
+            "certified amount does not fit u64 sats",
+        )
     })?;
     let mut payouts = 0usize;
     let mut op_returns = 0usize;
