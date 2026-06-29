@@ -1,38 +1,33 @@
-//! `xindex-custody-node` — Cobo TSS-Node callback handler.
+//! `xindex-custody-node` — the provider-neutral custody decision library.
 //!
-//! Under the Cobo MPC-TSS custody model (`DL-CUSTODY-COBO-1`) Cobo's TSS
-//! Node POSTs every pending signature to this callback server, which APPROVEs
-//! or REJECTs it before the MPC share signs (mutual RS256 JWT, fail-closed).
-//! Our destination-binding (CTD-1) runs HERE as custom risk-control on our own
-//! node — the provider's policy engine cannot inspect a `THORChain`
-//! `OP_RETURN` memo, so for the BTC raw-signing path this callback is the sole
-//! semantic enforcement, fail-closed.
+//! Under the Turnkey custody model (`DL-CUSTODY-TURNKEY-1`) every pending
+//! signature is a `CONSENSUS_NEEDED` activity that our approver-watcher must
+//! `approveActivity` before Turnkey's enclave signs (fail-closed by
+//! construction — no approval ⇒ no signature). Our destination-binding (CTD-1)
+//! runs HERE as the approval gate on our own fleet — the provider cannot
+//! inspect a `THORChain` `OP_RETURN` memo, so this is the sole semantic
+//! enforcement, fail-closed.
 //!
-//! **This crate today = the WIRE-INDEPENDENT core:** the bind-prepare context
-//! store ([`prepare`]) and the per-family CTD-1 spend decisions ([`btc`],
-//! [`evm`], [`account`]), built on the shared [`xindex_custody_core`] gates +
-//! binders. The thin Cobo-wire adapter — mutual RS256 JWT, the TSS-Node
-//! callback request schema (`request_detail` / `extra_info`), and the
-//! sighash ↔ callback-request tie-in — is pinned against the real Cobo dev-env
-//! (`api.dev.cobo.com`) and layered on top. The BTC `OP_RETURN` / raw-sighash
-//! capability the BTC path depends on is the OPEN gate — see
-//! `docs/runbooks/cobo-btc-gate.md`.
+//! This crate is the **wire-independent decision core:** the per-family CTD-1
+//! spend decisions ([`btc`], [`evm`], [`account`]) and the [`dispatch`]
+//! pipeline that runs them against the shared [`xindex_custody_core`] gates +
+//! binders + prepare/replay stores. The Turnkey wire (P-256 stamp, the
+//! `SIGN_RAW_PAYLOAD` activity schema, the `ACTIVITY_UPDATES` correlation) lives
+//! in `xindex-turnkey-client` and the approver-watcher binary; they are pinned
+//! against the real Turnkey dev-env and layered on top.
 
 pub mod account;
 pub mod btc;
-pub mod cobo_types;
 pub mod dispatch;
 pub mod evm;
-pub mod jwt;
-pub mod server;
 
 #[cfg(test)]
 mod test_support;
 
-/// The callback's verdict on a pending Cobo TSS-Node signature.
+/// The approver's verdict on a pending custody signature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// Every check passed — Cobo MPC may produce the signature.
+    /// Every check passed — Turnkey's enclave may produce the signature.
     Approve,
     /// Refused (fail-closed). `code` is the stable wire error code, `message`
     /// the operator-facing detail.

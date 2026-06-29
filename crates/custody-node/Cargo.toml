@@ -9,32 +9,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "xindex-custody-callback"
-path = "src/main.rs"
-
 [dependencies]
 xindex-custody-core.workspace = true
 xindex-shared.workspace = true
 alloy-primitives.workspace = true
 bitcoin.workspace = true
 tokio.workspace = true
-thiserror.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-# Cobo TSS-Node callback transport.
-# jsonwebtoken pinned to the 9.x line ON PURPOSE: 9.x is `ring`-backed (the
-# crypto backend the workspace already standardizes on via rustls/reqwest),
-# whereas 10.x forces a choice between `aws_lc_rs` (a C toolchain) and
-# `rust_crypto` (which pulls the RustCrypto `rsa` crate — RUSTSEC-2023-0071
-# Marvin, the very crate the workspace deliberately keeps out). 9.x reuses
-# `ring`, adds no second backend, and keeps `cargo deny`/`audit` clean.
-jsonwebtoken = "9.3"
-axum = { workspace = true, features = ["json"] }
-anyhow.workspace = true
-clap.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # Sign test RIC/ACC digests with a secp256k1 key (same pattern as the

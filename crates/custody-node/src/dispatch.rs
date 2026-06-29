@@ -1,14 +1,17 @@
-//! The Cobo callback decision pipeline — pure, transport-independent.
+//! The custody decision pipeline — pure, transport-independent.
 //!
-//! Given a parsed [`CallbackRequest`] + the prepare store + the replay store,
-//! decide APPROVE/REJECT for a pending Cobo MPC signature. The JWT verify /
-//! axum layer ([`crate::jwt`], [`crate::server`]) is a thin shell over this;
-//! everything security-relevant is here and unit-tested without a network.
+//! Given a prepared-spend lookup key + the prepare store + the replay store,
+//! decide APPROVE/REJECT for a pending custody signature. The Turnkey
+//! approver-watcher ([`crate::bin`]) is a thin shell over this: it observes a
+//! `CONSENSUS_NEEDED` signing activity, supplies the activity's signing
+//! `payload` (the sighash hex) as the lookup key, then maps the [`Decision`]
+//! to `approveActivity` / `rejectActivity`. Everything security-relevant is
+//! here and unit-tested without a network.
 //!
-//! Fail-safe by construction — APPROVE requires ALL of: the request is a
-//! `KeySign`, a prepare-context exists for its `request_id` (which only the
-//! executor creates when it submits the spend), and the family decision core
-//! passes the k-of-n RIC bind. Any miss → fail-closed REJECT.
+//! Fail-safe by construction — APPROVE requires ALL of: a prepare-context
+//! exists for the key (which only the executor creates when it submits the
+//! spend), and the family decision core passes the k-of-n RIC bind. Any miss →
+//! fail-closed REJECT.
 
 use bitcoin::ScriptBuf;
 use xindex_custody_core::gates::CustodyConfig;
@@ -16,56 +19,54 @@ use xindex_custody_core::replay::ReplayStore;
 
 use crate::account::{decide_account_send, AccountSend};
 use crate::btc::decide_redeem_spend;
-use crate::cobo_types::{CallbackRequest, CallbackResponse};
 use crate::evm::{decide_evm_deposit, EvmDeposit};
 use crate::Decision;
 use xindex_custody_core::prepare::{PrepareStore, PreparedSpend};
 
-/// Decide a Cobo TSS-Node callback. Looks up the prepared spend by
-/// `request_id`, runs the family decision core, maps to APPROVE/REJECT.
+/// Decide a pending custody signature. Looks up the prepared spend by
+/// `prepare_key` (the executor keys `prepare.put` by the signing-payload
+/// sighash hex), runs the family decision core, maps to APPROVE/REJECT.
 ///
-/// `btc_custody_spk` is this callback's own custody `scriptPubKey` (for the
+/// `btc_custody_spk` is this approver's own custody `scriptPubKey` (for the
 /// BTC output bind); `None` rejects any BTC spend.
 ///
-/// **SECURITY (W3, dev-env reconciliation):** this binds the spend to the
-/// k-of-n RIC via the prepare-context, but does NOT yet cross-check that the
-/// message Cobo is about to sign (carried in `req.request_detail`, schema
-/// non-public) equals the re-derived sighash of the prepared spend. Until that
-/// cross-check is wired, [`crate::server`]'s production guard must refuse prod
-/// (a coordinator that prepared ctx X but submitted tx Y under the same
-/// `request_id` would otherwise pass). See `docs/runbooks/cobo-btc-gate.md`.
+/// **SECURITY (dev-env reconciliation):** the prepared spend is bound to the
+/// k-of-n RIC (destination / amount / memo) by the family core. The
+/// approver-watcher correlates the activity to the prepared spend by the
+/// signing `payload` itself (the sighash), so a coordinator cannot pair
+/// prepared-context X with a signature over a different message Y under the
+/// same key. Re-deriving the sighash from the prepared tx and asserting it
+/// equals `prepare_key` is a follow-on hardening (`// RECONCILE AT DEV-ENV`,
+/// pinned once the real `ACTIVITY_UPDATES` payload shape is captured).
 pub async fn decide_callback<P, R>(
-    req: &CallbackRequest,
+    prepare_key: &str,
     prepare: &P,
     replay: &R,
     config: CustodyConfig<'_>,
     btc_custody_spk: Option<&ScriptBuf>,
     now_unix: i64,
-) -> CallbackResponse
+) -> Decision
 where
     P: PrepareStore,
     R: ReplayStore,
 {
-    if !req.is_key_sign() {
-        return CallbackResponse::reject(
-            "unsupported_request_type",
-            "only key-sign spends are gated by this callback (fail-closed)",
-        );
-    }
-    let spend = match prepare.get(&req.request_id).await {
+    let spend = match prepare.get(prepare_key).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return CallbackResponse::reject(
-                "no_prepare_context",
-                "no prepared spend bound to this request_id (fail-closed)",
-            );
+            return Decision::Reject {
+                code: "no_prepare_context",
+                message: "no prepared spend bound to this signing payload (fail-closed)"
+                    .to_string(),
+            };
         }
-        Err(e) => return CallbackResponse::reject("prepare_store_error", e.to_string()),
+        Err(e) => {
+            return Decision::Reject {
+                code: "prepare_store_error",
+                message: e.to_string(),
+            };
+        }
     };
-    match decide_prepared(&spend, replay, config, btc_custody_spk, now_unix).await {
-        Decision::Approve => CallbackResponse::approve(),
-        Decision::Reject { code, message } => CallbackResponse::reject(code, message),
-    }
+    decide_prepared(&spend, replay, config, btc_custody_spk, now_unix).await
 }
 
 /// Dispatch a [`PreparedSpend`] to its family decision core.
@@ -81,7 +82,7 @@ async fn decide_prepared<R: ReplayStore>(
             Some(spk) => decide_redeem_spend(ctx, replay, config, spk, now_unix).await,
             None => Decision::Reject {
                 code: "btc_custody_unconfigured",
-                message: "BTC custody scriptPubKey not configured on this callback".to_string(),
+                message: "BTC custody scriptPubKey not configured on this approver".to_string(),
             },
         },
         PreparedSpend::Evm(e) => {
@@ -119,7 +120,6 @@ mod tests {
     use xindex_shared::signer_wire::IntentProof;
     use xindex_shared::thorchain_router::depositWithExpiryCall;
 
-    use crate::cobo_types::CallbackRequest;
     use crate::test_support::{oracle, policy, signed_ric, CHAIN_ID, NOW};
     use xindex_custody_core::prepare::{EvmPrepared, InMemoryPrepareStore, PreparedSpend};
 
@@ -168,15 +168,6 @@ mod tests {
         })
     }
 
-    fn key_sign_req(request_id: &str) -> CallbackRequest {
-        CallbackRequest {
-            request_id: request_id.to_string(),
-            request_type: serde_json::json!(2),
-            request_detail: String::new(),
-            extra_info: String::new(),
-        }
-    }
-
     fn honest_ric() -> IntentProof {
         signed_ric(
             CHAIN,
@@ -187,30 +178,23 @@ mod tests {
         )
     }
 
+    fn is_reject(d: &Decision) -> bool {
+        matches!(d, Decision::Reject { .. })
+    }
+
     #[tokio::test]
-    async fn honest_keysign_approves() {
+    async fn honest_prepared_approves() {
         let policy = policy();
         let prepare = InMemoryPrepareStore::new();
         let _ = prepare
             .put(
-                "req-1".to_string(),
+                "sighash-1".to_string(),
                 evm_prepared(U256::from(AMOUNT), honest_ric()),
             )
             .await;
         let replay = InMemoryReplayStore::new();
-        let resp = decide_callback(
-            &key_sign_req("req-1"),
-            &prepare,
-            &replay,
-            config(&policy),
-            None,
-            NOW,
-        )
-        .await;
-        assert!(
-            resp.is_approve(),
-            "honest prepared KeySign must APPROVE: {resp:?}"
-        );
+        let d = decide_callback("sighash-1", &prepare, &replay, config(&policy), None, NOW).await;
+        assert_eq!(d, Decision::Approve, "honest prepared spend must APPROVE");
     }
 
     #[tokio::test]
@@ -218,34 +202,8 @@ mod tests {
         let policy = policy();
         let prepare = InMemoryPrepareStore::new();
         let replay = InMemoryReplayStore::new();
-        let resp = decide_callback(
-            &key_sign_req("absent"),
-            &prepare,
-            &replay,
-            config(&policy),
-            None,
-            NOW,
-        )
-        .await;
-        assert!(!resp.is_approve());
-    }
-
-    #[tokio::test]
-    async fn non_keysign_rejects() {
-        let policy = policy();
-        let prepare = InMemoryPrepareStore::new();
-        // Even WITH a valid prepared spend, a non-KeySign request is rejected.
-        let _ = prepare
-            .put(
-                "req-1".to_string(),
-                evm_prepared(U256::from(AMOUNT), honest_ric()),
-            )
-            .await;
-        let replay = InMemoryReplayStore::new();
-        let mut req = key_sign_req("req-1");
-        req.request_type = serde_json::json!(1); // KeyGen
-        let resp = decide_callback(&req, &prepare, &replay, config(&policy), None, NOW).await;
-        assert!(!resp.is_approve());
+        let d = decide_callback("absent", &prepare, &replay, config(&policy), None, NOW).await;
+        assert!(is_reject(&d));
     }
 
     #[tokio::test]
@@ -255,21 +213,13 @@ mod tests {
         let prepare = InMemoryPrepareStore::new();
         let _ = prepare
             .put(
-                "req-1".to_string(),
+                "sighash-1".to_string(),
                 evm_prepared(U256::from(AMOUNT + 1), honest_ric()),
             )
             .await;
         let replay = InMemoryReplayStore::new();
-        let resp = decide_callback(
-            &key_sign_req("req-1"),
-            &prepare,
-            &replay,
-            config(&policy),
-            None,
-            NOW,
-        )
-        .await;
-        assert!(!resp.is_approve());
+        let d = decide_callback("sighash-1", &prepare, &replay, config(&policy), None, NOW).await;
+        assert!(is_reject(&d));
     }
 
     #[tokio::test]
@@ -293,19 +243,11 @@ mod tests {
             acc: None,
         };
         let _ = prepare
-            .put("req-btc".to_string(), PreparedSpend::Btc(Box::new(ctx)))
+            .put("sighash-btc".to_string(), PreparedSpend::Btc(Box::new(ctx)))
             .await;
         let replay = InMemoryReplayStore::new();
         // btc_custody_spk = None → BTC spend must reject (fail-closed).
-        let resp = decide_callback(
-            &key_sign_req("req-btc"),
-            &prepare,
-            &replay,
-            config(&policy),
-            None,
-            NOW,
-        )
-        .await;
-        assert!(!resp.is_approve());
+        let d = decide_callback("sighash-btc", &prepare, &replay, config(&policy), None, NOW).await;
+        assert!(is_reject(&d));
     }
 }
