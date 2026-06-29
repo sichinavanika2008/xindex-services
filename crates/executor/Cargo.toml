@@ -74,6 +74,10 @@ name = "xindex-redeem-evm"
 path = "src/bin/xindex-redeem-evm.rs"
 
 [[bin]]
+name = "xindex-redeem-turnkey-btc"
+path = "src/bin/xindex-redeem-turnkey-btc.rs"
+
+[[bin]]
 name = "xindex-redeem-cosmos"
 path = "src/bin/xindex-redeem-cosmos.rs"
 
