@@ -5775,6 +5775,7 @@ dependencies = [
  "xindex-shared",
  "xindex-solana-tx",
  "xindex-tron-tx",
+ "xindex-turnkey-client",
  "xindex-xrp-tx",
 ]
 

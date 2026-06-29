@@ -21,6 +21,10 @@ xindex-safe-evm.workspace = true
 # bind-prepare store + the Cobo v2 REST client.
 xindex-custody-core.workspace = true
 xindex-cobo-client.workspace = true
+# Turnkey custody redeem reroute (DL-CUSTODY-TURNKEY-1): the Turnkey REST
+# client (raw P-256 signer). The executor builds the tx + sighash, Turnkey
+# signs, the executor assembles + broadcasts.
+xindex-turnkey-client.workspace = true
 # C7: Cosmos redeem leg — builds the MsgSend sign-doc + TxRaw and reads
 # account/sequence from the Cosmos chain.
 xindex-chain-cosmos.workspace = true
