@@ -169,6 +169,25 @@ impl SignRawPayloadResult {
         };
         Ok((r, s, v))
     }
+
+    /// Extract a 64-byte ed25519 signature (`R ‖ S`) — for the Solana custody
+    /// family, whose key is ed25519 (not secp256k1). Turnkey returns an
+    /// ed25519 `SIGN_RAW_PAYLOAD` result in the same `r` / `s` hex fields as
+    /// ECDSA: `r` is the 32-byte `R` point, `s` the 32-byte `S` scalar, so the
+    /// wire signature is their concatenation (`v` is unused for ed25519).
+    /// RECONCILE AT DEV-ENV: confirm Turnkey's ed25519 result field layout
+    /// against a captured activity.
+    ///
+    /// # Errors
+    /// [`TurnkeyError::Result`] if `r` / `s` are not 32 bytes each.
+    pub fn ed25519_sig(&self) -> Result<[u8; 64], TurnkeyError> {
+        let r = decode32(&self.r, "r")?;
+        let s = decode32(&self.s, "s")?;
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(&r);
+        out[32..].copy_from_slice(&s);
+        Ok(out)
+    }
 }
 
 fn decode32(hex: &str, field: &str) -> Result<[u8; 32], TurnkeyError> {
@@ -294,6 +313,21 @@ mod tests {
             v: "00".to_string(),
         };
         assert!(bad.rsv().is_err());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn ed25519_sig_concatenates_r_and_s() {
+        let res = SignRawPayloadResult {
+            r: "11".repeat(32),
+            s: "22".repeat(32),
+            v: String::new(),
+        };
+        let sig = res.ed25519_sig().expect("ed25519");
+        assert_eq!(sig[0], 0x11);
+        assert_eq!(sig[31], 0x11);
+        assert_eq!(sig[32], 0x22);
+        assert_eq!(sig[63], 0x22);
     }
 
     #[test]

@@ -180,6 +180,31 @@ pub fn serialize_single_sign(
     )?))
 }
 
+/// Assemble the final submittable SINGLE-sign tx-blob for a single
+/// secp256k1 custody key (the Turnkey enclave key — `DL-CUSTODY-TURNKEY-1`):
+/// the `Payment` with the custody `SigningPubKey` populated and a top-level
+/// `TxnSignature` (the DER low-S signature over [`crate::signing::single_sign_digest`]
+/// of [`serialize_single_sign`]), and NO `Signers` array. `txn_signature_der`
+/// is the [`crate::sigs::der_low_s_from_rs`] form of the custody key's
+/// `(r, s)`. `serialize_fields` sorts by `(type, field)`, so `TxnSignature`
+/// `(7,4)` lands immediately after `SigningPubKey` `(7,3)` in canonical order.
+///
+/// # Errors
+///
+/// Returns [`TxError::FieldTooLong`] if the memo or signature exceeds the XRPL
+/// variable-length maximum, or [`TxError::AmountOutOfRange`] if the amount /
+/// fee exceeds the XRP supply cap.
+pub fn build_signed_single_sig_tx(
+    body: &PaymentBody,
+    signing_pubkey: &[u8; 33],
+    txn_signature_der: &[u8],
+) -> Result<Vec<u8>, TxError> {
+    let mut fields = payment_fields(body, signing_pubkey, None)?;
+    let sig = vl_payload(txn_signature_der).ok_or(TxError::FieldTooLong)?;
+    fields.push(Field::new(T_BLOB, F_TXN_SIGNATURE, sig));
+    Ok(serialize_fields(fields))
+}
+
 /// One entry of a `SignerListSet` (a future signer + its weight).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignerEntry {
@@ -384,6 +409,47 @@ mod tests {
         );
         // Top-level SigningPubKey empty.
         assert!(hex.contains("7300"));
+    }
+
+    /// Single-sig assembly: the custody `SigningPubKey` is populated, a
+    /// top-level `TxnSignature` follows it (canonical `(7,4)` after `(7,3)`),
+    /// and there is NO `Signers` array. Uses the §9.3 sourced body + pubkey +
+    /// REAL DER signature (which verifies against the single-sign digest).
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn single_sig_assembly_populates_pubkey_and_txn_signature() {
+        let pubkey: [u8; 33] =
+            unhex_n("030cef2112503d3a56d2d48b3a0f0f6503e4353400f450f9dbf344d182e7c7069c");
+        let body = PaymentBody {
+            account: unhex_n("d4b66bcf790babd0032c5dbfdc14ff1c643a4f48"),
+            destination: unhex_n("fdffd00f2f2d215ecdad483b99be1dad2259b9c3"),
+            amount_drops: 24_528_352,
+            fee_drops: 750_000,
+            sequence: 1,
+            last_ledger_sequence: None,
+            network_id: Some(1234),
+            memo: b"memo".to_vec(),
+        };
+        let der = unhex("30440221008e9bc0a8d7927f1874d318bc2a57691b5321d618dd57857d64402be0e0bc0007021f4ab281ef93b0c448a9e75d6c07e9cf05ee705a3c51aafa61992510b65a03ae");
+        let tx = build_signed_single_sig_tx(&body, &pubkey, &der).expect("assemble");
+        let hex = hexs(&tx);
+        // Payment.
+        assert!(hex.starts_with("120000"));
+        // SigningPubKey (0x73) populated with the 33-byte (0x21) custody key.
+        let pk_hex = hexs(&pubkey);
+        let pk_field = format!("7321{pk_hex}");
+        let pk_at = hex.find(&pk_field).expect("populated SigningPubKey");
+        // TxnSignature (0x74) immediately follows SigningPubKey in canonical
+        // order, carrying the DER signature.
+        let sig_field = format!("74{:02x}{}", der.len(), hexs(&der));
+        let sig_at = hex.find(&sig_field).expect("TxnSignature field");
+        assert_eq!(
+            sig_at,
+            pk_at + pk_field.len(),
+            "TxnSignature (7,4) must immediately follow SigningPubKey (7,3)"
+        );
+        // No Signers array (single-sig).
+        assert!(!hex.contains("f3e0"), "single-sig tx has no Signers array");
     }
 
     /// P4.4-1 byte-match CLOSED (encoding): our three multisign encoders

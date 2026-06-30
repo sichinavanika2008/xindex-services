@@ -30,7 +30,9 @@
 //! network rejects (stuck funds) or, worse, one that spends differently
 //! than the members signed. See `xindex-services/KNOWN_FINDINGS.md`.
 
-use crate::addr::{encode_any, encode_legacy_amino_pubkey};
+use crate::addr::{
+    encode_any, encode_legacy_amino_pubkey, encode_secp256k1_pubkey, SECP256K1_PUBKEY_TYPE_URL,
+};
 use crate::proto::{put_len_delim, put_varint_field};
 use crate::sigs::AggregatedMultisig;
 use crate::CosmosMultisig;
@@ -199,6 +201,45 @@ pub fn build_tx_raw(
     let auth_info = encode_auth_info(&signer_info, &fee);
 
     encode_tx_raw(&body, &auth_info, &agg.multi_signature)
+}
+
+/// Assemble the broadcast-ready `TxRaw` bytes for a SINGLE-key `MsgSend`
+/// signed by one secp256k1 custody key (the Turnkey enclave key —
+/// `DL-CUSTODY-TURNKEY-1`).
+///
+/// The amino `StdSignDoc` (and thus its `SHA-256` sign-bytes) is identical to
+/// the multisig path — only the proto envelope differs: the
+/// `SignerInfo.public_key` is a `/cosmos.crypto.secp256k1.PubKey` `Any` (NOT a
+/// `LegacyAminoPubKey`), the `ModeInfo` is `Single(AMINO_JSON)` (NOT `Multi`),
+/// and `TxRaw.signatures[0]` is the raw 64-byte compact low-S signature (NOT a
+/// `MultiSignature` proto). `signature64` is the
+/// [`crate::sigs::to_cosmos_compact_low_s`] form of the custody key's `(r, s)`
+/// over the same sign-bytes `params` produced.
+///
+/// # Errors
+/// Encoding-only; cannot fail (kept return-symmetric with [`build_tx_raw`]).
+#[must_use]
+pub fn build_single_sig_tx_raw(
+    pubkey_compressed: &[u8; 33],
+    params: &CosmosTxParams<'_>,
+    signature64: &[u8; 64],
+) -> Vec<u8> {
+    let msg = encode_msg_send(
+        params.from_address,
+        params.to_address,
+        params.denom,
+        params.send_amount,
+    );
+    let body = encode_tx_body(&msg, params.memo);
+
+    let pubkey_proto = encode_secp256k1_pubkey(pubkey_compressed);
+    let pubkey_any = encode_any(SECP256K1_PUBKEY_TYPE_URL, &pubkey_proto);
+    let mode_info = encode_mode_info_single();
+    let signer_info = encode_signer_info(&pubkey_any, &mode_info, params.sequence);
+    let fee = encode_fee(params.denom, params.fee_amount, params.gas_limit);
+    let auth_info = encode_auth_info(&signer_info, &fee);
+
+    encode_tx_raw(&body, &auth_info, signature64)
 }
 
 #[cfg(test)]
@@ -442,5 +483,64 @@ mod tests {
         let mut v = Vec::new();
         put_varint(127, &mut v);
         assert_eq!(v, vec![0x7f]);
+    }
+
+    /// Single-sig `TxRaw`: the `SignerInfo.public_key` is a
+    /// `/cosmos.crypto.secp256k1.PubKey` `Any`, the `ModeInfo` is
+    /// `Single(127)`, and `signatures[0]` is the raw 64-byte compact sig.
+    #[test]
+    fn single_sig_tx_raw_uses_secp256k1_pubkey_and_raw_signature() {
+        let pubkey = {
+            let mut k = [0u8; 33];
+            k[0] = 0x02;
+            k[32] = 0x09;
+            k
+        };
+        let sig64 = [0xABu8; 64];
+        let params = CosmosTxParams {
+            from_address: "cosmos1custody",
+            to_address: "cosmos1asgard",
+            denom: "uatom",
+            send_amount: "5000000",
+            fee_amount: "5000",
+            gas_limit: 200_000,
+            memo: "=:ETH.USDT:0xabc:1",
+            sequence: 7,
+        };
+        let raw = build_single_sig_tx_raw(&pubkey, &params, &sig64);
+
+        // TxRaw: field 1 body, field 2 auth_info, field 3 signatures[0].
+        let (_f1, _w1, p) = read_tag(&raw, 0);
+        let (body, p) = read_len_delim(&raw, p);
+        let (_f2, _w2, p) = read_tag(&raw, p);
+        let (auth, p) = read_len_delim(&raw, p);
+        let (f3, w3, p) = read_tag(&raw, p);
+        assert_eq!((f3, w3), (3, 2));
+        let (sig, end) = read_len_delim(&raw, p);
+        // signatures[0] is the RAW 64-byte compact sig (not a MultiSignature).
+        assert_eq!(sig, &sig64);
+        assert_eq!(end, raw.len(), "no trailing fields after signatures[0]");
+        assert!(body.windows(5).any(|w| w == b"=:ETH"), "memo in body");
+
+        // AuthInfo → SignerInfo (field 1) → public_key Any (field 1) carries
+        // the secp256k1 type URL; mode_info (field 2) is Single, not Multi.
+        let (af, _aw, ap) = read_tag(auth, 0);
+        assert_eq!(af, 1);
+        let (signer_info, _ae) = read_len_delim(auth, ap);
+        let (pf, _pw, pp) = read_tag(signer_info, 0);
+        assert_eq!(pf, 1, "public_key is field 1 of SignerInfo");
+        let (pubkey_any, after_pk) = read_len_delim(signer_info, pp);
+        assert!(
+            pubkey_any
+                .windows(SECP256K1_PUBKEY_TYPE_URL.len())
+                .any(|w| w == SECP256K1_PUBKEY_TYPE_URL.as_bytes()),
+            "secp256k1 pubkey type URL embedded in the Any"
+        );
+        let (mf, _mw, mp) = read_tag(signer_info, after_pk);
+        assert_eq!(mf, 2, "mode_info is field 2 of SignerInfo");
+        let (mode_info, _me) = read_len_delim(signer_info, mp);
+        // ModeInfo.Single is field 1 (Multi would be field 2).
+        let (mode_kind, _kw, _kp) = read_tag(mode_info, 0);
+        assert_eq!(mode_kind, 1, "ModeInfo is Single (field 1), not Multi");
     }
 }

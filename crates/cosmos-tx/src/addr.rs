@@ -26,8 +26,10 @@ use sha2::{Digest, Sha256};
 
 use crate::proto;
 
-/// proto `type_url` for a secp256k1 pubkey inside an `Any`.
-const SECP256K1_PUBKEY_TYPE_URL: &str = "/cosmos.crypto.secp256k1.PubKey";
+/// proto `type_url` for a secp256k1 pubkey inside an `Any`. Shared with
+/// [`crate::tx`]'s single-sig `TxRaw` builder so the type-URL string is
+/// defined once (a divergent byte breaks the gaiad byte-match).
+pub(crate) const SECP256K1_PUBKEY_TYPE_URL: &str = "/cosmos.crypto.secp256k1.PubKey";
 
 /// Amino disambiguation prefix for `cosmos.crypto.multisig.LegacyAminoPubKey`
 /// (`tendermint/PubKeyMultisigThreshold`). The cosmos-sdk derives the
@@ -37,8 +39,9 @@ const AMINO_PREFIX_MULTISIG: [u8; 4] = [0x22, 0xc1, 0xf7, 0xe2];
 /// Amino disambiguation prefix for `tendermint/PubKeySecp256k1`.
 const AMINO_PREFIX_SECP256K1: [u8; 4] = [0xeb, 0x5a, 0xe9, 0x87];
 
-/// proto-encode `cosmos.crypto.secp256k1.PubKey { key: bytes = 1 }`.
-fn encode_secp256k1_pubkey(compressed: &[u8; 33]) -> Vec<u8> {
+/// proto-encode `cosmos.crypto.secp256k1.PubKey { key: bytes = 1 }`. Shared
+/// with [`crate::tx`]'s single-sig `TxRaw` builder.
+pub(crate) fn encode_secp256k1_pubkey(compressed: &[u8; 33]) -> Vec<u8> {
     let mut out = Vec::with_capacity(35);
     proto::put_len_delim(1, compressed, &mut out);
     out

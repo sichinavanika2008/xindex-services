@@ -78,6 +78,22 @@ name = "xindex-redeem-turnkey-btc"
 path = "src/bin/xindex-redeem-turnkey-btc.rs"
 
 [[bin]]
+name = "xindex-redeem-turnkey-cosmos"
+path = "src/bin/xindex-redeem-turnkey-cosmos.rs"
+
+[[bin]]
+name = "xindex-redeem-turnkey-xrp"
+path = "src/bin/xindex-redeem-turnkey-xrp.rs"
+
+[[bin]]
+name = "xindex-redeem-turnkey-tron"
+path = "src/bin/xindex-redeem-turnkey-tron.rs"
+
+[[bin]]
+name = "xindex-redeem-turnkey-solana"
+path = "src/bin/xindex-redeem-turnkey-solana.rs"
+
+[[bin]]
 name = "xindex-redeem-cosmos"
 path = "src/bin/xindex-redeem-cosmos.rs"
 

@@ -27,7 +27,11 @@ pub mod solana_redeem;
 pub mod solana_redeem_store;
 pub mod tron_redeem;
 pub mod turnkey_btc_redeem;
+pub mod turnkey_cosmos_redeem;
 pub mod turnkey_evm_redeem;
+pub mod turnkey_solana_redeem;
+pub mod turnkey_tron_redeem;
+pub mod turnkey_xrp_redeem;
 pub mod xrp_redeem;
 
 pub use broadcast_registry::{
