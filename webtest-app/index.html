@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Xindex — omnichain index</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: { extend: {
+      fontFamily: {
+        sans: ['"IBM Plex Sans"', "system-ui", "sans-serif"],
+        mono: ['"IBM Plex Mono"', "ui-monospace", "monospace"],
+      },
+      colors: {
+        base: "#0A0C11", panel: "#0F1219", panel2: "#151A24",
+        ink: "#E7E9F0", mute: "#8A90A3", faint: "#5A6173",
+        brand: "#B6509E", "brand-200": "#2EBAC6", cyan: "#7C5CFF",
+        green: "#3FD08B", amber: "#E8B45C", red: "#FF6B6B",
+      },
+    } },
+  };
+</script>
+<link rel="stylesheet" href="style.css">
+<!-- live Sepolia backend: ethers + verified addresses + real-web3 bridge -->
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+<script src="addresses.js"></script>
+<script src="xindex-chain.js"></script>
+</head>
+<body class="bg-base text-ink">
+<div id="root"></div>
+<script src="react.js"></script>
+<script src="react-dom.js"></script>
+<script src="babel.js"></script>
+<script type="text/babel" src="01-data.js"></script>
+<script type="text/babel" src="02-motion.js"></script>
+<script type="text/babel" src="03-primitives.js"></script>
+<script type="text/babel" src="04-catalog.js"></script>
+<script type="text/babel" src="05-indexpanel.js"></script>
+<script type="text/babel" src="06-redeem.js"></script>
+<script type="text/babel" src="07-shell.js"></script>
+</body>
+</html>
