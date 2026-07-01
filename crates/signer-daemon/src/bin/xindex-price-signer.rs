@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy_primitives::{Address, B256};
 use serde::Deserialize;
 use xindex_shared::eip712::price_oracle_domain;
+use xindex_shared::price_twap::{TwapConfig, TwapSample};
 use xindex_signer_daemon::price_sign::{produce_signed_price, PricePolicy, ProducerInputs};
 use xindex_signer_daemon::price_supply::{CoinGeckoSupply, SupplyFeed};
 use xindex_signer_daemon::price_venue::{BinanceVenue, CoinbaseVenue, Feed, KrakenVenue};
@@ -46,6 +47,17 @@ struct Config {
     max_deviation_bps: u32,
     /// Minimum independent supply sources (typically 1; see `PricePolicy`).
     supply_min_venues: usize,
+    /// TWAP window (secs): the trailing span the spatial medians are
+    /// time-weight-averaged over (OM-4). A transient spike must persist across
+    /// this window to move the signed price. Suggested a large multiple of
+    /// `interval_secs` (e.g. 30 min for a 60s interval).
+    twap_window_secs: u64,
+    /// Minimum samples informing the TWAP window (>= 2). Higher forces denser
+    /// coverage before a price can be signed.
+    twap_min_samples: usize,
+    /// Maximum stale gap allowed inside the TWAP window (secs). A longer feed
+    /// stall fails closed; must be in `interval_secs..=twap_window_secs`.
+    twap_max_gap_secs: u64,
     /// Seconds between observation rounds.
     interval_secs: u64,
     /// Path to the durable anti-equivocation state file (per-asset last-signed
@@ -110,18 +122,14 @@ fn save_last_signed(path: &str, map: &HashMap<B256, u64>) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args()
-        .nth(1)
-        .ok_or("usage: xindex-price-signer <config.json>")?;
-    let cfg: Config = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-
+/// Fail-closed boot-time validation of the venue-consensus + TWAP policy. A
+/// mis-set parameter silently weakens a manipulation guard, so refuse to start.
+fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // G/red-team RT-A-LOW: the aggregator's outlier rejection needs an ODD
     // honest anchor. At min_venues == 2 an even survivor set averages the two
     // middle quotes, so one compromised venue moves the median by (X-P)/2
     // (bounded only by max_deviation_bps). Require >= 3 price venues so a single
-    // bad venue is always out-voted by an honest majority. Fail closed at boot.
+    // bad venue is always out-voted by an honest majority.
     if cfg.min_venues < 3 {
         return Err(format!(
             "min_venues must be >= 3 for single-venue resistance (got {}); an even \
@@ -130,6 +138,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    // TWAP (OM-4) window sanity. Ordering: interval <= max_gap <= window, and
+    // >= 2 informing samples (a single sample is not a time average).
+    if cfg.twap_min_samples < 2 {
+        return Err(format!(
+            "twap_min_samples must be >= 2 (got {}); a single sample is not a time average",
+            cfg.twap_min_samples
+        )
+        .into());
+    }
+    if cfg.twap_window_secs < cfg.interval_secs {
+        return Err(format!(
+            "twap_window_secs ({}) must be >= interval_secs ({})",
+            cfg.twap_window_secs, cfg.interval_secs
+        )
+        .into());
+    }
+    if cfg.twap_max_gap_secs < cfg.interval_secs || cfg.twap_max_gap_secs > cfg.twap_window_secs {
+        return Err(format!(
+            "twap_max_gap_secs must be in {}..={} (got {}); below interval every normal \
+             gap trips it, above window it never trips",
+            cfg.interval_secs, cfg.twap_window_secs, cfg.twap_max_gap_secs
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::env::args()
+        .nth(1)
+        .ok_or("usage: xindex-price-signer <config.json>")?;
+    let cfg: Config = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    validate_config(&cfg)?;
 
     let oracle_contract: Address = cfg.oracle_contract.parse()?;
     let signer_address: Address = cfg.signer_address.parse()?;
@@ -150,11 +192,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_venues: cfg.min_venues,
         max_deviation_bps: cfg.max_deviation_bps,
         supply_min_venues: cfg.supply_min_venues,
+        twap: TwapConfig {
+            window_secs: cfg.twap_window_secs,
+            min_samples: cfg.twap_min_samples,
+            max_gap_secs: cfg.twap_max_gap_secs,
+        },
     };
 
     // Anti-equivocation guard, loaded from durable state so it survives a
     // restart (a corrupt state file fails closed inside load_last_signed).
     let mut last_signed = load_last_signed(&cfg.state_file)?;
+    // Per-asset TWAP sample buffer. In-memory only: on restart it starts empty
+    // and the TWAP fails closed (no signing) until it refills across the window
+    // — the safe cold-start behaviour, so it needs no durability.
+    let mut twap_history: HashMap<B256, Vec<TwapSample>> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs));
     loop {
         tick.tick().await;
@@ -186,7 +237,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 timestamp: now,
                 last_signed_at: last_signed.get(asset_id).copied(),
             };
-            match produce_signed_price(&hsm, signer_address, &domain, policy, &input).await {
+            let history = twap_history.entry(*asset_id).or_default();
+            match produce_signed_price(&hsm, signer_address, &domain, policy, &input, history).await
+            {
                 Ok(signed) => {
                     last_signed.insert(*asset_id, now);
                     // Persist the guard BEFORE emitting, so a restart cannot
@@ -245,5 +298,65 @@ mod tests {
             "corrupt state must fail closed"
         );
         let _ = std::fs::remove_file(p);
+    }
+
+    /// A sane policy: 3 venues, a 30-min TWAP window sampled every 60s with a
+    /// 5-min stale-gap cap and 10 informing samples.
+    fn valid_cfg() -> Config {
+        Config {
+            oracle_chain_id: 1,
+            oracle_contract: "0x0000000000000000000000000000000000000001".into(),
+            signer_address: "0x0000000000000000000000000000000000000002".into(),
+            hsm_url: "http://localhost".into(),
+            min_venues: 3,
+            max_deviation_bps: 5000,
+            supply_min_venues: 1,
+            twap_window_secs: 1800,
+            twap_min_samples: 10,
+            twap_max_gap_secs: 300,
+            interval_secs: 60,
+            state_file: "/tmp/xindex-price-signer-state.json".into(),
+            binance_base: String::new(),
+            coinbase_base: String::new(),
+            kraken_base: String::new(),
+            coingecko_base: String::new(),
+            assets: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_config_accepts_sane_policy() {
+        assert!(validate_config(&valid_cfg()).is_ok());
+    }
+
+    #[test]
+    fn validate_config_rejects_two_venues() {
+        let mut c = valid_cfg();
+        c.min_venues = 2; // no odd honest anchor
+        assert!(validate_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_single_twap_sample() {
+        let mut c = valid_cfg();
+        c.twap_min_samples = 1; // a single sample is not a time average
+        assert!(validate_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_window_below_interval() {
+        let mut c = valid_cfg();
+        c.twap_window_secs = 30; // < interval 60
+        assert!(validate_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_gap_out_of_range() {
+        let mut below = valid_cfg();
+        below.twap_max_gap_secs = 59; // < interval → every normal gap trips it
+        assert!(validate_config(&below).is_err());
+        let mut above = valid_cfg();
+        above.twap_max_gap_secs = above.twap_window_secs + 1; // > window → never trips
+        assert!(validate_config(&above).is_err());
     }
 }

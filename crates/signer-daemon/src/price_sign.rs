@@ -8,7 +8,9 @@
 //! never signs a price it was handed. That is the CTD-1 "don't trust the
 //! coordinator for the thing you sign" property applied to the NAV oracle.
 //!
-//! This module is the signing CORE: aggregate -> per-asset monotonic
+//! This module is the signing CORE: spatial median across venues
+//! ([`xindex_shared::price_aggregate`]) -> temporal TWAP over the trailing
+//! window ([`xindex_shared::price_twap`]) -> per-asset monotonic
 //! (anti-equivocation) guard -> EIP-712 digest -> HSM sign -> recover-verify
 //! (the M6 backstop). The venue HTTP clients that supply the quotes and the
 //! publish loop are a separate I/O layer on top of this.
@@ -18,6 +20,7 @@ use alloy_sol_types::Eip712Domain;
 use thiserror::Error;
 use xindex_shared::eip712::{price_attestation, price_attestation_signing_hash};
 use xindex_shared::price_aggregate::{aggregate_price, AggregateError};
+use xindex_shared::price_twap::{time_weighted_average, TwapConfig, TwapError, TwapSample};
 
 use crate::web3signer::{HsmDigestSigner, HsmError};
 
@@ -35,15 +38,20 @@ pub struct PricePolicy {
     /// so it is additionally backstopped by the on-chain absolute-bounds (L1)
     /// guard.
     pub supply_min_venues: usize,
+    /// Temporal smoothing applied to the sequence of spatial medians, AFTER the
+    /// venue outlier rejection (OM-4). Removes flash / one-interval manipulation
+    /// that briefly captures a venue majority.
+    pub twap: TwapConfig,
 }
 
-/// One price observation to sign.
+/// One fully-aggregated price observation to sign.
 #[derive(Debug, Clone)]
-pub struct PriceObservation<'a> {
+pub struct PriceObservation {
     /// Registry asset id (keccak of the `THORChain` asset string).
     pub asset_id: B256,
-    /// Independent venue quotes (WAD) for this asset.
-    pub venue_quotes: &'a [U256],
+    /// The robust price the signature commits to — the spatial median passed
+    /// through the temporal TWAP (both fail-closed upstream).
+    pub price_wad: U256,
     /// Token supply attested alongside the price (NAV input).
     pub supply: U256,
     /// Observation time (unix secs); MUST strictly exceed `last_signed_at`.
@@ -68,6 +76,10 @@ pub enum PriceSignError {
     /// Venue aggregation did not reach consensus.
     #[error("price aggregation: {0}")]
     Aggregate(#[from] AggregateError),
+    /// Temporal TWAP smoothing did not produce a trustworthy price (cold start,
+    /// stale feed, or too-thin window — all fail-closed).
+    #[error("price twap: {0}")]
+    Twap(#[from] TwapError),
     /// `timestamp` did not strictly exceed the last signed timestamp for this
     /// asset — refuse, lest two prices be signed for one instant (equivocation).
     #[error("non-monotonic timestamp {timestamp} <= last signed {last}")]
@@ -105,26 +117,21 @@ fn check_monotonic(timestamp: u64, last_signed_at: Option<u64>) -> Result<(), Pr
     }
 }
 
-/// Aggregate the venue quotes, then sign the resulting `PriceAttestation` with
-/// the HSM and verify the signature recovers to `signer_address`.
+/// Sign an already-aggregated `PriceObservation` (spatial median → TWAP done by
+/// the caller) as a `PriceAttestation` with the HSM, then verify the signature
+/// recovers to `signer_address`. Enforces the per-asset monotonic guard first.
 ///
 /// # Errors
-/// Fails CLOSED with [`PriceSignError`]: insufficient venue consensus, a
-/// non-monotonic timestamp, an HSM error, or a recover-verify mismatch.
+/// Fails CLOSED with [`PriceSignError`]: a non-monotonic timestamp, an HSM
+/// error, or a recover-verify mismatch.
 pub async fn sign_observed_price<H: HsmDigestSigner>(
     hsm: &H,
     signer_address: Address,
     domain: &Eip712Domain,
-    policy: PricePolicy,
-    obs: &PriceObservation<'_>,
+    obs: &PriceObservation,
 ) -> Result<SignedPrice, PriceSignError> {
     check_monotonic(obs.timestamp, obs.last_signed_at)?;
-    let price_wad = aggregate_price(
-        obs.venue_quotes,
-        policy.min_venues,
-        policy.max_deviation_bps,
-    )?;
-    let att = price_attestation(obs.asset_id, price_wad, obs.supply, obs.timestamp);
+    let att = price_attestation(obs.asset_id, obs.price_wad, obs.supply, obs.timestamp);
     let digest = price_attestation_signing_hash(&att, domain);
     let signature = hsm.sign_digest(signer_address, digest).await?;
     let recovered = PrimitiveSignature::try_from(&signature[..])
@@ -138,7 +145,7 @@ pub async fn sign_observed_price<H: HsmDigestSigner>(
         });
     }
     Ok(SignedPrice {
-        price_wad,
+        price_wad: obs.price_wad,
         signature,
     })
 }
@@ -161,36 +168,63 @@ pub struct ProducerInputs<'a> {
 }
 
 /// The full self-driven producer step for one asset: source price + supply from
-/// the configured venues, median each (outlier-rejected, fail-closed), then
-/// sign the resulting `PriceAttestation`. `supply` is medianed here; `price` is
-/// medianed inside [`sign_observed_price`].
+/// the configured venues, spatially median each (outlier-rejected, fail-closed),
+/// record the price sample into the per-asset TWAP `history`, temporally average
+/// the trailing window, and sign the result. `history` is the caller-owned
+/// rolling buffer for THIS asset; it accumulates across producer ticks and is
+/// coarse-pruned here.
+///
+/// The two robustness layers are complementary: the spatial median defeats a
+/// single manipulated venue in one instant; the TWAP defeats a spike that
+/// briefly captures a venue majority — it must persist across the window to move
+/// the signed price. Both fail closed, so a thin/stale window signs nothing.
 ///
 /// # Errors
-/// [`PriceSignError`] — price or supply consensus failure, non-monotonic
-/// timestamp, HSM error, or recover-verify mismatch (all fail-closed).
+/// [`PriceSignError`] — price or supply venue-consensus failure, insufficient /
+/// stale TWAP window, non-monotonic timestamp, HSM error, or recover-verify
+/// mismatch (all fail-closed).
 pub async fn produce_signed_price<H: HsmDigestSigner>(
     hsm: &H,
     signer_address: Address,
     domain: &Eip712Domain,
     policy: PricePolicy,
     input: &ProducerInputs<'_>,
+    history: &mut Vec<TwapSample>,
 ) -> Result<SignedPrice, PriceSignError> {
     let price_quotes = crate::price_venue::source_quotes(input.price_feeds).await;
     let supply_quotes =
         crate::price_supply::source_supply(input.supply_feeds, input.decimals).await;
+    // Spatial layer: median across venues, outlier-rejected (fail-closed). A
+    // consensus failure returns BEFORE recording a sample, so a bad round never
+    // pollutes the TWAP buffer.
+    let spatial = aggregate_price(&price_quotes, policy.min_venues, policy.max_deviation_bps)?;
     let supply = aggregate_price(
         &supply_quotes,
         policy.supply_min_venues,
         policy.max_deviation_bps,
     )?;
+    // Temporal layer: record this robust sample, then time-weight-average the
+    // window. Cold start / stale feed / thin window fail closed inside the TWAP.
+    record_sample(history, input.timestamp, spatial, policy.twap);
+    let price_wad = time_weighted_average(history, input.timestamp, policy.twap)?;
     let obs = PriceObservation {
         asset_id: input.asset_id,
-        venue_quotes: &price_quotes,
+        price_wad,
         supply,
         timestamp: input.timestamp,
         last_signed_at: input.last_signed_at,
     };
-    sign_observed_price(hsm, signer_address, domain, policy, &obs).await
+    sign_observed_price(hsm, signer_address, domain, &obs).await
+}
+
+/// Append the fresh spatial-median sample to the per-asset TWAP buffer and drop
+/// samples older than twice the window. The 2× margin keeps memory bounded
+/// while always retaining the carry-in sample a sound TWAP needs (a carry-in
+/// older than that would fail the TWAP gap guard anyway).
+fn record_sample(history: &mut Vec<TwapSample>, timestamp: u64, price: U256, cfg: TwapConfig) {
+    history.push(TwapSample { timestamp, price });
+    let cutoff = timestamp.saturating_sub(cfg.window_secs.saturating_mul(2));
+    history.retain(|s| s.timestamp >= cutoff);
 }
 
 #[cfg(test)]
@@ -237,28 +271,43 @@ mod tests {
             min_venues: 3,
             max_deviation_bps: 5000,
             supply_min_venues: 1,
+            // 60s window, ≥2 informing samples, ≤60s per stale gap.
+            twap: TwapConfig {
+                window_secs: 60,
+                min_samples: 2,
+                max_gap_secs: 60,
+            },
         }
     }
 
+    /// A carry-in sample dated at `window_start` (`now - window_secs`) priced at
+    /// `price`, so the TWAP has coverage back across the window in the warm-path
+    /// tests.
+    fn warm_history(now: u64, price: u64) -> Vec<TwapSample> {
+        vec![TwapSample {
+            timestamp: now - 60,
+            price: U256::from(price),
+        }]
+    }
+
     #[tokio::test]
-    async fn signs_aggregated_median_and_recovers_to_signer() {
+    async fn signs_given_robust_price_and_recovers_to_signer() {
         let (sk, addr) = key_and_addr(7);
         let hsm = StubHsm { sk };
-        let quotes = [U256::from(100u64), U256::from(101u64), U256::from(102u64)];
         let obs = PriceObservation {
             asset_id: B256::repeat_byte(0x11),
-            venue_quotes: &quotes,
+            price_wad: U256::from(101u64),
             supply: U256::from(1_000_000u64),
             timestamp: 1000,
             last_signed_at: Some(999),
         };
-        let signed = sign_observed_price(&hsm, addr, &domain(), policy(), &obs)
+        let signed = sign_observed_price(&hsm, addr, &domain(), &obs)
             .await
             .expect("sign");
-        // The signature commits to the venue MEDIAN (101), not any single feed.
+        // The signature commits to the aggregated price handed in (101).
         assert_eq!(signed.price_wad, U256::from(101u64));
         // Independent cross-check: the sig recovers to the signer over the
-        // digest of the AGGREGATED price (so it can't have signed a stray value).
+        // digest of that price (so it can't have signed a stray value).
         let att = price_attestation(obs.asset_id, U256::from(101u64), obs.supply, obs.timestamp);
         let digest = price_attestation_signing_hash(&att, &domain());
         let recovered = PrimitiveSignature::try_from(&signed.signature[..])
@@ -272,36 +321,17 @@ mod tests {
     async fn rejects_non_monotonic_timestamp() {
         let (sk, addr) = key_and_addr(7);
         let hsm = StubHsm { sk };
-        let quotes = [U256::from(100u64), U256::from(100u64), U256::from(100u64)];
         let obs = PriceObservation {
             asset_id: B256::repeat_byte(0x11),
-            venue_quotes: &quotes,
+            price_wad: U256::from(100u64),
             supply: U256::from(1_000_000u64),
             timestamp: 500,
             last_signed_at: Some(500), // equal → equivocation risk → refuse
         };
-        let err = sign_observed_price(&hsm, addr, &domain(), policy(), &obs)
+        let err = sign_observed_price(&hsm, addr, &domain(), &obs)
             .await
             .expect_err("must reject");
         assert!(matches!(err, PriceSignError::NonMonotonic { .. }));
-    }
-
-    #[tokio::test]
-    async fn fails_closed_on_insufficient_venue_consensus() {
-        let (sk, addr) = key_and_addr(7);
-        let hsm = StubHsm { sk };
-        let quotes = [U256::from(100u64)]; // 1 < min 3
-        let obs = PriceObservation {
-            asset_id: B256::repeat_byte(0x11),
-            venue_quotes: &quotes,
-            supply: U256::from(1_000_000u64),
-            timestamp: 1000,
-            last_signed_at: None,
-        };
-        let err = sign_observed_price(&hsm, addr, &domain(), policy(), &obs)
-            .await
-            .expect_err("must reject");
-        assert!(matches!(err, PriceSignError::Aggregate(_)));
     }
 
     #[derive(Debug)]
@@ -346,11 +376,7 @@ mod tests {
             FixedVenue(U256::from(101u64)),
             FixedVenue(U256::from(102u64)),
         );
-        let (s1, s2, s3) = (
-            FixedSupply(U256::from(1_000_000u64)),
-            FixedSupply(U256::from(1_000_000u64)),
-            FixedSupply(U256::from(1_000_000u64)),
-        );
+        let sup = FixedSupply(U256::from(1_000_000u64));
         let price_feeds = [
             Feed {
                 venue: &p1,
@@ -365,20 +391,10 @@ mod tests {
                 symbol: "X",
             },
         ];
-        let supply_feeds = [
-            SupplyFeed {
-                source: &s1,
-                id: "x",
-            },
-            SupplyFeed {
-                source: &s2,
-                id: "x",
-            },
-            SupplyFeed {
-                source: &s3,
-                id: "x",
-            },
-        ];
+        let supply_feeds = [SupplyFeed {
+            source: &sup,
+            id: "x",
+        }];
         let input = ProducerInputs {
             asset_id: B256::repeat_byte(0x11),
             decimals: 8,
@@ -387,10 +403,143 @@ mod tests {
             timestamp: 1000,
             last_signed_at: None,
         };
-        let signed = produce_signed_price(&hsm, addr, &domain(), policy(), &input)
+        // Warm buffer: a carry-in at the window start priced at the same stable
+        // 101, so the TWAP of a stable series is that value.
+        let mut history = warm_history(1000, 101);
+        let signed = produce_signed_price(&hsm, addr, &domain(), policy(), &input, &mut history)
             .await
             .expect("produce");
-        // Signs the MEDIAN price (101) over the median supply.
+        // Spatial median (101) time-averaged over a stable window → 101.
         assert_eq!(signed.price_wad, U256::from(101u64));
+    }
+
+    #[tokio::test]
+    async fn produce_dilutes_fresh_spike_via_twap() {
+        use crate::price_supply::SupplyFeed;
+        use crate::price_venue::Feed;
+        let (sk, addr) = key_and_addr(7);
+        let hsm = StubHsm { sk };
+        // Every venue reads a spiked 200 this round — the spatial median cannot
+        // help (the spike captured the WHOLE venue set).
+        let spike = FixedVenue(U256::from(200u64));
+        let sup = FixedSupply(U256::from(1_000_000u64));
+        let price_feeds = [
+            Feed {
+                venue: &spike,
+                symbol: "X",
+            },
+            Feed {
+                venue: &spike,
+                symbol: "X",
+            },
+            Feed {
+                venue: &spike,
+                symbol: "X",
+            },
+        ];
+        let supply_feeds = [SupplyFeed {
+            source: &sup,
+            id: "x",
+        }];
+        let input = ProducerInputs {
+            asset_id: B256::repeat_byte(0x22),
+            decimals: 8,
+            price_feeds: &price_feeds,
+            supply_feeds: &supply_feeds,
+            timestamp: 1060,
+            last_signed_at: None,
+        };
+        // History held a stable 100 across the whole window (carry-in at 1000).
+        let mut history = warm_history(1060, 100);
+        let signed = produce_signed_price(&hsm, addr, &domain(), policy(), &input, &mut history)
+            .await
+            .expect("produce");
+        // The 200 spike lands at `now` with ZERO dwell, so the TWAP is the 100
+        // that held all window: the signer commits to 100, NOT the 200 spatial
+        // median. Persistence — not a single spike — is required to move price.
+        assert_eq!(signed.price_wad, U256::from(100u64));
+    }
+
+    #[tokio::test]
+    async fn produce_cold_start_fails_closed() {
+        use crate::price_supply::SupplyFeed;
+        use crate::price_venue::Feed;
+        let (sk, addr) = key_and_addr(7);
+        let hsm = StubHsm { sk };
+        let v = FixedVenue(U256::from(100u64));
+        let sup = FixedSupply(U256::from(1_000_000u64));
+        let price_feeds = [
+            Feed {
+                venue: &v,
+                symbol: "X",
+            },
+            Feed {
+                venue: &v,
+                symbol: "X",
+            },
+            Feed {
+                venue: &v,
+                symbol: "X",
+            },
+        ];
+        let supply_feeds = [SupplyFeed {
+            source: &sup,
+            id: "x",
+        }];
+        let input = ProducerInputs {
+            asset_id: B256::repeat_byte(0x33),
+            decimals: 8,
+            price_feeds: &price_feeds,
+            supply_feeds: &supply_feeds,
+            timestamp: 1000,
+            last_signed_at: None,
+        };
+        // Empty buffer → no history covering the window start → fail closed; the
+        // round's robust sample is still recorded so later ticks succeed.
+        let mut history = Vec::new();
+        let err = produce_signed_price(&hsm, addr, &domain(), policy(), &input, &mut history)
+            .await
+            .expect_err("cold start must fail closed");
+        assert!(matches!(err, PriceSignError::Twap(_)));
+        assert_eq!(history.len(), 1, "the round's robust sample is recorded");
+    }
+
+    #[tokio::test]
+    async fn produce_fails_closed_on_insufficient_venue_consensus() {
+        use crate::price_supply::SupplyFeed;
+        use crate::price_venue::Feed;
+        let (sk, addr) = key_and_addr(7);
+        let hsm = StubHsm { sk };
+        let v = FixedVenue(U256::from(100u64));
+        let sup = FixedSupply(U256::from(1_000_000u64));
+        // 1 venue feed < min_venues 3 → spatial aggregation fails BEFORE any
+        // sample is recorded (a bad round never pollutes the TWAP buffer).
+        let price_feeds = [Feed {
+            venue: &v,
+            symbol: "X",
+        }];
+        let supply_feeds = [SupplyFeed {
+            source: &sup,
+            id: "x",
+        }];
+        let input = ProducerInputs {
+            asset_id: B256::repeat_byte(0x44),
+            decimals: 8,
+            price_feeds: &price_feeds,
+            supply_feeds: &supply_feeds,
+            timestamp: 1000,
+            last_signed_at: None,
+        };
+        let mut history = warm_history(1000, 100);
+        let before = history.len();
+        let err = produce_signed_price(&hsm, addr, &domain(), policy(), &input, &mut history)
+            .await
+            .expect_err("insufficient venues must fail closed");
+        assert!(matches!(err, PriceSignError::Aggregate(_)));
+        assert_eq!(
+            history.len(),
+            before,
+            "a failed spatial round records no sample"
+        );
     }
 }
