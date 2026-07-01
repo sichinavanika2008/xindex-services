@@ -23,9 +23,10 @@ use std::error::Error;
 
 use alloy_primitives::{hex, keccak256, Address};
 use bitcoin::secp256k1::{Secp256k1, SecretKey};
-use bitcoin::PublicKey;
+use bitcoin::{Network, PublicKey};
 use k256::ecdsa::SigningKey;
 use serde_json::json;
+use xindex_multisig::MultisigDescriptor;
 
 const OPERATORS: usize = 5;
 const QUORUM: usize = 3;
@@ -130,6 +131,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     for (op, a) in whitelist.iter().enumerate() {
         println!("  operator {op}: {a}");
     }
+    // Custody P2WSH the operators must fund — derived via the SAME
+    // `MultisigDescriptor::new_p2wsh` path the daemon uses (main.rs build_utxo),
+    // so the printed address is byte-identical to the one the daemons sign for.
+    let net = match network {
+        "bitcoin" | "mainnet" => Network::Bitcoin,
+        "testnet" => Network::Testnet,
+        "signet" => Network::Signet,
+        "regtest" => Network::Regtest,
+        other => return Err(format!("unknown network '{other}'").into()),
+    };
+    let custody = MultisigDescriptor::new_p2wsh(QUORUM, &btc_pubkeys)?;
+    println!("\nCustody P2WSH ({network}, {QUORUM}-of-{OPERATORS}) — FUND THIS:");
+    println!("  address:    {}", custody.address(net)?);
+    println!("  descriptor: {}", custody.to_descriptor_string());
+
     println!("\nNext: run each daemon with --dev + XINDEX_ALLOW_SOFTWARE_KEYS=1 (see up.sh).");
     Ok(())
 }
