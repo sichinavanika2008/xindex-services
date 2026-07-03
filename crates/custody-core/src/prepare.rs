@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::sync::Mutex;
 use xindex_shared::chain_registry::ChainId;
-use xindex_shared::signer_wire::{AcquireCancelProof, IntentProof};
+use xindex_shared::signer_wire::{AcquireCancelProof, IntentProof, TronAssetKind};
 
 /// A prepare-store failure.
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +53,26 @@ pub struct BindContext {
     pub acc: Option<AcquireCancelProof>,
 }
 
+/// The operational (non-cert-bound) inputs the EVM signing hash depends on.
+/// The approver reconstructs the unsigned tx from these + the RIC-bound
+/// `to`/`value`/`data` and asserts the recomputed hash equals the signing
+/// request (TK-01); `gas_limit`/`max_fee_per_gas` bound the fee (TK-02). The
+/// envelope type + EIP-155 chain id are DERIVED from `EvmPrepared::chain`, never
+/// stored (the approver uses the canonical value).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvmSigning {
+    /// Account nonce.
+    pub nonce: u64,
+    /// Gas units the tx may consume.
+    pub gas_limit: u64,
+    /// EIP-1559 max-fee-per-gas (wei); unused for a legacy chain.
+    pub max_fee_per_gas: u128,
+    /// EIP-1559 priority fee (wei); unused for a legacy chain.
+    pub max_priority_fee_per_gas: u128,
+    /// Legacy gas price (wei); unused for an EIP-1559 chain.
+    pub gas_price: u128,
+}
+
 /// The unsigned EVM `Router.depositWithExpiry` call + its RIC. Owned mirror of
 /// the EVM decision core's `EvmDeposit` (in `xindex-custody-node`).
 #[derive(Debug, Clone)]
@@ -65,14 +85,100 @@ pub struct EvmPrepared {
     pub value: U256,
     /// ABI-encoded `depositWithExpiry` calldata.
     pub data: Vec<u8>,
+    /// The operational signing-hash inputs (TK-01/TK-02).
+    pub signing: EvmSigning,
     /// The k-of-n RIC authorizing the redeem leg.
     pub ric: Option<IntentProof>,
     /// One-shot spend identity bound into the signed tx (the EVM account nonce).
     pub spend_identity: Vec<u8>,
 }
 
-/// The unsigned account-model send (Cosmos / XRP / TRON) + its RIC. Owned
-/// mirror of the account decision core's `AccountSend` (in `xindex-custody-node`).
+/// Per-family signing-hash inputs an approver needs to independently
+/// reconstruct an account-model tx and recompute its signing payload (TK-01),
+/// plus the custody-funded fee it range-checks (TK-02). The security-relevant
+/// destination / amount / memo live on [`AccountPrepared`] itself (they bind to
+/// the RIC); this carries the remaining operational fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccountSigning {
+    /// Cosmos amino `MsgSend` sign-doc inputs.
+    Cosmos {
+        /// Custody account (`MsgSend.from_address`).
+        from_address: String,
+        /// Consensus chain id bound into the sign-bytes.
+        cosmos_chain_id: String,
+        /// Account number.
+        account_number: u64,
+        /// Account sequence.
+        sequence: u64,
+        /// Native micro-denom.
+        denom: String,
+        /// Custody-funded fee amount (micro-denom).
+        fee_amount: u128,
+        /// Gas limit.
+        gas_limit: u64,
+    },
+    /// XRP single-sign `Payment` inputs.
+    Xrp {
+        /// Custody classic r-address (`Account`).
+        account_address: String,
+        /// Custody compressed secp256k1 pubkey (`SigningPubKey`, 33 bytes; a
+        /// `Vec` because serde has no const-generic `[u8; 33]` impl).
+        signing_pub_key: Vec<u8>,
+        /// Account `Sequence`.
+        sequence: u32,
+        /// `LastLedgerSequence` deadline.
+        last_ledger_sequence: u32,
+        /// Custody-funded fee (`Fee`, drops).
+        fee_drops: u128,
+    },
+    /// TRON `raw_data` inputs (`txID = SHA-256(raw_data)`).
+    Tron {
+        /// Custody `owner_address` (base58check `T…`).
+        owner_address: String,
+        /// Which asset moves (TRX or TRC20 USDT).
+        asset: TronAssetKind,
+        /// USDT only: the TRC20 contract address.
+        contract_address: Option<String>,
+        /// TAPOS `ref_block_bytes`.
+        ref_block_bytes: [u8; 2],
+        /// TAPOS `ref_block_hash`.
+        ref_block_hash: [u8; 8],
+        /// `expiration` (unix ms).
+        expiration: u64,
+        /// `timestamp` (unix ms).
+        timestamp: u64,
+        /// `fee_limit` (energy cap, sun; 0 for a TRX send).
+        fee_limit: u64,
+        /// `Contract.Permission_id`.
+        permission_id: u32,
+    },
+    /// Solana legacy-message inputs (`recent_blockhash` is not cert-bound).
+    Solana {
+        /// Custody fee-payer pubkey (message account 0).
+        from_pubkey: [u8; 32],
+        /// The recent blockhash bound into the message.
+        recent_blockhash: [u8; 32],
+    },
+}
+
+impl AccountSigning {
+    /// The custody-funded fee this spend pays, in the chain's base fee unit
+    /// (uatom / drops / sun), for the per-chain fee-cap range check (TK-02).
+    /// `None` for Solana (no message-level fee field in v1).
+    #[must_use]
+    pub fn declared_fee_base_units(&self) -> Option<u128> {
+        match self {
+            Self::Cosmos { fee_amount, .. } => Some(*fee_amount),
+            Self::Xrp { fee_drops, .. } => Some(*fee_drops),
+            Self::Tron { fee_limit, .. } => Some(u128::from(*fee_limit)),
+            Self::Solana { .. } => None,
+        }
+    }
+}
+
+/// The unsigned account-model send (Cosmos / XRP / TRON / Solana) + its RIC.
+/// Owned mirror of the account decision core's `AccountSend` (in
+/// `xindex-custody-node`).
 #[derive(Debug, Clone)]
 pub struct AccountPrepared {
     /// Account-model chain this send settles on.
@@ -83,6 +189,8 @@ pub struct AccountPrepared {
     pub amount_dec: String,
     /// Exact `THORChain` memo carried as a transaction field.
     pub memo: String,
+    /// The per-family operational signing-hash inputs (TK-01/TK-02).
+    pub signing: AccountSigning,
     /// The k-of-n RIC authorizing the redeem leg.
     pub ric: Option<IntentProof>,
     /// One-shot spend identity (sequence for Cosmos/XRP, txid for TRON).
@@ -244,6 +352,10 @@ struct StoredSpend {
     memo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     spend_identity_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    evm_signing: Option<EvmSigning>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    account_signing: Option<AccountSigning>,
 }
 
 fn require<T>(field: Option<T>, name: &str) -> Result<T, PrepareError> {
@@ -265,6 +377,8 @@ impl StoredSpend {
             amount_dec: None,
             memo: None,
             spend_identity_hex: None,
+            evm_signing: None,
+            account_signing: None,
         };
         match spend {
             PreparedSpend::Btc(ctx) => Self {
@@ -277,6 +391,7 @@ impl StoredSpend {
                 to_hex: Some(format!("{:#x}", e.to)),
                 value_dec: Some(e.value.to_string()),
                 data_hex: Some(alloy_primitives::hex::encode(&e.data)),
+                evm_signing: Some(e.signing.clone()),
                 ric: e.ric.clone(),
                 spend_identity_hex: Some(alloy_primitives::hex::encode(&e.spend_identity)),
                 ..base(e.chain, "evm")
@@ -285,6 +400,7 @@ impl StoredSpend {
                 to_address: Some(a.to_address.clone()),
                 amount_dec: Some(a.amount_dec.clone()),
                 memo: Some(a.memo.clone()),
+                account_signing: Some(a.signing.clone()),
                 ric: a.ric.clone(),
                 spend_identity_hex: Some(alloy_primitives::hex::encode(&a.spend_identity)),
                 ..base(a.chain, "account")
@@ -319,6 +435,7 @@ impl StoredSpend {
                     to,
                     value,
                     data: hexd(self.data_hex, "data_hex")?,
+                    signing: require(self.evm_signing, "evm_signing")?,
                     ric: self.ric,
                     spend_identity: hexd(self.spend_identity_hex, "spend_identity_hex")?,
                 }))
@@ -328,6 +445,7 @@ impl StoredSpend {
                 to_address: require(self.to_address, "to_address")?,
                 amount_dec: require(self.amount_dec, "amount_dec")?,
                 memo: require(self.memo, "memo")?,
+                signing: require(self.account_signing, "account_signing")?,
                 ric: self.ric,
                 spend_identity: hexd(self.spend_identity_hex, "spend_identity_hex")?,
             })),
@@ -369,6 +487,13 @@ mod tests {
             to: Address::repeat_byte(0xaa),
             value: U256::from(123_456_u64),
             data: vec![1, 2, 3, 4],
+            signing: EvmSigning {
+                nonce: 7,
+                gas_limit: 300_000,
+                max_fee_per_gas: 50_000_000_000,
+                max_priority_fee_per_gas: 1_500_000_000,
+                gas_price: 5_000_000_000,
+            },
             ric: None,
             spend_identity: vec![9, 9],
         })
@@ -380,6 +505,15 @@ mod tests {
             to_address: "cosmos1exampledestination".to_string(),
             amount_dec: "1000000".to_string(),
             memo: "=:ETH.USDT:0xrecipient:990000".to_string(),
+            signing: AccountSigning::Cosmos {
+                from_address: "cosmos1custody".to_string(),
+                cosmos_chain_id: "cosmoshub-4".to_string(),
+                account_number: 42,
+                sequence: 7,
+                denom: "uatom".to_string(),
+                fee_amount: 5_000,
+                gas_limit: 200_000,
+            },
             ric: None,
             spend_identity: vec![7],
         })

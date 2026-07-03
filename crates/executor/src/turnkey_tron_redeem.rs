@@ -29,7 +29,7 @@ use thiserror::Error;
 use tracing::{debug, info};
 
 use xindex_chain_tron::TronBlockRef;
-use xindex_custody_core::prepare::{AccountPrepared, PrepareStore, PreparedSpend};
+use xindex_custody_core::prepare::{AccountPrepared, AccountSigning, PrepareStore, PreparedSpend};
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::TronAssetKind;
 use xindex_tron_tx::addr::{decode_base58check, decode_to_evm20};
@@ -203,11 +203,17 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyTronRedeemExecutor<T, P> {
         let owner = decode_base58check(&self.config.owner_address)
             .map_err(|e| TurnkeyTronError::Address(format!("owner {e}")))?;
 
+        // TRX carries no energy fee; a TRC20 trigger caps energy at fee_limit.
+        // Record the SAME effective value the approver must reconstruct.
+        let effective_fee_limit = match self.config.asset {
+            TronAssetKind::Trx => 0,
+            TronAssetKind::Usdt => self.config.fee_limit,
+        };
         let raw_data = match self.config.asset {
             TronAssetKind::Trx => {
                 let to = decode_base58check(vault)
                     .map_err(|e| TurnkeyTronError::Address(format!("vault {e}")))?;
-                let tapos = self.tapos(block, expiration, 0);
+                let tapos = self.tapos(block, expiration, effective_fee_limit);
                 build_trx_raw_data(&TrxTransfer { owner, to, amount }, &tapos)
             }
             TronAssetKind::Usdt => {
@@ -220,7 +226,7 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyTronRedeemExecutor<T, P> {
                     .map_err(|e| TurnkeyTronError::Address(format!("contract {e}")))?;
                 let to_evm20 = decode_to_evm20(vault)
                     .map_err(|e| TurnkeyTronError::Address(format!("vault {e}")))?;
-                let tapos = self.tapos(block, expiration, self.config.fee_limit);
+                let tapos = self.tapos(block, expiration, effective_fee_limit);
                 build_usdt_raw_data(
                     &UsdtTransfer {
                         owner,
@@ -248,6 +254,7 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyTronRedeemExecutor<T, P> {
                     to_address: vault.to_string(),
                     amount_dec: amount.to_string(),
                     memo: task.memo.clone(),
+                    signing: self.tron_signing(block, expiration, effective_fee_limit),
                     ric: task.intent_proof.clone(),
                     spend_identity: tx_id.to_vec(),
                 }),
@@ -289,6 +296,27 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyTronRedeemExecutor<T, P> {
             redemption_id: task.redemption_id,
             activity_id: completed.id,
         })
+    }
+
+    /// The approver's TRON reconstruction inputs (TK-01/TK-02) — must mirror the
+    /// exact TAPOS + asset fields used to build `raw_data`.
+    fn tron_signing(
+        &self,
+        block: &TronBlockRef,
+        expiration: u64,
+        fee_limit: u64,
+    ) -> AccountSigning {
+        AccountSigning::Tron {
+            owner_address: self.config.owner_address.clone(),
+            asset: self.config.asset,
+            contract_address: self.config.contract_address.clone(),
+            ref_block_bytes: block.ref_block_bytes,
+            ref_block_hash: block.ref_block_hash,
+            expiration,
+            timestamp: block.timestamp_ms,
+            fee_limit,
+            permission_id: self.config.permission_id,
+        }
     }
 
     /// Build the shared TAPOS envelope from the block reference.

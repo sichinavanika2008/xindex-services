@@ -25,15 +25,16 @@
 //!
 //! ## Replay one-shot (the Solana-specific nuance)
 //!
-//! `spend_identity` = the **redemption id**. Unlike Cosmos/XRP (the monotonic
-//! account sequence) or TRON (the deterministic `txID`), a single-key Solana tx
-//! has no on-chain monotonic nonce and its `recent_blockhash` VARIES per
-//! re-drive — so the blockhash is NOT a safe one-shot key (two blockhashes ⇒
-//! two distinct keys ⇒ a double-spend window). Keying the RIC one-shot on the
-//! redemption id makes the certificate strictly single-use per redemption.
-//! Tighter on-chain replay binding (a durable-nonce account, or a Solana
-//! CTD-1 light-client proof) is post-v1 — `KNOWN_FINDINGS` P-SOL-7; Solana is
-//! not in mainnet v1 scope.
+//! `spend_identity` = `keccak256(message_bytes)`, a per-transaction value (TK-03).
+//! Like EVM's nonce / Cosmos+XRP's sequence / TRON's `txID`, it must differ for
+//! any two distinct signable messages so the RIC one-shot rejects a re-drive: a
+//! Solana message varies by `recent_blockhash`, so a CONSTANT identity (e.g. the
+//! redemption id) would make two distinct blockhash messages share one identity
+//! and both pass the `Idempotent→Ok` one-shot — a double-spend. Hashing the
+//! message bytes makes the certificate strictly single-message per redemption.
+//! Tighter on-chain replay binding (a durable-nonce account, or a Solana CTD-1
+//! light-client proof) is post-v1 — `KNOWN_FINDINGS` P-SOL-7; Solana is not in
+//! mainnet v1 scope.
 //!
 //! Fail-closed: a rejected/failed activity ⇒ no signature ⇒ no tx.
 
@@ -44,11 +45,10 @@ use alloy_primitives::B256;
 use thiserror::Error;
 use tracing::{debug, info};
 
-use xindex_custody_core::prepare::{AccountPrepared, PrepareStore, PreparedSpend};
+use xindex_custody_core::prepare::{AccountPrepared, AccountSigning, PrepareStore, PreparedSpend};
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::IntentProof;
-use xindex_solana_tx::message::{serialize_transaction, system_transfer, Instruction, Message};
-use xindex_solana_tx::squads::MEMO_PROGRAM_ID;
+use xindex_solana_tx::message::{build_transfer_message, serialize_transaction};
 use xindex_solana_tx::{Pubkey, SolanaTxError};
 use xindex_turnkey_client::{Activity, SignRawPayloadParams, TurnkeyApi};
 
@@ -203,18 +203,15 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeySolanaRedeemExecutor<T, P> {
         let from = Pubkey::new(self.config.custody_pubkey);
         let destination = Pubkey::from_base58(vault)?;
 
-        let instructions = vec![
-            system_transfer(from, destination, lamports),
-            memo_instruction(&task.memo),
-        ];
-        let message = Message::new_legacy(&from, recent_blockhash, &instructions)?;
-        let message_bytes = message.serialize()?;
+        let (_message, message_bytes) =
+            build_transfer_message(from, destination, lamports, &task.memo, recent_blockhash)?;
         let payload_hex = format!("0x{}", alloy_primitives::hex::encode(&message_bytes));
 
         // Persist the prepared spend keyed by the message bytes BEFORE signing —
         // the approver binds destination/amount/memo to the RIC and fail-closes
-        // on a missing context. spend_identity = the redemption id (see the
-        // module replay note).
+        // on a missing context. spend_identity = keccak256(message) — a per-tx
+        // one-shot key so a different-blockhash re-drive conflicts (TK-03).
+        let spend_identity = alloy_primitives::keccak256(&message_bytes).to_vec();
         self.prepare
             .put(
                 payload_hex.clone(),
@@ -223,8 +220,12 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeySolanaRedeemExecutor<T, P> {
                     to_address: vault.to_string(),
                     amount_dec: lamports.to_string(),
                     memo: task.memo.clone(),
+                    signing: AccountSigning::Solana {
+                        from_pubkey: self.config.custody_pubkey,
+                        recent_blockhash,
+                    },
                     ric: task.intent_proof.clone(),
-                    spend_identity: task.redemption_id.as_slice().to_vec(),
+                    spend_identity,
                 }),
             )
             .await
@@ -288,15 +289,6 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeySolanaRedeemExecutor<T, P> {
         Err(TurnkeySolanaError::PollTimeout {
             activity_id: current.id,
         })
-    }
-}
-
-/// An SPL-Memo instruction carrying the `THORChain` swap memo (no accounts).
-fn memo_instruction(memo: &str) -> Instruction {
-    Instruction {
-        program_id: MEMO_PROGRAM_ID,
-        accounts: vec![],
-        data: memo.as_bytes().to_vec(),
     }
 }
 
@@ -407,8 +399,12 @@ mod tests {
         if let Some(PreparedSpend::Account(a)) = stored {
             assert_eq!(a.to_address, vault());
             assert_eq!(a.amount_dec, "5000000000");
-            // spend_identity = redemption id (the one-shot key).
-            assert_eq!(a.spend_identity, B256::repeat_byte(0xd2).as_slice().to_vec());
+            // TK-03: spend_identity = keccak256(message) — a per-tx one-shot key
+            // (varies with recent_blockhash), NOT the constant redemption id.
+            assert_eq!(
+                a.spend_identity,
+                alloy_primitives::keccak256(&outcome.message_bytes).to_vec()
+            );
         }
     }
 

@@ -25,17 +25,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
-use alloy::eips::eip2718::Encodable2718;
-use alloy::eips::eip2930::AccessList;
-use alloy_primitives::{Address, Bytes, PrimitiveSignature, TxKind, B256, U256};
+use alloy_primitives::{Address, Bytes, PrimitiveSignature, B256, U256};
 use alloy_sol_types::SolCall;
 use thiserror::Error;
 use tracing::{debug, info};
 
 use xindex_chain_evm::EvmTxFee;
-use xindex_custody_core::prepare::{EvmPrepared, PrepareStore, PreparedSpend};
-use xindex_shared::chain_registry::{ChainId, EvmTxType};
+use xindex_custody_core::evm_tx::{build_unsigned, EvmUnsignedParams};
+use xindex_custody_core::prepare::{EvmPrepared, EvmSigning, PrepareStore, PreparedSpend};
+use xindex_shared::chain_registry::ChainId;
 use xindex_shared::thorchain_router::depositWithExpiryCall;
 use xindex_turnkey_client::{Activity, SignRawPayloadParams, TurnkeyApi};
 
@@ -123,30 +121,6 @@ pub struct TurnkeyEvmRedeemOutcome {
     pub activity_id: String,
 }
 
-/// An unsigned EVM tx, per envelope type.
-enum Unsigned {
-    Eip1559(Box<TxEip1559>),
-    Legacy(Box<TxLegacy>),
-}
-
-impl Unsigned {
-    fn signature_hash(&self) -> B256 {
-        match self {
-            Self::Eip1559(t) => t.signature_hash(),
-            Self::Legacy(t) => t.signature_hash(),
-        }
-    }
-
-    /// Attach the signature and 2718-encode to broadcastable bytes.
-    fn into_raw(self, sig: PrimitiveSignature) -> Bytes {
-        let envelope = match self {
-            Self::Eip1559(t) => TxEnvelope::from(t.into_signed(sig)),
-            Self::Legacy(t) => TxEnvelope::from(t.into_signed(sig)),
-        };
-        envelope.encoded_2718().into()
-    }
-}
-
 impl<T: TurnkeyApi, P: PrepareStore> TurnkeyEvmRedeemExecutor<T, P> {
     /// Construct.
     #[must_use]
@@ -184,14 +158,6 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyEvmRedeemExecutor<T, P> {
             .chain
             .thorchain_router_address()
             .ok_or(TurnkeyEvmError::NoRouterAddress(task.chain))?;
-        let evm_chain_id = task
-            .chain
-            .evm_chain_id()
-            .ok_or(TurnkeyEvmError::NotEvmChain(task.chain))?;
-        let tx_type = task
-            .chain
-            .tx_type()
-            .ok_or(TurnkeyEvmError::NotEvmChain(task.chain))?;
 
         let expiry = U256::from(now_secs().saturating_add(self.config.expiry_offset_secs));
         let calldata = depositWithExpiryCall {
@@ -203,21 +169,33 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyEvmRedeemExecutor<T, P> {
         }
         .abi_encode();
 
-        let unsigned = build_unsigned(
-            tx_type,
-            evm_chain_id,
+        let signing = EvmSigning {
             nonce,
-            &fee,
-            router,
-            task.amount_wei,
-            calldata.clone(),
-        );
+            gas_limit: fee.gas_limit,
+            max_fee_per_gas: fee.max_fee_per_gas,
+            max_priority_fee_per_gas: fee.max_priority_fee_per_gas,
+            gas_price: fee.gas_price,
+        };
+        let unsigned = build_unsigned(&EvmUnsignedParams {
+            chain: task.chain,
+            nonce: signing.nonce,
+            gas_limit: signing.gas_limit,
+            max_fee_per_gas: signing.max_fee_per_gas,
+            max_priority_fee_per_gas: signing.max_priority_fee_per_gas,
+            gas_price: signing.gas_price,
+            to: router,
+            value: task.amount_wei,
+            data: &calldata,
+        })
+        .ok_or(TurnkeyEvmError::NotEvmChain(task.chain))?;
         let signing_hash = unsigned.signature_hash();
         let payload_hex = format!("0x{}", alloy_primitives::hex::encode(signing_hash));
 
         // Persist the prepared spend keyed by the signing hash BEFORE signing —
-        // the approver binds against it; a missing context fail-closes.
-        // spend_identity = the account nonce (a re-drive advances it → one-shot).
+        // the approver reconstructs the unsigned tx from these fields, recomputes
+        // the hash, asserts it equals this key (TK-01), then binds to the RIC; a
+        // missing context fail-closes. spend_identity = the account nonce (a
+        // re-drive advances it → one-shot).
         self.prepare
             .put(
                 payload_hex.clone(),
@@ -226,6 +204,7 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyEvmRedeemExecutor<T, P> {
                     to: router,
                     value: task.amount_wei,
                     data: calldata,
+                    signing,
                     ric: task.intent_proof.clone(),
                     spend_identity: nonce.to_be_bytes().to_vec(),
                 }),
@@ -292,42 +271,6 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyEvmRedeemExecutor<T, P> {
         Err(TurnkeyEvmError::PollTimeout {
             activity_id: current.id,
         })
-    }
-}
-
-/// Build the unsigned tx for the chain's envelope type.
-fn build_unsigned(
-    tx_type: EvmTxType,
-    evm_chain_id: u64,
-    nonce: u64,
-    fee: &EvmTxFee,
-    router: Address,
-    value: U256,
-    calldata: Vec<u8>,
-) -> Unsigned {
-    let to = TxKind::Call(router);
-    let input = Bytes::from(calldata);
-    match tx_type {
-        EvmTxType::Eip1559 => Unsigned::Eip1559(Box::new(TxEip1559 {
-            chain_id: evm_chain_id,
-            nonce,
-            gas_limit: fee.gas_limit,
-            max_fee_per_gas: fee.max_fee_per_gas,
-            max_priority_fee_per_gas: fee.max_priority_fee_per_gas,
-            to,
-            value,
-            access_list: AccessList::default(),
-            input,
-        })),
-        EvmTxType::Legacy => Unsigned::Legacy(Box::new(TxLegacy {
-            chain_id: Some(evm_chain_id),
-            nonce,
-            gas_price: fee.gas_price,
-            gas_limit: fee.gas_limit,
-            to,
-            value,
-            input,
-        })),
     }
 }
 

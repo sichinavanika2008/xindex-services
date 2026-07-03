@@ -11,7 +11,9 @@
 use bitcoin::hashes::Hash;
 
 use xindex_custody_core::btc_bind::bind_outputs_to_cert;
-use xindex_custody_core::gates::{gate_spend_certificate, CustodyConfig};
+use xindex_custody_core::gates::{
+    consume_spend_certificate, validate_spend_certificate, CustodyConfig,
+};
 use xindex_custody_core::replay::ReplayStore;
 
 use crate::Decision;
@@ -31,18 +33,16 @@ pub async fn decide_redeem_spend<S: ReplayStore>(
     custody_spk: &bitcoin::ScriptBuf,
     now_unix: i64,
 ) -> Decision {
+    // TK-04: validate → bind → consume. The one-shot is recorded only after the
+    // output-set bind passes, so a bind-failing PSBT never pins the slot.
     let txid = ctx.psbt.unsigned_tx.compute_txid().to_byte_array();
-    let cert = match gate_spend_certificate(
+    let (cert, consume_key) = match validate_spend_certificate(
         config,
-        replay,
         ctx.chain,
         ctx.ric.as_ref(),
         ctx.acc.as_ref(),
-        &txid,
         now_unix,
-    )
-    .await
-    {
+    ) {
         Ok(c) => c,
         Err(r) => {
             return Decision::Reject {
@@ -52,6 +52,14 @@ pub async fn decide_redeem_spend<S: ReplayStore>(
         }
     };
     if let Err(r) = bind_outputs_to_cert(&ctx.psbt, custody_spk, &cert) {
+        return Decision::Reject {
+            code: r.code,
+            message: r.message,
+        };
+    }
+    if let Err(r) =
+        consume_spend_certificate(replay, ctx.chain, &consume_key, &txid, now_unix).await
+    {
         return Decision::Reject {
             code: r.code,
             message: r.message,

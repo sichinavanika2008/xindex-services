@@ -131,6 +131,24 @@ pub async fn gate_ric_intent<S: ReplayStore>(
     spend_identity: &[u8],
     now_unix: i64,
 ) -> Result<(VerifiedIntent, B256), GateRejection> {
+    let (cert, digest) = validate_ric_intent(config, chain, proof, now_unix)?;
+    consume_ric_one_shot(replay, chain, &cert, digest, spend_identity, now_unix).await?;
+    Ok((cert, digest))
+}
+
+/// TK-04: the STATELESS half of [`gate_ric_intent`] — k-of-n RIC verification +
+/// asset/decimals binds, with NO one-shot consume. Callers that bind the spend
+/// to the certificate should `validate` → bind → [`consume_ric_one_shot`] so a
+/// bind-failing request never pins the `(chain, redemptionId, legIndex)` slot.
+///
+/// # Errors
+/// [`GateRejection`] on a missing/invalid proof or asset/decimals mismatch.
+pub fn validate_ric_intent(
+    config: CustodyConfig<'_>,
+    chain: ChainId,
+    proof: Option<&IntentProof>,
+    now_unix: i64,
+) -> Result<(VerifiedIntent, B256), GateRejection> {
     let proof = proof.ok_or_else(|| {
         GateRejection::unprocessable(
             error_codes::INTENT_PROOF_REQUIRED,
@@ -165,16 +183,20 @@ pub async fn gate_ric_intent<S: ReplayStore>(
             ),
         ));
     }
-    consume_ric_one_shot(replay, chain, &cert, digest, spend_identity, now_unix).await?;
     Ok((cert, digest))
 }
 
-/// RA-1 / RUST-003: consume the `(chain, redemptionId, legIndex)` one-shot,
-/// recorded BEFORE any signature. The one-shot's `signature` BLOB stores the
-/// FIRST-consumed `spend_identity`; a same-cert retry must re-present the
-/// same identity (an HSM-failure retry / another input of the same BTC tx),
-/// while a re-drive into a different spend is a 409.
-async fn consume_ric_one_shot<S: ReplayStore>(
+/// RA-1 / RUST-003: consume the `(chain, redemptionId, legIndex)` one-shot.
+/// TK-04: the caller runs this AFTER a successful spend bind, so the one-shot's
+/// `signature` BLOB stores the FIRST-consumed `spend_identity` only for a spend
+/// that actually validated. A same-cert retry must re-present the same identity
+/// (an HSM-failure retry / another input of the same BTC tx); a re-drive into a
+/// different spend is a 409.
+///
+/// # Errors
+/// [`GateRejection`] on a one-shot conflict (different cert or different spend
+/// for the leg) or a replay-store failure.
+pub async fn consume_ric_one_shot<S: ReplayStore>(
     replay: &S,
     chain: ChainId,
     cert: &VerifiedIntent,
@@ -267,6 +289,23 @@ pub async fn gate_acquire_cancel_intent<S: ReplayStore>(
     spend_identity: &[u8],
     now_unix: i64,
 ) -> Result<(VerifiedCancel, B256), GateRejection> {
+    let (cert, digest) = validate_acquire_cancel_intent(config, chain, proof, now_unix)?;
+    consume_ac_one_shot(replay, chain, &cert, digest, spend_identity, now_unix).await?;
+    Ok((cert, digest))
+}
+
+/// TK-04: the STATELESS half of [`gate_acquire_cancel_intent`] — k-of-n ACC
+/// verification + asset/decimals binds, with NO one-shot consume. Callers should
+/// `validate` → bind → [`consume_ac_one_shot`].
+///
+/// # Errors
+/// [`GateRejection`] on an invalid proof or asset/decimals mismatch.
+pub fn validate_acquire_cancel_intent(
+    config: CustodyConfig<'_>,
+    chain: ChainId,
+    proof: &AcquireCancelProof,
+    now_unix: i64,
+) -> Result<(VerifiedCancel, B256), GateRejection> {
     let now = u64::try_from(now_unix).unwrap_or(0);
     let (cert, digest) = validate_acquire_cancel_proof(
         proof,
@@ -295,12 +334,15 @@ pub async fn gate_acquire_cancel_intent<S: ReplayStore>(
             ),
         ));
     }
-    consume_ac_one_shot(replay, chain, &cert, digest, spend_identity, now_unix).await?;
     Ok((cert, digest))
 }
 
-/// Slice C mirror of [`consume_ric_one_shot`] keyed `(chain, cancel_id)`.
-async fn consume_ac_one_shot<S: ReplayStore>(
+/// Slice C mirror of [`consume_ric_one_shot`] keyed `(chain, cancel_id)`. Run
+/// AFTER a successful bind (TK-04).
+///
+/// # Errors
+/// [`GateRejection`] on a one-shot conflict or a replay-store failure.
+pub async fn consume_ac_one_shot<S: ReplayStore>(
     replay: &S,
     chain: ChainId,
     cert: &VerifiedCancel,
@@ -418,6 +460,91 @@ pub async fn gate_spend_certificate<S: ReplayStore>(
                 memo_hash: cert.memo_hash,
                 mismatch_code: error_codes::INTENT_MISMATCH,
             })
+        }
+    }
+}
+
+/// TK-04: the one-shot a validated spend certificate will consume, carried from
+/// [`validate_spend_certificate`] to the post-bind [`consume_spend_certificate`]
+/// so a bind-failing PSBT never pins the slot.
+#[derive(Debug, Clone)]
+pub enum ConsumeKey {
+    /// A RIC redeem one-shot `(chain, redemptionId, legIndex)`.
+    Ric {
+        /// The verified redemption intent.
+        cert: VerifiedIntent,
+        /// Its EIP-712 digest.
+        digest: B256,
+    },
+    /// An ACC swap-back one-shot `(chain, cancelId)`.
+    Ac {
+        /// The verified acquire-cancel.
+        cert: VerifiedCancel,
+        /// Its EIP-712 digest.
+        digest: B256,
+    },
+}
+
+/// TK-04: the STATELESS half of [`gate_spend_certificate`] — validate the RIC
+/// XOR ACC and return the kind-agnostic [`CertifiedSpend`] plus the
+/// [`ConsumeKey`] to consume AFTER a successful output bind.
+///
+/// # Errors
+/// [`GateRejection`] from the dispatched validator, or `intent_proof_ambiguous`.
+pub fn validate_spend_certificate(
+    config: CustodyConfig<'_>,
+    chain: ChainId,
+    ric: Option<&IntentProof>,
+    acc: Option<&AcquireCancelProof>,
+    now_unix: i64,
+) -> Result<(CertifiedSpend, ConsumeKey), GateRejection> {
+    match (ric, acc) {
+        (Some(_), Some(_)) => Err(GateRejection::unprocessable(
+            error_codes::INTENT_PROOF_AMBIGUOUS,
+            "request carries BOTH a RIC and an Acquire-Cancel certificate — exactly one \
+             certificate kind must authorize a custody spend",
+        )),
+        (None, Some(proof)) => {
+            let (cert, digest) = validate_acquire_cancel_intent(config, chain, proof, now_unix)?;
+            let spend = CertifiedSpend {
+                amount: cert.amount,
+                immediate_target_hash: cert.immediate_target_hash,
+                memo_hash: cert.memo_hash,
+                mismatch_code: error_codes::ACQUIRE_CANCEL_MISMATCH,
+            };
+            Ok((spend, ConsumeKey::Ac { cert, digest }))
+        }
+        (ric_only, None) => {
+            let (cert, digest) = validate_ric_intent(config, chain, ric_only, now_unix)?;
+            let spend = CertifiedSpend {
+                amount: cert.amount,
+                immediate_target_hash: cert.immediate_target_hash,
+                memo_hash: cert.memo_hash,
+                mismatch_code: error_codes::INTENT_MISMATCH,
+            };
+            Ok((spend, ConsumeKey::Ric { cert, digest }))
+        }
+    }
+}
+
+/// TK-04: consume the one-shot a validated spend certificate authorizes, keyed
+/// by its [`ConsumeKey`]. Run AFTER the output bind succeeds.
+///
+/// # Errors
+/// [`GateRejection`] on a one-shot conflict or a replay-store failure.
+pub async fn consume_spend_certificate<S: ReplayStore>(
+    replay: &S,
+    chain: ChainId,
+    key: &ConsumeKey,
+    spend_identity: &[u8],
+    now_unix: i64,
+) -> Result<(), GateRejection> {
+    match key {
+        ConsumeKey::Ric { cert, digest } => {
+            consume_ric_one_shot(replay, chain, cert, *digest, spend_identity, now_unix).await
+        }
+        ConsumeKey::Ac { cert, digest } => {
+            consume_ac_one_shot(replay, chain, cert, *digest, spend_identity, now_unix).await
         }
     }
 }

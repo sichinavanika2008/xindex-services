@@ -8,7 +8,9 @@
 //! account-model families, whose `THORChain` memo is a transaction field (not
 //! an `OP_RETURN` output), so no PSBT / output-set binding is involved.
 
-use xindex_custody_core::gates::{bind_account_send_to_cert, gate_ric_intent, CustodyConfig};
+use xindex_custody_core::gates::{
+    bind_account_send_to_cert, consume_ric_one_shot, validate_ric_intent, CustodyConfig,
+};
 use xindex_custody_core::replay::ReplayStore;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::IntentProof;
@@ -46,16 +48,10 @@ pub async fn decide_account_send<S: ReplayStore>(
     config: CustodyConfig<'_>,
     now_unix: i64,
 ) -> Decision {
-    let (cert, _digest) = match gate_ric_intent(
-        config,
-        replay,
-        send.chain,
-        send.ric,
-        send.spend_identity,
-        now_unix,
-    )
-    .await
-    {
+    // TK-04: validate → bind → consume. The one-shot is recorded only after the
+    // destination/amount/memo bind passes, so a bind-failing request never pins
+    // the (chain, redemptionId, legIndex) slot.
+    let (cert, digest) = match validate_ric_intent(config, send.chain, send.ric, now_unix) {
         Ok(c) => c,
         Err(r) => {
             return Decision::Reject {
@@ -65,6 +61,21 @@ pub async fn decide_account_send<S: ReplayStore>(
         }
     };
     if let Err(r) = bind_account_send_to_cert(send.to_address, send.amount_dec, send.memo, &cert) {
+        return Decision::Reject {
+            code: r.code,
+            message: r.message,
+        };
+    }
+    if let Err(r) = consume_ric_one_shot(
+        replay,
+        send.chain,
+        &cert,
+        digest,
+        send.spend_identity,
+        now_unix,
+    )
+    .await
+    {
         return Decision::Reject {
             code: r.code,
             message: r.message,
@@ -174,6 +185,29 @@ mod tests {
         assert!(is_reject(
             &decide_account_send(&s, &replay, config(&policy), NOW).await
         ));
+    }
+
+    #[tokio::test]
+    async fn bind_failure_does_not_pin_the_leg() {
+        // TK-04: a valid-RIC but bind-failing request (wrong memo) with a bogus
+        // identity must NOT consume the one-shot; a later honest request under
+        // the same RIC (different identity) still APPROVES. Pre-fix (consume
+        // before bind) the bogus identity pinned the slot → the honest request
+        // hit a one-shot conflict and the leg was unspendable.
+        let policy = policy();
+        let ric = signed_ric(CHAIN, target(), MEMO, U256::from(AMOUNT), &[1, 2, 3]);
+        let replay = InMemoryReplayStore::new();
+
+        let bad = send("1000000", "=:ETH.USDT:0xattacker:1", &ric, b"bogus");
+        assert!(is_reject(
+            &decide_account_send(&bad, &replay, config(&policy), NOW).await
+        ));
+
+        let good = send("1000000", MEMO, &ric, b"honest");
+        assert_eq!(
+            decide_account_send(&good, &replay, config(&policy), NOW).await,
+            Decision::Approve
+        );
     }
 
     #[tokio::test]

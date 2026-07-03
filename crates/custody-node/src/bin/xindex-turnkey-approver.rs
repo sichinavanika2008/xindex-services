@@ -7,11 +7,14 @@
 //! approvers (each with its own diverse `THORChain` sources) behind a Turnkey
 //! N-of-M consensus policy (DL-CTD-2). Dev default = a single approver.
 //!
-//! **PRODUCTION-GATED.** The approver binds the spend to the k-of-n RIC but does
-//! not yet re-derive the sighash from the prepared tx and assert it equals the
-//! activity's signing `payload` (the dispatch.rs SECURITY note — pinned once the
-//! real `ACTIVITY_UPDATES` payload shape is captured at the dev-env). Until then
-//! this binary refuses to start without `--dev` (mirrors DL-REHEARSAL-1).
+//! **PRODUCTION-GATED.** The approver now recomputes the signing hash from the
+//! prepared fields and asserts it equals the activity payload (TK-01,
+//! [`xindex_custody_node::recompute`]) and caps the declared fee (TK-02). What is
+//! NOT yet validated is the Turnkey WIRE against the real dev-env — the P-256
+//! stamp shape, the `NO_OP` hash function, the real `signRawPayloadIntentV2`
+//! payload field the correlation key reads (R1–R4/R6 in
+//! `docs/runbooks/turnkey-custody-devenv.md`). Until that reconcile passes this
+//! binary refuses to start without `--dev` (mirrors DL-REHEARSAL-1).
 //!
 //! Activity discovery is via the watched ids passed on the CLI (the executor /
 //! operator hands them off); the production push trigger is Turnkey's
@@ -28,7 +31,7 @@ use clap::Parser;
 
 use xindex_custody_core::gates::CustodyConfig;
 use xindex_custody_core::prepare::{InMemoryPrepareStore, PrepareStore, SqlitePrepareStore};
-use xindex_custody_core::replay::InMemoryReplayStore;
+use xindex_custody_core::replay::{InMemoryReplayStore, ReplayStore, SqliteReplayStore};
 use xindex_custody_node::approver::process_activity;
 use xindex_shared::intent::IntentPolicy;
 use xindex_turnkey_client::{TurnkeyApi, TurnkeyClient, TurnkeyStamper, TURNKEY_API_BASE};
@@ -93,14 +96,18 @@ struct WatchConfig {
     poll_interval: Duration,
 }
 
-/// Refuse to start in production until the sighash ↔ payload cross-check lands.
+/// Refuse to start in production until the Turnkey wire is reconciled at the
+/// dev-env (R1–R4/R6). The TK-01 sighash↔payload recompute + TK-02 fee cap are
+/// already in force via [`xindex_custody_node::recompute`].
 fn assert_dev_only(dev: bool) -> Result<()> {
     if !dev {
         bail!(
-            "refusing to start: the approver binds the spend to the k-of-n RIC \
-             but does not yet re-derive the sighash and assert it equals the \
-             activity payload (dispatch.rs SECURITY note). Pass --dev for \
-             rehearsal; production is gated until that cross-check lands."
+            "refusing to start: the Turnkey wire (P-256 stamp shape, NO_OP hash \
+             function, the real signRawPayloadIntentV2 payload field the \
+             correlation key reads) is not yet reconciled against the dev-env \
+             (docs/runbooks/turnkey-custody-devenv.md R1–R4/R6). The TK-01 \
+             payload recompute + TK-02 fee cap are already enforced. Pass --dev \
+             for rehearsal; production is gated until the wire reconcile passes."
         );
     }
     Ok(())
@@ -138,14 +145,15 @@ fn now_unix() -> Result<i64> {
 }
 
 /// Poll the watched activities until each is voted-or-terminal, voting once per
-/// `CONSENSUS_NEEDED` activity. Generic over the prepare store so `main` picks
-/// in-memory (rehearsal) or sqlite (shared with the executor).
-async fn watch<P: PrepareStore>(
+/// `CONSENSUS_NEEDED` activity. Generic over the prepare + replay stores so
+/// `main` picks in-memory (rehearsal) or sqlite (shared with the executor); a
+/// persistent replay store keeps the RIC one-shot rows across restarts (RS-02).
+async fn watch<P: PrepareStore, R: ReplayStore>(
     client: &TurnkeyClient,
     prepare: &P,
+    replay: &R,
     cfg: WatchConfig,
 ) -> Result<()> {
-    let replay = InMemoryReplayStore::new();
     let mut pending = cfg.activity_ids.clone();
     let mut voted: HashSet<String> = HashSet::new();
 
@@ -176,7 +184,7 @@ async fn watch<P: PrepareStore>(
             match process_activity(
                 client,
                 prepare,
-                &replay,
+                replay,
                 config,
                 cfg.btc_custody_spk.as_ref(),
                 &act,
@@ -237,18 +245,25 @@ async fn main() -> Result<()> {
         poll_interval: Duration::from_secs(args.poll_interval_secs),
     };
 
+    // A shared sqlite URL backs BOTH the prepare store (executor `put`s here)
+    // and the replay store (custody-core migrations 0001–0015 live in one dir),
+    // so RIC one-shot rows persist across approver restarts (RS-02).
     if let Some(url) = &args.db {
         let prepare = SqlitePrepareStore::connect(url)
             .await
             .map_err(|e| anyhow::anyhow!("prepare store {url}: {e}"))?;
+        let replay = SqliteReplayStore::connect(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("replay store {url}: {e}"))?;
         tracing::info!(org = %args.organization_id, db = %url, watching = watch_cfg.activity_ids.len(),
             "xindex-turnkey-approver (dev, sqlite store) started");
-        watch(&client, &prepare, watch_cfg).await
+        watch(&client, &prepare, &replay, watch_cfg).await
     } else {
         let prepare = InMemoryPrepareStore::new();
+        let replay = InMemoryReplayStore::new();
         tracing::info!(org = %args.organization_id, watching = watch_cfg.activity_ids.len(),
             "xindex-turnkey-approver (dev, in-memory store) started");
-        watch(&client, &prepare, watch_cfg).await
+        watch(&client, &prepare, &replay, watch_cfg).await
     }
 }
 

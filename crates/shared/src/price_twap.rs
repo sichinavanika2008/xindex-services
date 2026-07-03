@@ -96,6 +96,16 @@ pub enum TwapError {
         /// The configured maximum.
         max: u64,
     },
+    /// Samples are not in ascending-timestamp order (RS-01) — a backward
+    /// wall-clock step slipped an out-of-order sample into the buffer. Fail
+    /// closed rather than underflow the segment-gap subtraction.
+    #[error("sample timestamp {ts} precedes segment start {seg_start} (non-monotonic)")]
+    NonMonotonicSamples {
+        /// The offending sample timestamp.
+        ts: u64,
+        /// The segment start it precedes.
+        seg_start: u64,
+    },
 }
 
 /// Time-weighted average of `samples` over `[now - window_secs, now]`.
@@ -159,7 +169,14 @@ pub fn time_weighted_average(
     let mut seg_price = samples[carry_idx].price;
     for s in &samples[carry_idx + 1..] {
         // `s.timestamp > window_start` for these (carry_idx was the last <=).
-        let gap = s.timestamp - seg_start;
+        // RS-01: checked so an out-of-order sample fails closed, not underflows.
+        let gap = s
+            .timestamp
+            .checked_sub(seg_start)
+            .ok_or(TwapError::NonMonotonicSamples {
+                ts: s.timestamp,
+                seg_start,
+            })?;
         if gap > cfg.max_gap_secs {
             return Err(TwapError::GapTooLarge {
                 gap,
@@ -219,6 +236,20 @@ mod tests {
             min_samples,
             max_gap_secs,
         }
+    }
+
+    #[test]
+    fn non_monotonic_samples_fail_closed() {
+        // RS-01: an out-of-order sample (1040 after 1050) must fail closed, not
+        // underflow the segment-gap subtraction.
+        let samples = [s(1000, 100), s(1050, 100), s(1040, 100)];
+        assert_eq!(
+            time_weighted_average(&samples, 1060, cfg(60, 2, 120)),
+            Err(TwapError::NonMonotonicSamples {
+                ts: 1040,
+                seg_start: 1050,
+            })
+        );
     }
 
     #[test]

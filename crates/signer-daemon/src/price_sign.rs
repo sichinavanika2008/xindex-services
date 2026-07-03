@@ -221,7 +221,17 @@ pub async fn produce_signed_price<H: HsmDigestSigner>(
 /// samples older than twice the window. The 2× margin keeps memory bounded
 /// while always retaining the carry-in sample a sound TWAP needs (a carry-in
 /// older than that would fail the TWAP gap guard anyway).
+///
+/// RS-01: keep the buffer strictly ascending. A backward wall-clock step on the
+/// (trusted) signing host would otherwise slip an out-of-order sample in and
+/// underflow the TWAP segment-gap math; drop any sample not newer than the last.
 fn record_sample(history: &mut Vec<TwapSample>, timestamp: u64, price: U256, cfg: TwapConfig) {
+    if history
+        .last()
+        .is_some_and(|last| timestamp <= last.timestamp)
+    {
+        return;
+    }
     history.push(TwapSample { timestamp, price });
     let cutoff = timestamp.saturating_sub(cfg.window_secs.saturating_mul(2));
     history.retain(|s| s.timestamp >= cutoff);
@@ -260,6 +270,24 @@ mod tests {
         let unc = vk.to_encoded_point(false);
         let hash = alloy_primitives::keccak256(&unc.as_bytes()[1..]);
         (sk, Address::from_slice(&hash[12..]))
+    }
+
+    #[test]
+    fn record_sample_drops_out_of_order() {
+        // RS-01: a backward-clock sample not newer than the last is dropped, so
+        // the buffer stays strictly ascending for the TWAP gap math.
+        let cfg = TwapConfig {
+            window_secs: 60,
+            min_samples: 2,
+            max_gap_secs: 60,
+        };
+        let mut history = Vec::new();
+        record_sample(&mut history, 1000, U256::from(100u64), cfg);
+        record_sample(&mut history, 1030, U256::from(101u64), cfg);
+        record_sample(&mut history, 1020, U256::from(999u64), cfg); // backward → dropped
+        record_sample(&mut history, 1030, U256::from(999u64), cfg); // equal → dropped
+        let ts: Vec<u64> = history.iter().map(|s| s.timestamp).collect();
+        assert_eq!(ts, vec![1000, 1030]);
     }
 
     fn domain() -> Eip712Domain {

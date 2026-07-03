@@ -291,6 +291,34 @@ pub fn system_transfer(from: Pubkey, to: Pubkey, lamports: u64) -> Instruction {
     }
 }
 
+/// Build the legacy `[system_transfer, SPL-Memo]` message a Turnkey Solana
+/// redeem signs, returning both the message and its serialized signing bytes.
+/// Shared by the executor (to compute the payload it asks the enclave to sign)
+/// and the approver (to independently recompute that payload, TK-01), so the
+/// two cannot diverge.
+///
+/// # Errors
+/// [`SolanaTxError`] if the message fails to compile or serialize.
+pub fn build_transfer_message(
+    from: Pubkey,
+    to: Pubkey,
+    lamports: u64,
+    memo: &str,
+    recent_blockhash: [u8; 32],
+) -> Result<(Message, Vec<u8>), SolanaTxError> {
+    let instructions = vec![
+        system_transfer(from, to, lamports),
+        Instruction {
+            program_id: crate::squads::MEMO_PROGRAM_ID,
+            accounts: vec![],
+            data: memo.as_bytes().to_vec(),
+        },
+    ];
+    let message = Message::new_legacy(&from, recent_blockhash, &instructions)?;
+    let bytes = message.serialize()?;
+    Ok((message, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

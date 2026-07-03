@@ -184,9 +184,39 @@ mod tests {
             to: router(),
             value: amount,
             data: calldata(amount),
+            signing: xindex_custody_core::prepare::EvmSigning {
+                nonce: 0,
+                gas_limit: 300_000,
+                max_fee_per_gas: 50_000_000_000,
+                max_priority_fee_per_gas: 1_500_000_000,
+                gas_price: 5_000_000_000,
+            },
             ric: Some(ric),
             spend_identity: b"0".to_vec(),
         })
+    }
+
+    /// The real signing-payload key for a prepared EVM spend (TK-01).
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn evm_key(spend: &PreparedSpend) -> String {
+        let PreparedSpend::Evm(e) = spend else {
+            unreachable!("evm_key on non-EVM spend")
+        };
+        let hash = xindex_custody_core::evm_tx::evm_signing_hash(
+            &xindex_custody_core::evm_tx::EvmUnsignedParams {
+                chain: e.chain,
+                nonce: e.signing.nonce,
+                gas_limit: e.signing.gas_limit,
+                max_fee_per_gas: e.signing.max_fee_per_gas,
+                max_priority_fee_per_gas: e.signing.max_priority_fee_per_gas,
+                gas_price: e.signing.gas_price,
+                to: e.to,
+                value: e.value,
+                data: &e.data,
+            },
+        )
+        .expect("evm signing hash");
+        format!("0x{}", alloy_primitives::hex::encode(hash))
     }
 
     fn honest_ric() -> IntentProof {
@@ -199,8 +229,9 @@ mod tests {
         )
     }
 
-    /// A `SIGN_RAW_PAYLOAD` activity whose signed payload is `PAYLOAD`.
-    fn consensus_activity() -> Activity {
+    /// A `SIGN_RAW_PAYLOAD` `CONSENSUS_NEEDED` activity whose signed payload is
+    /// `payload`.
+    fn consensus_activity(payload: &str) -> Activity {
         #[expect(clippy::expect_used, reason = "test code")]
         serde_json::from_value(serde_json::json!({
             "id": "act-1",
@@ -208,7 +239,7 @@ mod tests {
             "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
             "fingerprint": "fp-1",
             "intent": { "signRawPayloadIntentV2": {
-                "signWith": "custody-key", "payload": PAYLOAD,
+                "signWith": "custody-key", "payload": payload,
                 "encoding": "PAYLOAD_ENCODING_HEXADECIMAL", "hashFunction": "HASH_FUNCTION_NO_OP"
             }}
         }))
@@ -220,12 +251,9 @@ mod tests {
     async fn honest_activity_is_approved() {
         let policy = policy();
         let prepare = InMemoryPrepareStore::new();
-        let _ = prepare
-            .put(
-                PAYLOAD.to_string(),
-                evm_prepared(U256::from(AMOUNT), honest_ric()),
-            )
-            .await;
+        let spend = evm_prepared(U256::from(AMOUNT), honest_ric());
+        let key = evm_key(&spend);
+        let _ = prepare.put(key.clone(), spend).await;
         let replay = InMemoryReplayStore::new();
         let api = StubApi::default();
 
@@ -235,7 +263,7 @@ mod tests {
             &replay,
             config(&policy),
             None,
-            &consensus_activity(),
+            &consensus_activity(&key),
             NOW,
         )
         .await
@@ -261,7 +289,7 @@ mod tests {
             &replay,
             config(&policy),
             None,
-            &consensus_activity(),
+            &consensus_activity(PAYLOAD),
             NOW,
         )
         .await
@@ -275,15 +303,13 @@ mod tests {
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn tampered_spend_is_rejected() {
-        // RIC certifies AMOUNT; the prepared tx deposits AMOUNT+1.
+        // RIC certifies AMOUNT; the prepared tx deposits AMOUNT+1. The payload
+        // recompute passes (self-consistent) but the RIC amount bind fails.
         let policy = policy();
         let prepare = InMemoryPrepareStore::new();
-        let _ = prepare
-            .put(
-                PAYLOAD.to_string(),
-                evm_prepared(U256::from(AMOUNT + 1), honest_ric()),
-            )
-            .await;
+        let spend = evm_prepared(U256::from(AMOUNT + 1), honest_ric());
+        let key = evm_key(&spend);
+        let _ = prepare.put(key.clone(), spend).await;
         let replay = InMemoryReplayStore::new();
         let api = StubApi::default();
 
@@ -293,7 +319,7 @@ mod tests {
             &replay,
             config(&policy),
             None,
-            &consensus_activity(),
+            &consensus_activity(&key),
             NOW,
         )
         .await

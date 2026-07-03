@@ -10,7 +10,7 @@
 use alloy_primitives::{Address, U256};
 
 use xindex_custody_core::evm_bind::bind_evm_deposit_to_cert;
-use xindex_custody_core::gates::{gate_ric_intent, CustodyConfig};
+use xindex_custody_core::gates::{consume_ric_one_shot, validate_ric_intent, CustodyConfig};
 use xindex_custody_core::replay::ReplayStore;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::IntentProof;
@@ -48,16 +48,8 @@ pub async fn decide_evm_deposit<S: ReplayStore>(
     config: CustodyConfig<'_>,
     now_unix: i64,
 ) -> Decision {
-    let (cert, _digest) = match gate_ric_intent(
-        config,
-        replay,
-        deposit.chain,
-        deposit.ric,
-        deposit.spend_identity,
-        now_unix,
-    )
-    .await
-    {
+    // TK-04: validate → bind → consume (see [`crate::account`]).
+    let (cert, digest) = match validate_ric_intent(config, deposit.chain, deposit.ric, now_unix) {
         Ok(c) => c,
         Err(r) => {
             return Decision::Reject {
@@ -73,6 +65,21 @@ pub async fn decide_evm_deposit<S: ReplayStore>(
         deposit.data,
         &cert,
     ) {
+        return Decision::Reject {
+            code: r.code,
+            message: r.message,
+        };
+    }
+    if let Err(r) = consume_ric_one_shot(
+        replay,
+        deposit.chain,
+        &cert,
+        digest,
+        deposit.spend_identity,
+        now_unix,
+    )
+    .await
+    {
         return Decision::Reject {
             code: r.code,
             message: r.message,

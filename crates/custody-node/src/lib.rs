@@ -21,6 +21,7 @@ pub mod approver;
 pub mod btc;
 pub mod dispatch;
 pub mod evm;
+pub mod recompute;
 
 #[cfg(test)]
 mod test_support;

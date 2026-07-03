@@ -1,7 +1,7 @@
 //! The Turnkey REST client.
 
 use std::future::Future;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -114,7 +114,11 @@ impl TurnkeyClient {
         organization_id: impl Into<String>,
         stamper: TurnkeyStamper,
     ) -> Result<Self, TurnkeyError> {
+        // RS-02: bound every request so a hung/black-holed endpoint cannot stall
+        // the executor's sign loop or the approver's poll loop indefinitely.
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| TurnkeyError::Http(e.to_string()))?;
         Ok(Self {
@@ -193,6 +197,14 @@ impl TurnkeyApi for TurnkeyClient {
             activity_id,
         };
         let resp: ActivityResponse = self.post_stamped(QUERY_GET_ACTIVITY, &req).await?;
+        // RS-02: fail closed if the response is for a different activity than we
+        // polled — never poll one activity and act on another's status.
+        if resp.activity.id != activity_id {
+            return Err(TurnkeyError::Http(format!(
+                "get_activity returned id {} for requested {activity_id}",
+                resp.activity.id
+            )));
+        }
         Ok(resp.activity)
     }
 

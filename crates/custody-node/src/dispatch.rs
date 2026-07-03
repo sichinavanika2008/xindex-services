@@ -30,14 +30,15 @@ use xindex_custody_core::prepare::{PrepareStore, PreparedSpend};
 /// `btc_custody_spk` is this approver's own custody `scriptPubKey` (for the
 /// BTC output bind); `None` rejects any BTC spend.
 ///
-/// **SECURITY (dev-env reconciliation):** the prepared spend is bound to the
-/// k-of-n RIC (destination / amount / memo) by the family core. The
-/// approver-watcher correlates the activity to the prepared spend by the
-/// signing `payload` itself (the sighash), so a coordinator cannot pair
-/// prepared-context X with a signature over a different message Y under the
-/// same key. Re-deriving the sighash from the prepared tx and asserting it
-/// equals `prepare_key` is a follow-on hardening (`// RECONCILE AT DEV-ENV`,
-/// pinned once the real `ACTIVITY_UPDATES` payload shape is captured).
+/// **SECURITY (TK-01/TK-02):** the executor writes BOTH the store key and the
+/// Turnkey payload, so before binding to the RIC the approver INDEPENDENTLY
+/// reconstructs the unsigned tx from the prepared fields, recomputes its signing
+/// hash, and asserts it equals `prepare_key`
+/// ([`crate::recompute::verify_payload_and_fee`]) — a coordinator therefore
+/// cannot pair an honest bound context with a signature over a different
+/// message. The same pass caps the declared fee (TK-02). Then the family core
+/// binds the certified destination / amount / memo to the k-of-n RIC. Any miss
+/// is a fail-closed REJECT.
 pub async fn decide_callback<P, R>(
     prepare_key: &str,
     prepare: &P,
@@ -66,6 +67,11 @@ where
             };
         }
     };
+    // TK-01/TK-02: the signing payload MUST be the hash of a tx reconstructed
+    // from these prepared fields, and the declared fee within the per-chain cap.
+    if let Err((code, message)) = crate::recompute::verify_payload_and_fee(&spend, prepare_key) {
+        return Decision::Reject { code, message };
+    }
     decide_prepared(&spend, replay, config, btc_custody_spk, now_unix).await
 }
 
@@ -163,9 +169,40 @@ mod tests {
             to: router(),
             value: amount,
             data: calldata(amount),
+            signing: xindex_custody_core::prepare::EvmSigning {
+                nonce: 0,
+                gas_limit: 300_000,
+                max_fee_per_gas: 50_000_000_000,
+                max_priority_fee_per_gas: 1_500_000_000,
+                gas_price: 5_000_000_000,
+            },
             ric: Some(ric),
             spend_identity: b"0".to_vec(),
         })
+    }
+
+    /// The real signing-payload key for a prepared EVM spend (what the executor
+    /// keys `prepare.put` by, and what the approver recomputes — TK-01).
+    fn evm_key(spend: &PreparedSpend) -> String {
+        let PreparedSpend::Evm(e) = spend else {
+            unreachable!("evm_key on non-EVM spend")
+        };
+        #[expect(clippy::expect_used, reason = "test code")]
+        let hash = xindex_custody_core::evm_tx::evm_signing_hash(
+            &xindex_custody_core::evm_tx::EvmUnsignedParams {
+                chain: e.chain,
+                nonce: e.signing.nonce,
+                gas_limit: e.signing.gas_limit,
+                max_fee_per_gas: e.signing.max_fee_per_gas,
+                max_priority_fee_per_gas: e.signing.max_priority_fee_per_gas,
+                gas_price: e.signing.gas_price,
+                to: e.to,
+                value: e.value,
+                data: &e.data,
+            },
+        )
+        .expect("evm signing hash");
+        format!("0x{}", alloy_primitives::hex::encode(hash))
     }
 
     fn honest_ric() -> IntentProof {
@@ -186,15 +223,28 @@ mod tests {
     async fn honest_prepared_approves() {
         let policy = policy();
         let prepare = InMemoryPrepareStore::new();
-        let _ = prepare
-            .put(
-                "sighash-1".to_string(),
-                evm_prepared(U256::from(AMOUNT), honest_ric()),
-            )
-            .await;
+        let spend = evm_prepared(U256::from(AMOUNT), honest_ric());
+        let key = evm_key(&spend);
+        let _ = prepare.put(key.clone(), spend).await;
         let replay = InMemoryReplayStore::new();
-        let d = decide_callback("sighash-1", &prepare, &replay, config(&policy), None, NOW).await;
+        let d = decide_callback(&key, &prepare, &replay, config(&policy), None, NOW).await;
         assert_eq!(d, Decision::Approve, "honest prepared spend must APPROVE");
+    }
+
+    #[tokio::test]
+    async fn payload_binding_mismatch_rejects() {
+        // TK-01: the prepared context is honest but the signing payload the
+        // enclave is asked to sign is NOT its recomputed hash → fail-closed.
+        let policy = policy();
+        let prepare = InMemoryPrepareStore::new();
+        let spend = evm_prepared(U256::from(AMOUNT), honest_ric());
+        let _ = prepare.put("0xdeadbeef".to_string(), spend).await;
+        let replay = InMemoryReplayStore::new();
+        let d = decide_callback("0xdeadbeef", &prepare, &replay, config(&policy), None, NOW).await;
+        assert!(
+            matches!(&d, Decision::Reject { code, .. } if *code == "payload_binding_mismatch"),
+            "unbound payload must REJECT, got {d:?}"
+        );
     }
 
     #[tokio::test]
@@ -208,17 +258,15 @@ mod tests {
 
     #[tokio::test]
     async fn tampered_spend_rejects() {
-        // RIC certifies AMOUNT; the prepared tx deposits AMOUNT+1.
+        // RIC certifies AMOUNT; the prepared tx deposits AMOUNT+1. The payload
+        // recompute passes (self-consistent) but the RIC amount bind fails.
         let policy = policy();
         let prepare = InMemoryPrepareStore::new();
-        let _ = prepare
-            .put(
-                "sighash-1".to_string(),
-                evm_prepared(U256::from(AMOUNT + 1), honest_ric()),
-            )
-            .await;
+        let spend = evm_prepared(U256::from(AMOUNT + 1), honest_ric());
+        let key = evm_key(&spend);
+        let _ = prepare.put(key.clone(), spend).await;
         let replay = InMemoryReplayStore::new();
-        let d = decide_callback("sighash-1", &prepare, &replay, config(&policy), None, NOW).await;
+        let d = decide_callback(&key, &prepare, &replay, config(&policy), None, NOW).await;
         assert!(is_reject(&d));
     }
 

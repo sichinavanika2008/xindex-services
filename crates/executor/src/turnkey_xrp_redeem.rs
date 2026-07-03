@@ -36,7 +36,7 @@ use alloy_primitives::B256;
 use thiserror::Error;
 use tracing::{debug, info};
 
-use xindex_custody_core::prepare::{AccountPrepared, PrepareStore, PreparedSpend};
+use xindex_custody_core::prepare::{AccountPrepared, AccountSigning, PrepareStore, PreparedSpend};
 use xindex_shared::chain_registry::ChainId;
 use xindex_turnkey_client::{Activity, SignRawPayloadParams, TurnkeyApi};
 use xindex_xrp_tx::addr::decode_classic_address;
@@ -229,6 +229,13 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyXrpRedeemExecutor<T, P> {
                     to_address: vault.to_string(),
                     amount_dec: amount_drops.to_string(),
                     memo: task.memo.clone(),
+                    signing: AccountSigning::Xrp {
+                        account_address: self.config.account_address.clone(),
+                        signing_pub_key: self.config.custody_pubkey.to_vec(),
+                        sequence,
+                        last_ledger_sequence,
+                        fee_drops: self.config.fee_drops,
+                    },
                     ric: task.intent_proof.clone(),
                     spend_identity: sequence.to_be_bytes().to_vec(),
                 }),

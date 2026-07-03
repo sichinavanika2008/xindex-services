@@ -17,6 +17,13 @@ path = "src/bin/xindex-turnkey-approver.rs"
 xindex-custody-core.workspace = true
 xindex-shared.workspace = true
 xindex-turnkey-client.workspace = true
+# TK-01: the approver independently reconstructs each family's unsigned tx from
+# the prepared fields (using the SAME builders the executor signs with) and
+# recomputes the signing payload to assert it equals the signing request.
+xindex-cosmos-tx.workspace = true
+xindex-xrp-tx.workspace = true
+xindex-tron-tx.workspace = true
+xindex-solana-tx.workspace = true
 alloy-primitives.workspace = true
 bitcoin.workspace = true
 tokio.workspace = true

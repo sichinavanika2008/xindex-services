@@ -5692,6 +5692,7 @@ dependencies = [
 name = "xindex-custody-core"
 version = "0.0.1"
 dependencies = [
+ "alloy",
  "alloy-primitives",
  "alloy-sol-types",
  "bitcoin",
@@ -5718,9 +5719,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xindex-cosmos-tx",
  "xindex-custody-core",
  "xindex-shared",
+ "xindex-solana-tx",
+ "xindex-tron-tx",
  "xindex-turnkey-client",
+ "xindex-xrp-tx",
 ]
 
 [[package]]

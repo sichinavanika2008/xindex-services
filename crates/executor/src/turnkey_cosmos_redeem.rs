@@ -32,7 +32,7 @@ use tracing::{debug, info};
 use xindex_cosmos_tx::amino::CosmosSendSignDoc;
 use xindex_cosmos_tx::sigs::to_cosmos_compact_low_s;
 use xindex_cosmos_tx::tx::{build_single_sig_tx_raw, CosmosTxParams};
-use xindex_custody_core::prepare::{AccountPrepared, PrepareStore, PreparedSpend};
+use xindex_custody_core::prepare::{AccountPrepared, AccountSigning, PrepareStore, PreparedSpend};
 use xindex_shared::chain_registry::ChainId;
 use xindex_turnkey_client::{Activity, SignRawPayloadParams, TurnkeyApi};
 
@@ -216,6 +216,15 @@ impl<T: TurnkeyApi, P: PrepareStore> TurnkeyCosmosRedeemExecutor<T, P> {
                     to_address: vault.to_string(),
                     amount_dec: send_amount_dec.clone(),
                     memo: task.memo.clone(),
+                    signing: AccountSigning::Cosmos {
+                        from_address: self.config.account_address.clone(),
+                        cosmos_chain_id: self.config.cosmos_chain_id.clone(),
+                        account_number,
+                        sequence,
+                        denom: self.config.denom.clone(),
+                        fee_amount: self.config.fee_amount,
+                        gas_limit: self.config.gas_limit,
+                    },
                     ric: task.intent_proof.clone(),
                     spend_identity: sequence.to_be_bytes().to_vec(),
                 }),
