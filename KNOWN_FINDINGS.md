@@ -796,6 +796,66 @@ No code change applied (no fund-critical bug; the Low/Info items are fail-closed
 config-hardening where current behavior is already correct). TOCTOU-2/-3 (explicit
 `busy_timeout`/WAL) is the one worthwhile follow-up hardening if a dedicated pass is opened.
 
+## Delta audit (2026-07-02) — Turnkey custody stack — TK-01…04 / RS-01…02
+
+Report: `~/XINDEX audit/AUDIT-REPORT-2026-07-02.md`. Seven findings, all
+independently re-verified real. All FIXED 2026-07-04 on `feat/turnkey-custody`
+(the Solidity SOL-01 sibling is in the `Xindex` repo). The Turnkey approver was
+`--dev`-gated; TK-01 + TK-02 were the stated preconditions for lifting that gate.
+
+- **TK-01 — CRITICAL (was gated). ✅ Fixed.** The approver looked up the prepared
+  spend by the store key but never re-derived the signing hash from the declared
+  fields, so an untrusted executor (which writes BOTH the store key and the
+  Turnkey payload) could pair an honest bound context with a signature over a
+  different message. FIX: widened `EvmPrepared` (`EvmSigning`: nonce/gas/fees) and
+  `AccountPrepared` (`AccountSigning` per-family enum) to carry every signing-hash
+  input; the approver now reconstructs the unsigned tx and recomputes the hash
+  (`custody-node/src/recompute.rs::verify_payload_and_fee`, run in
+  `dispatch::decide_callback` BEFORE the family core) and REJECTs unless it equals
+  the payload. BTC recomputes each input's BIP-143 sighash from the PSBT
+  `witness_utxo`. The EVM builder is shared (`custody-core/src/evm_tx.rs`) so the
+  executor and approver cannot diverge; the account families reuse the exact
+  tx-crate builders. Schema-widen decision = DL-TK01-SCHEMA-1 (founder, 2026-07-03).
+  Deleted the false `dispatch.rs` comment that invited premature gate removal.
+- **TK-02 — HIGH (was gated). ✅ Fixed.** Fee/gas were copied verbatim into the
+  Turnkey path with no cap (RUST-002/M2b regression). FIX: the approver enforces
+  per-chain `max_redeem_fee_base_units()` on the declared fee — EVM
+  `gas_limit × max_fee` (or `gas_price` for legacy), Cosmos `fee_amount`, XRP
+  `fee_drops`, TRON `fee_limit`, and BTC implied fee `Σin − Σout` from the
+  `witness_utxo` values (parity with the daemon's `enforce_change_and_fee`).
+- **TK-03 — LOW (latent, fail-closed). ✅ Fixed.** The Solana one-shot keyed on the
+  CONSTANT `redemption_id`, so two different-blockhash messages shared one identity
+  and both passed `Idempotent→Ok`. FIX: `spend_identity = keccak256(message_bytes)`
+  (per-tx, varies with the blockhash), and the false module doc corrected. Solana
+  stays out of v1 (`intent_proof=None` still fail-closes; P-SOL-7).
+- **TK-04 — LOW (fail-closed griefing, prod path). ✅ Fixed.** The RIC/ACC one-shot
+  was consumed BEFORE the dest/amount/memo bind, so a valid-RIC-but-bind-failing
+  request with a bogus identity pinned `(chain, redemptionId, legIndex)` and the
+  leg was unspendable (no reset path). FIX: split the gates into validate → (caller
+  binds) → consume (`gates.rs::{validate_ric_intent, consume_ric_one_shot,
+  validate_spend_certificate, consume_spend_certificate, ConsumeKey}`); the
+  custody-node cores (account/evm/btc) now record the one-shot only after a
+  successful bind. Regression: `account::bind_failure_does_not_pin_the_leg`. The
+  transitional signer-daemon keeps the old order (consume-in-gate) — it is being
+  retired and its custody role is out of the go-forward path; noted as a follow-on.
+- **RS-01 — LOW (robustness, fail-closed). ✅ Fixed.** The TWAP buffer assumed
+  monotonic timestamps; a backward wall-clock step underflowed the segment-gap
+  subtraction. FIX: `price_twap::compute` uses `checked_sub` → `NonMonotonicSamples`
+  (fail closed), and `price_sign::record_sample` drops any sample not newer than the
+  last (buffer stays strictly ascending). Trigger needs a trusted-host clock step.
+- **RS-02 — LOW (robustness, dev-gated). ✅ Fixed.** FIX: `turnkey-client` sets
+  `connect_timeout(10s)` + `timeout(30s)`; `get_activity` asserts the returned
+  `activity.id` matches the request; the approver bin wires `SqliteReplayStore`
+  when `--db` is set (was hard-coded `InMemoryReplayStore`) — a shared URL backs
+  both stores (custody-core migrations 0001–0015 live in one dir), so RIC one-shot
+  rows persist across restarts.
+
+Verify: `custody-core` 44, `custody-node` 32 (+recompute/TK-04 regressions),
+`turnkey-client`, `solana-tx`, `shared` 137 (+RS-01), `signer-daemon` 136 (+RS-01),
+`executor` 96 — all green; `just gate` (fmt + clippy `-D warnings` + workspace test
++ deny + audit) run before commit. SOL-01 (the only live finding) is Solidity — see
+`Xindex/KNOWN_FINDINGS.md`.
+
 ## When this file gets updated
 
 - New audit pass (internal or external) → add a section

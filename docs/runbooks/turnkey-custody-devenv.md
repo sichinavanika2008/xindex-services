@@ -52,7 +52,7 @@ request/response JSON and confirm or fix the pinned shape.
 | R2 | `turnkey-client/src/types.rs` (`HASH_FUNCTION_NO_OP`) | a pre-hashed sighash uses `HASH_FUNCTION_NO_OP` | Confirm `NO_OP` (sign the bytes as-given) vs `NOT_APPLICABLE`. Wrong value ⇒ Turnkey re-hashes our sighash ⇒ invalid signature. |
 | R3 | `turnkey-client/src/types.rs` (`Activity::signed_payload`) | the signed payload is at `activity.intent.signRawPayloadIntentV2.payload` | Capture a real `SIGN_RAW_PAYLOAD` activity; confirm the intent field name + that `payload` echoes our submitted sighash hex. The approver's correlation key depends on this. |
 | R4 | `turnkey-client/src/lib.rs` + approver bin | the approver discovers activities via CLI `--activity-id`; `ACTIVITY_UPDATES` webhook is the production push trigger | Capture the real `ACTIVITY_UPDATES` webhook payload; build the push path (see §3 follow-on). |
-| R5 | `custody-node/src/dispatch.rs` | the family core binds dest/amount/memo to the RIC; it does NOT yet re-derive the sighash and assert it equals the activity `payload` | Implement the cross-check once R3 confirms the payload field: `sighash(prepared_tx) == activity.payload`. This closes the "coordinator prepared X, submitted Y" gap; until then the approver-watcher's `--dev` flag gates it (`xindex-turnkey-approver` refuses to start without `--dev`). |
+| R5 | `custody-node/src/recompute.rs` + `dispatch.rs` | **BUILT (TK-01, 2026-07-04):** the approver reconstructs the unsigned tx from the prepared fields, recomputes the signing hash, and asserts it equals the correlation `payload` (`verify_payload_and_fee`, run in `decide_callback` before the family core) + caps the fee (TK-02). | Confirm R3 first — the recompute compares against the SAME string the approver reads as `payload`. Once R3 pins the real payload field, verify an honest signet/Sepolia activity APPROVEs (hashes match) and a tampered one REJECTs `payload_binding_mismatch`. The remaining gate is the wire (R1–R4/R6), not this cross-check. |
 | R6 | EVM (`value` / chain ids) | EIP-1559/legacy per `chain.tx_type`; nonce + `EvmTxFee` caller-supplied (DL-P3.2-7) | Confirm Turnkey's `r,s,v` parity maps to EIP-1559 `y_parity = v==1`; broadcast a real testnet tx and verify it confirms. |
 
 ## 2. BTC validation (the decisive gate — Phase 2.A's only mainnet chain)
@@ -78,17 +78,22 @@ OP_RETURN, STOP** — the BTC path is blocked (re-evaluate before any more code)
 
 ## 3. Follow-on (gated on §1–§2 passing — do NOT build before validation)
 
-- **Sighash↔payload cross-check** (R5) — the one remaining security hardening;
-  needed before dropping `--dev`.
 - **`ACTIVITY_UPDATES` webhook** push-trigger for the approver (R4) — replaces
   the CLI `--activity-id` poll path for production.
-- **Account-family reroutes** (Cosmos / XRP / TRON) + **Solana** — same
-  build+sign+return shape as BTC/EVM; the `decide_account_send` decision core
-  already exists. **Deliberately deferred until the BTC wire is validated** —
-  building 4 more families on an unvalidated wire risks reworking all of them.
+- **Account-family reroutes** (Cosmos / XRP / TRON / Solana) — BUILT
+  (`executor::turnkey_{cosmos,xrp,tron,solana}_redeem` + the approver recompute
+  for each family), but the same wire (R1–R4/R6) must be validated before their
+  own dev-env sign tests. Solana stays out of v1 (`intent_proof=None`
+  fail-closes; P-SOL-7).
+- **`--dev` gate lift** — with TK-01 + TK-02 in force AND R1–R4/R6 reconciled
+  green, the audit's stated preconditions are met. Do NOT lift silently: replace
+  `assert_dev_only` with an explicit `--production` opt-in and surface for founder
+  sign-off at that moment.
 - **Retire the on-chain multisig crates** (`multisig`/`safe-evm`/`*-tx`/
   `signer-daemon`) once Turnkey is confirmed as THE custody model.
-- README "no single key" honesty edit; mirror DL-CUSTODY-TURNKEY-1 → plan §14.
+- README "no single key" honesty edit; mirror DL-CUSTODY-TURNKEY-1 → plan §14
+  (deferred until the provider is validated — do not bake Turnkey into public
+  positioning while the wire is unvalidated).
 - SOC 2 Type II review + key-export DR rehearsal (founder procurement).
 
 ## Gate state (as of this branch)
