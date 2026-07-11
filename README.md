@@ -5,9 +5,11 @@ protocol. Sibling repo to the Solidity layer; independent git history,
 CI, and audit scope.
 
 The on-chain (Solidity) layer cannot finalize a single async mint or
-settle a single redeem until the services in this repo ship. See
-`~/.claude/plans/so-our-project-should-zany-yao.md` §15–§16 for the
-authoritative milestone plan.
+settle a single redeem until the services in this repo ship. Read the
+[shared Codex/GPT project guide](../Xindex/AGENTS.md) and this repository's
+[local guide](AGENTS.md) before making changes. They replace prior AI-session
+plans as the active operating context; current source, tests, the recent
+findings, and the Turnkey runbook are authoritative.
 
 ## Crates
 
@@ -23,7 +25,7 @@ authoritative milestone plan.
 | `executor` | Watches `RedeemDispatched` events. Constructs Bitcoin PSBTs, coordinates 3-of-5 multisig signing rounds, broadcasts. |
 | `ops` | Prometheus metrics, structured tracing/logging, alerting glue, on-call runbook. |
 
-## Milestone status
+## Historical milestone snapshot
 
 | Milestone | Status |
 |---|---|
@@ -34,7 +36,9 @@ authoritative milestone plan.
 | M5 — YubiHSM2 + ops + adversarial | — |
 | M6 — audits + mainnet | — |
 
-See plan §15 for milestone details and §16 for M1 execution gates.
+This table is retained as historical context and can be stale. Use the current
+guides, code, tests, and runbooks rather than an old planning document to judge
+readiness or launch gates.
 
 ## Local development
 

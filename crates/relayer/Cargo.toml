@@ -27,6 +27,7 @@ futures-util.workspace = true
 sqlx.workspace = true
 prometheus.workspace = true
 serde_json.workspace = true
+axum = { workspace = true, features = ["json"] }
 
 [[bin]]
 name = "xindex-cancel"
@@ -39,3 +40,7 @@ path = "src/bin/xindex-finalize-redeem.rs"
 [[bin]]
 name = "xindex-hint-builder"
 path = "src/bin/xindex-hint-builder.rs"
+
+[[bin]]
+name = "xindex-price-collector"
+path = "src/bin/xindex-price-collector.rs"

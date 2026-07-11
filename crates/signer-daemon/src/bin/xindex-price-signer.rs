@@ -4,9 +4,9 @@
 //! On an interval, for each configured asset: source the price from multiple
 //! independent CEX venues + the circulating supply from supply feeds, median
 //! each (outlier-rejected, fail-closed), sign the `PriceAttestation` with the
-//! HSM (recover-verified), and emit it as a JSON line on stdout. A collector
-//! gathers the k-of-n signatures and posts `attestPrice` on-chain (that posting
-//! half folds into the rehearsal, like the other families' broadcast legs).
+//! HSM (recover-verified), emit the complete signed tuple as a JSON line, and
+//! push it to the configured untrusted collectors. Collectors recover-verify
+//! and group exact tuples before posting `attestPrice` on-chain.
 //!
 //! It NEVER signs a price it was handed — it signs its own aggregated value
 //! (the CTD-1 "don't trust the coordinator" property applied to the oracle).
@@ -26,6 +26,7 @@ use alloy_primitives::{Address, B256};
 use serde::Deserialize;
 use xindex_shared::eip712::price_oracle_domain;
 use xindex_shared::price_twap::{TwapConfig, TwapSample};
+use xindex_shared::price_wire::SignedPriceMessage;
 use xindex_signer_daemon::price_sign::{produce_signed_price, PricePolicy, ProducerInputs};
 use xindex_signer_daemon::price_supply::{CoinGeckoSupply, SupplyFeed};
 use xindex_signer_daemon::price_venue::{BinanceVenue, CoinbaseVenue, Feed, KrakenVenue};
@@ -60,9 +61,25 @@ struct Config {
     twap_max_gap_secs: u64,
     /// Seconds between observation rounds.
     interval_secs: u64,
+    /// Deterministic timestamp epoch shared by every independent signer. The
+    /// timestamp signed in a round is `floor(now / epoch_secs) * epoch_secs`,
+    /// never the host's arbitrary wall-clock second.
+    epoch_secs: u64,
+    /// Decimal significant digits retained in the signed WAD price. Four is the
+    /// minimum accepted (<10 bps deterministic downward canonicalization).
+    price_significant_digits: u8,
+    /// Decimal significant digits retained in the signed raw supply.
+    supply_significant_digits: u8,
     /// Path to the durable anti-equivocation state file (per-asset last-signed
     /// timestamps); persists the monotonic guard across restarts.
     state_file: String,
+    /// Base URLs of redundant untrusted collectors. The signer independently
+    /// creates the price; collectors receive only an already-signed tuple.
+    collector_urls: Vec<String>,
+    /// Per-collector publish attempts for transient transport/5xx/429 errors.
+    publish_attempts: u32,
+    /// Timeout for one collector HTTP attempt.
+    publish_timeout_secs: u64,
     binance_base: String,
     coinbase_base: String,
     kraken_base: String,
@@ -87,6 +104,15 @@ fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Align an observation to the shared deterministic epoch. `epoch_secs == 0`
+/// is rejected at boot, so this helper's zero branch is defensive only.
+fn observation_epoch(now: u64, epoch_secs: u64) -> u64 {
+    if epoch_secs == 0 {
+        return 0;
+    }
+    now - now % epoch_secs
 }
 
 /// Load the persisted per-asset last-signed timestamps (the anti-equivocation
@@ -138,6 +164,32 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    if cfg.epoch_secs == 0 || cfg.interval_secs == 0 || cfg.epoch_secs != cfg.interval_secs {
+        return Err(format!(
+            "epoch_secs and interval_secs must be the same non-zero cadence (epoch={}, interval={}); \
+             every signer must produce at most one tuple for the same shared epoch",
+            cfg.epoch_secs, cfg.interval_secs
+        )
+        .into());
+    }
+    if !(4..=78).contains(&cfg.price_significant_digits) {
+        return Err(format!(
+            "price_significant_digits must be in 4..=78 (got {}); fewer than 4 can \
+             move the canonical price downward by >=10 bps",
+            cfg.price_significant_digits
+        )
+        .into());
+    }
+    if !(4..=78).contains(&cfg.supply_significant_digits) {
+        return Err(format!(
+            "supply_significant_digits must be in 4..=78 (got {})",
+            cfg.supply_significant_digits
+        )
+        .into());
+    }
+    if cfg.publish_attempts == 0 || cfg.publish_timeout_secs == 0 {
+        return Err("publish_attempts and publish_timeout_secs must be non-zero".into());
+    }
     // TWAP (OM-4) window sanity. Ordering: interval <= max_gap <= window, and
     // >= 2 informing samples (a single sample is not a time average).
     if cfg.twap_min_samples < 2 {
@@ -165,6 +217,49 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+const COLLECT_PATH: &str = "/api/v1/price-signature";
+
+/// Publish an already-signed tuple. Retry only errors that can plausibly change
+/// without changing the signed plaintext (transport, 429, 5xx). A collector's
+/// deterministic 4xx rejection is logged and not retried.
+async fn publish_to_collector(
+    http: &reqwest::Client,
+    base_url: &str,
+    message: &SignedPriceMessage,
+    attempts: u32,
+) -> Result<(), String> {
+    let url = format!("{}{COLLECT_PATH}", base_url.trim_end_matches('/'));
+    for attempt in 1..=attempts {
+        match http.post(&url).json(message).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response)
+                if response.status().is_server_error()
+                    || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                let status = response.status();
+                if attempt == attempts {
+                    return Err(format!("http {status} after {attempts} attempt(s)"));
+                }
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!(
+                    "collector rejected signed tuple: http {status}: {body}"
+                ));
+            }
+            Err(e) => {
+                if attempt == attempts {
+                    return Err(format!("transport after {attempts} attempt(s): {e}"));
+                }
+            }
+        }
+        let shift = attempt.saturating_sub(1).min(6);
+        tokio::time::sleep(Duration::from_millis(250u64.saturating_mul(1u64 << shift))).await;
+    }
+    Err("publish attempt loop exhausted".to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
@@ -182,6 +277,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Result<_, _>>()?;
 
     let http = reqwest::Client::new();
+    let publish_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(cfg.publish_timeout_secs))
+        .build()?;
     let binance = BinanceVenue::new(http.clone(), &cfg.binance_base);
     let coinbase = CoinbaseVenue::new(http.clone(), &cfg.coinbase_base);
     let kraken = KrakenVenue::new(http.clone(), &cfg.kraken_base);
@@ -192,6 +290,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         min_venues: cfg.min_venues,
         max_deviation_bps: cfg.max_deviation_bps,
         supply_min_venues: cfg.supply_min_venues,
+        price_significant_digits: cfg.price_significant_digits,
+        supply_significant_digits: cfg.supply_significant_digits,
         twap: TwapConfig {
             window_secs: cfg.twap_window_secs,
             min_samples: cfg.twap_min_samples,
@@ -209,7 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs));
     loop {
         tick.tick().await;
-        let now = now_unix();
+        let now = observation_epoch(now_unix(), cfg.epoch_secs);
         for (asset_id, a) in &assets {
             let price_feeds = [
                 Feed {
@@ -253,15 +353,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cfg.state_file
                         );
                     }
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "assetId": format!("{asset_id:#x}"),
-                            "priceWad": signed.price_wad.to_string(),
-                            "timestamp": now,
-                            "signature": format!("0x{}", alloy_primitives::hex::encode(signed.signature)),
-                        })
-                    );
+                    let message = SignedPriceMessage {
+                        asset_id: format!("{:#x}", signed.asset_id),
+                        price_wad: signed.price_wad.to_string(),
+                        supply: signed.supply.to_string(),
+                        timestamp: signed.timestamp,
+                        signer_address: format!("{:#x}", signed.signer_address),
+                        signature: format!("0x{}", alloy_primitives::hex::encode(signed.signature)),
+                    };
+                    println!("{}", serde_json::to_string(&message)?);
+                    for collector in &cfg.collector_urls {
+                        if let Err(e) = publish_to_collector(
+                            &publish_http,
+                            collector,
+                            &message,
+                            cfg.publish_attempts,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "price-publish {asset_id:#x} epoch {now} to {collector} failed: {e}"
+                            );
+                        }
+                    }
                 }
                 Err(e) => eprintln!("price-sign {asset_id:#x} failed (fail-closed): {e}"),
             }
@@ -315,7 +429,13 @@ mod tests {
             twap_min_samples: 10,
             twap_max_gap_secs: 300,
             interval_secs: 60,
+            epoch_secs: 60,
+            price_significant_digits: 4,
+            supply_significant_digits: 6,
             state_file: "/tmp/xindex-price-signer-state.json".into(),
+            collector_urls: vec!["http://127.0.0.1:9191".into()],
+            publish_attempts: 3,
+            publish_timeout_secs: 5,
             binance_base: String::new(),
             coinbase_base: String::new(),
             kraken_base: String::new(),
@@ -333,6 +453,26 @@ mod tests {
     fn validate_config_rejects_two_venues() {
         let mut c = valid_cfg();
         c.min_venues = 2; // no odd honest anchor
+        assert!(validate_config(&c).is_err());
+    }
+
+    #[test]
+    fn observation_time_is_epoch_aligned_and_never_future() {
+        assert_eq!(observation_epoch(1_700_000_059, 60), 1_700_000_040);
+        assert!(observation_epoch(1_700_000_059, 60) <= 1_700_000_059);
+    }
+
+    #[test]
+    fn validate_config_rejects_mismatched_epoch_cadence() {
+        let mut c = valid_cfg();
+        c.epoch_secs = 30;
+        assert!(validate_config(&c).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_coarse_price_canonicalization() {
+        let mut c = valid_cfg();
+        c.price_significant_digits = 3;
         assert!(validate_config(&c).is_err());
     }
 

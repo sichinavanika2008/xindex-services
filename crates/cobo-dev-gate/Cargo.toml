@@ -1,0 +1,28 @@
+[package]
+name = "xindex-cobo-dev-gate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "xindex-cobo-dev-gate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+bitcoin.workspace = true
+alloy.workspace = true
+alloy-primitives.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+xindex-shared.workspace = true

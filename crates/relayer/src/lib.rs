@@ -13,12 +13,16 @@
 //! contract's `IntentState` is canonical.
 
 pub mod hint_builder;
+pub mod price_collector;
 pub mod redemption_store;
 pub mod store;
 pub mod tracker;
 
 pub use hint_builder::{
     plan_stream, slip_bps, HintParams, StreamPlan, MAX_STREAM_BLOCKS, THOR_BLOCK_SECS,
+};
+pub use price_collector::{
+    IngestOutcome, PriceCollectError, PriceCollector, PricePayload, ReadyPrice,
 };
 pub use redemption_store::{
     InMemoryRedemptionTracker, RedemptionTrackerError, RedemptionTrackerStore,

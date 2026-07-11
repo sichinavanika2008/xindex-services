@@ -34,10 +34,19 @@ pub struct PricePolicy {
     pub max_deviation_bps: u32,
     /// Minimum independent SUPPLY sources required. Separate (and typically
     /// lower) than `min_venues`: far fewer independent circulating-supply feeds
-    /// exist than price venues, and supply is slow-moving + less manipulable,
-    /// so it is additionally backstopped by the on-chain absolute-bounds (L1)
-    /// guard.
+    /// exist than price venues, and supply is slow-moving. It is signed because
+    /// it is part of the deployed EIP-712/on-chain quote shape; the current NAV
+    /// consumer reads price only, so supply is not presently a mint input.
     pub supply_min_venues: usize,
+    /// Decimal significant digits retained in the signed price. Every signer
+    /// applies the same deterministic floor after its independent TWAP. This
+    /// makes close honest observations converge to byte-identical payloads;
+    /// the collector still requires an exact k-of-n match.
+    pub price_significant_digits: u8,
+    /// Decimal significant digits retained in the signed raw supply. Supply is
+    /// slow moving, but it is still part of the EIP-712 plaintext and therefore
+    /// must be canonicalized identically across signers.
+    pub supply_significant_digits: u8,
     /// Temporal smoothing applied to the sequence of spatial medians, AFTER the
     /// venue outlier rejection (OM-4). Removes flash / one-interval manipulation
     /// that briefly captures a venue majority.
@@ -52,7 +61,8 @@ pub struct PriceObservation {
     /// The robust price the signature commits to — the spatial median passed
     /// through the temporal TWAP (both fail-closed upstream).
     pub price_wad: U256,
-    /// Token supply attested alongside the price (NAV input).
+    /// Token supply attested and stored alongside the price. The current NAV
+    /// consumer discards it, but it remains part of the deployed signed shape.
     pub supply: U256,
     /// Observation time (unix secs); MUST strictly exceed `last_signed_at`.
     pub timestamp: u64,
@@ -61,11 +71,21 @@ pub struct PriceObservation {
     pub last_signed_at: Option<u64>,
 }
 
-/// A signed price attestation: the aggregated price + the 65-byte signature.
+/// A complete signed price attestation. The collector needs every signed field
+/// (including supply) to group byte-identical payloads safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedPrice {
+    /// Registry asset id committed by the signature.
+    pub asset_id: B256,
     /// The aggregated (robust) price the signature commits to.
     pub price_wad: U256,
+    /// Raw circulating supply committed by the signature.
+    pub supply: U256,
+    /// Deterministic observation epoch committed by the signature.
+    pub timestamp: u64,
+    /// Address recovered from the signature (and pinned to the configured HSM
+    /// address before this value is returned).
+    pub signer_address: Address,
     /// 65-byte recoverable ECDSA signature over the EIP-712 digest.
     pub signature: [u8; 65],
 }
@@ -80,6 +100,15 @@ pub enum PriceSignError {
     /// stale feed, or too-thin window — all fail-closed).
     #[error("price twap: {0}")]
     Twap(#[from] TwapError),
+    /// Significant-digit canonicalization was misconfigured. Signing without
+    /// canonicalization would silently destroy exact quorum liveness.
+    #[error("{field} significant digits must be in 1..=78 (got {digits})")]
+    InvalidCanonicalDigits {
+        /// Policy field that was invalid.
+        field: &'static str,
+        /// Rejected significant-digit count.
+        digits: u8,
+    },
     /// `timestamp` did not strictly exceed the last signed timestamp for this
     /// asset — refuse, lest two prices be signed for one instant (equivocation).
     #[error("non-monotonic timestamp {timestamp} <= last signed {last}")]
@@ -134,8 +163,13 @@ pub async fn sign_observed_price<H: HsmDigestSigner>(
     let att = price_attestation(obs.asset_id, obs.price_wad, obs.supply, obs.timestamp);
     let digest = price_attestation_signing_hash(&att, domain);
     let signature = hsm.sign_digest(signer_address, digest).await?;
-    let recovered = PrimitiveSignature::try_from(&signature[..])
-        .map_err(|e| PriceSignError::SignatureParse(e.to_string()))?
+    // PriceAttestationOracle uses OpenZeppelin ECDSA, which enforces EIP-2
+    // low-S. Normalize defensively (Web3Signer normally already emits low-S)
+    // and recover-verify the exact canonical bytes we publish.
+    let parsed = PrimitiveSignature::try_from(&signature[..])
+        .map_err(|e| PriceSignError::SignatureParse(e.to_string()))?;
+    let canonical = parsed.normalize_s().unwrap_or(parsed);
+    let recovered = canonical
         .recover_address_from_prehash(&digest)
         .map_err(|e| PriceSignError::SignatureParse(e.to_string()))?;
     if recovered != signer_address {
@@ -145,9 +179,52 @@ pub async fn sign_observed_price<H: HsmDigestSigner>(
         });
     }
     Ok(SignedPrice {
+        asset_id: obs.asset_id,
         price_wad: obs.price_wad,
-        signature,
+        supply: obs.supply,
+        timestamp: obs.timestamp,
+        signer_address,
+        signature: canonical.as_bytes(),
     })
+}
+
+/// Deterministically floor a decimal integer to `significant_digits` decimal
+/// significant digits. This is deliberately an integer operation over the
+/// already-robust observation; it does not introduce a coordinator-chosen
+/// price. For example, `43_217` at four digits becomes `43_210`.
+///
+/// The maximum downward movement is less than `10^(1-digits)` of the value
+/// (four digits: <10 bps). Production config is validated separately so a
+/// coarse setting cannot be introduced accidentally.
+fn canonicalize_significant(value: U256, significant_digits: u8) -> U256 {
+    let decimal_digits = value.to_string().len();
+    let keep = usize::from(significant_digits);
+    if decimal_digits <= keep {
+        return value;
+    }
+    let mut quantum = U256::from(1u8);
+    for _ in 0..(decimal_digits - keep) {
+        // `decimal_digits <= 78` for U256 and we only raise to at most
+        // 10^77 here, so this multiplication cannot saturate.
+        quantum = quantum.saturating_mul(U256::from(10u8));
+    }
+    (value / quantum) * quantum
+}
+
+fn validate_canonical_digits(policy: PricePolicy) -> Result<(), PriceSignError> {
+    if !(1..=78).contains(&policy.price_significant_digits) {
+        return Err(PriceSignError::InvalidCanonicalDigits {
+            field: "price",
+            digits: policy.price_significant_digits,
+        });
+    }
+    if !(1..=78).contains(&policy.supply_significant_digits) {
+        return Err(PriceSignError::InvalidCanonicalDigits {
+            field: "supply",
+            digits: policy.supply_significant_digits,
+        });
+    }
+    Ok(())
 }
 
 /// Where to source one asset's price + circulating supply for a producer step.
@@ -191,6 +268,7 @@ pub async fn produce_signed_price<H: HsmDigestSigner>(
     input: &ProducerInputs<'_>,
     history: &mut Vec<TwapSample>,
 ) -> Result<SignedPrice, PriceSignError> {
+    validate_canonical_digits(policy)?;
     let price_quotes = crate::price_venue::source_quotes(input.price_feeds).await;
     let supply_quotes =
         crate::price_supply::source_supply(input.supply_feeds, input.decimals).await;
@@ -207,6 +285,12 @@ pub async fn produce_signed_price<H: HsmDigestSigner>(
     // window. Cold start / stale feed / thin window fail closed inside the TWAP.
     record_sample(history, input.timestamp, spatial, policy.twap);
     let price_wad = time_weighted_average(history, input.timestamp, policy.twap)?;
+    // Coordination layer: honest operators observe independently, then each
+    // applies the SAME deterministic epoch (caller) and significant-digit
+    // flooring (here). No coordinator supplies a price. The untrusted collector
+    // groups only exact four-field matches and cannot average signatures.
+    let price_wad = canonicalize_significant(price_wad, policy.price_significant_digits);
+    let supply = canonicalize_significant(supply, policy.supply_significant_digits);
     let obs = PriceObservation {
         asset_id: input.asset_id,
         price_wad,
@@ -299,6 +383,8 @@ mod tests {
             min_venues: 3,
             max_deviation_bps: 5000,
             supply_min_venues: 1,
+            price_significant_digits: 4,
+            supply_significant_digits: 6,
             // 60s window, ≥2 informing samples, ≤60s per stale gap.
             twap: TwapConfig {
                 window_secs: 60,
@@ -306,6 +392,45 @@ mod tests {
                 max_gap_secs: 60,
             },
         }
+    }
+
+    #[test]
+    fn canonicalization_converges_close_observations_exactly() {
+        assert_eq!(
+            canonicalize_significant(U256::from(43_217u64), 4),
+            U256::from(43_210u64)
+        );
+        assert_eq!(
+            canonicalize_significant(U256::from(43_219u64), 4),
+            U256::from(43_210u64)
+        );
+        assert_eq!(
+            canonicalize_significant(U256::from(999u64), 4),
+            U256::from(999u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_canonicalization_policy_fails_before_hsm() {
+        let (sk, addr) = key_and_addr(7);
+        let hsm = StubHsm { sk };
+        let mut bad = policy();
+        bad.price_significant_digits = 0;
+        let input = ProducerInputs {
+            asset_id: B256::repeat_byte(0x11),
+            decimals: 8,
+            price_feeds: &[],
+            supply_feeds: &[],
+            timestamp: 1000,
+            last_signed_at: None,
+        };
+        let err = produce_signed_price(&hsm, addr, &domain(), bad, &input, &mut Vec::new())
+            .await
+            .expect_err("invalid policy must fail first");
+        assert!(matches!(
+            err,
+            PriceSignError::InvalidCanonicalDigits { field: "price", .. }
+        ));
     }
 
     /// A carry-in sample dated at `window_start` (`now - window_secs`) priced at

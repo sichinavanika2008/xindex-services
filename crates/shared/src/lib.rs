@@ -11,6 +11,7 @@ pub mod eip712;
 pub mod intent;
 pub mod price_aggregate;
 pub mod price_twap;
+pub mod price_wire;
 pub mod redemption_dispatch;
 pub mod ric_relay;
 pub mod signer_wire;

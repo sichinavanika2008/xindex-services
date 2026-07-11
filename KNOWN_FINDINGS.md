@@ -4,6 +4,11 @@ Mirror of the Solidity-side `Xindex/KNOWN_FINDINGS.md` discipline:
 every audit finding is either fixed in code or documented here with
 verdict and reasoning. No silent suppressions.
 
+> **Historical-record note (2026-07-10):** legacy AI-tool names and out-of-tree
+> paths in older entries are provenance only, not active instructions. Use
+> `AGENTS.md`, current source, tests, and the current Turnkey runbook for
+> present work.
+
 Audit log: 2026-05-09 (two-pass internal audit covering ~5,000 LOC).
 
 ## Status legend
@@ -277,7 +282,7 @@ available.
 Revisit when either sqlx-mysql moves off rsa 0.9 or a patched rsa
 release lands.
 
-### P3.1-9: Per-chain end-to-end PSBT test modules (deferred)
+### P3.1-9: Per-chain end-to-end PSBT test modules (partially closed)
 
 The plan called for 4 per-chain E2E test modules (LTC + BCH + DOGE +
 ZEC). The implementation ships the building blocks (U4 descriptor
@@ -286,11 +291,20 @@ fully unit-tested. The combined per-chain E2E harnesses are deferred
 to a follow-up — they add concentration coverage but no NEW
 security-critical surface beyond the unit tests.
 
-**Status:** ⏳ Deferred. Pre-mainnet (per DL-P3-7) audit + per-chain
-key ceremony will require at least one per-chain mainnet rehearsal,
-which the per-chain E2E test should mirror.
+**Status:** BTC, LTC, and DOGE are closed in
+`signer-daemon/tests/utxo_multichain_e2e.rs`: the production descriptor,
+canonical address codec, chain parameters, PSBT builder, BIP-143 signer, and
+miniscript finalizer are exercised end to end for both SegWit chains; DOGE
+additionally forces the production P2SH `non_witness_utxo` + pre-BIP-143 legacy
+sighash branch through a finalized 3-of-5 transaction. BCH and ZEC now have
+chain-specific negative qualification tests that exercise their canonical
+codecs, parameters, descriptors, and prevout shapes before pinning the exact
+`UnsupportedSighash(BchForkId|ZcashBlake2b)` result. Positive BCH/ZEC E2E remains
+deferred until those algorithms are implemented and independently audited.
+Pre-mainnet rehearsals and per-chain key ceremonies remain mandatory under
+DL-P3-7.
 
-### P3.1-10: 2-chain loopback (BTC + LTC) deferred
+### P3.1-10: 2-chain loopback (BTC + LTC)
 
 The plan called for the `signer-daemon` loopback test to be extended
 to a parametrized 2-chain harness exercising the multi-role HashMap
@@ -298,7 +312,11 @@ routing. The U8 commit ships the multi-role machinery; the
 integration-level 2-chain loopback is deferred to the same follow-up
 as P3.1-9.
 
-**Status:** ⏳ Deferred.
+**Status:** ✅ Closed in `signer-daemon/tests/utxo_multichain_e2e.rs`. One real
+daemon serves BTC and LTC simultaneously with distinct descriptors and HSM
+aliases; the test proves successful chain routing and finalization, identical
+outpoints remain isolated by the replay store's `ChainId`, and a BTC PSBT sent
+to the LTC role is rejected before the LTC HSM key is invoked.
 
 ## Phase 3.2 — EVM custody family (2026-05-26)
 

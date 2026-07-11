@@ -5676,6 +5676,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-cobo-dev-gate"
+version = "0.0.1"
+dependencies = [
+ "alloy",
+ "alloy-primitives",
+ "anyhow",
+ "bitcoin",
+ "clap",
+ "ed25519-dalek",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "xindex-shared",
+]
+
+[[package]]
 name = "xindex-cosmos-tx"
 version = "0.0.1"
 dependencies = [
@@ -5800,6 +5818,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "anyhow",
+ "axum",
  "clap",
  "futures-util",
  "prometheus",
@@ -5898,6 +5917,7 @@ dependencies = [
  "xindex-chain-evm",
  "xindex-chain-solana",
  "xindex-chain-tron",
+ "xindex-chain-utxo",
  "xindex-chain-xrp",
  "xindex-cosmos-tx",
  "xindex-custody-core",

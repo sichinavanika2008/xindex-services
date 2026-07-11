@@ -78,6 +78,12 @@ The coordinator presents its client cert to each daemon:
 | `AttestationOracle` signer set + threshold | the 5 Set-B addresses, 3 | matches §1 `signer_whitelist` / `intent_quorum` |
 | `PriceAttestationOracle` L1 bounds / L2 Chainlink feed / deviation cap | ____ | per `DL-INDEX-METHOD-ORACLE-1`; the off-chain `xindex-price-signer` feeds it |
 
+The price path is configured separately in
+[`price-oracle-pipeline.md`](price-oracle-pipeline.md). All independent price
+signers must share the exact epoch/canonicalization policy; the collector must
+boot with the complete on-chain signer set and matching threshold. A code-green
+pipeline does not replace the Sepolia rehearsal and external-audit gates.
+
 ## 4. Per-family gate (none live on mainnet until ALL are checked)
 
 For every chain, before it touches mainnet funds: per-family external audit ·

@@ -427,9 +427,10 @@ pub fn acquire_cancel_signing_hash(acc: &AcquireCancelCertificate, domain: &Eip7
 sol! {
     /// Per-asset price quote signed by each k-of-n price signer. The on-chain
     /// `PriceAttestationOracle.attestPrice` recovers the signers from the
-    /// EIP-712 digest of this struct and lands `(priceWad, supply)` for
-    /// `assetId` as the NAV input (after its L1 bounds / L2 Chainlink / L3
-    /// challenge-window guards). `timestamp` is the observation time, strictly
+    /// EIP-712 digest of this struct and stores `(priceWad, supply)` for
+    /// `assetId` (after its L1 bounds / L2 Chainlink / L3 challenge-window
+    /// guards). Current NAV math consumes `priceWad` and discards `supply`, but
+    /// both remain in the deployed signed shape. `timestamp` is the observation time, strictly
     /// increasing per asset (anti-replay). A SEPARATE EIP-712 domain (name
     /// `Xindex PriceAttestationOracle`) and typehash from the mint/redeem
     /// attestations — a price signature can never verify on a custody path.
