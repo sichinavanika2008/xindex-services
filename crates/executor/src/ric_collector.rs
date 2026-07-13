@@ -79,6 +79,9 @@ pub enum RicCollectError {
     /// could never assemble a proof. Surfaced at construction.
     #[error("{configured} observer URL(s) configured, need ≥ quorum {quorum}")]
     NotEnoughObservers { configured: usize, quorum: usize },
+    /// Unsafe URL or malformed pinned mTLS material.
+    #[error("observer transport configuration: {0}")]
+    TransportConfiguration(String),
     /// The collected certifications did not assemble into a quorum
     /// proof (too few observers responded, or they split across
     /// incompatible Asgard resolutions).
@@ -140,7 +143,78 @@ impl RicCollector {
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Ok(Self {
-            observer_urls,
+            observer_urls: observer_urls
+                .into_iter()
+                .map(|url| url.trim_end_matches('/').to_string())
+                .collect(),
+            quorum,
+            http,
+        })
+    }
+
+    /// Construct the production collector with a client identity, pinned
+    /// observer roots, HTTPS-only transport, and no system-root fallback.
+    ///
+    /// # Errors
+    /// Insufficient endpoints, non-HTTPS URL, malformed PEM, or client build.
+    pub fn with_mtls_pem(
+        observer_urls: Vec<String>,
+        quorum: usize,
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        observer_root_pem: &[u8],
+        timeout: Duration,
+    ) -> Result<Self, RicCollectError> {
+        if quorum == 0 || observer_urls.len() < quorum {
+            return Err(RicCollectError::NotEnoughObservers {
+                configured: observer_urls.len(),
+                quorum,
+            });
+        }
+        for raw in &observer_urls {
+            let url = reqwest::Url::parse(raw).map_err(|error| {
+                RicCollectError::TransportConfiguration(format!("observer URL: {error}"))
+            })?;
+            if url.scheme() != "https" {
+                return Err(RicCollectError::TransportConfiguration(
+                    "production observer URLs must use https".to_string(),
+                ));
+            }
+        }
+        let mut identity_pem = Vec::with_capacity(client_cert_pem.len() + client_key_pem.len() + 1);
+        identity_pem.extend_from_slice(client_cert_pem);
+        identity_pem.push(b'\n');
+        identity_pem.extend_from_slice(client_key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|_| {
+            RicCollectError::TransportConfiguration(
+                "observer mTLS identity PEM is invalid".to_string(),
+            )
+        })?;
+        let roots = reqwest::Certificate::from_pem_bundle(observer_root_pem).map_err(|_| {
+            RicCollectError::TransportConfiguration("observer root PEM is invalid".to_string())
+        })?;
+        if roots.is_empty() {
+            return Err(RicCollectError::TransportConfiguration(
+                "observer root PEM is empty".to_string(),
+            ));
+        }
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .identity(identity);
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+        let http = builder.build().map_err(|_| {
+            RicCollectError::TransportConfiguration("build observer mTLS client failed".to_string())
+        })?;
+        Ok(Self {
+            observer_urls: observer_urls
+                .into_iter()
+                .map(|url| url.trim_end_matches('/').to_string())
+                .collect(),
             quorum,
             http,
         })
@@ -369,6 +443,22 @@ mod tests {
     fn rejects_zero_quorum() {
         let err = RicCollector::new(vec!["http://a".to_string()], 0).expect_err("must reject");
         assert!(matches!(err, RicCollectError::NotEnoughObservers { .. }));
+    }
+
+    #[test]
+    fn production_collector_rejects_plaintext_before_loading_identity() {
+        let result = RicCollector::with_mtls_pem(
+            vec!["http://observer.example".to_string()],
+            1,
+            b"invalid",
+            b"invalid",
+            b"invalid",
+            Duration::from_secs(1),
+        );
+        assert!(matches!(
+            result,
+            Err(RicCollectError::TransportConfiguration(_))
+        ));
     }
 
     #[tokio::test]

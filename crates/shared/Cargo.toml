@@ -18,13 +18,13 @@ workspace = true
 alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-sol-types.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 # F2 redemption-dispatch store (executor writer / signer reader).
 sqlx.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 # RIC/ACC verifier unit tests (`intent` module) sign test digests with a
 # secp256k1 key. k256 is the workspace secp256k1 crate used across the
 # signing crates; here it is test-only.

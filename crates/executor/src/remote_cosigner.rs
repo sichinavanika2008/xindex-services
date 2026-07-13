@@ -82,10 +82,66 @@ impl RemoteMultisigCosigner {
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
             chain_id,
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             expected_pubkey,
             inner,
         }
+    }
+
+    /// Build a production client with a pinned daemon trust bundle and a
+    /// coordinator client certificate. Plaintext and system-root fallback are
+    /// deliberately unavailable.
+    ///
+    /// # Errors
+    /// Invalid HTTPS URL, PEM identity/root material, or TLS client build.
+    pub fn with_mtls_pem(
+        chain_id: ChainId,
+        base_url: impl Into<String>,
+        expected_pubkey: bitcoin::PublicKey,
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        daemon_root_pem: &[u8],
+        timeout: Duration,
+    ) -> Result<Self, ExecuteError> {
+        let base_url = base_url.into();
+        let parsed = reqwest::Url::parse(&base_url)
+            .map_err(|error| ExecuteError::Configuration(format!("cosigner URL: {error}")))?;
+        if parsed.scheme() != "https" {
+            return Err(ExecuteError::Configuration(
+                "production cosigner URL must use https".to_string(),
+            ));
+        }
+        let mut identity_pem = Vec::with_capacity(client_cert_pem.len() + client_key_pem.len() + 1);
+        identity_pem.extend_from_slice(client_cert_pem);
+        identity_pem.push(b'\n');
+        identity_pem.extend_from_slice(client_key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|_| {
+            ExecuteError::Configuration("cosigner mTLS identity PEM is invalid".to_string())
+        })?;
+        let roots = reqwest::Certificate::from_pem_bundle(daemon_root_pem)
+            .map_err(|_| ExecuteError::Configuration("cosigner root PEM is invalid".to_string()))?;
+        if roots.is_empty() {
+            return Err(ExecuteError::Configuration(
+                "cosigner root PEM is empty".to_string(),
+            ));
+        }
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .identity(identity);
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+        let inner = builder
+            .build()
+            .map_err(|_| ExecuteError::Configuration("build cosigner mTLS client".to_string()))?;
+        Ok(Self {
+            chain_id,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            expected_pubkey,
+            inner,
+        })
     }
 }
 
@@ -189,6 +245,23 @@ mod tests {
         Transaction, TxIn, TxOut, Witness,
     };
     use xindex_multisig::MultisigDescriptor;
+
+    #[test]
+    fn production_cosigner_rejects_plaintext_before_loading_identity() {
+        let secp = Secp256k1::new();
+        let (_, keys) = make_descriptor(&secp);
+        let pubkey = bitcoin::PublicKey::new(keys[0].public_key(&secp));
+        let result = RemoteMultisigCosigner::with_mtls_pem(
+            ChainId::Btc,
+            "http://cosigner.example",
+            pubkey,
+            b"invalid",
+            b"invalid",
+            b"invalid",
+            Duration::from_secs(1),
+        );
+        assert!(matches!(result, Err(ExecuteError::Configuration(_))));
+    }
 
     fn make_descriptor(secp: &Secp256k1<All>) -> (MultisigDescriptor, Vec<SecretKey>) {
         let sks: Vec<SecretKey> = (1u8..=3u8)

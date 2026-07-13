@@ -48,8 +48,11 @@
 
 pub mod http;
 pub mod metrics;
+pub mod tls;
+pub mod topology;
 pub mod tracing_init;
 
 pub use http::{serve_metrics, HttpError};
 pub use metrics::{Metrics, MetricsError};
+pub use topology::{validate_topology, TopologyError, TopologySummary};
 pub use tracing_init::init_tracing;

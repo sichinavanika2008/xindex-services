@@ -6,6 +6,27 @@ Deeper, slower assurance runs in the **Assurance** workflow
 (`.github/workflows/assurance.yml`, scheduled weekly + manual `workflow_dispatch`)
 on GitHub runners rather than a local box that thrashes on full-workspace builds.
 
+## Gate-3 release evidence
+
+The compile/static gate is necessary but does not prove the production trust
+topology or evidence-retention controls. A release custodian must also run:
+
+```bash
+./scripts/check-gate3-release.sh \
+  /secure/release/gate3-topology.json \
+  /var/lib/xindex/evidence/price-signer \
+  /var/lib/xindex/evidence/registry-signer \
+  /var/lib/xindex/evidence/settlement-observer
+```
+
+The wrapper reruns ABI and production-profile checks, validates the checked-in
+Prometheus rules with `promtool`, rejects a collapsed or placeholder operator
+topology, and verifies every evidence file plus its inventory root. It requires
+real owner-only release artifacts and therefore is not replaced by CI fixtures.
+Alert routing, WORM export/reconciliation and incident-drill evidence remain
+operator-controlled requirements described in
+[`gate3-operations.md`](runbooks/gate3-operations.md).
+
 ## cargo-careful — UB + stdlib debug assertions
 
 Runs the suite under a `std` built with debug assertions and extra UB checks.

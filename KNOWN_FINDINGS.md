@@ -879,42 +879,74 @@ Verify: `custody-core` 44, `custody-node` 32 (+recompute/TK-04 regressions),
 The parent-repository audit initially assessed clean `main@365d9b4` and found
 4 Critical, 5 High and 2 Medium production-readiness findings. Local `main` was
 then fast-forwarded, from already-present objects and without fetch/push, to
-`1de7114`; the current feature branch contains the remediation delta.
+`1de7114`; published commit `f22b71a` contains the first remediation pass and
+the current uncommitted feature-branch candidate contains the code-completion
+pass below.
 
-Closed or materially hardened at code level:
+Closed at the reviewed launch-code boundary:
 
 - all eight current parent ABIs are manifested and drift-checked;
 - all seven current EIP-712 report types have Rust vectors, with four pure
   Solidity cross-language checks;
-- registry signing reserves durable state before HSM release, refuses
-  conflicts/equivocation, supports cached retry and serializes/reconciles quote
-  nonces;
-- registry collector input is fully parsed, digest-recomputed,
-  low-S/recovery/allowlist checked and deterministically grouped;
-- price startup requires three distinct price origins, two distinct supply
-  origins and two collector origins; exact bounded raw responses are persisted
-  before signing and anomaly/source failure halts publication;
-- THOR agreement requires all three sources and treats missing halt/LP-pause
-  fields as unsafe;
-- reviewed raw software/Turnkey signer paths and centralized legacy attesters
-  are dev-only, production signer startup requires durable state + mTLS + an
-  external HSM boundary, and permissionless posters accept managed addresses
-  rather than local private keys; and
-- credential-bearing endpoints, malformed secret inputs and upstream response
-  bodies are redacted across the reviewed paths.
+- attestation, RIC and registry-signature paths atomically reserve durable
+  anti-equivocation state before HSM release and complete the reservation with
+  the exact returned signature; quote nonces are serialized and reconciled;
+- `xindex-registry-signer` and `xindex-registry-coordinator` are live,
+  supervised, pinned-mTLS inbound/quote producer, quorum and poster services;
+- `xindex-finalized-observer` persists consensus-finalized Ethereum blocks,
+  validates parent continuity, rolls back noncanonical facts, and pairs
+  `Acquired` with `MintIntentCreated` only in the exact same transaction;
+- independent settlement observers agree exact THOR status/details/stages and
+  vault state across three sources, bind Bitcoin and finalized Ethereum facts,
+  consume physical native/ERC-20 inflows one-to-one, persist pre-sign evidence,
+  and request current mint/delivery/refund/streamed signatures from one pinned
+  remote HSM daemon per operator;
+- `xindex-settlement-collector` validates exact observer signatures and posts
+  threshold reports through a node-managed account without local poster keys;
+- registry, settlement-observer, RIC and custody/cosigner runtime launchers all
+  pin the reviewed exact 3-of-5 topology, and duplicate descriptor/cosigner
+  public keys fail closed;
+- the production `xindex-redeem` profile is intentionally Bitcoin-mainnet-only,
+  consumes the finalized journal, collects an exact 3-of-5 RIC, validates the
+  full PSBT policy in remote HSM signers, reserves before signing, persists the
+  F2 correlation and exact finalized bytes before broadcast, and supervises
+  exact-byte rebroadcast/finality state;
+- the price path requires the exact 7-of-11 roster, pinned mTLS and distinct
+  sources/collectors; exact raw observations are persisted and fsynced before
+  HSM release, and anomaly/source/transport failure stops publication;
+- all long-running launch services supervise their API/event, worker and
+  loopback metrics tasks so monitoring cannot silently die while signing or
+  posting continues;
+- production secret-bearing config, mTLS identity/private-key, custody
+  transport-key and anti-equivocation state paths fail closed on unsafe
+  permissions, terminal symlinks or hard-link aliasing; durable/evidence
+  directories and the release topology file receive equivalent checks;
+- `gate3-alerts.yml`, the topology validator, evidence verifier/reconciliation
+  root, release wrapper and operations/incident runbook now cover the
+  code-addressable monitoring and evidence controls; and
+- evidence stores reject terminal directory symlinks and refuse symlinked,
+  hard-linked or non-owner-only existing records even on idempotent writes.
 
-Gate disposition remains **FAIL/open**. The exact registry components are
-libraries rather than a complete live inbound/quote producer/poster. Current
-mint/delivery/refund/streamed observation, finalized checkpoints/reorg rollback,
-consumed-inflow/custody-spend coverage, a full native transaction-policy
-executor, production metrics/alerts, independent operator/HSM/source records,
-and independent review remain absent.
+Code disposition: every original Gate-3 code finding is closed or hard-gated
+outside the reviewed BTC launch profile. This does **not** create operational or
+production evidence. A clean successor commit, populated independent
+operator/HSM/source topology, live alert delivery, WORM reconciliation,
+failure drills/testnet rehearsal and an independent audit remain release gates.
+`promtool` was unavailable locally, so only YAML parsing—not PromQL rule
+validation—was performed for the checked-in alert file.
 
-Key-free verification: eight-ABI and production-profile gates pass; 75 selected
-Rust tests and four pure Solidity vectors pass; fmt, locked/offline all-target
-Clippy and compile-only tests pass; cargo-deny and policy-configured cargo-audit
-pass with documented warnings. No signer, custody, key, deployment, broadcast
-or external transaction was used. The authoritative report is
+Key-free verification: both eight-ABI gates, the production-profile gate,
+formatting, locked/offline workspace Clippy and compile-only test build pass;
+focused exact regressions cover reservation atomicity, finalized rollback and
+decoding, streamed settlement, logical/physical inflow uniqueness, topology
+collapse, evidence tampering/sidecars/symlinks and duplicate-key/parser
+failures. `cargo deny`
+passes with its standing warnings; `cargo audit` passes with four allowed
+warnings against a freshly isolated 1,160-advisory RustSec database. No
+deployment, broadcast, external transaction, protocol/custody key or external
+signer/HSM was used. One deterministic in-process unit-signing fixture ran once
+because an initial test-name filter was too broad; all subsequent execution was
+fully qualified and key-free. The authoritative report is
 `../memory/GATE-3-SIGNER-SERVICE-AUDIT.md`.
 
 ## When this file gets updated

@@ -26,8 +26,23 @@
 
 pub mod agreement;
 pub mod client;
+pub mod policy;
+pub mod source;
 pub mod types;
 
 pub use agreement::{AgreementError, AsgardAgreement, HaltOutcome, MIN_AGREEING_SOURCES};
-pub use client::{ThorClient, ThorError};
-pub use types::{InboundAddress, OutboundEntry, OutboundTx, Pool, TxDetailsResponse, TxResponse};
+pub use client::{RawResponse, ThorClient, ThorConsensusClient, ThorError};
+pub use policy::{
+    derive_inbound, evaluate_quote, evm_raw_to_thor, thor_to_evm_raw, validate_common_inbound,
+    validate_common_quote, validate_independent_inbound, validate_independent_quote,
+    CanonicalSourceBundle, DerivedInbound, ExternalPriceObservation, InboundCandidate,
+    InboundPolicy, QuoteCandidate, QuoteDecision, QuoteEvidence, QuotePolicy, SourceResponseHashes,
+    SourceSnapshot, ThorPolicyError, TipCheckpoint, PAUSE_CHAIN_HALTED, PAUSE_CHAIN_TRADING,
+    PAUSE_GLOBAL_TRADING, PAUSE_SIGNING, PAUSE_STALE_CONSENSUS, PAUSE_STREAMING,
+    PAUSE_TARGET_OR_POOL,
+};
+pub use source::{RawSourcePoll, ThorSourceClient};
+pub use types::{
+    ConsensusTip, InboundAddress, Mimir, OutboundEntry, OutboundTx, Pool, SwapQuoteFees,
+    SwapQuoteRequest, SwapQuoteResponse, TxDetailsResponse, TxResponse, TxStatusResponse,
+};

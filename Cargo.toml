@@ -112,6 +112,7 @@ xindex-chain-utxo = { path = "crates/chain-utxo" }
 xindex-multisig = { path = "crates/multisig" }
 xindex-safe-evm = { path = "crates/safe-evm" }
 xindex-signer = { path = "crates/signer" }
+xindex-signer-daemon = { path = "crates/signer-daemon" }
 xindex-executor = { path = "crates/executor" }
 xindex-relayer = { path = "crates/relayer" }
 xindex-ops = { path = "crates/ops" }

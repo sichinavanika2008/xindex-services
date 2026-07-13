@@ -12,7 +12,7 @@ use bdk_esplora::esplora_client::{self, BlockingClient};
 use bitcoin::{Address, Amount, Network, Transaction, Txid};
 use thiserror::Error;
 
-use crate::types::{UtxoEntry, UtxoTxStatus};
+use crate::types::{UtxoEntry, UtxoOutputFacts, UtxoTransactionFacts, UtxoTxStatus};
 
 /// Default per-request timeout (seconds). Chosen to be generous enough for
 /// the slowest Esplora endpoints (Blockstream's free tier under load) but
@@ -283,6 +283,62 @@ impl EsploraClient {
             Some(h) if tip >= h => tip.saturating_sub(h).saturating_add(1),
             _ => 0,
         }
+    }
+
+    /// Decode one transaction's exact inputs, outputs, scripts, and current
+    /// confirmation status for pre-sign policy/evidence checks.
+    ///
+    /// # Errors
+    /// Transport/decode failure or an output index that cannot fit `u32`.
+    pub fn transaction_facts(&self, txid: &Txid) -> Result<UtxoTransactionFacts, UtxoError> {
+        let transaction = self
+            .inner
+            .get_tx_info(txid)
+            .map_err(|_| UtxoError::Transport("esplora request failed".to_string()))?
+            .ok_or_else(|| UtxoError::Decode(format!("tx {txid} not found")))?;
+        let tip = self.get_tip_height()?;
+        let input_addresses = transaction
+            .vin
+            .iter()
+            .filter_map(|input| input.prevout.as_ref())
+            .map(|previous| {
+                Address::from_script(previous.scriptpubkey.as_script(), self.network)
+                    .map(|address| address.to_string())
+                    .map_err(|error| {
+                        UtxoError::Decode(format!("vin script not an address: {error}"))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let outputs = transaction
+            .vout
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let vout = u32::try_from(index).map_err(|error| {
+                    UtxoError::Decode(format!("vout index out of range: {error}"))
+                })?;
+                let address = Address::from_script(output.scriptpubkey.as_script(), self.network)
+                    .ok()
+                    .map(|address| address.to_string());
+                Ok(UtxoOutputFacts {
+                    vout,
+                    value_sats: output.value,
+                    script_pubkey_hex: bitcoin::hex::DisplayHex::to_lower_hex_string(
+                        output.scriptpubkey.as_bytes(),
+                    ),
+                    address,
+                })
+            })
+            .collect::<Result<Vec<_>, UtxoError>>()?;
+        Ok(UtxoTransactionFacts {
+            txid: txid.to_string(),
+            confirmed: transaction.status.confirmed,
+            confirmations: Self::confirmations_from(tip, transaction.status.block_height),
+            block_height: transaction.status.block_height,
+            block_hash: transaction.status.block_hash.map(|hash| hash.to_string()),
+            input_addresses,
+            outputs,
+        })
     }
 }
 

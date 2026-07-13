@@ -6,6 +6,7 @@
 //!   `value` per UTXO to spend).
 
 use bitcoin::{Amount, BlockHash, Txid};
+use serde::Serialize;
 
 /// A confirmed UTXO at a watched address.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,4 +37,28 @@ pub struct UtxoTxStatus {
     pub block_hash: Option<BlockHash>,
     /// Confirmation count at the time of query. `0` for unconfirmed.
     pub confirmations: u32,
+}
+
+/// Fully decoded public transaction facts retained by settlement observers
+/// before requesting any HSM signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UtxoTransactionFacts {
+    pub txid: String,
+    pub confirmed: bool,
+    pub confirmations: u32,
+    pub block_height: Option<u32>,
+    pub block_hash: Option<String>,
+    pub input_addresses: Vec<String>,
+    pub outputs: Vec<UtxoOutputFacts>,
+}
+
+/// One output from [`UtxoTransactionFacts`]. The raw script is retained as
+/// canonical lowercase hex so callers can bind both payments and `OP_RETURN`
+/// memo bytes without trusting an address renderer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UtxoOutputFacts {
+    pub vout: u32,
+    pub value_sats: u64,
+    pub script_pubkey_hex: String,
+    pub address: Option<String>,
 }

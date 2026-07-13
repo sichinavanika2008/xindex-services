@@ -22,17 +22,19 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::net::IpAddr;
-use std::path::Path;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, U256};
+use prometheus::Registry;
 use serde::{Deserialize, Serialize};
+use xindex_ops::{serve_metrics, Metrics};
 use xindex_shared::eip712::price_oracle_domain;
 use xindex_shared::price_twap::{TwapConfig, TwapSample};
 use xindex_shared::price_wire::SignedPriceMessage;
 use xindex_signer_daemon::price_sign::{
-    produce_signed_price_from_observations, ObservedProducerInputs, PricePolicy,
+    produce_signed_price_from_observations, ObservedProducerInputs, PricePolicy, PriceSignError,
 };
 use xindex_signer_daemon::price_supply::{
     source_supply_evidence, CoinCapSupply, CoinGeckoSupply, SupplyFeed,
@@ -43,6 +45,7 @@ use xindex_signer_daemon::price_venue::{
 use xindex_signer_daemon::web3signer::HttpHsmClient;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     /// EIP-712 domain chainId of the `PriceAttestationOracle`.
     oracle_chain_id: u64,
@@ -100,6 +103,12 @@ struct Config {
     publish_attempts: u32,
     /// Timeout for one collector HTTP attempt.
     publish_timeout_secs: u64,
+    /// Loopback Prometheus/health listener supervised with the producer loop.
+    metrics_address: SocketAddr,
+    /// Combined PEM client certificate/private key presented to collectors.
+    collector_client_identity_pem: PathBuf,
+    /// Explicit collector CA/certificate pins. System roots are disabled.
+    collector_server_ca_pems: Vec<PathBuf>,
     binance_base: String,
     coinbase_base: String,
     kraken_base: String,
@@ -224,9 +233,11 @@ fn save_last_signed(path: &str, map: &HashMap<B256, u64>) -> std::io::Result<()>
 
 fn ensure_evidence_directory(path: &str) -> std::io::Result<()> {
     let path = Path::new(path);
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_dir() {
-        return Err(std::io::Error::other("evidence path is not a directory"));
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::other(
+            "evidence path must be a non-symlink directory",
+        ));
     }
     #[cfg(unix)]
     {
@@ -234,6 +245,78 @@ fn ensure_evidence_directory(path: &str) -> std::io::Result<()> {
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(std::io::Error::other(
                 "evidence directory must not be group/world accessible",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_owner_only_file(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "secret path must be a non-symlink regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            return Err(std::io::Error::other(
+                "secret-bearing file must be owner-only and have exactly one hard link",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_state_path(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| std::io::Error::other("state path has no parent"))?;
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if !parent_metadata.file_type().is_dir() {
+        return Err(std::io::Error::other(
+            "state parent must be a non-symlink directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if parent_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("state parent must be owner-only"));
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(std::io::Error::other(
+                    "existing state must be a non-symlink regular file",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+                    return Err(std::io::Error::other(
+                        "existing state must be owner-only and have exactly one hard link",
+                    ));
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn validate_transport_files(cfg: &Config) -> std::io::Result<()> {
+    validate_owner_only_file(&cfg.collector_client_identity_pem)?;
+    for path in &cfg.collector_server_ca_pems {
+        if !std::fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(std::io::Error::other(
+                "collector CA path must be a non-symlink regular file",
             ));
         }
     }
@@ -276,7 +359,7 @@ fn persist_raw_evidence(
         "{epoch}-{}.json",
         alloy_primitives::hex::encode(asset_id.as_slice())
     );
-    let path = Path::new(directory).join(file_name);
+    let path = Path::new(directory).join(&file_name);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -284,9 +367,22 @@ fn persist_raw_evidence(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let mut file = options.open(&path)?;
     file.write_all(&encoded)?;
     file.sync_all()?;
+    let digest = alloy_primitives::hex::encode(alloy_primitives::keccak256(&encoded).as_slice());
+    let sidecar = Path::new(directory).join(format!("{file_name}.keccak256"));
+    let mut sidecar_options = OpenOptions::new();
+    sidecar_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        sidecar_options.mode(0o600);
+    }
+    let mut sidecar_file = sidecar_options.open(sidecar)?;
+    sidecar_file.write_all(digest.as_bytes())?;
+    sidecar_file.write_all(b"\n")?;
+    sidecar_file.sync_all()?;
     File::open(directory)?.sync_all()
 }
 
@@ -392,6 +488,12 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if cfg.publish_attempts == 0 || cfg.publish_timeout_secs == 0 {
         return Err("publish_attempts and publish_timeout_secs must be non-zero".into());
     }
+    if cfg.metrics_address.port() == 0 || !cfg.metrics_address.ip().is_loopback() {
+        return Err("metrics_address must be a non-zero loopback listener".into());
+    }
+    if cfg.collector_server_ca_pems.is_empty() {
+        return Err("collector_server_ca_pems must not be empty".into());
+    }
     if cfg.collector_urls.len() < 2 {
         return Err("at least two redundant collector endpoints are required".into());
     }
@@ -447,6 +549,12 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
             endpoint_origin(&format!("collector_urls[{index}]"), endpoint, false)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if collector_origins
+        .iter()
+        .any(|origin| !origin.starts_with("https://"))
+    {
+        return Err("collector endpoints must use HTTPS for pinned mTLS".into());
+    }
     if collector_origins.iter().collect::<HashSet<_>>().len() != collector_origins.len() {
         return Err("collector endpoints must have distinct network origins".into());
     }
@@ -548,17 +656,50 @@ async fn publish_to_collector(
     Err("publish attempt loop exhausted".to_string())
 }
 
+fn collector_client(cfg: &Config) -> Result<reqwest::Client, Box<dyn std::error::Error>> {
+    let identity =
+        reqwest::Identity::from_pem(&std::fs::read(&cfg.collector_client_identity_pem)?)?;
+    let mut builder = reqwest::Client::builder()
+        .identity(identity)
+        .timeout(Duration::from_secs(cfg.publish_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
+        .tls_built_in_root_certs(false);
+    for path in &cfg.collector_server_ca_pems {
+        builder =
+            builder.add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(path)?)?);
+    }
+    Ok(builder.build()?)
+}
+
 #[tokio::main]
-#[expect(
-    clippy::too_many_lines,
-    reason = "one sequential observe-evidence-sign-persist-publish loop is easier to audit"
-)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .ok_or("usage: xindex-price-signer <config.json>")?;
+    validate_owner_only_file(Path::new(&path))?;
     let cfg: Config = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     validate_config(&cfg)?;
+    validate_state_path(Path::new(&cfg.state_file))?;
+    validate_transport_files(&cfg)?;
+    let registry = Registry::new();
+    let metrics = Metrics::new(&registry)?;
+    let metrics_address = cfg.metrics_address;
+    let producer = run_producer(cfg, metrics);
+    let metrics_server = serve_metrics(registry, metrics_address);
+    tokio::select! {
+        result = producer => result,
+        result = metrics_server => match result {
+            Ok(()) => Err("price signer metrics server exited unexpectedly".into()),
+            Err(error) => Err(format!("price signer metrics server failed: {error}").into()),
+        },
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one sequential observe-evidence-sign-persist-publish loop is easier to audit"
+)]
+async fn run_producer(cfg: Config, metrics: Metrics) -> Result<(), Box<dyn std::error::Error>> {
     ensure_evidence_directory(&cfg.evidence_dir)
         .map_err(|error| format!("unsafe/unavailable evidence directory: {error}"))?;
 
@@ -574,9 +715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()?;
-    let publish_http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.publish_timeout_secs))
-        .build()?;
+    let publish_http = collector_client(&cfg)?;
     let binance = BinanceVenue::new(http.clone(), &cfg.binance_base);
     let coinbase = CoinbaseVenue::new(http.clone(), &cfg.coinbase_base);
     let kraken = KrakenVenue::new(http.clone(), &cfg.kraken_base);
@@ -606,10 +745,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut twap_history: HashMap<B256, Vec<TwapSample>> = HashMap::new();
     let mut failure_streaks: HashMap<B256, u32> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs));
+    for (asset_id, _) in &assets {
+        let asset = format!("{asset_id:#x}");
+        metrics
+            .price_signer_anomaly_streak
+            .with_label_values(&[&asset])
+            .set(0);
+        metrics
+            .price_signer_last_success_timestamp_seconds
+            .with_label_values(&[&asset])
+            .set(
+                last_signed
+                    .get(asset_id)
+                    .copied()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .unwrap_or(0),
+            );
+    }
     loop {
         tick.tick().await;
         let now = observation_epoch(now_unix(), cfg.epoch_secs);
         for (asset_id, a) in &assets {
+            let asset = format!("{asset_id:#x}");
             let price_feeds = [
                 Feed {
                     venue: &binance,
@@ -647,6 +804,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &price_observations,
                 &supply_observations,
             ) {
+                metrics
+                    .price_signer_rounds
+                    .with_label_values(&["evidence_error"])
+                    .inc();
                 return Err(format!(
                     "raw evidence persistence failed; signing halted before HSM use: {error}"
                 )
@@ -680,6 +841,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 Ok(signed) => {
                     failure_streaks.insert(*asset_id, 0);
+                    metrics
+                        .price_signer_anomaly_streak
+                        .with_label_values(&[&asset])
+                        .set(0);
                     let mut next_last_signed = last_signed.clone();
                     next_last_signed.insert(*asset_id, now);
                     // Persist the guard BEFORE emitting, so a restart cannot
@@ -687,10 +852,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Publication MUST stop if the durable guard cannot be
                     // committed. Continuing would let a restart sign a
                     // different payload for the same epoch.
-                    save_last_signed(&cfg.state_file, &next_last_signed).map_err(|e| {
-                        format!("anti-equivocation persistence failed; publication halted: {e}")
-                    })?;
+                    if let Err(error) = save_last_signed(&cfg.state_file, &next_last_signed) {
+                        metrics
+                            .price_signer_rounds
+                            .with_label_values(&["state_error"])
+                            .inc();
+                        return Err(format!(
+                            "anti-equivocation persistence failed; publication halted: {error}"
+                        )
+                        .into());
+                    }
                     last_signed = next_last_signed;
+                    metrics
+                        .price_signer_rounds
+                        .with_label_values(&["signed"])
+                        .inc();
+                    metrics
+                        .price_signer_last_success_timestamp_seconds
+                        .with_label_values(&[&asset])
+                        .set(i64::try_from(now).unwrap_or(i64::MAX));
                     let message = SignedPriceMessage {
                         asset_id: format!("{:#x}", signed.asset_id),
                         price_wad: signed.price_wad.to_string(),
@@ -710,14 +890,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await
                         {
+                            metrics
+                                .price_collector_deliveries
+                                .with_label_values(&["error"])
+                                .inc();
                             eprintln!(
                                 "price-publish {asset_id:#x} epoch {now} collector_index={collector_index} failed: {e}"
                             );
                         } else {
                             delivered += 1;
+                            metrics
+                                .price_collector_deliveries
+                                .with_label_values(&["success"])
+                                .inc();
                         }
                     }
                     if delivered == 0 {
+                        metrics
+                            .price_signer_rounds
+                            .with_label_values(&["publish_error"])
+                            .inc();
                         return Err(format!(
                             "all collectors rejected/unreachable for {asset_id:#x} epoch {now}; anomaly latch halted the signer"
                         )
@@ -725,14 +917,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
+                    let result = if matches!(
+                        &e,
+                        PriceSignError::Hsm(_)
+                            | PriceSignError::RecoverMismatch { .. }
+                            | PriceSignError::SignatureParse(_)
+                    ) {
+                        "hsm_error"
+                    } else {
+                        "refused"
+                    };
+                    metrics
+                        .price_signer_rounds
+                        .with_label_values(&[result])
+                        .inc();
                     let streak = failure_streaks
                         .entry(*asset_id)
                         .and_modify(|count| *count = count.saturating_add(1))
                         .or_insert(1);
+                    metrics
+                        .price_signer_anomaly_streak
+                        .with_label_values(&[&asset])
+                        .set(i64::from(*streak));
                     eprintln!(
                         "price-sign {asset_id:#x} failed (fail-closed), consecutive_failures={streak}: {e}"
                     );
                     if *streak >= cfg.anomaly_failure_threshold {
+                        metrics
+                            .price_signer_rounds
+                            .with_label_values(&["latched"])
+                            .inc();
                         return Err(format!(
                             "price anomaly latch tripped for {asset_id:#x} after {streak} consecutive failed rounds"
                         )
@@ -747,6 +961,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::expect_used, reason = "test-only temporary path setup")]
+    fn state_and_evidence_paths_reject_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "xindex-price-path-policy-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::create_dir(&root).expect("create root");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("secure root");
+        let missing_state = root.join("state.json");
+        assert!(validate_state_path(&missing_state).is_ok());
+
+        let target = root.join("target");
+        std::fs::write(&target, b"{}").expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("secure target");
+        let state_link = root.join("state-link.json");
+        symlink(&target, &state_link).expect("link state");
+        assert!(validate_state_path(&state_link).is_err());
+
+        let evidence_link = root.join("evidence-link");
+        symlink(&root, &evidence_link).expect("link evidence");
+        assert!(ensure_evidence_directory(evidence_link.to_str().expect("utf8")).is_err());
+
+        std::fs::remove_file(evidence_link).expect("remove evidence link");
+        std::fs::remove_file(state_link).expect("remove state link");
+        std::fs::remove_file(target).expect("remove target");
+        std::fs::remove_dir(root).expect("remove root");
+    }
 
     /// G/RT-A-MED: the anti-equivocation guard must persist across restarts and
     /// fail closed on a corrupt state file (never silently reset).
@@ -798,11 +1047,14 @@ mod tests {
             evidence_operator_id: "P01".into(),
             anomaly_failure_threshold: 12,
             collector_urls: vec![
-                "http://127.0.0.1:9191".into(),
-                "http://127.0.0.1:9292".into(),
+                "https://collector-one.prod".into(),
+                "https://collector-two.prod".into(),
             ],
             publish_attempts: 3,
             publish_timeout_secs: 5,
+            metrics_address: SocketAddr::from(([127, 0, 0, 1], 9095)),
+            collector_client_identity_pem: "/tmp/collector-identity.pem".into(),
+            collector_server_ca_pems: vec!["/tmp/collector-ca.pem".into()],
             binance_base: "https://api.binance.com".into(),
             coinbase_base: "https://api.coinbase.com".into(),
             kraken_base: "https://api.kraken.com".into(),

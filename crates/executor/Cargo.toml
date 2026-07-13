@@ -24,6 +24,7 @@ xindex-custody-core.workspace = true
 # client (raw P-256 signer). The executor builds the tx + sighash, Turnkey
 # signs, the executor assembles + broadcasts.
 xindex-turnkey-client.workspace = true
+xindex-ops.workspace = true
 # C7: Cosmos redeem leg — builds the MsgSend sign-doc + TxRaw and reads
 # account/sequence from the Cosmos chain.
 xindex-chain-cosmos.workspace = true
@@ -57,6 +58,7 @@ sqlx.workspace = true
 # — same pattern as `crates/signer`'s `RemoteHsmBackend`.
 reqwest = { workspace = true, features = ["blocking"] }
 base64 = "0.22"
+prometheus.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

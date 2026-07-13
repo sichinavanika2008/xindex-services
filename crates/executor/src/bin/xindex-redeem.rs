@@ -1,17 +1,11 @@
-//! `xindex-redeem` — production redemption executor (M3 deliverable).
+//! `xindex-redeem` — current-protocol Bitcoin custody executor.
 //!
-//! Watches a deployed `ThorchainAdapter` for `RedeemDispatched` events,
-//! constructs a Bitcoin spending transaction from the multisig UTXO set,
-//! signs it with K-of-N software keys, and broadcasts to the configured
-//! Esplora endpoint. Together with `xindex-attest` (the attestation
-//! poster) this closes the off-chain settlement loop.
-//!
-//! Trust note (M3, not M5): the K secret keys are loaded as a single
-//! comma-separated CLI argument and held in this one process. Production
-//! (M5) splits each key into its own daemon backed by `YubiHSM2` and
-//! exchanges partial signatures over a wire protocol. The library code
-//! in `xindex-executor` is structured so that swap is a drop-in: replace
-//! `InProcessExecutor` with a `MultisigCosigner`-backed equivalent.
+//! Production consumes only the canonical finalized observer journal,
+//! collects an exact 3-of-5 RIC from independent observers, builds one exact
+//! Bitcoin transaction, obtains threshold partial signatures from remote
+//! HSM-backed daemons over pinned mTLS, persists the correlation and finalized
+//! bytes before broadcast, and supervises exact-byte rebroadcast/reorg state.
+//! The software-key and latest-log paths exist only behind explicit `--dev`.
 //!
 //! Replay-after-restart: the daemon optionally backfills missed events
 //! between `--from-block` and the latest tip before subscribing live.
@@ -26,6 +20,10 @@
 //! reverts to the unsafe behaviour and the daemon logs a warning at
 //! startup.
 
+use std::collections::HashSet;
+use std::fs;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,8 +38,11 @@ use bitcoin::secp256k1::{Secp256k1, SecretKey};
 use bitcoin::{Network, PublicKey};
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
+use prometheus::Registry;
 use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::ThorchainAdapter;
+use xindex_chain_eth::finalized_observer::{FinalizedDispatchRecord, SqliteFinalizedObserverStore};
+use xindex_chain_eth::finalized_rpc::FinalizedRpcClient;
 use xindex_chain_eth::rpc::redacted_endpoint;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::{EsploraClient, UtxoChainClient, UtxoParams};
@@ -63,6 +64,7 @@ enum SignerMode {
     Remote,
 }
 use xindex_multisig::MultisigDescriptor;
+use xindex_ops::{serve_metrics, Metrics};
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::redemption_dispatch::{AnyRedemptionDispatch, RedemptionDispatchStore};
 
@@ -83,6 +85,32 @@ struct Args {
     /// `RedeemDispatched` events.
     #[arg(long, env = "THORCHAIN_ADAPTER_ADDR")]
     thorchain_adapter: String,
+
+    /// Expected BTC target-token sentinel emitted by the adapter.
+    #[arg(long, env = "BTC_TARGET_TOKEN")]
+    btc_target_token: Option<String>,
+
+    /// HTTP RPC exposing Ethereum's consensus-finalized tag. Production uses
+    /// this only to prove the shared finalized journal is caught up/canonical.
+    #[arg(long, env = "ETH_FINALIZED_RPC_URL")]
+    eth_finalized_rpc_url: Option<String>,
+
+    /// Expected Ethereum chain id for the finalized execution RPC.
+    #[arg(long, env = "EXPECTED_ETH_CHAIN_ID")]
+    expected_eth_chain_id: Option<u64>,
+
+    /// Finalized observer `SQLite` database populated by this operator's
+    /// `xindex-finalized-observer` instance.
+    #[arg(long, env = "FINALIZED_OBSERVER_DATABASE_URL")]
+    finalized_observer_database_url: Option<String>,
+
+    /// Exact observer identity used to namespace the finalized journal.
+    #[arg(long, env = "FINALIZED_OBSERVER_ID")]
+    finalized_observer_id: Option<String>,
+
+    /// Production finalized-journal scan interval.
+    #[arg(long, env = "FINALIZED_POLL_MILLIS", default_value_t = 2_000)]
+    finalized_poll_millis: u64,
 
     /// `THORNode` REST base URL. Used to resolve the live BTC Asgard
     /// inbound vault (rotates per churn) the reverse deposit is sent to.
@@ -163,6 +191,18 @@ struct Args {
     #[arg(long, env = "COSIGNER_PUBKEYS")]
     cosigner_pubkeys: Option<String>,
 
+    /// Production mTLS client certificate presented to every custody signer.
+    #[arg(long, env = "COSIGNER_CLIENT_CERT_PEM")]
+    cosigner_client_cert_pem: Option<PathBuf>,
+
+    /// Owner-only production mTLS client private key.
+    #[arg(long, env = "COSIGNER_CLIENT_KEY_PEM")]
+    cosigner_client_key_pem: Option<PathBuf>,
+
+    /// Pinned signer-daemon CA/certificate bundle; system roots are disabled.
+    #[arg(long, env = "COSIGNER_SERVER_CA_PEM")]
+    cosigner_server_ca_pem: Option<PathBuf>,
+
     /// CTD-1 (`DL-CTD-2` Slice B): comma-separated base URLs of the
     /// per-operator REDEMPTION OBSERVER services (one per operator,
     /// e.g. `http://op1.internal:9101,http://op2.internal:9101`). When
@@ -179,6 +219,18 @@ struct Args {
     /// of 5). Required when `--observer-urls` is set.
     #[arg(long, env = "INTENT_QUORUM")]
     intent_quorum: Option<usize>,
+
+    /// Production mTLS client certificate presented to observer services.
+    #[arg(long, env = "OBSERVER_CLIENT_CERT_PEM")]
+    observer_client_cert_pem: Option<PathBuf>,
+
+    /// Owner-only observer-transport client private key.
+    #[arg(long, env = "OBSERVER_CLIENT_KEY_PEM")]
+    observer_client_key_pem: Option<PathBuf>,
+
+    /// Pinned observer CA/certificate bundle; system roots are disabled.
+    #[arg(long, env = "OBSERVER_SERVER_CA_PEM")]
+    observer_server_ca_pem: Option<PathBuf>,
 
     /// Fee FLOOR + fallback (sats). The daemon derives the absolute fee
     /// from a live Esplora `/fee-estimates` rate at startup
@@ -236,6 +288,12 @@ struct Args {
     /// Default 100 blocks (~16 h on BTC).
     #[arg(long, env = "REBROADCAST_FINAL_DEPTH", default_value_t = 100)]
     rebroadcast_final_depth: u32,
+
+    /// Loopback Prometheus/health listener. The custody process treats an
+    /// unexpected metrics-server exit as fatal so monitoring cannot silently
+    /// disappear while broadcasts continue.
+    #[arg(long, env = "METRICS_ADDRESS", default_value = "127.0.0.1:9094")]
+    metrics_address: SocketAddr,
 }
 
 impl Args {
@@ -249,27 +307,163 @@ impl Args {
         if self.chain != "btc" || !matches!(self.btc_network.as_str(), "bitcoin" | "mainnet") {
             anyhow::bail!("the reviewed production profile enables Bitcoin mainnet only");
         }
-        if self.multisig_threshold < 3 {
-            anyhow::bail!("production custody threshold must be at least 3");
+        let custody_signers = csv_member_count(Some(&self.multisig_pubkeys));
+        if custody_signers != 5 || self.multisig_threshold != 3 {
+            anyhow::bail!("production custody topology must be exactly 3-of-5");
+        }
+        if !self.metrics_address.ip().is_loopback() || self.metrics_address.port() == 0 {
+            anyhow::bail!("production metrics listener must use a non-zero loopback port");
         }
         if self.broadcast_database_url.is_none() || self.redemption_database_url.is_none() {
             anyhow::bail!("production requires durable broadcast and redemption SQLite stores");
         }
-        let observers = self
-            .observer_urls
-            .as_deref()
-            .map_or(0, |s| s.split(',').filter(|v| !v.trim().is_empty()).count());
-        let quorum = self.intent_quorum.unwrap_or(0);
-        if observers < 5 || quorum < 3 || quorum <= observers / 2 {
+        if self.finalized_observer_database_url.is_none()
+            || self.finalized_observer_id.is_none()
+            || self.eth_finalized_rpc_url.is_none()
+            || self
+                .expected_eth_chain_id
+                .is_none_or(|chain_id| chain_id == 0)
+            || self.btc_target_token.is_none()
+            || !(500..=30_000).contains(&self.finalized_poll_millis)
+        {
             anyhow::bail!(
-                "production requires at least five observer endpoints and a strict-majority quorum"
+                "production requires a bounded, canonical finalized-observer journal source"
             );
+        }
+        validate_finalized_rpc_url(
+            self.eth_finalized_rpc_url
+                .as_deref()
+                .context("finalized RPC absent")?,
+        )?;
+        let target = EvmAddress::from_str(
+            self.btc_target_token
+                .as_deref()
+                .context("BTC target token absent")?,
+        )
+        .context("BTC target token invalid")?;
+        if target.is_zero() {
+            anyhow::bail!("BTC target token must be non-zero");
+        }
+        let observers = csv_member_count(self.observer_urls.as_deref());
+        let quorum = self.intent_quorum.unwrap_or(0);
+        if observers != 5 || quorum != 3 {
+            anyhow::bail!("production observer topology must be exactly 3-of-5");
         }
         if self.cosigner_daemon_urls.is_none() || self.cosigner_pubkeys.is_none() {
             anyhow::bail!("production requires pinned remote cosigner endpoints and public keys");
         }
+        let cosigner_endpoints = csv_member_count(self.cosigner_daemon_urls.as_deref());
+        let cosigner_keys = csv_member_count(self.cosigner_pubkeys.as_deref());
+        if cosigner_endpoints != 5 || cosigner_keys != 5 {
+            anyhow::bail!("production remote-cosigner topology must be exactly 3-of-5");
+        }
+        for path in [
+            &self.cosigner_client_cert_pem,
+            &self.cosigner_client_key_pem,
+            &self.cosigner_server_ca_pem,
+            &self.observer_client_cert_pem,
+            &self.observer_client_key_pem,
+            &self.observer_server_ca_pem,
+        ] {
+            if path.is_none() {
+                anyhow::bail!(
+                    "production requires pinned mTLS material for cosigners and observers"
+                );
+            }
+        }
+        validate_distinct_https_origins(
+            self.cosigner_daemon_urls.as_deref().unwrap_or_default(),
+            "cosigner",
+        )?;
+        validate_distinct_https_origins(
+            self.observer_urls.as_deref().unwrap_or_default(),
+            "observer",
+        )?;
+        validate_secret_file(
+            self.cosigner_client_key_pem
+                .as_deref()
+                .context("cosigner client key absent")?,
+        )?;
+        validate_secret_file(
+            self.observer_client_key_pem
+                .as_deref()
+                .context("observer client key absent")?,
+        )?;
         Ok(())
     }
+}
+
+fn csv_member_count(spec: Option<&str>) -> usize {
+    spec.unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.trim().is_empty())
+        .count()
+}
+
+fn validate_distinct_https_origins(spec: &str, label: &str) -> Result<()> {
+    let mut origins = HashSet::new();
+    for raw in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let url = reqwest::Url::parse(raw).with_context(|| format!("invalid {label} URL"))?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            anyhow::bail!("production {label} URLs must be credential-free HTTPS origins");
+        }
+        let host = url
+            .host_str()
+            .with_context(|| format!("{label} URL has no host"))?;
+        let port = url
+            .port_or_known_default()
+            .with_context(|| format!("{label} URL has no port"))?;
+        if !origins.insert(format!("{}:{port}", host.to_ascii_lowercase())) {
+            anyhow::bail!("production {label} endpoint origins must be distinct");
+        }
+    }
+    Ok(())
+}
+
+fn validate_finalized_rpc_url(raw: &str) -> Result<()> {
+    let url = reqwest::Url::parse(raw).context("invalid finalized RPC URL")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        anyhow::bail!("finalized RPC URL must not contain credentials/query/fragment");
+    }
+    let host = url.host_str().context("finalized RPC URL has no host")?;
+    let host_ip = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        anyhow::bail!("finalized RPC must use HTTPS or loopback HTTP");
+    }
+    Ok(())
+}
+
+fn validate_secret_file(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspect {}", path.display()))?;
+    if !path.is_absolute() || !metadata.file_type().is_file() {
+        anyhow::bail!("secret path must be an absolute non-symlink regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            anyhow::bail!("transport private key must be owner-only and single-link");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -293,7 +487,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("connect SqliteBroadcastRegistry")?,
         );
-        run(args, registry).await
+        Box::pin(run(args, registry)).await
     } else {
         // The double-pay defense (registry.has_record gate before
         // executing) only works if the registry persists across
@@ -307,7 +501,7 @@ async fn main() -> Result<()> {
              Set BROADCAST_DATABASE_URL=sqlite:./xindex-redeem.db?mode=rwc for production."
         );
         let registry = Arc::new(InMemoryBroadcastRegistry::new());
-        run(args, registry).await
+        Box::pin(run(args, registry)).await
     }
 }
 
@@ -328,9 +522,18 @@ fn parse_network(s: &str) -> Result<Network> {
 /// Parse a comma-separated list of hex-encoded compressed secp256k1
 /// public keys.
 fn parse_pubkeys(spec: &str) -> Result<Vec<PublicKey>> {
-    spec.split(',')
+    let pubkeys = spec
+        .split(',')
         .map(|s| PublicKey::from_str(s.trim()).with_context(|| format!("invalid pubkey: {s}")))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let unique = pubkeys
+        .iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
+    if unique.len() != pubkeys.len() {
+        anyhow::bail!("multisig/cosigner pubkeys must be distinct");
+    }
+    Ok(pubkeys)
 }
 
 /// Parse a comma-separated list of hex-encoded 32-byte secret keys.
@@ -510,12 +713,42 @@ fn build_executor(
                 }
             }
             let mut cosigners: Vec<Box<dyn MultisigCosigner>> = Vec::with_capacity(pks.len());
+            let tls = if args.dev {
+                None
+            } else {
+                Some((
+                    fs::read(
+                        args.cosigner_client_cert_pem
+                            .as_deref()
+                            .context("cosigner client certificate required")?,
+                    )?,
+                    fs::read(
+                        args.cosigner_client_key_pem
+                            .as_deref()
+                            .context("cosigner client key required")?,
+                    )?,
+                    fs::read(
+                        args.cosigner_server_ca_pem
+                            .as_deref()
+                            .context("cosigner server CA required")?,
+                    )?,
+                ))
+            };
             for (url, pk) in urls.iter().zip(pks.iter()) {
-                cosigners.push(Box::new(RemoteMultisigCosigner::new(
-                    chain_id,
-                    (*url).to_string(),
-                    *pk,
-                )));
+                let cosigner = if let Some((cert, key, roots)) = &tls {
+                    RemoteMultisigCosigner::with_mtls_pem(
+                        chain_id,
+                        (*url).to_string(),
+                        *pk,
+                        cert,
+                        key,
+                        roots,
+                        Duration::from_secs(10),
+                    )?
+                } else {
+                    RemoteMultisigCosigner::new(chain_id, (*url).to_string(), *pk)
+                };
+                cosigners.push(Box::new(cosigner));
             }
             InProcessExecutor::with_cosigners(descriptor, cosigners, chain, network, fee_sats)
                 .map_err(|e| anyhow::anyhow!("build executor: {e}"))
@@ -539,8 +772,31 @@ fn build_ric_collector(args: &Args) -> Result<Option<RicCollector>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let collector =
-        RicCollector::new(urls, quorum).map_err(|e| anyhow::anyhow!("build RIC collector: {e}"))?;
+    let collector = if args.dev {
+        RicCollector::new(urls, quorum)
+    } else {
+        RicCollector::with_mtls_pem(
+            urls,
+            quorum,
+            &fs::read(
+                args.observer_client_cert_pem
+                    .as_deref()
+                    .context("observer client certificate required")?,
+            )?,
+            &fs::read(
+                args.observer_client_key_pem
+                    .as_deref()
+                    .context("observer client key required")?,
+            )?,
+            &fs::read(
+                args.observer_server_ca_pem
+                    .as_deref()
+                    .context("observer server CA required")?,
+            )?,
+            Duration::from_secs(20),
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("build RIC collector: {e}"))?;
     info!(
         quorum,
         "CTD-1 RIC collector enabled (per-operator observers)"
@@ -576,6 +832,28 @@ async fn resolve_self_btc_asgard(
     }
 }
 
+fn finalized_dispatch_event(
+    record: FinalizedDispatchRecord,
+    expected_target: EvmAddress,
+) -> Result<ThorchainAdapter::RedeemDispatched> {
+    if record.leg_index != 0 {
+        anyhow::bail!("reviewed BTC launch profile permits redemption leg 0 only");
+    }
+    if record.target_token != expected_target {
+        anyhow::bail!("finalized dispatch target token differs from launch configuration");
+    }
+    let memo =
+        String::from_utf8(record.facts.memo).context("finalized dispatch memo is not UTF-8")?;
+    Ok(ThorchainAdapter::RedeemDispatched {
+        dispatchId: record.dispatch_id,
+        redemptionId: record.redemption_id,
+        targetToken: record.target_token,
+        amount: record.facts.amount,
+        destination: record.facts.final_destination,
+        memo,
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "single sequential pipeline; splitting fights alloy 0.8's deeply nested fillers generic"
@@ -584,6 +862,9 @@ async fn run<R>(args: Args, registry: Arc<R>) -> Result<()>
 where
     R: BroadcastRegistry + 'static,
 {
+    let prometheus = Registry::new();
+    let metrics = Metrics::new(&prometheus).context("register custody metrics")?;
+    let metrics_address = args.metrics_address;
     let adapter_addr = EvmAddress::from_str(&args.thorchain_adapter)
         .context("THORCHAIN_ADAPTER_ADDR must be a 20-byte hex address")?;
     let network = parse_network(&args.btc_network)?;
@@ -692,15 +973,6 @@ where
             .context("connect F2 redemption-dispatch store")?,
     );
 
-    let ws = WsConnect::new(&args.rpc_url);
-    let provider = Arc::new(
-        ProviderBuilder::new()
-            .with_recommended_fillers()
-            .on_ws(ws)
-            .await
-            .context("connect WS provider")?,
-    );
-
     // Spawn the reorg-aware re-broadcast watcher BEFORE entering the
     // subscribe loop. Closes Rust-audit finding L-R2: previously a
     // broadcast tx that was evicted from mempool (fee competition,
@@ -711,13 +983,26 @@ where
         .pending_count()
         .await
         .context("registry pending_count")?;
+    let reserved_at_startup = registry
+        .reserved_count()
+        .await
+        .context("registry reserved_count")?;
+    if reserved_at_startup != 0 && !args.dev {
+        anyhow::bail!(
+            "{reserved_at_startup} custody dispatch reservation(s) lack an exact persisted transaction; operator incident review required"
+        );
+    }
     info!(
         pending_broadcasts_recovered = pending_at_startup,
+        incomplete_reservations = reserved_at_startup,
         stuck_timeout_secs = args.rebroadcast_stuck_timeout_secs,
         min_confirmations = args.rebroadcast_min_confirmations,
         final_depth = args.rebroadcast_final_depth,
         "spawning rebroadcast watcher"
     );
+    metrics
+        .executor_pending_broadcasts
+        .set(i64::try_from(pending_at_startup).unwrap_or(i64::MAX));
     let watcher_registry = Arc::clone(&registry);
     let watcher_chain_clone = Arc::clone(&watcher_chain);
     let watcher_cfg = WatcherConfig {
@@ -726,20 +1011,26 @@ where
         min_confirmations: args.rebroadcast_min_confirmations,
         final_depth: args.rebroadcast_final_depth,
     };
-    tokio::spawn(async move {
-        if let Err(e) = run_watcher(watcher_registry, watcher_chain_clone, watcher_cfg).await {
-            error!(error = %e, "watcher exited; redemptions may sit stuck without re-broadcast");
-        }
-    });
+    let watcher = run_watcher(
+        watcher_registry,
+        watcher_chain_clone,
+        watcher_cfg,
+        Some(metrics.clone()),
+    );
 
     // Helper: process one decoded event end-to-end. Inlined as a closure
     // returning a Future so we can `.await` the registry calls.
     // Errors LOGGED, not propagated — a single bad event never crashes
     // the daemon.
     let process_event = async |ev: ThorchainAdapter::RedeemDispatched| {
+        metrics.executor_redemptions_received.inc();
         let mut task = match decode_redeem_event(&ev) {
             Ok(t) => t,
             Err(e) => {
+                metrics
+                    .executor_redemptions_failed
+                    .with_label_values(&["decode_error"])
+                    .inc();
                 error!(redemption_id = %ev.redemptionId, error = %e,
                        "decode failed; skipping event");
                 return;
@@ -754,12 +1045,20 @@ where
         // to THORChain twice for one burn. Defer on lookup error.
         match registry.has_record(&task.dispatch_id).await {
             Ok(true) => {
+                metrics
+                    .custody_dispatches
+                    .with_label_values(&["btc", "refused"])
+                    .inc();
                 info!(dispatch_id = %task.dispatch_id,
                       "dispatch already in registry; skipping replay");
                 return;
             }
             Ok(false) => {}
             Err(e) => {
+                metrics
+                    .custody_dispatches
+                    .with_label_values(&["btc", "error"])
+                    .inc();
                 error!(dispatch_id = %task.dispatch_id, error = %e,
                        "registry has_record check failed; skipping for safety");
                 return;
@@ -777,7 +1076,11 @@ where
         // mode, so that path is dev-only by construction.
         let collected: Option<CollectedRic> = match collector.as_ref() {
             Some(c) => {
-                let stamp = now_unix_secs().unwrap_or(0);
+                let Some(stamp) = now_unix_secs() else {
+                    error!(redemption_id = %task.redemption_id,
+                           "system clock is before Unix epoch; refusing RIC collection");
+                    return;
+                };
                 // RicCollector is a reqwest::blocking client — collect on a
                 // blocking thread, not this async worker.
                 let c = c.clone();
@@ -785,11 +1088,19 @@ where
                 match tokio::task::spawn_blocking(move || c.collect(chain, rid, 0, stamp)).await {
                     Ok(Ok(cr)) => Some(cr),
                     Ok(Err(e)) => {
+                        metrics
+                            .custody_dispatches
+                            .with_label_values(&["btc", "refused"])
+                            .inc();
                         error!(redemption_id = %task.redemption_id, error = %e,
                                "RIC collection failed; skipping (no proof-less custody spend)");
                         return;
                     }
                     Err(e) => {
+                        metrics
+                            .custody_dispatches
+                            .with_label_values(&["btc", "error"])
+                            .inc();
                         error!(redemption_id = %task.redemption_id, error = %e,
                                "RIC collection task panicked; skipping");
                         return;
@@ -835,130 +1146,291 @@ where
         // Skip on a pre-existing reservation (replay); fail-safe-skip on
         // error (never broadcast without a persisted reservation).
         match registry.reserve(&task.dispatch_id).await {
-            Ok(true) => {}
+            Ok(true) => metrics
+                .custody_dispatches
+                .with_label_values(&["btc", "reserved"])
+                .inc(),
             Ok(false) => {
+                metrics
+                    .custody_dispatches
+                    .with_label_values(&["btc", "refused"])
+                    .inc();
                 info!(dispatch_id = %task.dispatch_id,
                       "dispatch already reserved; skipping (reserve-before-broadcast)");
                 return;
             }
             Err(e) => {
+                metrics
+                    .custody_dispatches
+                    .with_label_values(&["btc", "error"])
+                    .inc();
                 error!(dispatch_id = %task.dispatch_id, error = %e,
                        "reserve failed; skipping for safety (no broadcast)");
                 return;
             }
         }
-        // The executor (Esplora + cosigners) is reqwest::blocking — run the
-        // spend on a blocking thread; return task/asgard for the async
-        // registry + F2 bookkeeping below.
-        let executor = std::sync::Arc::clone(&executor);
-        let (exec_result, task, asgard) = match tokio::task::spawn_blocking(move || {
-            let r = executor.execute_capturing_tx(&task, &asgard);
-            (r, task, asgard)
+        // Build + HSM-sign the exact transaction after reservation but do not
+        // broadcast yet. The finalized bytes and F2 correlation must both be
+        // durable first, so an ambiguous transport result can only retry this
+        // same txid, never select a second UTXO.
+        let prepare_executor = std::sync::Arc::clone(&executor);
+        let (prepare_result, task, asgard) = match tokio::task::spawn_blocking(move || {
+            let result = prepare_executor.prepare_redemption_tx(&task, &asgard);
+            (result, task, asgard)
         })
         .await
         {
             Ok(triple) => triple,
             Err(e) => {
-                error!(error = %e, "execute task panicked; skipping event");
+                metrics
+                    .executor_redemptions_failed
+                    .with_label_values(&["psbt_sign"])
+                    .inc();
+                metrics
+                    .custody_dispatches
+                    .with_label_values(&["btc", "error"])
+                    .inc();
+                error!(error = %e, "prepare task panicked; dispatch remains reserved");
                 return;
             }
         };
-        match exec_result {
-            Ok((txid, tx)) => {
-                info!(redemption_id = %task.redemption_id, %txid, "BTC→Asgard broadcast");
-                let tx_bytes = bitcoin::consensus::serialize(&tx);
-                let Some(now) = now_unix_secs() else {
-                    warn!(redemption_id = %task.redemption_id, %txid,
-                          "clock failure (pre-1970) post-broadcast; SKIPPING registry + F2 \
-                           record. Operator must monitor this txid AND manually backfill the \
-                           F2 redemptionId→txid mapping before the redemption deadline.");
-                    return;
-                };
-                let amount_sats = u64::try_from(task.amount).unwrap_or(0);
-                let entry = PendingBroadcast {
-                    intent_id: task.dispatch_id, // dedup key = dispatch id
-                    txid,
-                    tx_bytes,
-                    recipient_addr: asgard.to_string(),
-                    amount_sats,
-                    broadcast_at_unix_secs: now,
-                    last_attempt_unix_secs: now,
-                };
-                if let Err(e) = registry.register(entry).await {
-                    warn!(redemption_id = %task.redemption_id, error = %e,
-                          "register broadcast failed; watcher won't re-broadcast on eviction");
-                }
-                // F2: correlate (redemptionId, legIndex) → inbound_txid
-                // so the signer's redemption cross-check can exact-txid
-                // query THORChain. First-write-wins per leg, so a
-                // re-broadcast keeps the original.
-                //
-                // leg_index = 0: today's THORChain rail is single-async-
-                // slot, so every RedeemDispatched event is leg 0. Phase
-                // 3.1 (U10) routes per ChainId::from_asset_id and will
-                // populate this from the dispatched event's leg.
-                if let Err(e) = dispatch_store
-                    .record(task.redemption_id, 0u32, chain, txid.to_string(), now)
-                    .await
-                {
-                    error!(redemption_id = %task.redemption_id, %txid, error = %e,
-                           "F2 dispatch record FAILED — signer cannot correlate this \
-                            redemption; finalize/cancel will stall. Operator must backfill \
-                            the F2 mapping manually before the redemption deadline.");
-                }
+        let tx = match prepare_result {
+            Ok(tx) => tx,
+            Err(e) => {
+                metrics
+                    .executor_redemptions_failed
+                    .with_label_values(&["psbt_sign"])
+                    .inc();
+                metrics
+                    .custody_dispatches
+                    .with_label_values(&["btc", "error"])
+                    .inc();
+                error!(redemption_id = %task.redemption_id, error = %e,
+                       "prepare/sign failed; dispatch remains durably reserved");
+                return;
             }
-            Err(e) => error!(redemption_id = %task.redemption_id, error = %e,
-                              "execute failed; will not retry this event in current process"),
+        };
+        metrics
+            .custody_dispatches
+            .with_label_values(&["btc", "signed"])
+            .inc();
+        let txid = tx.compute_txid();
+        let Some(now) = now_unix_secs() else {
+            metrics
+                .custody_dispatches
+                .with_label_values(&["btc", "error"])
+                .inc();
+            error!(redemption_id = %task.redemption_id, %txid,
+                   "clock failure after signing; dispatch remains reserved and is not broadcast");
+            return;
+        };
+        let Ok(amount_sats) = u64::try_from(task.amount) else {
+            metrics
+                .custody_dispatches
+                .with_label_values(&["btc", "error"])
+                .inc();
+            error!(redemption_id = %task.redemption_id,
+                   "prepared amount no longer fits u64; dispatch remains reserved");
+            return;
+        };
+
+        // F2 correlation and exact tx bytes are both write-ahead records.
+        // Either failure leaves a visible reservation and no broadcast.
+        if let Err(e) = dispatch_store
+            .record(task.redemption_id, 0u32, chain, txid.to_string(), now)
+            .await
+        {
+            metrics
+                .custody_dispatches
+                .with_label_values(&["btc", "error"])
+                .inc();
+            error!(redemption_id = %task.redemption_id, %txid, error = %e,
+                   "F2 dispatch record failed before broadcast; dispatch remains reserved");
+            return;
+        }
+        let entry = PendingBroadcast {
+            intent_id: task.dispatch_id,
+            txid,
+            tx_bytes: bitcoin::consensus::serialize(&tx),
+            recipient_addr: asgard.to_string(),
+            amount_sats,
+            broadcast_at_unix_secs: now,
+            // Zero makes an ambiguous/failed initial attempt eligible for
+            // exact-byte rebroadcast on the next watcher tick.
+            last_attempt_unix_secs: 0,
+        };
+        if let Err(e) = registry.register(entry).await {
+            metrics
+                .custody_dispatches
+                .with_label_values(&["btc", "error"])
+                .inc();
+            error!(redemption_id = %task.redemption_id, %txid, error = %e,
+                   "exact transaction persistence failed; not broadcasting");
+            return;
+        }
+        metrics.executor_pending_broadcasts.inc();
+
+        let broadcast_executor = std::sync::Arc::clone(&executor);
+        let broadcast =
+            tokio::task::spawn_blocking(move || broadcast_executor.broadcast_prepared(&tx)).await;
+        match broadcast {
+            Ok(Ok(observed)) => {
+                metrics.executor_redemptions_broadcast.inc();
+                metrics
+                    .custody_dispatches
+                    .with_label_values(&["btc", "broadcast"])
+                    .inc();
+                if let Err(e) = registry.touch_attempt(&task.dispatch_id, now).await {
+                    warn!(dispatch_id = %task.dispatch_id, error = %e,
+                          "broadcast succeeded but attempt timestamp update failed");
+                }
+                info!(redemption_id = %task.redemption_id, txid = %observed,
+                      "BTC→Asgard broadcast from persisted transaction");
+            }
+            Ok(Err(e)) => {
+                metrics
+                    .executor_redemptions_failed
+                    .with_label_values(&["broadcast_error"])
+                    .inc();
+                warn!(redemption_id = %task.redemption_id, %txid, error = %e,
+                      "initial broadcast ambiguous/failed; exact tx queued for retry");
+            }
+            Err(e) => {
+                metrics
+                    .executor_redemptions_failed
+                    .with_label_values(&["broadcast_error"])
+                    .inc();
+                warn!(redemption_id = %task.redemption_id, %txid, error = %e,
+                      "broadcast task panicked; exact tx queued for retry");
+            }
         }
     };
 
-    // Backfill missed events if the operator passed `--from-block`.
-    if args.from_block > 0 {
-        let latest = provider
-            .get_block_number()
+    let event_source = async {
+        if !args.dev {
+            let observer_store = SqliteFinalizedObserverStore::connect(
+                args.finalized_observer_database_url
+                    .as_deref()
+                    .context("finalized observer database required")?,
+                args.finalized_observer_id
+                    .as_deref()
+                    .context("finalized observer id required")?,
+            )
             .await
-            .context("get block number")?;
-        info!(
-            from_block = args.from_block,
-            latest, "backfilling missed events"
+            .context("connect finalized observer journal")?;
+            let finalized_rpc = FinalizedRpcClient::new(
+                args.eth_finalized_rpc_url
+                    .as_deref()
+                    .context("finalized RPC required")?
+                    .to_string(),
+            )?;
+            let chain_id = finalized_rpc.chain_id().await?;
+            if Some(chain_id.value) != args.expected_eth_chain_id {
+                anyhow::bail!("finalized RPC chain id differs from production configuration");
+            }
+            let expected_target = EvmAddress::from_str(
+                args.btc_target_token
+                    .as_deref()
+                    .context("BTC target token required")?,
+            )?;
+            let poll = Duration::from_millis(args.finalized_poll_millis);
+            loop {
+                let head = finalized_rpc.finalized_head().await?;
+                let checkpoint = observer_store.last_checkpoint().await?;
+                let caught_up = checkpoint.is_some_and(|checkpoint| {
+                    checkpoint.block_number == head.value.number
+                        && checkpoint.block_hash == head.value.hash
+                });
+                if !caught_up {
+                    warn!(
+                        finalized_head = head.value.number,
+                        "custody paused until the finalized observer journal catches up"
+                    );
+                    tokio::time::sleep(poll).await;
+                    continue;
+                }
+                for record in observer_store.all_dispatches().await? {
+                    let event = finalized_dispatch_event(record, expected_target)?;
+                    process_event(event).await;
+                }
+                tokio::time::sleep(poll).await;
+            }
+        }
+
+        // Development-only event source. Production never subscribes to latest
+        // logs and reaches this point only when `--dev` was explicitly supplied.
+        let ws = WsConnect::new(&args.rpc_url);
+        let provider = Arc::new(
+            ProviderBuilder::new()
+                .with_recommended_fillers()
+                .on_ws(ws)
+                .await
+                .context("connect development WS provider")?,
         );
-        let backfill_filter = Filter::new()
+
+        // Backfill missed events if the operator passed `--from-block`.
+        if args.from_block > 0 {
+            let latest = provider
+                .get_block_number()
+                .await
+                .context("get block number")?;
+            info!(
+                from_block = args.from_block,
+                latest, "backfilling missed events"
+            );
+            let backfill_filter = Filter::new()
+                .address(adapter_addr)
+                .event_signature(ThorchainAdapter::RedeemDispatched::SIGNATURE_HASH)
+                .from_block(BlockNumberOrTag::Number(args.from_block))
+                .to_block(BlockNumberOrTag::Number(latest));
+            let logs = provider
+                .get_logs(&backfill_filter)
+                .await
+                .context("backfill get_logs")?;
+            info!(count = logs.len(), "backfill batch");
+            for log in logs {
+                match log.log_decode::<ThorchainAdapter::RedeemDispatched>() {
+                    Ok(decoded) => process_event(decoded.inner.data).await,
+                    Err(e) => warn!(error = %e, "failed to decode RedeemDispatched log"),
+                }
+            }
+        }
+
+        let filter = Filter::new()
             .address(adapter_addr)
-            .event_signature(ThorchainAdapter::RedeemDispatched::SIGNATURE_HASH)
-            .from_block(BlockNumberOrTag::Number(args.from_block))
-            .to_block(BlockNumberOrTag::Number(latest));
-        let logs = provider
-            .get_logs(&backfill_filter)
+            .event_signature(ThorchainAdapter::RedeemDispatched::SIGNATURE_HASH);
+        let sub = provider
+            .subscribe_logs(&filter)
             .await
-            .context("backfill get_logs")?;
-        info!(count = logs.len(), "backfill batch");
-        for log in logs {
+            .context("subscribe to RedeemDispatched")?;
+        let mut stream = sub.into_stream();
+
+        info!("subscribed; waiting for RedeemDispatched events…");
+
+        while let Some(log) = stream.next().await {
             match log.log_decode::<ThorchainAdapter::RedeemDispatched>() {
                 Ok(decoded) => process_event(decoded.inner.data).await,
                 Err(e) => warn!(error = %e, "failed to decode RedeemDispatched log"),
             }
         }
+        anyhow::Ok(())
+    };
+
+    let metrics_server = serve_metrics(prometheus, metrics_address);
+    tokio::select! {
+        result = event_source => match result {
+            Ok(()) => Err(anyhow::anyhow!("custody event source exited unexpectedly")),
+            Err(error) => Err(error),
+        },
+        result = watcher => match result {
+            Ok(()) => Err(anyhow::anyhow!("rebroadcast watcher exited unexpectedly")),
+            Err(error) => Err(anyhow::anyhow!("rebroadcast watcher failed: {error}")),
+        },
+        result = metrics_server => match result {
+            Ok(()) => Err(anyhow::anyhow!("custody metrics server exited unexpectedly")),
+            Err(error) => Err(anyhow::anyhow!("custody metrics server failed: {error}")),
+        },
     }
-
-    let filter = Filter::new()
-        .address(adapter_addr)
-        .event_signature(ThorchainAdapter::RedeemDispatched::SIGNATURE_HASH);
-    let sub = provider
-        .subscribe_logs(&filter)
-        .await
-        .context("subscribe to RedeemDispatched")?;
-    let mut stream = sub.into_stream();
-
-    info!("subscribed; waiting for RedeemDispatched events…");
-
-    while let Some(log) = stream.next().await {
-        match log.log_decode::<ThorchainAdapter::RedeemDispatched>() {
-            Ok(decoded) => process_event(decoded.inner.data).await,
-            Err(e) => warn!(error = %e, "failed to decode RedeemDispatched log"),
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -978,6 +1450,13 @@ mod tests {
     fn parse_network_rejects_unknown() {
         assert!(parse_network("doge").is_err());
         assert!(parse_network("").is_err());
+    }
+
+    #[test]
+    fn parse_pubkeys_rejects_duplicate_members() {
+        const GENERATOR: &str =
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        assert!(parse_pubkeys(&format!("{GENERATOR},{GENERATOR}")).is_err());
     }
 
     #[test]

@@ -26,6 +26,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 # Blocking JSON-RPC for the sync `Erc20ArrivalClient` (mirrors how
 # chain-btc's Esplora backs the sync `BitcoinChainClient`).
 reqwest = { workspace = true, features = ["blocking"] }
@@ -33,6 +34,10 @@ reqwest = { workspace = true, features = ["blocking"] }
 # exposes /api/v1/certify-ric over HTTP — same axum surface the
 # signer-daemon uses.
 axum = { workspace = true, features = ["json"] }
+sqlx.workspace = true
+xindex-ops.workspace = true
+prometheus.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 
 [dev-dependencies]
 wiremock.workspace = true
@@ -44,6 +49,10 @@ path = "src/bin/xindex-watch.rs"
 [[bin]]
 name = "xindex-observe-redeem"
 path = "src/bin/xindex-observe-redeem.rs"
+
+[[bin]]
+name = "xindex-finalized-observer"
+path = "src/bin/xindex-finalized-observer.rs"
 
 [[bin]]
 name = "xindex-attest"

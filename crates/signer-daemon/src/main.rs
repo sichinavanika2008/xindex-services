@@ -23,17 +23,23 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use alloy_primitives::Address;
 use anyhow::{bail, Context, Result};
+use axum::extract::{Request, State};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use bitcoin::{Network, PublicKey};
+use prometheus::Registry;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use xindex_multisig::MultisigDescriptor;
+use xindex_ops::{serve_metrics, Metrics};
 use xindex_shared::chain_registry::ChainId;
 use xindex_signer_daemon::intent::IntentPolicy;
 use xindex_signer_daemon::psbt::UtxoSignerConfig;
@@ -42,6 +48,9 @@ use xindex_signer_daemon::server::{router, CertVolumePolicy, DaemonConfig, Daemo
 use xindex_signer_daemon::soft_hsm::SoftwareHsm;
 use xindex_signer_daemon::tls;
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HttpHsmClient};
+
+const PRODUCTION_SIGNER_COUNT: usize = 5;
+const PRODUCTION_THRESHOLD: usize = 3;
 
 // ───────────────────────────── config (serde) ─────────────────────────────
 
@@ -75,6 +84,9 @@ struct FileConfig {
     tls: Option<TlsFile>,
     /// Listen address, e.g. `127.0.0.1:8443`.
     bind: String,
+    /// Loopback Prometheus/health listener. Production supervises this with
+    /// the signer API so monitoring cannot disappear silently.
+    metrics_bind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +159,7 @@ struct Serve {
     dev: bool,
     tls: Option<rustls::ServerConfig>,
     bind: SocketAddr,
+    metrics_bind: SocketAddr,
 }
 
 /// Assemble the daemon state and serve it (mTLS, or plain HTTP under
@@ -168,21 +181,83 @@ where
             .assert_production_safe()
             .map_err(|e| anyhow::anyhow!("production-safety check failed: {e}"))?;
     }
-    let app = router(state);
+    let prometheus = Registry::new();
+    let metrics = Metrics::new(&prometheus).context("register signer metrics")?;
+    let app = router(state).layer(middleware::from_fn_with_state(
+        metrics,
+        record_signer_request,
+    ));
     let listener = TcpListener::bind(serve.bind)
         .await
         .with_context(|| format!("bind {}", serve.bind))?;
     info!(bind = %serve.bind, mtls = serve.tls.is_some(), "xindex-signer-daemon listening");
-    if let Some(server_config) = serve.tls {
-        return tls::serve_mtls(listener, Arc::new(server_config), app)
-            .await
-            .map_err(Into::into);
+    let api_server = async move {
+        if let Some(server_config) = serve.tls {
+            return tls::serve_mtls(listener, Arc::new(server_config), app).await;
+        }
+        if !serve.dev {
+            return Err(std::io::Error::other(
+                "production signer reached plain-HTTP serve path",
+            ));
+        }
+        warn!("--dev: serving PLAIN HTTP (no mTLS) — loopback rehearsal only");
+        axum::serve(listener, app).await
+    };
+    let metrics_server = serve_metrics(prometheus, serve.metrics_bind);
+    tokio::select! {
+        result = api_server => match result {
+            Ok(()) => Err(anyhow::anyhow!("signer API exited unexpectedly")),
+            Err(error) => Err(anyhow::anyhow!("signer API failed: {error}")),
+        },
+        result = metrics_server => match result {
+            Ok(()) => Err(anyhow::anyhow!("signer metrics server exited unexpectedly")),
+            Err(error) => Err(anyhow::anyhow!("signer metrics server failed: {error}")),
+        },
     }
-    if !serve.dev {
-        bail!("mTLS config (`tls`) is required outside --dev; a production daemon must not serve plain HTTP");
+}
+
+async fn record_signer_request(
+    State(metrics): State<Metrics>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let role = signer_role(request.uri().path());
+    let response = next.run(request).await;
+    if let Some(role) = role {
+        if role == "psbt" && response.status() == axum::http::StatusCode::CONFLICT {
+            metrics.custody_one_shot_conflicts.inc();
+        }
+        let result = if response.status().is_success() {
+            "success"
+        } else if response.status().is_client_error() {
+            "refused"
+        } else {
+            "error"
+        };
+        metrics
+            .signer_requests
+            .with_label_values(&[role, result])
+            .inc();
     }
-    warn!("--dev: serving PLAIN HTTP (no mTLS) — loopback rehearsal only");
-    axum::serve(listener, app).await.map_err(Into::into)
+    response
+}
+
+fn signer_role(path: &str) -> Option<&'static str> {
+    match path {
+        "/api/v1/sign/eip712-attestation" => Some("mint"),
+        "/api/v1/sign/eip712-redemption-delivery" => Some("delivery"),
+        "/api/v1/sign/eip712-refund" => Some("refund"),
+        "/api/v1/sign/eip712-streamed-settlement" => Some("streamed"),
+        "/api/v1/sign/eip712-ric" => Some("ric"),
+        "/api/v1/sign/eip712-acc" => Some("acc"),
+        "/api/v1/sign/psbt-input" => Some("psbt"),
+        "/api/v1/sign/evm-safe-tx" => Some("evm"),
+        "/api/v1/sign/cosmos-tx" => Some("cosmos"),
+        "/api/v1/sign/xrp-tx" => Some("xrp"),
+        "/api/v1/sign/solana-tx" => Some("solana"),
+        "/api/v1/sign/tron-tx" => Some("tron"),
+        _ => None,
+    }
 }
 
 #[tokio::main]
@@ -199,6 +274,10 @@ async fn main() -> Result<()> {
         .find(|a| !a.starts_with("--"))
         .context("usage: xindex-signer-daemon <config.json> [--dev]")?;
 
+    if !dev {
+        validate_owner_only_regular_file(Path::new(config_path), "configuration")?;
+    }
+
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config {config_path}"))?;
     let file: FileConfig = serde_json::from_str(&raw).context("parse config json")?;
@@ -211,11 +290,16 @@ async fn main() -> Result<()> {
         .bind
         .parse()
         .with_context(|| format!("bind address {}", file.bind))?;
+    let metrics_bind: SocketAddr = file
+        .metrics_bind
+        .parse()
+        .context("metrics_bind must be a socket address")?;
     let serve = Serve {
         utxo,
         dev,
         tls,
         bind,
+        metrics_bind,
     };
 
     match (file.database_url.as_deref(), file.hsm.kind) {
@@ -248,6 +332,20 @@ fn warn_in_memory() {
 /// replay backend, the transport to the HSM frontend, and the outer mTLS
 /// listener. These checks run before opening the database or binding a socket.
 fn validate_runtime_mode(file: &FileConfig, dev: bool) -> Result<()> {
+    let bind = file
+        .bind
+        .parse::<SocketAddr>()
+        .context("bind must be a socket address")?;
+    let metrics_bind = file
+        .metrics_bind
+        .parse::<SocketAddr>()
+        .context("metrics_bind must be a socket address")?;
+    if bind.port() == 0 {
+        bail!("bind must use a non-zero port");
+    }
+    if metrics_bind.port() == 0 || !metrics_bind.ip().is_loopback() || metrics_bind == bind {
+        bail!("metrics_bind must be a distinct non-zero loopback listener");
+    }
     if file.hsm.kind == HsmKind::Software && !dev {
         bail!("hsm.kind=\"software\" requires --dev; a production daemon must front an HSM (hsm.kind=\"http\")");
     }
@@ -260,11 +358,90 @@ fn validate_runtime_mode(file: &FileConfig, dev: bool) -> Result<()> {
         )?;
     }
     if !dev {
-        if file.database_url.is_none() {
-            bail!("database_url is required outside --dev; production replay/equivocation state must survive restart");
+        if file.intent_policy.signer_whitelist.len() != PRODUCTION_SIGNER_COUNT
+            || file.intent_policy.intent_quorum != PRODUCTION_THRESHOLD
+        {
+            bail!("production certification topology must be exactly 3-of-5");
         }
-        if file.tls.is_none() {
-            bail!("mTLS config (`tls`) is required outside --dev; a production daemon must not serve plain HTTP");
+        if let Some(utxo) = &file.utxo {
+            if utxo.pubkeys.len() != PRODUCTION_SIGNER_COUNT
+                || utxo.threshold != PRODUCTION_THRESHOLD
+            {
+                bail!("production custody topology must be exactly 3-of-5");
+            }
+        }
+        let database_url = file.database_url.as_deref().context(
+            "database_url is required outside --dev; production replay/equivocation state must survive restart",
+        )?;
+        validate_database_url(database_url)?;
+        let tls = file.tls.as_ref().context(
+            "mTLS config (`tls`) is required outside --dev; a production daemon must not serve plain HTTP",
+        )?;
+        validate_owner_only_regular_file(Path::new(&tls.server_key), "mTLS server key")?;
+    }
+    Ok(())
+}
+
+fn validate_database_url(database_url: &str) -> Result<()> {
+    let path = database_url
+        .strip_prefix("sqlite://")
+        .context("database_url must be sqlite:///absolute/path")?
+        .split('?')
+        .next()
+        .context("database_url path is absent")?;
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        bail!("database_url must resolve to an absolute durable path");
+    }
+    validate_owner_only_directory(path.parent().context("database path has no parent")?)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                bail!("existing replay database must be a non-symlink regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+                    bail!(
+                        "existing replay database must be owner-only and have exactly one hard link"
+                    );
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect existing replay database"),
+    }
+    Ok(())
+}
+
+fn validate_owner_only_directory(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect durable directory {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("durable database parent must be a non-symlink directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("durable database parent must be owner-only");
+        }
+    }
+    Ok(())
+}
+
+fn validate_owner_only_regular_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("{label} must be a non-symlink regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+            bail!("{label} must be owner-only and have exactly one hard link");
         }
     }
     Ok(())
@@ -301,6 +478,9 @@ fn validate_hsm_url(raw: &str) -> Result<()> {
 // ───────────────────────────── builders ─────────────────────────────
 
 fn build_daemon_config(file: &FileConfig) -> Result<DaemonConfig> {
+    if file.chain_id == 0 {
+        bail!("chain_id must be non-zero");
+    }
     let intent_policy = IntentPolicy {
         signer_whitelist: file
             .intent_policy
@@ -342,10 +522,20 @@ fn build_utxo(u: &UtxoFile) -> Result<UtxoSignerConfig> {
         .iter()
         .map(|p| PublicKey::from_str(p).with_context(|| format!("utxo pubkey {p}")))
         .collect::<Result<Vec<_>>>()?;
+    let unique_pubkeys = pubkeys
+        .iter()
+        .map(ToString::to_string)
+        .collect::<std::collections::HashSet<_>>();
+    if unique_pubkeys.len() != pubkeys.len() {
+        bail!("utxo pubkeys must be distinct");
+    }
     let descriptor = MultisigDescriptor::new_p2wsh(u.threshold, &pubkeys)
         .map_err(|e| anyhow::anyhow!("build p2wsh descriptor: {e}"))?;
     let my_pubkey = PublicKey::from_str(&u.my_pubkey)
         .with_context(|| format!("utxo my_pubkey {}", u.my_pubkey))?;
+    if !pubkeys.contains(&my_pubkey) {
+        bail!("utxo my_pubkey must appear in the configured descriptor");
+    }
     Ok(UtxoSignerConfig {
         chain_id: parse_chain_id(&u.chain)?,
         network: parse_network(&u.network)?,
@@ -394,7 +584,11 @@ fn build_server_config(t: &TlsFile) -> Result<rustls::ServerConfig> {
 // ───────────────────────────── parse helpers ─────────────────────────────
 
 fn parse_addr(s: &str) -> Result<Address> {
-    Address::from_str(s).with_context(|| format!("invalid address {s}"))
+    let address = Address::from_str(s).with_context(|| format!("invalid address {s}"))?;
+    if address.is_zero() {
+        bail!("address must be non-zero");
+    }
+    Ok(address)
 }
 
 fn hex32(s: &str) -> Result<[u8; 32]> {
@@ -452,5 +646,11 @@ mod tests {
         let error = hex32(secret).expect_err("malformed secret must fail");
         assert!(!error.to_string().contains(secret));
         assert!(error.to_string().contains("redacted"));
+    }
+
+    #[test]
+    fn signer_identities_and_database_paths_fail_closed() {
+        assert!(parse_addr("0x0000000000000000000000000000000000000000").is_err());
+        assert!(validate_database_url("sqlite://relative.db").is_err());
     }
 }

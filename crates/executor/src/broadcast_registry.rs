@@ -204,6 +204,13 @@ pub trait BroadcastRegistry: Send + Sync {
         &self,
     ) -> impl std::future::Future<Output = Result<usize, RegistryError>> + Send;
 
+    /// Count write-ahead reservations that never reached exact-transaction
+    /// persistence. Any non-zero production startup count requires an
+    /// operator incident review; these rows must never be auto-released.
+    fn reserved_count(
+        &self,
+    ) -> impl std::future::Future<Output = Result<usize, RegistryError>> + Send;
+
     /// True iff ANY record (pending OR confirmed) exists for `intent_id`.
     /// Used by `xindex-redeem` to gate against re-executing an
     /// already-broadcast intent during `--from-block` backfill — a
@@ -381,6 +388,17 @@ impl BroadcastRegistry for InMemoryBroadcastRegistry {
             .entries
             .values()
             .filter(|s| s.status == BroadcastStatus::Pending)
+            .count())
+    }
+
+    async fn reserved_count(&self) -> Result<usize, RegistryError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .entries
+            .values()
+            .filter(|stored| stored.status == BroadcastStatus::Reserved)
             .count())
     }
 
@@ -688,6 +706,15 @@ impl BroadcastRegistry for SqliteBroadcastRegistry {
             .map_err(|e| RegistryError::Decode(format!("count→usize overflow: {e}")))
     }
 
+    async fn reserved_count(&self) -> Result<usize, RegistryError> {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM broadcasts WHERE status = 'reserved'")
+                .fetch_one(&self.pool)
+                .await?;
+        usize::try_from(row.0)
+            .map_err(|error| RegistryError::Decode(format!("count→usize overflow: {error}")))
+    }
+
     async fn has_record(&self, intent_id: &B256) -> Result<bool, RegistryError> {
         let id_bytes = intent_id.as_slice();
         let row: Option<(i64,)> =
@@ -881,12 +908,14 @@ mod tests {
         assert!(r.reserve(&id).await.expect("reserve"));
         assert!(!r.reserve(&id).await.expect("second reserve is a no-op"));
         assert!(r.has_record(&id).await.expect("has"));
+        assert_eq!(r.reserved_count().await.expect("reserved count"), 1);
         assert_eq!(
             r.pending_count().await.expect("count"),
             0,
             "a reserved row is not pending"
         );
         r.register(entry(id, 100)).await.expect("register");
+        assert_eq!(r.reserved_count().await.expect("reserved count"), 0);
         assert_eq!(r.pending_count().await.expect("count"), 1);
         let pending = r.list_pending().await.expect("list");
         assert_eq!(pending.len(), 1);
@@ -903,10 +932,12 @@ mod tests {
         assert!(r.reserve(&id).await.expect("reserve"));
         assert!(!r.reserve(&id).await.expect("second reserve is a no-op"));
         assert!(r.has_record(&id).await.expect("has"));
+        assert_eq!(r.reserved_count().await.expect("reserved count"), 1);
         assert_eq!(r.pending_count().await.expect("count"), 0);
         // register promotes the reserved placeholder and fills the real
         // recipient/amount (the upsert covers all columns, not just txid).
         r.register(entry(id, 100)).await.expect("register");
+        assert_eq!(r.reserved_count().await.expect("reserved count"), 0);
         assert_eq!(r.pending_count().await.expect("count"), 1);
         let pending = r.list_pending().await.expect("list");
         assert_eq!(pending.len(), 1);

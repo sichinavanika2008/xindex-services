@@ -17,6 +17,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 futures-util.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 wiremock.workspace = true

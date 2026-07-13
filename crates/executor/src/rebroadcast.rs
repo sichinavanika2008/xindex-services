@@ -53,6 +53,7 @@ use thiserror::Error;
 use tokio::time::interval;
 use tracing::{error, info, warn};
 use xindex_chain_utxo::{UtxoChainClient, UtxoError};
+use xindex_ops::Metrics;
 
 use crate::broadcast_registry::{now_unix_secs, BroadcastRegistry, RegistryError};
 
@@ -104,18 +105,20 @@ impl Default for WatcherConfig {
     }
 }
 
-/// Long-lived watcher task. Spawn via `tokio::spawn`; the future runs
-/// forever unless cancelled by the caller (drop the `JoinHandle` to stop).
+/// Long-lived watcher task. The future runs forever unless cancelled by the
+/// caller. Production callers should supervise it alongside their event source
+/// and metrics server so an unexpected exit terminates the process.
 ///
 /// # Errors
-/// Returns only if the registry returns a fatal error AND the caller
-/// chose to propagate. Default behaviour: log + continue. The function
-/// returns `Result<()>` for testing — production usage spawns it via
-/// `tokio::spawn(async move { let _ = run_watcher(...).await; })`.
+/// Returns only if the outer loop itself fails. Per-tick registry and chain
+/// errors are logged and retried. Passing metrics keeps the pending-broadcast
+/// gauge synchronized with the durable registry and records rebroadcast
+/// outcomes.
 pub async fn run_watcher<R, C>(
     registry: Arc<R>,
     chain: Arc<C>,
     cfg: WatcherConfig,
+    metrics: Option<Metrics>,
 ) -> Result<(), WatcherError>
 where
     R: BroadcastRegistry + 'static,
@@ -134,9 +137,19 @@ where
 
     loop {
         ticker.tick().await;
-        if let Err(e) = tick_once(registry.as_ref(), chain.as_ref(), cfg).await {
+        if let Err(e) =
+            tick_once_with_metrics(registry.as_ref(), chain.as_ref(), cfg, metrics.as_ref()).await
+        {
             // Tick-level errors are non-fatal: log + retry next tick.
             warn!(error = %e, "watcher tick failed; will retry");
+        }
+        if let Some(metrics) = &metrics {
+            match registry.pending_count().await {
+                Ok(pending) => metrics
+                    .executor_pending_broadcasts
+                    .set(i64::try_from(pending).unwrap_or(i64::MAX)),
+                Err(error) => warn!(%error, "pending broadcast metric refresh failed"),
+            }
         }
     }
 }
@@ -144,7 +157,21 @@ where
 /// One pass of the watcher loop. Extracted for testability. Processes the
 /// pending set (confirm-or-rebroadcast) and then RE-VALIDATES the confirmed
 /// set against re-org (audit M8).
+#[cfg(test)]
 async fn tick_once<R, C>(registry: &R, chain: &C, cfg: WatcherConfig) -> Result<(), WatcherError>
+where
+    R: BroadcastRegistry,
+    C: UtxoChainClient,
+{
+    tick_once_with_metrics(registry, chain, cfg, None).await
+}
+
+async fn tick_once_with_metrics<R, C>(
+    registry: &R,
+    chain: &C,
+    cfg: WatcherConfig,
+    metrics: Option<&Metrics>,
+) -> Result<(), WatcherError>
 where
     R: BroadcastRegistry,
     C: UtxoChainClient,
@@ -153,8 +180,8 @@ where
         warn!("system clock failure (pre-1970); skipping watcher tick");
         return Ok(());
     };
-    process_pending(registry, chain, cfg, now).await?;
-    revalidate_confirmed(registry, chain, cfg).await?;
+    process_pending(registry, chain, cfg, now, metrics).await?;
+    revalidate_confirmed(registry, chain, cfg, metrics).await?;
     Ok(())
 }
 
@@ -166,6 +193,7 @@ async fn process_pending<R, C>(
     chain: &C,
     cfg: WatcherConfig,
     now: u64,
+    metrics: Option<&Metrics>,
 ) -> Result<(), WatcherError>
 where
     R: BroadcastRegistry,
@@ -191,6 +219,12 @@ where
                     error!(intent_id = %entry.intent_id, error = %e,
                            "mark_confirmed failed; will retry next tick");
                 } else {
+                    if let Some(metrics) = metrics {
+                        metrics
+                            .custody_dispatches
+                            .with_label_values(&["btc", "confirmed"])
+                            .inc();
+                    }
                     info!(
                         intent_id = %entry.intent_id,
                         txid = %entry.txid,
@@ -223,6 +257,7 @@ where
                             error!(intent_id = %entry.intent_id, error = %e,
                                    "touch_attempt failed after successful re-broadcast");
                         } else {
+                            record_rebroadcast(metrics, "success");
                             info!(
                                 intent_id = %entry.intent_id,
                                 txid = %entry.txid,
@@ -240,6 +275,7 @@ where
                             warn!(intent_id = %entry.intent_id, error = %e,
                                   "touch_attempt failed after already-known re-broadcast");
                         } else {
+                            record_rebroadcast(metrics, "already_known");
                             info!(
                                 intent_id = %entry.intent_id,
                                 "re-broadcast no-op (node already has tx)"
@@ -247,6 +283,7 @@ where
                         }
                     }
                     Err(e) => {
+                        record_rebroadcast(metrics, "error");
                         warn!(intent_id = %entry.intent_id, error = %e,
                               "re-broadcast failed; will retry next tick");
                     }
@@ -268,6 +305,15 @@ where
     Ok(())
 }
 
+fn record_rebroadcast(metrics: Option<&Metrics>, outcome: &str) {
+    if let Some(metrics) = metrics {
+        metrics
+            .executor_rebroadcasts
+            .with_label_values(&[outcome])
+            .inc();
+    }
+}
+
 /// Re-validate each `Confirmed` broadcast against re-org (audit M8). For each
 /// confirmed row the watcher re-queries the chain:
 ///
@@ -285,6 +331,7 @@ async fn revalidate_confirmed<R, C>(
     registry: &R,
     chain: &C,
     cfg: WatcherConfig,
+    metrics: Option<&Metrics>,
 ) -> Result<(), WatcherError>
 where
     R: BroadcastRegistry,
@@ -340,6 +387,9 @@ where
                     error!(intent_id = %c.entry.intent_id, error = %e,
                            "mark_pending failed after reorg orphan; will retry next tick");
                 } else {
+                    if let Some(metrics) = metrics {
+                        metrics.executor_pending_broadcasts.inc();
+                    }
                     warn!(
                         intent_id = %c.entry.intent_id,
                         txid = %c.entry.txid,

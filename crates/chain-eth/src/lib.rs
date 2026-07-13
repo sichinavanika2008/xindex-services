@@ -9,10 +9,13 @@
 
 pub mod bindings;
 pub mod erc20;
+pub mod finalized_observer;
+pub mod finalized_rpc;
 pub mod observer;
 pub mod rpc;
+pub mod settlement_observer;
 
-pub use erc20::RpcErc20LogClient;
+pub use erc20::{FinalizedRpcErc20LogClient, RpcErc20LogClient};
 pub use observer::{
     InMemoryLegSource, LegFacts, Observer, ObserverConfig, ObserverError, RedeemLegSource,
 };

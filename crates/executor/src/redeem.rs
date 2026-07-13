@@ -29,6 +29,9 @@ use xindex_shared::signer_wire::{AcquireCancelProof, IntentProof};
 /// Errors surfaced during a single redemption execution.
 #[derive(Debug, Error)]
 pub enum ExecuteError {
+    /// Unsafe or malformed production transport/custody configuration.
+    #[error("configuration: {0}")]
+    Configuration(String),
     /// The contract-emitted memo is empty or exceeds the 80-byte
     /// `OP_RETURN` standard-relay limit. We trust the memo verbatim (the
     /// Solidity adapter builds the canonical
@@ -342,15 +345,46 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
         task: &RedeemTask,
         asgard: &Address,
     ) -> Result<(Txid, Transaction), ExecuteError> {
-        let certificate = task.intent_proof.clone().map(SpendCertificate::Ric);
-        let (txid, tx) =
-            self.execute_spend(task.amount, &task.memo, asgard, certificate.as_ref())?;
+        let tx = self.prepare_redemption_tx(task, asgard)?;
+        let txid = self.broadcast_prepared(&tx)?;
         info!(
             redemption_id = %task.redemption_id,
             %txid,
             "BTC→Asgard redemption deposit broadcast"
         );
         Ok((txid, tx))
+    }
+
+    /// Build, policy-check, HSM-sign and finalize the exact redemption
+    /// transaction without broadcasting it. Production callers persist these
+    /// bytes in their write-ahead registry before calling
+    /// [`InProcessExecutor::broadcast_prepared`].
+    ///
+    /// # Errors
+    /// Invalid facts, UTXO/PSBT failure, or a cosigner policy/HSM refusal.
+    pub fn prepare_redemption_tx(
+        &self,
+        task: &RedeemTask,
+        asgard: &Address,
+    ) -> Result<Transaction, ExecuteError> {
+        let certificate = task.intent_proof.clone().map(SpendCertificate::Ric);
+        self.prepare_spend(task.amount, &task.memo, asgard, certificate.as_ref())
+    }
+
+    /// Broadcast one already-finalized transaction and require the chain
+    /// client to return its exact locally-computed txid.
+    ///
+    /// # Errors
+    /// Chain transport/rejection or an upstream txid mismatch.
+    pub fn broadcast_prepared(&self, tx: &Transaction) -> Result<Txid, ExecuteError> {
+        let expected = tx.compute_txid();
+        let observed = self.chain.broadcast(tx)?;
+        if observed != expected {
+            return Err(ExecuteError::Chain(UtxoError::Upstream(
+                "broadcast endpoint returned a different txid".to_string(),
+            )));
+        }
+        Ok(expected)
     }
 
     /// The shared custody-spend core, used by BOTH the redeem path
@@ -373,6 +407,19 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
         asgard: &Address,
         certificate: Option<&SpendCertificate>,
     ) -> Result<(Txid, Transaction), ExecuteError> {
+        let tx = self.prepare_spend(amount, memo, asgard, certificate)?;
+        let txid = self.broadcast_prepared(&tx)?;
+        Ok((txid, tx))
+    }
+
+    /// Prepare the exact custody transaction without broadcasting it.
+    fn prepare_spend(
+        &self,
+        amount: U256,
+        memo: &[u8],
+        asgard: &Address,
+        certificate: Option<&SpendCertificate>,
+    ) -> Result<Transaction, ExecuteError> {
         let recipient_value = Self::amount_to_sats(amount)?;
         let needed = recipient_value
             .checked_add(Amount::from_sat(self.fee_sats))
@@ -473,8 +520,7 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
                 && tx.input[0].previous_output.vout == selected.vout,
             "vin[0] must be the selected multisig UTXO (THORChain refund-to-sender)"
         );
-        let txid = self.chain.broadcast(&tx)?;
-        Ok((txid, tx))
+        Ok(tx)
     }
 }
 

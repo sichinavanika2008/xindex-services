@@ -36,11 +36,17 @@ venue connectivity. Example shape (values are development placeholders):
   "evidence_operator_id": "operator-01",
   "anomaly_failure_threshold": 12,
   "collector_urls": [
-    "http://127.0.0.1:9191",
-    "http://127.0.0.1:9192"
+    "https://collector-a.internal:9191",
+    "https://collector-b.internal:9191"
   ],
   "publish_attempts": 3,
   "publish_timeout_secs": 5,
+  "metrics_address": "127.0.0.1:9095",
+  "collector_client_identity_pem": "/etc/xindex/tls/price-signer-client.pem",
+  "collector_server_ca_pems": [
+    "/etc/xindex/tls/collector-a-ca.pem",
+    "/etc/xindex/tls/collector-b-ca.pem"
+  ],
   "binance_base": "https://api.binance.com",
   "coinbase_base": "https://api.coinbase.com",
   "kraken_base": "https://api.kraken.com",
@@ -70,12 +76,16 @@ live on durable storage; create the evidence directory ahead of time with mode
 `0700` (group/world access is rejected).
 
 For every asset/epoch, the signer writes one create-new, mode-`0600` evidence
-file containing each exact raw provider response, normalized value and response
-hash, then fsyncs the file and directory before asking the HSM to sign. It signs
-the values from those persisted observations, not a second fetch. A persistence
-failure stops publication. Repeated observation failures latch the process shut
-at `anomaly_failure_threshold`; the threshold must be at least
+file and a Keccak-256 sidecar containing each exact raw provider response,
+normalized value and response hash, then fsyncs both and the directory before
+asking the HSM to sign. The fixed identity is also the crash-safe pre-HSM
+reservation: a restart cannot overwrite or produce a second observation for
+the same asset/epoch. It signs the values from those persisted observations,
+not a second fetch. A persistence failure stops publication. Repeated
+observation failures latch the process shut at `anomaly_failure_threshold`; the threshold must be at least
 `twap_min_samples + 2`. If every collector is unavailable, the signer exits.
+Collector delivery uses a client identity and explicit CA pins with system
+roots disabled. The metrics task and producer loop are supervised together.
 
 Run one producer per independent signer:
 
@@ -91,32 +101,38 @@ disagreement, or the anomaly latch exiting the process.
 
 ## Collector/poster
 
-Keep the default loopback bind unless an authenticated private service mesh is
-in front of the endpoint. The collector has no private-key input. Its connected
-RPC must delegate `eth_sendTransaction` signing for the configured address to a
-node-managed external signer such as Clef/HSM.
+The collector API always requires pinned mutual TLS. Its only private key is an
+owner-only transport key; it has no price-signing or poster private-key input.
+Its connected RPC must delegate `eth_sendTransaction` signing for the
+configured address to a node-managed external signer such as Clef/HSM.
 
 ```sh
 export ETH_RPC_URL=http://127.0.0.1:8545
 export PRICE_ORACLE_ADDR=0x________________________________________
 export PRICE_POSTER_ADDRESS=0x____________________________________
-export PRICE_SIGNER_ADDRESSES=0xSigner1,0xSigner2,0xSigner3
-export PRICE_THRESHOLD=2
+export PRICE_SIGNER_ADDRESSES=0xSigner1,...,0xSigner11
+export PRICE_THRESHOLD=7
+export EXPECTED_ETH_CHAIN_ID=1
+export PRICE_SERVER_CERT_PEM=/etc/xindex/tls/price-collector.pem
+export PRICE_SERVER_KEY_PEM=/etc/xindex/tls/price-collector.key
+export PRICE_PINNED_CLIENT_CERT_PEMS=/etc/xindex/tls/p01.pem,...,/etc/xindex/tls/p11.pem
+export METRICS_ADDRESS=127.0.0.1:9192
 
 cargo run -p xindex-relayer --bin xindex-price-collector
 ```
 
-Startup reads `threshold()`, `signerCount()`, and `isSigner(address)` and refuses
-any roster mismatch. Signer rotation therefore requires a collector restart
-with the complete new set. The HTTP endpoint is
+Production startup requires exactly the approved 7-of-11 topology, pins the
+chain id, reads `threshold()`, `signerCount()`, and `isSigner(address)`, and
+refuses any roster mismatch. Signer rotation therefore requires a collector
+restart with the complete new set. The mTLS endpoint is
 `POST /api/v1/price-signature` with `SignedPriceMessage` JSON.
 
 Posting is nonce-serialized and idempotence-checks `pendingQuote` before every
 attempt. Transport, rate-limit, server, receipt, and short-reorg failures receive
 bounded exponential retries. Bounds, Chainlink divergence, pause, stale epoch,
 and bad-quorum reverts are deterministic for a signed tuple and are not retried.
-If the poster worker exits, the HTTP server terminates fail-closed rather than
-accepting a quorum it can no longer enqueue.
+If the poster worker, mTLS API, or metrics server exits, the process terminates
+fail-closed rather than accepting a quorum it can no longer enqueue or monitor.
 
 ## Release gates still required
 
@@ -128,6 +144,7 @@ accepting a quorum it can no longer enqueue.
 - Configure production L1 bounds, Chainlink gates, heartbeat, challenge window,
   and alerts before the first price.
 - Include the final pipeline and operating configuration in external audit.
-- Wire Prometheus health/metrics for this binary and demonstrate the alert
-  routes and evidence-retention policy. Structured logs and fail-closed exits
-  exist, but that is not by itself monitoring evidence.
+- Demonstrate the checked-in Prometheus rules, dual alert routes, evidence
+  inventory/WORM retention, and incident procedures in
+  [`gate3-operations.md`](gate3-operations.md). Code is not operational
+  evidence.

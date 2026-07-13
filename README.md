@@ -13,23 +13,30 @@ take precedence over historical milestone prose.
 
 The workspace contains 24 packages spanning shared protocol types, EVM and
 native-chain clients, signers, custody, executors, relayers and operations.
-The 2026-07-13 Gate-3 delta adds:
+The 2026-07-13 Gate-3 code candidate adds:
 
 - eight manifested current Solidity ABIs and an exact drift gate;
 - all seven current EIP-712 report types with Rust/Solidity vectors;
-- durable registry signature reservation and quote-nonce state;
-- exact inbound-state/quote signer and collector cores;
-- fail-closed three-source THOR agreement;
-- a multi-source price signer and exact untrusted collector/poster with raw
-  evidence and anomaly refusal; and
-- production-profile checks that require durable state, mTLS and an external
-  HSM boundary while keeping software/raw-key paths dev-only.
+- live fail-closed inbound-state and exact-quote signer/coordinator services,
+  with three-source THOR agreement, durable reservations and serialized nonce
+  state;
+- a finalized Ethereum observer journal with checkpoint continuity, rollback,
+  exact same-transaction mint pairing and current mint/delivery/refund/streamed
+  settlement certification;
+- exact settlement and price collectors, pinned mutual TLS, threshold-roster
+  checks, bounded raw evidence and anomaly refusal;
+- a production-gated BTC custody executor that reserves before HSM work,
+  validates the RIC/full transaction policy, persists the F2 correlation and
+  exact transaction bytes before broadcast, and only rebroadcasts those bytes;
+- one-to-one logical/physical native and ERC-20 inflow ledgers; and
+- supervised metrics, checked-in Prometheus alerts, evidence verification,
+  release topology validation and incident/retention runbooks.
 
-Gate 3 nevertheless remains **FAIL/open**. The current tree does not provide a
-complete live inbound/quote producer/poster, every current mint/redemption
-observer/poster, finalized/reorg-safe state, a policy-complete native custody
-executor, demonstrated production monitoring, independent operator/HSM/source
-records, or an independent audit. Do not connect it to value-bearing systems.
+The code-addressable Gate-3 findings are closed in the current uncommitted
+candidate on top of `f22b71a`. This is not production approval: real independent
+operator/HSM/source records, alert delivery and WORM-retention drills, testnet
+rehearsal, a pinned clean release commit, and independent audit evidence do not
+exist in this checkout. Do not connect it to value-bearing systems.
 
 ## Historical milestone snapshot
 
@@ -61,6 +68,17 @@ cargo audit --no-fetch --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0185
 
 `--no-run` compiles signer and custody tests but does not execute signature
 operations. See `just gate` and CI for the full authorized test gate.
+
+The release-evidence wrapper additionally requires a real owner-only topology
+registry, one or more populated evidence directories, and `promtool`:
+
+```bash
+./scripts/check-gate3-release.sh \
+  /secure/release/gate3-topology.json \
+  /var/lib/xindex/evidence/ROLE
+```
+
+It intentionally cannot pass against placeholders or an empty evidence set.
 
 ## End-to-end against local Anvil
 

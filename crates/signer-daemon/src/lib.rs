@@ -26,6 +26,7 @@
 //! coordinator host" not "leak a signing key" (DL-M5-1).
 
 pub mod cosmos_tx;
+pub mod evidence;
 pub mod evm_safe;
 pub use xindex_shared::intent;
 pub mod price_sign;

@@ -4,6 +4,8 @@
 //! `serde(default)` lets us tolerate missing or new optional fields
 //! without breaking on every upstream schema change.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Missing upstream safety fields are ambiguous, never affirmative evidence
@@ -159,6 +161,109 @@ pub struct Pool {
     pub balance_rune: String,
     #[serde(default)]
     pub asset_tor_price: Option<String>,
+}
+
+/// `GET /thorchain/mimir` response. Keys are case-insensitive in `THORNode`;
+/// policy code normalizes them to uppercase before reading or hashing them.
+pub type Mimir = BTreeMap<String, i64>;
+
+/// Complete query parameters Xindex permits for `/thorchain/quote/swap`.
+///
+/// Every safety-sensitive option is explicit: no affiliate, no automatic
+/// streaming quantity, no implicit refund recipient, and the fee-aware
+/// `liquidity_tolerance_bps` parameter (never the legacy `tolerance_bps`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct SwapQuoteRequest {
+    pub from_asset: String,
+    pub to_asset: String,
+    /// `THORChain` Base amount (1e8), encoded losslessly as decimal text.
+    pub amount: String,
+    pub destination: String,
+    pub refund_address: String,
+    pub liquidity_tolerance_bps: u16,
+    pub streaming_interval: u64,
+    pub streaming_quantity: u64,
+}
+
+/// Fee breakdown returned by `/thorchain/quote/swap`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapQuoteFees {
+    pub asset: String,
+    pub affiliate: String,
+    pub outbound: String,
+    pub liquidity: String,
+    pub total: String,
+    pub slippage_bps: u64,
+    pub total_bps: u64,
+}
+
+/// Safety-relevant subset of `/thorchain/quote/swap`.
+///
+/// Load-bearing fields intentionally have no serde defaults. If `THORNode` or a
+/// provider drops one, decoding fails and the signer cannot authorize a swap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapQuoteResponse {
+    pub inbound_address: String,
+    pub inbound_confirmation_blocks: u64,
+    pub inbound_confirmation_seconds: u64,
+    pub outbound_delay_blocks: u64,
+    pub outbound_delay_seconds: u64,
+    pub fees: SwapQuoteFees,
+    pub expiry: u64,
+    pub warning: String,
+    pub dust_threshold: String,
+    pub recommended_min_amount_in: String,
+    pub recommended_gas_rate: String,
+    pub gas_rate_units: String,
+    pub memo: String,
+    pub expected_amount_out: String,
+    pub max_streaming_quantity: u64,
+    pub streaming_swap_blocks: u64,
+    #[serde(default)]
+    pub streaming_swap_seconds: u64,
+    pub total_swap_seconds: u64,
+}
+
+/// Standard `CometBFT` `/status` envelope (only the sync fields Xindex reads).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsensusStatusResponse {
+    pub result: ConsensusStatusResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsensusStatusResult {
+    pub node_info: ConsensusNodeInfo,
+    pub sync_info: ConsensusSyncInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsensusNodeInfo {
+    pub id: String,
+    pub network: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsensusSyncInfo {
+    pub latest_block_hash: String,
+    pub latest_block_height: String,
+    pub latest_block_time: String,
+    pub catching_up: bool,
+}
+
+/// Parsed, policy-ready `CometBFT` tip. Numeric/time parsing happens at the
+/// client boundary so no signer can accidentally compare height strings or
+/// treat a malformed timestamp as fresh.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConsensusTip {
+    pub node_id: String,
+    pub network: String,
+    pub version: String,
+    pub block_hash: String,
+    pub height: u64,
+    pub block_time_unix: u64,
+    pub catching_up: bool,
 }
 
 /// Subset of `GET /thorchain/tx/status/{hash}` — the swap-lifecycle

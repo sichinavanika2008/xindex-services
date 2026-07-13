@@ -41,26 +41,20 @@ pub enum ReplayError {
     #[error("volume window contention: {0}")]
     Contention(String),
 
-    /// A concurrent request already recorded this exact identity tuple — the
-    /// write-side race the `check_*` pre-flight cannot fully close (two
-    /// identical requests both observe `FirstTime`, both sign deterministically,
-    /// both attempt to `record_*`). The PK admits exactly one row, so the
-    /// second `record_*` surfaces this instead of a generic error; the handler
-    /// recovers by re-reading the now-present row and returning the cached
-    /// signature idempotently — deterministic ECDSA means the bytes are
-    /// identical anyway, so the race-loser never gets a spurious 4xx/5xx
-    /// (audit L10).
+    /// A concurrent request already owns or completed this exact identity
+    /// tuple. For the EIP-712 replay families, an empty signature reserves the
+    /// tuple before the HSM is called and a later non-empty signature completes
+    /// that same reservation. The primary key admits one payload per tuple;
+    /// callers recover from this race by re-reading the winner's row.
     #[error("duplicate record (concurrent write race)")]
     Duplicate,
 }
 
 /// Whether a failed `record_*` must propagate as an error, or can be recovered
-/// from. `Duplicate` means a concurrent identical request won the write race
-/// (audit L10): the handler re-reads and returns the winner's cached signature
-/// instead of surfacing a spurious 4xx/5xx. Every other variant is a real
-/// failure that must propagate. Centralized so all twelve signing handlers
-/// share ONE tested copy of the recovery predicate instead of duplicating the
-/// `!matches!(e, Duplicate)` guard each.
+/// from. `Duplicate` means another request owns or completed the tuple: the
+/// handler re-reads the durable row and either proceeds with the same pending
+/// payload, returns the completed signature, or rejects a conflict. Every
+/// other variant is a real failure that must propagate.
 #[must_use]
 pub fn must_propagate_record_error(e: &ReplayError) -> bool {
     !matches!(e, ReplayError::Duplicate)
@@ -74,7 +68,8 @@ pub struct SignedRecord {
     /// SHA-256 of the canonical request payload bytes.
     pub payload_hash: [u8; 32],
     /// Signature bytes the daemon returned the first time (65 bytes for
-    /// EIP-712 secp256k1; variable for PSBT DER).
+    /// EIP-712 secp256k1; variable for PSBT DER). An empty vector is a durable
+    /// pre-HSM reservation for replay families that use reserve/complete.
     pub signature: Vec<u8>,
     /// When the daemon first signed it. Operator-visible.
     pub signed_at_unix: i64,
@@ -82,18 +77,19 @@ pub struct SignedRecord {
 
 /// Outcome of a "may I sign this?" pre-flight check.
 ///
-/// The handler runs this BEFORE invoking the HSM. If `FirstTime`, the
-/// handler proceeds to compute the digest and call the HSM, then
-/// `record_*` to commit the result. If `Idempotent`, the cached sig is
-/// returned verbatim. If `Conflict`, the daemon refuses with 409 and
-/// the HSM is never touched.
+/// The handler runs this BEFORE invoking the HSM. For reserve/complete
+/// families, `FirstTime` is first recorded with an empty signature; only after
+/// that durable reservation succeeds may the HSM be called. An `Idempotent`
+/// record with an empty signature is the same payload's pending reservation;
+/// a non-empty signature is returned verbatim. `Conflict` never reaches the
+/// HSM.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckOutcome {
     /// No prior record for this identity tuple. Caller proceeds to sign.
     FirstTime,
-    /// Prior record with the SAME `payload_hash`. Caller returns the
-    /// cached signature; the HSM is not invoked again (deterministic
-    /// re-sign would yield the same bytes anyway).
+    /// Prior record with the SAME `payload_hash`. A non-empty signature is
+    /// cached completion; an empty signature is a pending reservation that
+    /// may be retried with the exact same payload.
     Idempotent(SignedRecord),
     /// Prior record with a DIFFERENT `payload_hash`. The daemon refuses
     /// to sign; the previous payload's hash is included so the operator
@@ -182,11 +178,11 @@ pub trait ReplayStore: Send + Sync {
         payload_hash: [u8; 32],
     ) -> impl std::future::Future<Output = Result<CheckOutcome, ReplayError>> + Send;
 
-    /// Insert a fresh attestation record. Fails with the underlying
-    /// uniqueness error if the tuple already exists — the handler
-    /// would normally have caught that via [`Self::check_attestation`],
-    /// but this is the second line of defense against a race where two
-    /// concurrent identical requests both see `FirstTime`.
+    /// Reserve or complete an attestation tuple. An empty `signature` inserts
+    /// the durable pre-HSM reservation. A non-empty `signature` either inserts
+    /// a completed row for backwards compatibility or atomically completes an
+    /// existing empty reservation with the same payload. Every other existing
+    /// row returns [`ReplayError::Duplicate`].
     fn record_attestation(
         &self,
         intent_id: B256,
@@ -573,18 +569,25 @@ impl ReplayStore for InMemoryReplayStore {
         now_unix: i64,
     ) -> Result<(), ReplayError> {
         let mut g = self.inner.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(e) =
-            g.attestations.entry((intent_id, slot_index))
-        {
-            e.insert(SignedRecord {
-                payload_hash,
-                signature,
-                signed_at_unix: now_unix,
-            });
-            Ok(())
-        } else {
-            // Mirror the SQLite UNIQUE violation surface (audit L10).
-            Err(ReplayError::Duplicate)
+        match g.attestations.entry((intent_id, slot_index)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(SignedRecord {
+                    payload_hash,
+                    signature,
+                    signed_at_unix: now_unix,
+                });
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(mut e)
+                if e.get().payload_hash == payload_hash
+                    && e.get().signature.is_empty()
+                    && !signature.is_empty() =>
+            {
+                e.get_mut().signature = signature;
+                e.get_mut().signed_at_unix = now_unix;
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(ReplayError::Duplicate),
         }
     }
 
@@ -624,20 +627,29 @@ impl ReplayStore for InMemoryReplayStore {
         now_unix: i64,
     ) -> Result<(), ReplayError> {
         let mut g = self.inner.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(e) =
-            g.redemptions.entry((redemption_id, leg_index))
-        {
-            e.insert((
-                kind,
-                SignedRecord {
-                    payload_hash,
-                    signature,
-                    signed_at_unix: now_unix,
-                },
-            ));
-            Ok(())
-        } else {
-            Err(ReplayError::Duplicate)
+        match g.redemptions.entry((redemption_id, leg_index)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((
+                    kind,
+                    SignedRecord {
+                        payload_hash,
+                        signature,
+                        signed_at_unix: now_unix,
+                    },
+                ));
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(mut e)
+                if e.get().0 == kind
+                    && e.get().1.payload_hash == payload_hash
+                    && e.get().1.signature.is_empty()
+                    && !signature.is_empty() =>
+            {
+                e.get_mut().1.signature = signature;
+                e.get_mut().1.signed_at_unix = now_unix;
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(ReplayError::Duplicate),
         }
     }
 
@@ -981,15 +993,25 @@ impl ReplayStore for InMemoryReplayStore {
     ) -> Result<(), ReplayError> {
         let key = (chain_id.thor_asset(), redemption_id, leg_index);
         let mut g = self.inner.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(e) = g.ric_certs.entry(key) {
-            e.insert(SignedRecord {
-                payload_hash,
-                signature,
-                signed_at_unix: now_unix,
-            });
-            Ok(())
-        } else {
-            Err(ReplayError::Duplicate)
+        match g.ric_certs.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(SignedRecord {
+                    payload_hash,
+                    signature,
+                    signed_at_unix: now_unix,
+                });
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(mut e)
+                if e.get().payload_hash == payload_hash
+                    && e.get().signature.is_empty()
+                    && !signature.is_empty() =>
+            {
+                e.get_mut().signature = signature;
+                e.get_mut().signed_at_unix = now_unix;
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(ReplayError::Duplicate),
         }
     }
 
@@ -1061,15 +1083,25 @@ impl ReplayStore for InMemoryReplayStore {
     ) -> Result<(), ReplayError> {
         let key = (chain_id.thor_asset(), cancel_id);
         let mut g = self.inner.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(e) = g.ac_certs.entry(key) {
-            e.insert(SignedRecord {
-                payload_hash,
-                signature,
-                signed_at_unix: now_unix,
-            });
-            Ok(())
-        } else {
-            Err(ReplayError::Duplicate)
+        match g.ac_certs.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(SignedRecord {
+                    payload_hash,
+                    signature,
+                    signed_at_unix: now_unix,
+                });
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(mut e)
+                if e.get().payload_hash == payload_hash
+                    && e.get().signature.is_empty()
+                    && !signature.is_empty() =>
+            {
+                e.get_mut().signature = signature;
+                e.get_mut().signed_at_unix = now_unix;
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(ReplayError::Duplicate),
         }
     }
 
@@ -1149,6 +1181,26 @@ impl SqliteReplayStore {
             Err(e) => Err(ReplayError::Sqlite(e)),
         }
     }
+
+    /// Map a reserve/complete UPSERT. `SQLite` reports zero affected rows when
+    /// the tuple already exists but is not the same empty reservation being
+    /// completed. Surface that as [`ReplayError::Duplicate`] so the caller can
+    /// re-read and distinguish completed, pending, and conflicting winners.
+    fn map_reserve_or_complete(
+        res: Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>,
+    ) -> Result<(), ReplayError> {
+        match res {
+            Ok(done) if done.rows_affected() == 1 => Ok(()),
+            Ok(_) => Err(ReplayError::Duplicate),
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation) =>
+            {
+                Err(ReplayError::Duplicate)
+            }
+            Err(e) => Err(ReplayError::Sqlite(e)),
+        }
+    }
 }
 
 impl ReplayStore for SqliteReplayStore {
@@ -1201,7 +1253,13 @@ impl ReplayStore for SqliteReplayStore {
         let res = sqlx::query(
             "INSERT INTO signed_attestations
                 (intent_id, slot_index, payload_hash, signature, signed_at_unix)
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(intent_id, slot_index) DO UPDATE SET
+                signature = excluded.signature,
+                signed_at_unix = excluded.signed_at_unix
+             WHERE signed_attestations.payload_hash = excluded.payload_hash
+               AND length(signed_attestations.signature) = 0
+               AND length(excluded.signature) > 0",
         )
         .bind(intent_id.as_slice())
         .bind(slot_bytes.as_slice())
@@ -1210,7 +1268,7 @@ impl ReplayStore for SqliteReplayStore {
         .bind(now_unix)
         .execute(&self.pool)
         .await;
-        Self::map_insert(res)
+        Self::map_reserve_or_complete(res)
     }
 
     async fn check_redemption(
@@ -1279,7 +1337,14 @@ impl ReplayStore for SqliteReplayStore {
         let res = sqlx::query(
             "INSERT INTO signed_redemptions
                 (redemption_id, leg_index, kind, payload_hash, signature, signed_at_unix)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(redemption_id, leg_index) DO UPDATE SET
+                signature = excluded.signature,
+                signed_at_unix = excluded.signed_at_unix
+             WHERE signed_redemptions.kind = excluded.kind
+               AND signed_redemptions.payload_hash = excluded.payload_hash
+               AND length(signed_redemptions.signature) = 0
+               AND length(excluded.signature) > 0",
         )
         .bind(redemption_id.as_slice())
         .bind(i64::from(leg_index))
@@ -1289,7 +1354,7 @@ impl ReplayStore for SqliteReplayStore {
         .bind(now_unix)
         .execute(&self.pool)
         .await;
-        Self::map_insert(res)
+        Self::map_reserve_or_complete(res)
     }
 
     async fn check_psbt_input(
@@ -1846,7 +1911,13 @@ impl ReplayStore for SqliteReplayStore {
         let res = sqlx::query(
             "INSERT INTO ric_certs
                 (chain_id, redemption_id, leg_index, payload_hash, signature, signed_at_unix)
-             VALUES (?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(chain_id, redemption_id, leg_index) DO UPDATE SET
+                signature = excluded.signature,
+                signed_at_unix = excluded.signed_at_unix
+             WHERE ric_certs.payload_hash = excluded.payload_hash
+               AND length(ric_certs.signature) = 0
+               AND length(excluded.signature) > 0",
         )
         .bind(chain_id.thor_asset())
         .bind(redemption_id.as_slice())
@@ -1856,7 +1927,7 @@ impl ReplayStore for SqliteReplayStore {
         .bind(now_unix)
         .execute(&self.pool)
         .await;
-        Self::map_insert(res)
+        Self::map_reserve_or_complete(res)
     }
 
     async fn check_ac_intent(
@@ -1967,7 +2038,13 @@ impl ReplayStore for SqliteReplayStore {
         let res = sqlx::query(
             "INSERT INTO ac_certs
                 (chain_id, cancel_id, payload_hash, signature, signed_at_unix)
-             VALUES (?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(chain_id, cancel_id) DO UPDATE SET
+                signature = excluded.signature,
+                signed_at_unix = excluded.signed_at_unix
+             WHERE ac_certs.payload_hash = excluded.payload_hash
+               AND length(ac_certs.signature) = 0
+               AND length(excluded.signature) > 0",
         )
         .bind(chain_id.thor_asset())
         .bind(cancel_id.as_slice())
@@ -1976,7 +2053,7 @@ impl ReplayStore for SqliteReplayStore {
         .bind(now_unix)
         .execute(&self.pool)
         .await;
-        Self::map_insert(res)
+        Self::map_reserve_or_complete(res)
     }
 
     async fn consume_cert_volume(
@@ -2124,6 +2201,198 @@ mod tests {
                 .record_attestation(id1(), U256::from(0u8), hash_a(), vec![9, 9, 9], 200)
                 .await
                 .is_err());
+        }
+    }
+
+    /// The attestation replay row is a two-phase durable state machine:
+    /// empty signature = reserved before HSM release, non-empty = completed.
+    async fn run_attestation_reservation_lifecycle<S: ReplayStore>(store: &S) {
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let intent = id1();
+            let slot = U256::from(77u8);
+            store
+                .record_attestation(intent, slot, hash_a(), Vec::new(), 10)
+                .await
+                .expect("reserve");
+            assert!(matches!(
+                store
+                    .check_attestation(intent, slot, hash_a())
+                    .await
+                    .expect("check pending"),
+                CheckOutcome::Idempotent(rec) if rec.signature.is_empty()
+            ));
+            assert!(matches!(
+                store
+                    .check_attestation(intent, slot, hash_b())
+                    .await
+                    .expect("check conflict"),
+                CheckOutcome::Conflict { .. }
+            ));
+            assert!(matches!(
+                store
+                    .record_attestation(intent, slot, hash_a(), Vec::new(), 11)
+                    .await,
+                Err(ReplayError::Duplicate)
+            ));
+            assert!(matches!(
+                store
+                    .record_attestation(intent, slot, hash_b(), vec![0xBB], 12)
+                    .await,
+                Err(ReplayError::Duplicate)
+            ));
+            store
+                .record_attestation(intent, slot, hash_a(), vec![1, 2, 3], 13)
+                .await
+                .expect("complete");
+            assert!(matches!(
+                store
+                    .check_attestation(intent, slot, hash_a())
+                    .await
+                    .expect("check complete"),
+                CheckOutcome::Idempotent(rec)
+                    if rec.signature == vec![1, 2, 3] && rec.signed_at_unix == 13
+            ));
+            assert!(matches!(
+                store
+                    .record_attestation(intent, slot, hash_a(), vec![4, 5, 6], 14)
+                    .await,
+                Err(ReplayError::Duplicate)
+            ));
+        }
+    }
+
+    /// Delivery/refund/streamed reservations preserve the per-leg mutex while
+    /// transitioning from pending to completed.
+    async fn run_redemption_reservation_lifecycle<S: ReplayStore>(store: &S) {
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let redemption = id1();
+            let leg = 77;
+            store
+                .record_redemption(
+                    redemption,
+                    leg,
+                    RedemptionKind::Delivery,
+                    hash_a(),
+                    Vec::new(),
+                    20,
+                )
+                .await
+                .expect("reserve");
+            assert!(matches!(
+                store
+                    .check_redemption(redemption, leg, RedemptionKind::Delivery, hash_a())
+                    .await
+                    .expect("check pending"),
+                RedemptionCheckOutcome::Idempotent(rec) if rec.signature.is_empty()
+            ));
+            assert!(matches!(
+                store
+                    .check_redemption(redemption, leg, RedemptionKind::Refund, hash_a())
+                    .await
+                    .expect("check mutex"),
+                RedemptionCheckOutcome::MutexViolation {
+                    previous_kind: RedemptionKind::Delivery,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                store
+                    .record_redemption(
+                        redemption,
+                        leg,
+                        RedemptionKind::Refund,
+                        hash_a(),
+                        vec![0xCC],
+                        21,
+                    )
+                    .await,
+                Err(ReplayError::Duplicate)
+            ));
+            store
+                .record_redemption(
+                    redemption,
+                    leg,
+                    RedemptionKind::Delivery,
+                    hash_a(),
+                    vec![7, 8, 9],
+                    22,
+                )
+                .await
+                .expect("complete");
+            assert!(matches!(
+                store
+                    .check_redemption(redemption, leg, RedemptionKind::Delivery, hash_a())
+                    .await
+                    .expect("check complete"),
+                RedemptionCheckOutcome::Idempotent(rec)
+                    if rec.signature == vec![7, 8, 9] && rec.signed_at_unix == 22
+            ));
+        }
+    }
+
+    /// RIC and ACC certificate namespaces independently use the same durable
+    /// reserve/complete transition.
+    async fn run_certificate_reservation_lifecycle<S: ReplayStore>(store: &S) {
+        use xindex_shared::chain_registry::ChainId;
+
+        #[expect(clippy::expect_used, reason = "test code")]
+        {
+            let redemption = id1();
+            store
+                .record_ric_cert(ChainId::Btc, redemption, 77, hash_a(), Vec::new(), 30)
+                .await
+                .expect("reserve ric");
+            assert!(matches!(
+                store
+                    .check_ric_cert(ChainId::Btc, redemption, 77, hash_a())
+                    .await
+                    .expect("check pending ric"),
+                CheckOutcome::Idempotent(rec) if rec.signature.is_empty()
+            ));
+            assert!(matches!(
+                store
+                    .record_ric_cert(ChainId::Btc, redemption, 77, hash_b(), vec![1], 31)
+                    .await,
+                Err(ReplayError::Duplicate)
+            ));
+            store
+                .record_ric_cert(ChainId::Btc, redemption, 77, hash_a(), vec![1, 2], 32)
+                .await
+                .expect("complete ric");
+            assert!(matches!(
+                store
+                    .check_ric_cert(ChainId::Btc, redemption, 77, hash_a())
+                    .await
+                    .expect("check complete ric"),
+                CheckOutcome::Idempotent(rec) if rec.signature == vec![1, 2]
+            ));
+
+            let cancel = id2();
+            store
+                .record_ac_cert(ChainId::Btc, cancel, hash_a(), Vec::new(), 40)
+                .await
+                .expect("reserve acc");
+            assert!(matches!(
+                store
+                    .check_ac_cert(ChainId::Btc, cancel, hash_b())
+                    .await
+                    .expect("check conflicting acc"),
+                CheckOutcome::Conflict { .. }
+            ));
+            store
+                .record_ac_cert(ChainId::Btc, cancel, hash_a(), vec![3, 4], 41)
+                .await
+                .expect("complete acc");
+            assert!(matches!(
+                store
+                    .check_ac_cert(ChainId::Btc, cancel, hash_a())
+                    .await
+                    .expect("check complete acc"),
+                CheckOutcome::Idempotent(rec)
+                    if rec.signature == vec![3, 4] && rec.signed_at_unix == 41
+            ));
         }
     }
 
@@ -2594,6 +2863,25 @@ mod tests {
     async fn in_memory_attestation_lifecycle() {
         let store = InMemoryReplayStore::new();
         run_attestation_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    async fn in_memory_eip712_reservations_complete_atomically() {
+        let store = InMemoryReplayStore::new();
+        run_attestation_reservation_lifecycle(&store).await;
+        run_redemption_reservation_lifecycle(&store).await;
+        run_certificate_reservation_lifecycle(&store).await;
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn sqlite_eip712_reservations_complete_atomically() {
+        let store = SqliteReplayStore::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        run_attestation_reservation_lifecycle(&store).await;
+        run_redemption_reservation_lifecycle(&store).await;
+        run_certificate_reservation_lifecycle(&store).await;
     }
 
     #[tokio::test]

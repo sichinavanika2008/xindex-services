@@ -320,6 +320,18 @@ fn parse_inbound(
     Ok(payload)
 }
 
+/// Decode the complete inbound plaintext without counting its signature.
+/// Collector HTTP envelopes use this to bind attached candidate evidence
+/// before mutating quorum state.
+///
+/// # Errors
+/// The same field errors as [`RegistryCollector::ingest_inbound`].
+pub fn inbound_payload_from_message(
+    message: &SignedInboundStateMessage,
+) -> Result<InboundPayload, RegistryCollectError> {
+    parse_inbound(message)
+}
+
 fn parse_quote(
     message: &SignedQuoteAuthorizationMessage,
 ) -> Result<QuotePayload, RegistryCollectError> {
@@ -363,6 +375,16 @@ fn parse_quote(
         });
     }
     Ok(payload)
+}
+
+/// Decode the complete quote plaintext without counting its signature.
+///
+/// # Errors
+/// The same field errors as [`RegistryCollector::ingest_quote`].
+pub fn quote_payload_from_message(
+    message: &SignedQuoteAuthorizationMessage,
+) -> Result<QuotePayload, RegistryCollectError> {
+    parse_quote(message)
 }
 
 fn parse_address(field: &'static str, raw: &str) -> Result<Address, RegistryCollectError> {

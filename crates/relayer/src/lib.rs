@@ -16,6 +16,8 @@ pub mod hint_builder;
 pub mod price_collector;
 pub mod redemption_store;
 pub mod registry_collector;
+pub mod registry_hints;
+pub mod settlement_collector;
 pub mod store;
 pub mod tracker;
 
@@ -28,6 +30,10 @@ pub use price_collector::{
 pub use redemption_store::{
     InMemoryRedemptionTracker, RedemptionTrackerError, RedemptionTrackerStore,
     SqliteRedemptionTracker, StuckDecision, TrackedRedemption,
+};
+pub use settlement_collector::{
+    ReadySettlement, SettlementCollectError, SettlementCollector, SettlementIngestOutcome,
+    SettlementPayload,
 };
 pub use store::{InMemoryIntentTracker, IntentTrackerStore, SqliteIntentTracker, TrackerError};
 pub use tracker::{IntentTracker, RelayDecision, TrackedIntent};

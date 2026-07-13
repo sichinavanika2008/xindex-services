@@ -95,6 +95,27 @@ pub enum QuoteNonceReservation {
     Exhausted,
 }
 
+/// Durable consensus tip retained for one independently configured source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryTipCheckpoint {
+    pub height: u64,
+    pub block_hash: String,
+    pub observed_at: u64,
+    pub advanced_once: bool,
+}
+
+/// Result of atomically comparing and recording one source tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TipAdvance {
+    /// First observation. It is stored, but cannot prove advancement yet.
+    First,
+    /// Height increased; carries the prior durable checkpoint for policy.
+    Advanced { previous: RegistryTipCheckpoint },
+    /// Same height and hash. The prior `observed_at` is deliberately retained
+    /// so repeated frozen reads eventually cross the stale threshold.
+    Unchanged { previous: RegistryTipCheckpoint },
+}
+
 /// SQLite-backed registry state. Production callers must use a durable volume
 /// and a backup/restore policy; there is intentionally no in-memory production
 /// fallback.
@@ -441,6 +462,102 @@ impl SqliteRegistryState {
         }
     }
 
+    /// Atomically compare and retain a `THORChain` consensus tip.
+    ///
+    /// Heights may only advance. A same-height/same-hash poll is returned as
+    /// [`TipAdvance::Unchanged`] without refreshing the stored timestamp; a
+    /// same-height hash change or backward height is an anomaly and fails
+    /// closed. A first observation is durable but does not count as proof of
+    /// progress until a later height arrives.
+    ///
+    /// # Errors
+    /// Invalid identity/tip fields, a backward/replaced tip, or `SQLite`
+    /// failure.
+    pub async fn record_source_tip(
+        &self,
+        source_id: &str,
+        height: u64,
+        block_hash: &str,
+        observed_at: u64,
+    ) -> Result<TipAdvance, RegistryStateError> {
+        if source_id.is_empty()
+            || source_id.len() > 128
+            || !source_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || height == 0
+            || block_hash.is_empty()
+            || observed_at == 0
+        {
+            return Err(RegistryStateError::InvalidTransition(
+                "invalid source identity or zero/empty tip field".to_string(),
+            ));
+        }
+        let height_i = to_i64(height, "source tip height")?;
+        let observed_i = to_i64(observed_at, "source tip observation")?;
+        let mut transaction = self.pool.begin().await?;
+        let existing: Option<(i64, String, i64, i64)> = sqlx::query_as(
+            "SELECT height, block_hash, observed_at, advanced_once
+             FROM thor_source_tip_checkpoints WHERE source_id = ?",
+        )
+        .bind(source_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let outcome = match existing {
+            None => {
+                sqlx::query(
+                    "INSERT INTO thor_source_tip_checkpoints
+                        (source_id, height, block_hash, observed_at, advanced_once)
+                     VALUES (?, ?, ?, ?, 0)",
+                )
+                .bind(source_id)
+                .bind(height_i)
+                .bind(block_hash)
+                .bind(observed_i)
+                .execute(&mut *transaction)
+                .await?;
+                TipAdvance::First
+            }
+            Some((previous_height_i, previous_hash, previous_observed_i, advanced_i)) => {
+                let previous = RegistryTipCheckpoint {
+                    height: from_i64(previous_height_i, "stored source tip height")?,
+                    block_hash: previous_hash,
+                    observed_at: from_i64(previous_observed_i, "stored source tip observation")?,
+                    advanced_once: decode_bool(advanced_i, "stored source advanced flag")?,
+                };
+                if height < previous.height {
+                    return Err(RegistryStateError::InvalidTransition(format!(
+                        "source {source_id} height moved backward from {} to {height}",
+                        previous.height
+                    )));
+                }
+                if height == previous.height {
+                    if block_hash != previous.block_hash {
+                        return Err(RegistryStateError::InvalidTransition(format!(
+                            "source {source_id} changed block hash at height {height}"
+                        )));
+                    }
+                    TipAdvance::Unchanged { previous }
+                } else {
+                    sqlx::query(
+                        "UPDATE thor_source_tip_checkpoints
+                         SET height = ?, block_hash = ?, observed_at = ?, advanced_once = 1
+                         WHERE source_id = ?",
+                    )
+                    .bind(height_i)
+                    .bind(block_hash)
+                    .bind(observed_i)
+                    .bind(source_id)
+                    .execute(&mut *transaction)
+                    .await?;
+                    TipAdvance::Advanced { previous }
+                }
+            }
+        };
+        transaction.commit().await?;
+        Ok(outcome)
+    }
+
     async fn reserve_signature(
         &self,
         kind: RegistrySignatureKind,
@@ -592,6 +709,16 @@ fn decode_signature(bytes: &[u8]) -> Result<[u8; 65], RegistryStateError> {
     })
 }
 
+fn decode_bool(value: i64, field: &str) -> Result<bool, RegistryStateError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RegistryStateError::Decode(format!(
+            "{field} is neither 0 nor 1"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, reason = "test code")]
@@ -727,6 +854,64 @@ mod tests {
             QuoteNonceReservation::Reserved { nonce: 6 }
         );
         drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn source_tip_requires_real_monotonic_advance_and_survives_restart() {
+        let (state, path) = store("source-tip").await;
+        assert_eq!(
+            state
+                .record_source_tip("owned", 100, "HASH100", 1_000)
+                .await
+                .expect("first"),
+            TipAdvance::First
+        );
+        assert_eq!(
+            state
+                .record_source_tip("owned", 100, "HASH100", 1_006)
+                .await
+                .expect("same"),
+            TipAdvance::Unchanged {
+                previous: RegistryTipCheckpoint {
+                    height: 100,
+                    block_hash: "HASH100".to_string(),
+                    observed_at: 1_000,
+                    advanced_once: false,
+                }
+            }
+        );
+        assert!(state
+            .record_source_tip("owned", 100, "REORGED", 1_007)
+            .await
+            .is_err());
+        assert_eq!(
+            state
+                .record_source_tip("owned", 101, "HASH101", 1_008)
+                .await
+                .expect("advance"),
+            TipAdvance::Advanced {
+                previous: RegistryTipCheckpoint {
+                    height: 100,
+                    block_hash: "HASH100".to_string(),
+                    observed_at: 1_000,
+                    advanced_once: false,
+                }
+            }
+        );
+        drop(state);
+        let url = format!("sqlite://{path}?mode=rwc");
+        let reopened = SqliteRegistryState::connect(&url).await.expect("reopen");
+        assert!(matches!(
+            reopened
+                .record_source_tip("owned", 102, "HASH102", 1_014)
+                .await
+                .expect("advance after restart"),
+            TipAdvance::Advanced {
+                previous: RegistryTipCheckpoint { height: 101, .. }
+            }
+        ));
+        drop(reopened);
         let _ = std::fs::remove_file(path);
     }
 }

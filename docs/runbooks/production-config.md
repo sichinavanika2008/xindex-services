@@ -14,11 +14,11 @@ fill Solana values for mainnet.
 
 | Setting | Validator | Fails closed when |
 |---|---|---|
-| `IntentPolicy` | `IntentPolicy::validate()` | empty/duplicate Set-B whitelist, zero quorum, quorum > whitelist, zero `ric_max_age_secs` |
+| `IntentPolicy` | `IntentPolicy::validate()` + `DaemonState::assert_production_safe()` | empty/duplicate Set-B whitelist, zero quorum, quorum > whitelist, zero `ric_max_age_secs`, or a production roster other than exact 3-of-5 |
 | `CertVolumePolicy` | `CertVolumePolicy::validate()` | `window_secs == 0`, any cap `== 0` |
 | **Production metering** | `DaemonState::assert_production_safe()` → `CertVolumePolicy::assert_metered_for(served)` | **any served RIC-gated chain (BTC/EVM/Cosmos/XRP/TRON) has no positive cap** — `unmetered()` is dev/test ONLY |
-| **Durable replay** | binary startup | `database_url` is absent outside `--dev` |
-| **Signer perimeter** | binary startup | software HSM, missing outer mTLS, or a non-loopback/credential-bearing HSM URL is configured |
+| **Durable replay** | binary startup | `database_url` is absent outside `--dev`, is not an absolute SQLite path under an owner-only non-symlink directory, or names an existing unsafe/symlinked/hard-linked database |
+| **Signer perimeter** | binary startup | software HSM, missing outer mTLS, a non-loopback/credential-bearing HSM URL, an unsafe config/TLS-key file, a zero identity, or a production custody descriptor other than exact 3-of-5 is configured |
 
 A production launcher MUST call `DaemonState::assert_production_safe()` after
 constructing state and before serving. `unmetered()` + an in-process HSM stub
@@ -57,6 +57,7 @@ tls_pinned_client_cert = /etc/xindex/tls/coordinator.pem  # the SELF-SIGNED coor
 
 # ── durable anti-replay/equivocation state ──
 database_url            = sqlite:///var/lib/xindex/signer-daemon.db
+metrics_bind             = 127.0.0.1:9090
 ```
 
 - Build the rustls server via `signer-daemon::tls::server_config(load_cert_chain(server), load_private_key(key), pinned_root_store([coordinator]))` and serve with `serve_mtls`. An unpinned client is dropped at the handshake.
@@ -69,7 +70,14 @@ database_url            = sqlite:///var/lib/xindex/signer-daemon.db
   production-wired daemon. Do not mark those families enabled until their
   launchers and rehearsals land.
 
-## 2. Coordinator / observer (`xindex-observe-redeem`, `xindex-attest*`, `xindex-redeem-*`)
+## 2. Current coordinator / observer / custody services
+
+The production path uses `xindex-finalized-observer`,
+`xindex-settlement-collector`, `xindex-registry-signer`,
+`xindex-registry-coordinator`, `xindex-price-signer`,
+`xindex-price-collector`, and the Bitcoin-only `xindex-redeem`. The historical
+`xindex-observe-redeem` and centralized `xindex-attest*` binaries are dev-only
+and are not production alternatives.
 
 ```
 --signer-mode remote                                 # mainnet MUST be remote (HSM-backed daemons)
@@ -82,6 +90,19 @@ database_url            = sqlite:///var/lib/xindex/signer-daemon.db
 --eth-min-confirmations 12                            # >= ETH conf_depth (enforced at startup, audit M9)
 --btc-min-confirmations 6                             # >= the leg chain's conf_depth (enforced per-leg)
 ```
+
+Every service uses a distinct durable SQLite database/evidence directory and a
+distinct loopback metrics port. Service-to-service traffic uses explicit mTLS
+client identities and CA/certificate pins with system roots disabled. The
+finalized observer, event journal, source pollers, API, poster, metrics and
+exact-byte rebroadcast tasks are supervised; an unexpected exit terminates the
+owning process.
+
+The price collector additionally requires the approved 7-of-11 roster. The
+registry, settlement-observer and custody roles are each 3-of-5. Validate the
+real dual-reviewed operator/HSM/source registry with `xindex-topology-check`;
+see [`gate3-operations.md`](gate3-operations.md). A checked-in example roster
+is intentionally absent because placeholders are not production evidence.
 
 The coordinator presents its client cert to each daemon:
 `reqwest::Client::builder().use_preconfigured_tls(signer-daemon::tls::client_config(client_chain, client_key, pinned_server_root))` — the pinned coordinator identity from §1's `tls_pinned_client_cert`.
@@ -99,6 +120,10 @@ The price path is configured separately in
 signers must share the exact epoch/canonicalization policy; the collector must
 boot with the complete on-chain signer set and matching threshold. A code-green
 pipeline does not replace the Sepolia rehearsal and external-audit gates.
+
+All evidence directories must pass `xindex-evidence-check` and be reconciled
+to an independently administered WORM copy under the retention/incident policy
+in [`gate3-operations.md`](gate3-operations.md).
 
 ## 4. Per-family gate (none live on mainnet until ALL are checked)
 

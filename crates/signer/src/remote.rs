@@ -17,12 +17,13 @@ use alloy_primitives::{Address, B256};
 use alloy_sol_types::Eip712Domain;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::{
-    AcquireCancelCertificate, AsyncLegDeliveryAttestation, AsyncLegRefundAttestation, Attestation,
-    RedemptionIntentCertificate,
+    AcquireCancelCertificate, AsyncLegDeliveryAttestation, AsyncLegRefundAttestation,
+    AsyncLegStreamedSettlement, Attestation, RedemptionIntentCertificate,
 };
 use xindex_shared::signer_wire::{
     AcquireCancelSignRequest, AttestationSignRequest, Eip712SignResponse,
     RedemptionDeliverySignRequest, RefundSignRequest, RicSignRequest,
+    StreamedSettlementSignRequest,
 };
 
 use crate::{HsmBackend, RicSigner, SignerError, SoftwareSigner};
@@ -79,6 +80,59 @@ impl RemoteHsmBackend {
             eth_address,
             inner,
         }
+    }
+
+    /// Construct a production client that presents a coordinator/observer
+    /// certificate, trusts only the supplied daemon certificate roots, and
+    /// refuses plaintext HTTP. The TLS private key authenticates transport;
+    /// it is not an attestation or custody signing key.
+    ///
+    /// # Errors
+    /// Invalid HTTPS URL, malformed PEM identity/root bundle, or client build
+    /// failure. No permissive fallback is used.
+    pub fn with_mtls_pem(
+        base_url: impl Into<String>,
+        eth_address: Address,
+        client_cert_pem: &[u8],
+        client_key_pem: &[u8],
+        daemon_root_pem: &[u8],
+        timeout: Duration,
+    ) -> Result<Self, SignerError> {
+        let base_url = base_url.into();
+        let parsed = reqwest::Url::parse(&base_url)
+            .map_err(|error| SignerError::Backend(format!("daemon URL: {error}")))?;
+        if parsed.scheme() != "https" {
+            return Err(SignerError::Backend(
+                "production daemon URL must use https".to_string(),
+            ));
+        }
+        let mut identity_pem = Vec::with_capacity(client_cert_pem.len() + client_key_pem.len() + 1);
+        identity_pem.extend_from_slice(client_cert_pem);
+        identity_pem.push(b'\n');
+        identity_pem.extend_from_slice(client_key_pem);
+        let identity = reqwest::Identity::from_pem(&identity_pem)
+            .map_err(|_| SignerError::Backend("daemon mTLS identity PEM is invalid".to_string()))?;
+        let roots = reqwest::Certificate::from_pem_bundle(daemon_root_pem)
+            .map_err(|_| SignerError::Backend("daemon root PEM is invalid".to_string()))?;
+        if roots.is_empty() {
+            return Err(SignerError::Backend("daemon root PEM is empty".to_string()));
+        }
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .identity(identity);
+        for root in roots {
+            builder = builder.add_root_certificate(root);
+        }
+        let inner = builder
+            .build()
+            .map_err(|_| SignerError::Backend("build daemon mTLS client".to_string()))?;
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            eth_address,
+            inner,
+        })
     }
 
     fn post_sign<T: serde::Serialize>(
@@ -321,6 +375,21 @@ impl HsmBackend for RemoteHsmBackend {
         };
         self.post_sign("/api/v1/sign/eip712-refund", &req)
     }
+
+    fn sign_streamed_settlement_msg(
+        &self,
+        _domain: &Eip712Domain,
+        attestation: &AsyncLegStreamedSettlement,
+    ) -> Result<[u8; 65], SignerError> {
+        let req = StreamedSettlementSignRequest {
+            redemption_id: format!("{:#x}", attestation.redemptionId),
+            leg_index: attestation.legIndex.to_string(),
+            asset_id: format!("{:#x}", attestation.assetId),
+            delivered_usdt: attestation.deliveredUsdt.to_string(),
+            refunded_native: attestation.refundedNative.to_string(),
+        };
+        self.post_sign("/api/v1/sign/eip712-streamed-settlement", &req)
+    }
 }
 
 /// Enum [`HsmBackend`] adapter — covers both [`SoftwareSigner`] (dev /
@@ -382,6 +451,17 @@ impl HsmBackend for AnyHsmBackend {
         match self {
             Self::Software(s) => s.sign_refund_attestation_msg(domain, attestation),
             Self::Remote(r) => r.sign_refund_attestation_msg(domain, attestation),
+        }
+    }
+
+    fn sign_streamed_settlement_msg(
+        &self,
+        domain: &Eip712Domain,
+        attestation: &AsyncLegStreamedSettlement,
+    ) -> Result<[u8; 65], SignerError> {
+        match self {
+            Self::Software(s) => s.sign_streamed_settlement_msg(domain, attestation),
+            Self::Remote(r) => r.sign_streamed_settlement_msg(domain, attestation),
         }
     }
 }

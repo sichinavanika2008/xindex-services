@@ -28,5 +28,5 @@ pub use codec::{
     ZecCodec,
 };
 pub use params::{ScriptKind, UtxoParams};
-pub use types::{UtxoEntry, UtxoTxStatus};
+pub use types::{UtxoEntry, UtxoOutputFacts, UtxoTransactionFacts, UtxoTxStatus};
 pub use watcher::find_arrival;

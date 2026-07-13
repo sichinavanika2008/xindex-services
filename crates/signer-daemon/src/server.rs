@@ -11,11 +11,12 @@
 //!    fixed-shape field bytes — not the raw JSON, so field-reordering
 //!    can't smuggle a different payload past the replay DB).
 //! 4. `ReplayStore.check_*`:
-//!    - `FirstTime` → compute the EIP-712 digest from
-//!      `xindex_shared::eip712`, call the HSM frontend, **record**,
-//!      return the signature.
-//!    - `Idempotent` → return the cached signature; the HSM is not
-//!      invoked again.
+//!    - `FirstTime` → durably reserve the exact payload, compute the EIP-712
+//!      digest from `xindex_shared::eip712`, call the HSM frontend, atomically
+//!      complete the reservation, return the signature.
+//!    - `Idempotent` with a signature → return it without invoking the HSM.
+//!      An empty signature is a crash-recoverable pending reservation and may
+//!      retry only the exact same payload.
 //!    - `Conflict` / `MutexViolation` → 409, never reach the HSM.
 //! 5. Render the response.
 
@@ -63,6 +64,9 @@ use crate::solana_tx::{handle_solana_tx, SolSignerConfig};
 use crate::tron_tx::{handle_tron_tx, TronSignerConfig};
 use crate::web3signer::{HsmDigestSigner, HsmError};
 use crate::xrp_tx::{handle_xrp_tx, XrpSignerConfig};
+
+const PRODUCTION_INTENT_SIGNER_COUNT: usize = 5;
+const PRODUCTION_INTENT_THRESHOLD: usize = 3;
 
 /// Static daemon configuration. Loaded once at startup; never mutated.
 #[derive(Debug, Clone)]
@@ -259,15 +263,16 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
     /// Fail-closed PRODUCTION startup assertion (workstream F). A daemon
     /// bound to a real HSM MUST refuse to boot with safety features off.
     /// Composes the individual sanity checks ([`IntentPolicy::validate`] +
-    /// [`CertVolumePolicy::validate`]) with the production-only invariant
-    /// they miss: every RIC-gated chain this daemon signs for is metered
+    /// [`CertVolumePolicy::validate`]) with the production-only invariants
+    /// they miss: the RIC policy is the reviewed exact 3-of-5 role and every
+    /// RIC-gated chain this daemon signs for is metered
     /// ([`CertVolumePolicy::assert_metered_for`], `DL-CTD-E`). Solana is
-    /// excluded — RIC-exempt + hard-gated (RA-2). Dev/test harnesses
-    /// (stub HSM + `unmetered()`) do not call this.
+    /// excluded — RIC-exempt + hard-gated (RA-2). Dev/test harnesses (stub
+    /// HSM + `unmetered()`) do not call this.
     ///
     /// # Errors
-    /// The first production-unsafe setting: an invalid `intent_policy`, or a
-    /// served RIC-gated chain with no positive cert-volume cap.
+    /// The first production-unsafe setting: a non-3-of-5 `intent_policy`, or
+    /// a served RIC-gated chain with no positive cert-volume cap.
     pub fn assert_production_safe(&self) -> Result<(), String> {
         let served: Vec<ChainId> = self
             .utxo
@@ -279,7 +284,7 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
             .copied()
             .collect();
         self.config.cert_volume.assert_metered_for(&served)?;
-        self.config.intent_policy.validate()
+        assert_production_intent_policy(&self.config.intent_policy)
     }
 
     /// Builder: attach a per-chain UTXO signing role to an existing
@@ -327,6 +332,16 @@ impl<S: ReplayStore + 'static, H: HsmDigestSigner + 'static> DaemonState<S, H> {
         self.tron.insert(config.chain, Arc::new(config));
         self
     }
+}
+
+fn assert_production_intent_policy(policy: &IntentPolicy) -> Result<(), String> {
+    policy.validate()?;
+    if policy.signer_whitelist.len() != PRODUCTION_INTENT_SIGNER_COUNT
+        || policy.intent_quorum != PRODUCTION_INTENT_THRESHOLD
+    {
+        return Err("production intent policy must be exactly 3-of-5".to_string());
+    }
+    Ok(())
 }
 
 /// Build the daemon router. Returns a `Router` ready to be served with
@@ -605,6 +620,29 @@ fn render_signature(state: &DaemonConfig, sig: [u8; 65]) -> Eip712SignResponse {
     }
 }
 
+/// Render a completed EIP-712 replay row. An empty signature is the durable
+/// pending marker installed before the HSM call, so the exact same payload may
+/// resume signing; any other non-65-byte value is corrupt and fails closed.
+fn cached_eip712_response(
+    config: &DaemonConfig,
+    signature: &[u8],
+) -> Result<Option<Json<Eip712SignResponse>>, (StatusCode, Json<ErrorBody>)> {
+    if signature.is_empty() {
+        return Ok(None);
+    }
+    let arr: [u8; 65] = signature.try_into().map_err(|_| {
+        bad(
+            error_codes::BAD_REQUEST,
+            "stored signature not 65 bytes".to_string(),
+        )
+    })?;
+    Ok(Some(Json(render_signature(config, arr))))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "security-critical reserve/sign/complete pipeline is kept linear for auditability"
+)]
 async fn handle_attestation<S, H>(
     State(state): State<DaemonState<S, H>>,
     Json(req): Json<AttestationSignRequest>,
@@ -625,13 +663,10 @@ where
         .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
     match outcome {
         CheckOutcome::Idempotent(rec) => {
-            let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
-                bad(
-                    error_codes::BAD_REQUEST,
-                    "stored signature not 65 bytes".to_string(),
-                )
-            })?;
-            return Ok(Json(render_signature(&state.config, arr)));
+            if let Some(response) = cached_eip712_response(&state.config, rec.signature.as_slice())?
+            {
+                return Ok(response);
+            }
         }
         CheckOutcome::Conflict { .. } => {
             return Err(conflict(
@@ -640,6 +675,54 @@ where
             ));
         }
         CheckOutcome::FirstTime => {}
+    }
+
+    // Reserve the tuple before asking the HSM to release a signature. A
+    // conflicting request that races this one can no longer exploit a crash
+    // between HSM release and replay persistence to equivocate after restart.
+    if let Err(e) = state
+        .replay
+        .record_attestation(
+            intent_id,
+            slot_index,
+            payload_hash,
+            Vec::new(),
+            now_unix_secs(),
+        )
+        .await
+    {
+        if crate::replay::must_propagate_record_error(&e) {
+            return Err(bad(
+                error_codes::BAD_REQUEST,
+                format!("replay reserve: {e}"),
+            ));
+        }
+        match state
+            .replay
+            .check_attestation(intent_id, slot_index, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
+        {
+            CheckOutcome::Idempotent(rec) => {
+                if let Some(response) =
+                    cached_eip712_response(&state.config, rec.signature.as_slice())?
+                {
+                    return Ok(response);
+                }
+            }
+            CheckOutcome::Conflict { .. } => {
+                return Err(conflict(
+                    error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                    "intent already attested with a different amount",
+                ));
+            }
+            CheckOutcome::FirstTime => {
+                return Err(internal(
+                    error_codes::BAD_REQUEST,
+                    "reservation race left no row",
+                ));
+            }
+        }
     }
     let att = attestation(intent_id, slot_index, attested_amount);
     let digest = attestation_signing_hash(&att, &state.config.domain());
@@ -663,8 +746,8 @@ where
         if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
-        // L10: lost the write race; the winner already recorded. Re-read
-        // and return its cached signature idempotently.
+        // A same-payload signer completed first. Re-read and return the
+        // winner's cached signature idempotently.
         return match state
             .replay
             .check_attestation(intent_id, slot_index, payload_hash)
@@ -672,13 +755,12 @@ where
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
         {
             CheckOutcome::Idempotent(rec) => {
-                let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
-                    bad(
+                cached_eip712_response(&state.config, rec.signature.as_slice())?.ok_or_else(|| {
+                    internal(
                         error_codes::BAD_REQUEST,
-                        "stored signature not 65 bytes".to_string(),
+                        "completion race left a pending reservation",
                     )
-                })?;
-                Ok(Json(render_signature(&state.config, arr)))
+                })
             }
             CheckOutcome::Conflict { .. } => Err(conflict(
                 error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
@@ -686,7 +768,7 @@ where
             )),
             CheckOutcome::FirstTime => Err(internal(
                 error_codes::BAD_REQUEST,
-                "record race left no row",
+                "completion race left no row",
             )),
         };
     }
@@ -811,6 +893,10 @@ where
 
 /// Shared body for the two redemption legs — same replay flow, only
 /// the digest computation + the `RedemptionKind` differ.
+#[expect(
+    clippy::too_many_lines,
+    reason = "security-critical reserve/sign/complete pipeline is kept linear for auditability"
+)]
 async fn handle_redemption_common<S, H, F>(
     state: &DaemonState<S, H>,
     redemption_id: B256,
@@ -831,13 +917,10 @@ where
         .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
     match outcome {
         RedemptionCheckOutcome::Idempotent(rec) => {
-            let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
-                bad(
-                    error_codes::BAD_REQUEST,
-                    "stored signature not 65 bytes".to_string(),
-                )
-            })?;
-            return Ok(Json(render_signature(&state.config, arr)));
+            if let Some(response) = cached_eip712_response(&state.config, rec.signature.as_slice())?
+            {
+                return Ok(response);
+            }
         }
         RedemptionCheckOutcome::Conflict { .. } => {
             return Err(conflict(
@@ -852,6 +935,59 @@ where
             ));
         }
         RedemptionCheckOutcome::FirstTime => {}
+    }
+
+    // Reserve the per-leg delivery/refund/streamed mutex before HSM release.
+    if let Err(e) = state
+        .replay
+        .record_redemption(
+            redemption_id,
+            leg_index,
+            kind,
+            payload_hash,
+            Vec::new(),
+            now_unix_secs(),
+        )
+        .await
+    {
+        if crate::replay::must_propagate_record_error(&e) {
+            return Err(bad(
+                error_codes::BAD_REQUEST,
+                format!("replay reserve: {e}"),
+            ));
+        }
+        match state
+            .replay
+            .check_redemption(redemption_id, leg_index, kind, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
+        {
+            RedemptionCheckOutcome::Idempotent(rec) => {
+                if let Some(response) =
+                    cached_eip712_response(&state.config, rec.signature.as_slice())?
+                {
+                    return Ok(response);
+                }
+            }
+            RedemptionCheckOutcome::Conflict { .. } => {
+                return Err(conflict(
+                    error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
+                    "redemption already signed with a different amount",
+                ));
+            }
+            RedemptionCheckOutcome::MutexViolation { .. } => {
+                return Err(conflict(
+                    error_codes::CONFLICT_DELIVERY_REFUND_MUTEX,
+                    "redemption already resolved as the opposite leg",
+                ));
+            }
+            RedemptionCheckOutcome::FirstTime => {
+                return Err(internal(
+                    error_codes::BAD_REQUEST,
+                    "reservation race left no row",
+                ));
+            }
+        }
     }
     let digest = compute_digest();
     let sig = state
@@ -875,9 +1011,8 @@ where
         if crate::replay::must_propagate_record_error(&e) {
             return Err(bad(error_codes::BAD_REQUEST, format!("replay record: {e}")));
         }
-        // L10: lost the write race; the winner already recorded. Re-read
-        // and return its cached signature idempotently (handle all four
-        // RedemptionCheckOutcome variants).
+        // A same-payload signer completed first. Re-read and return the
+        // winner's cached signature idempotently.
         return match state
             .replay
             .check_redemption(redemption_id, leg_index, kind, payload_hash)
@@ -885,13 +1020,12 @@ where
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?
         {
             RedemptionCheckOutcome::Idempotent(rec) => {
-                let arr: [u8; 65] = rec.signature.as_slice().try_into().map_err(|_| {
-                    bad(
+                cached_eip712_response(&state.config, rec.signature.as_slice())?.ok_or_else(|| {
+                    internal(
                         error_codes::BAD_REQUEST,
-                        "stored signature not 65 bytes".to_string(),
+                        "completion race left a pending reservation",
                     )
-                })?;
-                Ok(Json(render_signature(&state.config, arr)))
+                })
             }
             RedemptionCheckOutcome::Conflict { .. } => Err(conflict(
                 error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
@@ -903,7 +1037,7 @@ where
             )),
             RedemptionCheckOutcome::FirstTime => Err(internal(
                 error_codes::BAD_REQUEST,
-                "record race left no row",
+                "completion race left no row",
             )),
         };
     }
@@ -1431,20 +1565,16 @@ type SignResult = Result<Json<Eip712SignResponse>, (StatusCode, Json<ErrorBody>)
 
 /// Map a `ric_certs` replay outcome to a response: the cached RIC
 /// signature on an identical retry, 409 on an equivocating retry,
-/// `None` on first-time (caller proceeds — or treats it as impossible
-/// in the post-record race re-read).
+/// `None` on first-time or on the exact payload's durable pending
+/// reservation (caller proceeds — or treats it as impossible after a failed
+/// completion).
 fn ric_cert_cached(config: &DaemonConfig, outcome: CheckOutcome) -> Option<SignResult> {
     match outcome {
-        CheckOutcome::Idempotent(rec) => {
-            let arr: Result<[u8; 65], _> = rec.signature.as_slice().try_into();
-            Some(match arr {
-                Ok(a) => Ok(Json(render_signature(config, a))),
-                Err(_) => Err(bad(
-                    error_codes::BAD_REQUEST,
-                    "stored signature not 65 bytes".to_string(),
-                )),
-            })
-        }
+        CheckOutcome::Idempotent(rec) => match cached_eip712_response(config, &rec.signature) {
+            Ok(Some(response)) => Some(Ok(response)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        },
         CheckOutcome::Conflict { .. } => Some(Err(conflict(
             error_codes::CONFLICT_ALREADY_SIGNED_DIFFERENT,
             "leg already certified under a different intent — refusing to equivocate",
@@ -1462,8 +1592,13 @@ fn ric_cert_cached(config: &DaemonConfig, outcome: CheckOutcome) -> Option<SignR
 /// `vault_resolved_at` at the source; refuses to EQUIVOCATE — the
 /// `ric_certs` replay arm (SEPARATE from the custody one-shot) makes a
 /// second, different certificate for the same `(chain, redemption,
-/// leg)` a 409 that never reaches the HSM; recover-verifies the HSM
-/// signature (M6) before recording and returning it.
+/// leg)` a 409 that never reaches the HSM; durably reserves the exact digest
+/// before HSM release; recover-verifies the HSM signature (M6) before
+/// completing the reservation and returning it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "certificate validation and reserve/sign/complete checks are kept linear for auditability"
+)]
 async fn handle_ric_sign<S, H>(
     State(state): State<DaemonState<S, H>>,
     Json(req): Json<RicSignRequest>,
@@ -1511,6 +1646,43 @@ where
     if let Some(resp) = ric_cert_cached(&state.config, outcome) {
         return resp;
     }
+    if let Err(e) = state
+        .replay
+        .record_ric_cert(
+            req.chain_id,
+            redemption_id,
+            leg,
+            payload_hash,
+            Vec::new(),
+            now_unix_secs(),
+        )
+        .await
+    {
+        if crate::replay::must_propagate_record_error(&e) {
+            return Err(bad(
+                error_codes::BAD_REQUEST,
+                format!("replay reserve: {e}"),
+            ));
+        }
+        let outcome = state
+            .replay
+            .check_ric_cert(req.chain_id, redemption_id, leg, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+        if matches!(outcome, CheckOutcome::FirstTime) {
+            return Err(internal(
+                error_codes::BAD_REQUEST,
+                "reservation race left no row",
+            ));
+        }
+        if let Some(resp) = ric_cert_cached(&state.config, outcome) {
+            return resp;
+        }
+    }
+    // The reservation intentionally precedes the fail-closed volume consume.
+    // A crash retry of the same pending digest may consume twice, reducing
+    // liveness but never bypassing the configured cap or permitting a
+    // different certificate for this tuple.
     consume_cert_volume_gate(&state, req.chain_id, amount).await?;
     let sig = state
         .hsm
@@ -1542,7 +1714,7 @@ where
         return ric_cert_cached(&state.config, outcome).unwrap_or_else(|| {
             Err(internal(
                 error_codes::BAD_REQUEST,
-                "record race left no row",
+                "completion race left a pending reservation or no row",
             ))
         });
     }
@@ -1557,7 +1729,12 @@ where
 /// from the plaintext on the daemon's pinned domain; refuses stale/future
 /// `vault_resolved_at` at the source; refuses to EQUIVOCATE — a second,
 /// different certificate for the same `(chain, cancel_id)` is a 409 via
-/// the SEPARATE `ac_certs` arm; M6 recover-verify before record/return.
+/// the SEPARATE `ac_certs` arm; the exact digest is durably reserved before
+/// HSM release; M6 recover-verify precedes reservation completion/return.
+#[expect(
+    clippy::too_many_lines,
+    reason = "certificate validation and reserve/sign/complete checks are kept linear for auditability"
+)]
 async fn handle_acc_sign<S, H>(
     State(state): State<DaemonState<S, H>>,
     Json(req): Json<AcquireCancelSignRequest>,
@@ -1608,6 +1785,38 @@ where
     if let Some(resp) = ric_cert_cached(&state.config, outcome) {
         return resp;
     }
+    if let Err(e) = state
+        .replay
+        .record_ac_cert(
+            req.chain_id,
+            cancel_id,
+            payload_hash,
+            Vec::new(),
+            now_unix_secs(),
+        )
+        .await
+    {
+        if crate::replay::must_propagate_record_error(&e) {
+            return Err(bad(
+                error_codes::BAD_REQUEST,
+                format!("replay reserve: {e}"),
+            ));
+        }
+        let outcome = state
+            .replay
+            .check_ac_cert(req.chain_id, cancel_id, payload_hash)
+            .await
+            .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
+        if matches!(outcome, CheckOutcome::FirstTime) {
+            return Err(internal(
+                error_codes::BAD_REQUEST,
+                "reservation race left no row",
+            ));
+        }
+        if let Some(resp) = ric_cert_cached(&state.config, outcome) {
+            return resp;
+        }
+    }
     // Slice E: the mint-cancel swap-back consumes the SAME per-chain
     // window as redemptions — the cancel path cannot bypass the breaker.
     consume_cert_volume_gate(&state, req.chain_id, amount).await?;
@@ -1639,7 +1848,7 @@ where
         return ric_cert_cached(&state.config, outcome).unwrap_or_else(|| {
             Err(internal(
                 error_codes::BAD_REQUEST,
-                "record race left no row",
+                "completion race left a pending reservation or no row",
             ))
         });
     }
@@ -2127,6 +2336,18 @@ mod tests {
             metered.assert_metered_for(&[ChainId::Btc]).is_err(),
             "a served chain absent from caps is the unmetered footgun — rejected"
         );
+    }
+
+    #[test]
+    fn production_intent_policy_is_exactly_three_of_five() {
+        let policy = |count, quorum| IntentPolicy {
+            signer_whitelist: (1..=count).map(Address::repeat_byte).collect(),
+            intent_quorum: quorum,
+            ric_max_age_secs: 3_600,
+        };
+        assert!(assert_production_intent_policy(&policy(5, 3)).is_ok());
+        assert!(assert_production_intent_policy(&policy(5, 2)).is_err());
+        assert!(assert_production_intent_policy(&policy(3, 2)).is_err());
     }
 
     #[tokio::test]

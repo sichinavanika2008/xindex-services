@@ -29,17 +29,28 @@
 //! path without any network access.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address as EthAddress, B256};
 use async_trait::async_trait;
-use bitcoin::{Address, Amount, Network};
+use bitcoin::hashes::Hash;
+#[cfg(test)]
+use bitcoin::Amount;
+use bitcoin::Txid;
+use bitcoin::{Address, Network};
+use serde::Serialize;
+use std::str::FromStr;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use xindex_chain_thor::{ThorClient, ThorError, TxResponse};
-use xindex_chain_utxo::{find_arrival, UtxoChainClient, UtxoError};
+use xindex_chain_thor::{InboundAddress, ThorClient, ThorError, TxDetailsResponse, TxResponse};
+use xindex_chain_utxo::{UtxoChainClient, UtxoError};
 use xindex_shared::consumed_inflow::{
     AnyConsumedInflow, ConsumedInflowError, ConsumedInflowStore, InflowConsumeOutcome,
+};
+use xindex_shared::native_inflow::{
+    AnyNativeInflow, NativeFlowKind, NativeInflowClaim, NativeInflowError, NativeInflowOutcome,
+    NativeInflowStore,
 };
 
 /// Errors surfaced by the cross-check.
@@ -49,6 +60,8 @@ pub enum CrossCheckError {
     Thor(#[from] ThorError),
     #[error("Bitcoin chain error: {0}")]
     Btc(#[from] UtxoError),
+    #[error("native inflow ledger: {0}")]
+    NativeLedger(#[from] NativeInflowError),
     /// `THORChain` has not finished observing the inbound or has no
     /// matching outbound action yet. The signer should poll again
     /// later, NOT sign.
@@ -122,6 +135,7 @@ pub struct ThorUtxoPolicy<C: UtxoChainClient + Send + Sync> {
     /// equality. Operators can raise this to absorb known fee shapes
     /// if `THORChain`'s accounting and the on-chain UTXO ever diverge.
     tolerance_sats: u64,
+    native_inflows: Arc<AnyNativeInflow>,
 }
 
 impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorUtxoPolicy<C> {
@@ -155,11 +169,285 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
             btc_multisig_address,
             min_confirmations,
             tolerance_sats,
+            native_inflows: Arc::new(AnyNativeInflow::memory()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_native_inflows(
+        thor: ThorClient,
+        btc: C,
+        btc_multisig_address: Address,
+        min_confirmations: u32,
+        tolerance_sats: u64,
+        native_inflows: Arc<AnyNativeInflow>,
+    ) -> Self {
+        Self {
+            thor,
+            btc,
+            btc_multisig_address,
+            min_confirmations,
+            tolerance_sats,
+            native_inflows,
         }
     }
 
     fn within_tolerance(&self, expected: u64, actual: u64) -> bool {
         actual.abs_diff(expected) <= self.tolerance_sats
+    }
+
+    /// Resolve and consume the actual finalized BTC delivery for a mint slot.
+    /// This is the production path for current intents whose async preview is
+    /// intentionally zero: the attested amount comes from the exact observed
+    /// `THORChain` outbound and Bitcoin UTXO, never from the preview.
+    ///
+    /// # Errors
+    /// Returns [`CrossCheckError`] unless the planned action, observed
+    /// outbound, live Asgard funder, confirmed UTXO, and one-shot ledger all
+    /// agree on one unambiguous delivery.
+    pub async fn observe_settlement(
+        &self,
+        thor_inbound_tx_hash: &str,
+        intent_id: B256,
+        slot_index: u32,
+    ) -> Result<u64, CrossCheckError> {
+        self.verify_settlement(thor_inbound_tx_hash, None, intent_id, slot_index)
+            .await
+    }
+
+    /// Resolve and consume a mint delivery from a caller-supplied, already
+    /// quorum-agreed `THORChain` snapshot. Production settlement observers use
+    /// this path so the policy cannot re-query one primary source after the
+    /// three-source evidence set was fixed.
+    ///
+    /// # Errors
+    /// The same fail-closed policy errors as [`Self::observe_settlement`].
+    pub async fn observe_settlement_from_snapshot(
+        &self,
+        thor_inbound_tx_hash: &str,
+        status: &TxResponse,
+        details: &TxDetailsResponse,
+        vault: &InboundAddress,
+        intent_id: B256,
+        slot_index: u32,
+    ) -> Result<u64, CrossCheckError> {
+        self.verify_settlement_snapshot(
+            thor_inbound_tx_hash,
+            status,
+            details,
+            vault,
+            None,
+            intent_id,
+            slot_index,
+        )
+        .await
+    }
+
+    async fn verify_settlement(
+        &self,
+        thor_inbound_tx_hash: &str,
+        expected_sats: Option<u64>,
+        lifecycle_id: B256,
+        slot_index: u32,
+    ) -> Result<u64, CrossCheckError> {
+        let status = self.thor.tx_status(thor_inbound_tx_hash).await?;
+        let details = self.thor.tx_details(thor_inbound_tx_hash).await?;
+        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+            CrossCheckError::ThorNotReady {
+                reason: "no BTC inbound address from THORChain".to_string(),
+            }
+        })?;
+        self.verify_settlement_snapshot(
+            thor_inbound_tx_hash,
+            &status,
+            &details,
+            &vault,
+            expected_sats,
+            lifecycle_id,
+            slot_index,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the snapshot policy deliberately binds the agreed THOR views, Bitcoin observation, and durable lifecycle claim in one auditable sequence"
+    )]
+    async fn verify_settlement_snapshot(
+        &self,
+        thor_inbound_tx_hash: &str,
+        resp: &TxResponse,
+        details: &TxDetailsResponse,
+        vault: &InboundAddress,
+        expected_sats: Option<u64>,
+        lifecycle_id: B256,
+        slot_index: u32,
+    ) -> Result<u64, CrossCheckError> {
+        if lifecycle_id == B256::ZERO {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "mint lifecycle id is zero".to_string(),
+            });
+        }
+        if resp.observed_tx.status != "done" {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: format!(
+                    "observed_tx.status = {} (expected 'done')",
+                    resp.observed_tx.status
+                ),
+            });
+        }
+        let multisig = self.btc_multisig_address.to_string();
+        let actions: Vec<_> = resp
+            .actions
+            .iter()
+            .filter(|action| {
+                action.chain == "BTC"
+                    && action.to_address == multisig
+                    && action.coin.asset.eq_ignore_ascii_case("BTC.BTC")
+            })
+            .collect();
+        if actions.len() != 1 {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: format!(
+                    "expected exactly one BTC.BTC action to custody, got {}",
+                    actions.len()
+                ),
+            });
+        }
+        let action = actions[0];
+        let thor_sats: u64 =
+            action
+                .coin
+                .amount
+                .parse()
+                .map_err(|error| CrossCheckError::ThorNotReady {
+                    reason: format!(
+                        "non-integer outbound amount '{}': {error}",
+                        action.coin.amount
+                    ),
+                })?;
+        if thor_sats == 0 {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "zero BTC outbound amount".to_string(),
+            });
+        }
+        if let Some(expected) = expected_sats {
+            if !self.within_tolerance(expected, thor_sats) {
+                return Err(CrossCheckError::AmountMismatch {
+                    thor_sats,
+                    claim_sats: expected,
+                });
+            }
+        }
+
+        let matching_outbounds: Vec<_> = details
+            .out_txs
+            .iter()
+            .filter(|outbound| {
+                outbound.chain == "BTC"
+                    && outbound.to_address == multisig
+                    && outbound.coins.iter().any(|coin| {
+                        coin.asset.eq_ignore_ascii_case("BTC.BTC")
+                            && coin
+                                .amount
+                                .parse::<u64>()
+                                .is_ok_and(|amount| self.within_tolerance(thor_sats, amount))
+                    })
+            })
+            .collect();
+        if matching_outbounds.len() != 1 {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: format!(
+                    "expected exactly one observed BTC outbound, got {}",
+                    matching_outbounds.len()
+                ),
+            });
+        }
+        let observed_txid = Txid::from_str(&matching_outbounds[0].id).map_err(|error| {
+            CrossCheckError::ThorNotReady {
+                reason: format!("observed BTC outbound txid is invalid: {error}"),
+            }
+        })?;
+
+        if vault.chain != "BTC"
+            || vault.address.is_empty()
+            || vault.halted
+            || vault.chain_trading_paused
+            || vault.global_trading_paused
+            || vault.chain_lp_actions_paused
+        {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "BTC trading or LP actions halted on THORChain".to_string(),
+            });
+        }
+
+        let utxos = self.btc.get_address_utxos(&self.btc_multisig_address)?;
+        let candidates: Vec<_> = utxos
+            .iter()
+            .filter(|utxo| {
+                utxo.txid == observed_txid
+                    && utxo.confirmations >= self.min_confirmations
+                    && self.within_tolerance(thor_sats, utxo.value.to_sat())
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(CrossCheckError::BtcNotReady {
+                needed_sats: thor_sats,
+                min_confs: self.min_confirmations,
+            });
+        }
+        if candidates.len() != 1 {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: format!(
+                    "observed BTC transaction has {} ambiguous custody outputs",
+                    candidates.len()
+                ),
+            });
+        }
+        let utxo = candidates[0];
+        let actual_sats = utxo.value.to_sat();
+        if let Some(expected) = expected_sats {
+            if !self.within_tolerance(expected, actual_sats) {
+                return Err(CrossCheckError::AmountMismatch {
+                    thor_sats: actual_sats,
+                    claim_sats: expected,
+                });
+            }
+        }
+        let funders = self.btc.tx_input_addresses(&utxo.txid)?;
+        if !funders.iter().any(|funder| funder == &vault.address) {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "BTC UTXO not funded by the live Asgard vault".to_string(),
+            });
+        }
+
+        let physical_hash = B256::from(utxo.txid.to_raw_hash().to_byte_array());
+        let outcome = self
+            .native_inflows
+            .consume(
+                xindex_shared::chain_registry::ChainId::Btc,
+                physical_hash,
+                utxo.vout,
+                NativeInflowClaim {
+                    kind: NativeFlowKind::MintDelivery,
+                    lifecycle_id,
+                    leg_index: slot_index,
+                },
+                observation_time()?,
+            )
+            .await?;
+        if matches!(outcome, NativeInflowOutcome::Conflict { .. }) {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "observed BTC output was already consumed by another lifecycle".to_string(),
+            });
+        }
+
+        info!(
+            tx_hash = thor_inbound_tx_hash,
+            actual_sats, "cross-check OK — THORChain observed outbound + exact BTC UTXO confirmed"
+        );
+        Ok(actual_sats)
     }
 }
 
@@ -170,88 +458,12 @@ impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorUtxoPolicy<C> {
         thor_inbound_tx_hash: &str,
         expected_sats: u64,
     ) -> Result<(), CrossCheckError> {
-        // Step 1: `THORChain` side.
-        let resp = self.thor.tx_status(thor_inbound_tx_hash).await?;
-        if resp.observed_tx.status != "done" {
-            return Err(CrossCheckError::ThorNotReady {
-                reason: format!(
-                    "observed_tx.status = {} (expected 'done')",
-                    resp.observed_tx.status
-                ),
-            });
-        }
-        // We expect at least one outbound action targeting our chain.
-        let multisig_str = self.btc_multisig_address.to_string();
-        let matching_action = resp
-            .actions
-            .iter()
-            .find(|a| a.chain == "BTC" && a.to_address == multisig_str);
-        let action = matching_action.ok_or_else(|| CrossCheckError::ThorNotReady {
-            reason: "no BTC outbound action targeting our multisig in `THORChain` response"
-                .to_string(),
-        })?;
-        let thor_sats: u64 =
-            action
-                .coin
-                .amount
-                .parse()
-                .map_err(|e| CrossCheckError::ThorNotReady {
-                    reason: format!("non-integer outbound amount '{}': {e}", action.coin.amount),
-                })?;
-        if !self.within_tolerance(expected_sats, thor_sats) {
-            return Err(CrossCheckError::AmountMismatch {
-                thor_sats,
-                claim_sats: expected_sats,
-            });
-        }
-
-        // Resolve the live Asgard vault — the UTXO MUST originate there
-        // (sender binding, P3.3-9 for BTC). Refuse while BTC trading is
-        // halted (defense-in-depth — an operator incident signal).
-        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
-            CrossCheckError::ThorNotReady {
-                reason: "no BTC inbound address from THORChain".to_string(),
-            }
-        })?;
-        if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
-            return Err(CrossCheckError::ThorNotReady {
-                reason: "BTC trading halted on THORChain".to_string(),
-            });
-        }
-
-        // Step 2: Bitcoin side.
-        let needed = Amount::from_sat(expected_sats);
-        let utxo = find_arrival(
-            &self.btc,
-            &self.btc_multisig_address,
-            needed,
-            self.min_confirmations,
-        )?;
-        let utxo = utxo.ok_or(CrossCheckError::BtcNotReady {
-            needed_sats: expected_sats,
-            min_confs: self.min_confirmations,
-        })?;
-        if !self.within_tolerance(expected_sats, utxo.value.to_sat()) {
-            return Err(CrossCheckError::AmountMismatch {
-                thor_sats: utxo.value.to_sat(),
-                claim_sats: expected_sats,
-            });
-        }
-
-        // Bind the UTXO's funding inputs to the live Asgard vault — a
-        // recipient+amount match alone is forgeable since our multisig
-        // address is public.
-        let funders = self.btc.tx_input_addresses(&utxo.txid)?;
-        if !funders.iter().any(|f| f == &vault.address) {
-            return Err(CrossCheckError::ThorNotReady {
-                reason: "BTC UTXO not funded by the live Asgard vault".to_string(),
-            });
-        }
-
-        info!(
-            tx_hash = thor_inbound_tx_hash,
-            expected_sats, "cross-check OK — `THORChain` done + BTC UTXO confirmed"
-        );
+        let lifecycle_id =
+            parse_thor_hash(thor_inbound_tx_hash).ok_or_else(|| CrossCheckError::ThorNotReady {
+                reason: "THOR inbound hash is not bytes32".to_string(),
+            })?;
+        self.verify_settlement(thor_inbound_tx_hash, Some(expected_sats), lifecycle_id, 0)
+            .await?;
         Ok(())
     }
 }
@@ -275,7 +487,8 @@ impl<C: UtxoChainClient + Send + Sync> CrossCheck for ThorUtxoPolicy<C> {
 const THOR_TO_USDT_SCALE: u128 = 100;
 
 /// One observed ERC20 credit to an address.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Erc20Arrival {
     /// Transferred value in the token's own decimals (USDT: 1e6).
     pub value: u128,
@@ -366,13 +579,33 @@ pub async fn confirm_erc20_arrival<E: Erc20ArrivalClient>(
     min_confs: u32,
     binding: &InflowBinding,
 ) -> Result<Option<Erc20Arrival>, InflowError> {
-    for arrival in client.transfers_to(token, to)? {
+    let arrivals = client.transfers_to(token, to)?;
+    confirm_erc20_arrival_from_snapshot(store, &arrivals, min_value, min_confs, binding)
+        .await
+        .map_err(Into::into)
+}
+
+/// Confirm and consume one arrival from a caller-supplied finalized snapshot.
+/// Production settlement observers preserve that exact snapshot as raw RPC
+/// evidence and pass the decoded arrivals here, preventing a second RPC query
+/// between evidence capture and HSM release.
+///
+/// # Errors
+/// [`ConsumedInflowError`] if the one-shot ledger cannot be read or updated.
+pub async fn confirm_erc20_arrival_from_snapshot(
+    store: &AnyConsumedInflow,
+    arrivals: &[Erc20Arrival],
+    min_value: u128,
+    min_confs: u32,
+    binding: &InflowBinding,
+) -> Result<Option<Erc20Arrival>, ConsumedInflowError> {
+    for arrival in arrivals {
         if arrival.value >= min_value
             && arrival.confirmations >= min_confs
             && arrival.transaction_hash == binding.expected_outbound_hash
             && claim_inflow(store, binding, arrival.transaction_hash, arrival.log_index).await?
         {
-            return Ok(Some(arrival));
+            return Ok(Some(arrival.clone()));
         }
     }
     Ok(None)
@@ -407,6 +640,21 @@ async fn claim_inflow(
                 %existing_redemption_id,
                 existing_leg_index,
                 "USDT inflow already consumed by another redemption leg — skipping (RUST-004)"
+            );
+            Ok(false)
+        }
+        InflowConsumeOutcome::ConflictByOtherInflow {
+            existing_tx_hash,
+            existing_log_index,
+        } => {
+            warn!(
+                redemption_id = %binding.redemption_id,
+                leg_index = binding.leg_index,
+                %tx_hash,
+                log_index,
+                %existing_tx_hash,
+                existing_log_index,
+                "redemption leg already selected a different USDT inflow — skipping"
             );
             Ok(false)
         }
@@ -489,6 +737,8 @@ pub enum RefundCrossCheckError {
     Thor(#[from] ThorError),
     #[error("Bitcoin chain error: {0}")]
     Btc(#[from] UtxoError),
+    #[error("native inflow ledger: {0}")]
+    NativeLedger(#[from] NativeInflowError),
     #[error("`THORChain` not yet ready: {reason}")]
     ThorNotReady { reason: String },
     #[error("refund BTC not yet confirmed at multisig: need ≥{need_sats} sats ≥{confs} confs")]
@@ -568,6 +818,13 @@ impl RefundCrossCheck for PassThroughRefund {
 #[inline]
 fn within(a: u128, b: u128, tol: u128) -> bool {
     a.abs_diff(b) <= tol
+}
+
+fn observation_time() -> Result<u64, NativeInflowError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| NativeInflowError::Decode(format!("system clock: {error}")))
 }
 
 /// Lower-cased `0x`-hex of an ETH address for case-insensitive
@@ -729,6 +986,7 @@ pub struct ThorUtxoRefundPolicy<C: UtxoChainClient + Send + Sync> {
     btc_multisig_address: Address,
     min_confirmations: u32,
     tolerance_sats: u64,
+    native_inflows: Arc<AnyNativeInflow>,
 }
 
 impl<C: UtxoChainClient + Send + Sync> std::fmt::Debug for ThorUtxoRefundPolicy<C> {
@@ -756,10 +1014,34 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoRefundPolicy<C> {
             btc_multisig_address,
             min_confirmations,
             tolerance_sats,
+            native_inflows: Arc::new(AnyNativeInflow::memory()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_native_inflows(
+        thor: ThorClient,
+        btc: C,
+        btc_multisig_address: Address,
+        min_confirmations: u32,
+        tolerance_sats: u64,
+        native_inflows: Arc<AnyNativeInflow>,
+    ) -> Self {
+        Self {
+            thor,
+            btc,
+            btc_multisig_address,
+            min_confirmations,
+            tolerance_sats,
+            native_inflows,
         }
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "refund verification deliberately keeps outcome exclusion, observed outbound, finalized UTXO, Asgard-funder, and one-shot-ledger checks in one fail-closed sequence"
+)]
 #[async_trait]
 impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy<C> {
     async fn verify(&self, btc_txid: &str) -> Result<u64, RefundCrossCheckError> {
@@ -800,6 +1082,32 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
                     reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
                 })?;
 
+        // The planned action carries no destination-chain transaction ID.
+        // Resolve the observed Bitcoin outbound and bind the later UTXO check
+        // to that exact transaction rather than accepting any same-valued
+        // output sent to the public custody address.
+        let details = self.thor.tx_details(btc_txid).await?;
+        let observed = details
+            .out_txs
+            .iter()
+            .find(|outbound| {
+                outbound.chain == "BTC"
+                    && outbound.to_address == multisig
+                    && outbound.coins.iter().any(|coin| {
+                        coin.asset.eq_ignore_ascii_case("BTC.BTC")
+                            && coin.amount.parse::<u64>().is_ok_and(|amount| {
+                                amount.abs_diff(thor_sats) <= self.tolerance_sats
+                            })
+                    })
+            })
+            .ok_or_else(|| RefundCrossCheckError::ThorNotReady {
+                reason: "no observed BTC refund tx in tx/details".to_string(),
+            })?;
+        let observed_txid =
+            Txid::from_str(&observed.id).map_err(|error| RefundCrossCheckError::ThorNotReady {
+                reason: format!("observed BTC refund txid is invalid: {error}"),
+            })?;
+
         // Resolve the live Asgard vault — the refund UTXO MUST originate
         // there (sender binding, P3.3-9 for BTC). Refuse while BTC trading
         // is halted on THORChain.
@@ -816,17 +1124,18 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
 
         // Independent Bitcoin observation. BTC is 1e8 BOTH on THORChain
         // and on-chain (sats) — no scaling, unlike USDT.
-        let floor = Amount::from_sat(thor_sats.saturating_sub(self.tolerance_sats));
-        let utxo = find_arrival(
-            &self.btc,
-            &self.btc_multisig_address,
-            floor,
-            self.min_confirmations,
-        )?
-        .ok_or(RefundCrossCheckError::BtcNotReady {
-            need_sats: thor_sats,
-            confs: self.min_confirmations,
-        })?;
+        let utxos = self.btc.get_address_utxos(&self.btc_multisig_address)?;
+        let utxo = utxos
+            .iter()
+            .find(|utxo| {
+                utxo.txid == observed_txid
+                    && utxo.confirmations >= self.min_confirmations
+                    && utxo.value.to_sat().abs_diff(thor_sats) <= self.tolerance_sats
+            })
+            .ok_or(RefundCrossCheckError::BtcNotReady {
+                need_sats: thor_sats,
+                confs: self.min_confirmations,
+            })?;
         let utxo_sats = utxo.value.to_sat();
         if utxo_sats.abs_diff(thor_sats) > self.tolerance_sats {
             return Err(RefundCrossCheckError::AmountMismatch {
@@ -840,6 +1149,31 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
         if !funders.iter().any(|f| f == &vault.address) {
             return Err(RefundCrossCheckError::ThorNotReady {
                 reason: "BTC refund UTXO not funded by the live Asgard vault".to_string(),
+            });
+        }
+        let lifecycle_id =
+            parse_thor_hash(btc_txid).ok_or_else(|| RefundCrossCheckError::ThorNotReady {
+                reason: "BTC inbound hash is not bytes32".to_string(),
+            })?;
+        let physical_hash = B256::from(utxo.txid.to_raw_hash().to_byte_array());
+        let claim = self
+            .native_inflows
+            .consume(
+                xindex_shared::chain_registry::ChainId::Btc,
+                physical_hash,
+                utxo.vout,
+                NativeInflowClaim {
+                    kind: NativeFlowKind::RedemptionRefund,
+                    lifecycle_id,
+                    leg_index: 0,
+                },
+                observation_time()?,
+            )
+            .await?;
+        if matches!(claim, NativeInflowOutcome::Conflict { .. }) {
+            return Err(RefundCrossCheckError::ThorNotReady {
+                reason: "observed BTC refund output was already consumed by another lifecycle"
+                    .to_string(),
             });
         }
         info!(btc_txid, refunded_sats = utxo_sats, "refund cross-check OK");
@@ -890,6 +1224,8 @@ pub enum StreamedSettlementCrossCheckError {
     /// The consumed-inflow ledger query failed (RUST-004).
     #[error("consumed-inflow ledger error: {0}")]
     Ledger(#[from] ConsumedInflowError),
+    #[error("native inflow ledger: {0}")]
+    NativeLedger(#[from] NativeInflowError),
 }
 
 impl From<InflowError> for StreamedSettlementCrossCheckError {
@@ -943,6 +1279,10 @@ pub struct ThorUtxoStreamedSettlementPolicy<E: Erc20ArrivalClient, C: UtxoChainC
     /// so a streamed settlement and a plain delivery can never both credit the
     /// same physical USDT inflow.
     store: Arc<AnyConsumedInflow>,
+    /// Shared native-output ledger. A physical BTC refund output can be
+    /// credited to only one redemption lifecycle across both the plain and
+    /// streamed settlement paths.
+    native_inflows: Arc<AnyNativeInflow>,
 }
 
 impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> std::fmt::Debug
@@ -988,6 +1328,39 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
             tolerance_1e6,
             tolerance_sats,
             store,
+            native_inflows: Arc::new(AnyNativeInflow::memory()),
+        }
+    }
+
+    /// Construct the production policy with both durable inflow ledgers.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "combined policy threads both delivery and refund verification parameters plus two durable one-shot ledgers"
+    )]
+    pub fn with_native_inflows(
+        thor: ThorClient,
+        erc20: E,
+        btc: C,
+        usdt_token: EthAddress,
+        btc_multisig_address: Address,
+        min_confirmations: u32,
+        tolerance_1e6: u128,
+        tolerance_sats: u64,
+        store: Arc<AnyConsumedInflow>,
+        native_inflows: Arc<AnyNativeInflow>,
+    ) -> Self {
+        Self {
+            thor,
+            erc20,
+            btc,
+            usdt_token,
+            btc_multisig_address,
+            min_confirmations,
+            tolerance_1e6,
+            tolerance_sats,
+            store,
+            native_inflows,
         }
     }
 
@@ -995,40 +1368,101 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
     /// (a full refund); `Ok(Some(value_1e6))` once the on-chain arrival is
     /// confirmed; an error while the THOR action is present but the
     /// on-chain USDT is not yet confirmed / mismatched.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "delivery snapshot validation deliberately remains a linear evidence-to-ledger policy"
+    )]
     async fn verify_delivery_leg(
         &self,
         resp: &TxResponse,
-        btc_txid: &str,
+        details: &TxDetailsResponse,
+        arrivals: &[Erc20Arrival],
         index_token: EthAddress,
         redemption_id: B256,
         leg_index: u32,
     ) -> Result<Option<u128>, StreamedSettlementCrossCheckError> {
         let want = eth_addr_lc(index_token);
-        let Some(action) = resp.actions.iter().find(|a| {
-            a.chain == "ETH"
-                && a.coin.asset.to_uppercase().starts_with("ETH.USDT")
-                && a.to_address.to_lowercase() == want
-        }) else {
+        let actions: Vec<_> = resp
+            .actions
+            .iter()
+            .filter(|action| {
+                action.chain == "ETH"
+                    && action.coin.asset.to_uppercase().starts_with("ETH.USDT")
+                    && action.to_address.to_lowercase() == want
+            })
+            .collect();
+        if actions.is_empty() {
+            let unexplained = details.out_txs.iter().any(|outbound| {
+                outbound.chain == "ETH"
+                    && outbound.to_address.to_lowercase() == want
+                    && outbound
+                        .coins
+                        .iter()
+                        .any(|coin| coin.asset.to_uppercase().starts_with("ETH.USDT"))
+            });
+            if unexplained {
+                return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                    reason: "observed ETH.USDT outbound has no matching planned action".to_string(),
+                });
+            }
             return Ok(None);
-        };
+        }
+        if actions.len() != 1 {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!(
+                    "expected at most one ETH.USDT delivery action, got {}",
+                    actions.len()
+                ),
+            });
+        }
+        let action = actions[0];
         let thor_1e8: u128 = action.coin.amount.parse().map_err(|e| {
             StreamedSettlementCrossCheckError::ThorNotReady {
                 reason: format!("non-integer outbound amount '{}': {e}", action.coin.amount),
             }
         })?;
         let thor_1e6 = thor_1e8 / THOR_TO_USDT_SCALE;
-        // RUST-004: bind to the OBSERVED outbound tx hash + consume the inflow.
-        let expected_outbound_hash = observed_usdt_outbound_hash(&self.thor, btc_txid, index_token)
-            .await?
-            .ok_or_else(|| StreamedSettlementCrossCheckError::ThorNotReady {
-                reason: "no observed ETH.USDT outbound hash in tx/details yet".to_string(),
+        if thor_1e8 == 0 || thor_1e6 == 0 {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "zero/sub-base-unit ETH.USDT delivery action".to_string(),
+            });
+        }
+        let matching_outbounds: Vec<_> = details
+            .out_txs
+            .iter()
+            .filter(|outbound| {
+                outbound.chain == "ETH"
+                    && outbound.to_address.to_lowercase() == want
+                    && outbound.coins.iter().any(|coin| {
+                        coin.asset.to_uppercase().starts_with("ETH.USDT")
+                            && coin.amount.parse::<u128>().is_ok_and(|amount_1e8| {
+                                within(
+                                    thor_1e6,
+                                    amount_1e8 / THOR_TO_USDT_SCALE,
+                                    self.tolerance_1e6,
+                                )
+                            })
+                    })
+            })
+            .collect();
+        if matching_outbounds.len() != 1 {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!(
+                    "expected exactly one observed ETH.USDT outbound, got {}",
+                    matching_outbounds.len()
+                ),
+            });
+        }
+        let expected_outbound_hash =
+            parse_thor_hash(&matching_outbounds[0].id).ok_or_else(|| {
+                StreamedSettlementCrossCheckError::ThorNotReady {
+                    reason: "observed ETH.USDT outbound hash is invalid".to_string(),
+                }
             })?;
         let floor = thor_1e6.saturating_sub(self.tolerance_1e6);
-        let arrival = confirm_erc20_arrival(
-            &self.erc20,
+        let arrival = confirm_erc20_arrival_from_snapshot(
             &self.store,
-            self.usdt_token,
-            index_token,
+            arrivals,
             floor,
             self.min_confirmations,
             &InflowBinding {
@@ -1053,45 +1487,129 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
 
     /// Refund leg: `Ok(None)` if `THORChain` emitted no BTC refund (a full
     /// delivery); `Ok(Some(sats))` once the vault-bound UTXO is confirmed.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "refund snapshot validation deliberately remains a linear evidence-to-ledger policy"
+    )]
     async fn verify_refund_leg(
         &self,
         resp: &TxResponse,
+        details: &TxDetailsResponse,
+        vault: &InboundAddress,
+        redemption_id: B256,
+        leg_index: u32,
     ) -> Result<Option<u64>, StreamedSettlementCrossCheckError> {
         let multisig = self.btc_multisig_address.to_string();
-        let Some(action) = resp.actions.iter().find(|a| {
-            a.chain == "BTC"
-                && a.to_address == multisig
-                && a.memo.to_uppercase().starts_with("REFUND:")
-                && a.coin.asset.to_uppercase() == "BTC.BTC"
-        }) else {
+        let actions: Vec<_> = resp
+            .actions
+            .iter()
+            .filter(|action| {
+                action.chain == "BTC"
+                    && action.to_address == multisig
+                    && action.memo.to_uppercase().starts_with("REFUND:")
+                    && action.coin.asset.to_uppercase() == "BTC.BTC"
+            })
+            .collect();
+        if actions.is_empty() {
+            let unexplained = details.out_txs.iter().any(|outbound| {
+                outbound.chain == "BTC"
+                    && outbound.to_address == multisig
+                    && outbound
+                        .coins
+                        .iter()
+                        .any(|coin| coin.asset.eq_ignore_ascii_case("BTC.BTC"))
+            });
+            if unexplained {
+                return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                    reason: "observed BTC custody outbound has no matching refund action"
+                        .to_string(),
+                });
+            }
             return Ok(None);
-        };
+        }
+        if actions.len() != 1 {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!(
+                    "expected at most one BTC refund action, got {}",
+                    actions.len()
+                ),
+            });
+        }
+        let action = actions[0];
         let thor_sats: u64 = action.coin.amount.parse().map_err(|e| {
             StreamedSettlementCrossCheckError::ThorNotReady {
                 reason: format!("non-integer refund amount '{}': {e}", action.coin.amount),
             }
         })?;
-        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
-            StreamedSettlementCrossCheckError::ThorNotReady {
-                reason: "no BTC inbound address from THORChain".to_string(),
-            }
-        })?;
-        if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+        if thor_sats == 0 {
             return Err(StreamedSettlementCrossCheckError::ThorNotReady {
-                reason: "BTC trading halted on THORChain".to_string(),
+                reason: "zero BTC refund amount".to_string(),
             });
         }
-        let floor = Amount::from_sat(thor_sats.saturating_sub(self.tolerance_sats));
-        let utxo = find_arrival(
-            &self.btc,
-            &self.btc_multisig_address,
-            floor,
-            self.min_confirmations,
-        )?
-        .ok_or(StreamedSettlementCrossCheckError::BtcNotReady {
-            need_sats: thor_sats,
-            confs: self.min_confirmations,
+
+        let observed: Vec<_> = details
+            .out_txs
+            .iter()
+            .filter(|outbound| {
+                outbound.chain == "BTC"
+                    && outbound.to_address == multisig
+                    && outbound.coins.iter().any(|coin| {
+                        coin.asset.eq_ignore_ascii_case("BTC.BTC")
+                            && coin.amount.parse::<u64>().is_ok_and(|amount| {
+                                amount.abs_diff(thor_sats) <= self.tolerance_sats
+                            })
+                    })
+            })
+            .collect();
+        if observed.len() != 1 {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!(
+                    "expected exactly one observed BTC refund outbound, got {}",
+                    observed.len()
+                ),
+            });
+        }
+        let observed_txid = Txid::from_str(&observed[0].id).map_err(|error| {
+            StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!("observed BTC refund txid is invalid: {error}"),
+            }
         })?;
+
+        if vault.chain != "BTC"
+            || vault.address.is_empty()
+            || vault.halted
+            || vault.chain_trading_paused
+            || vault.global_trading_paused
+            || vault.chain_lp_actions_paused
+        {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "BTC trading or LP actions halted on THORChain".to_string(),
+            });
+        }
+        let utxos = self.btc.get_address_utxos(&self.btc_multisig_address)?;
+        let candidates: Vec<_> = utxos
+            .iter()
+            .filter(|utxo| {
+                utxo.txid == observed_txid
+                    && utxo.confirmations >= self.min_confirmations
+                    && utxo.value.to_sat().abs_diff(thor_sats) <= self.tolerance_sats
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Err(StreamedSettlementCrossCheckError::BtcNotReady {
+                need_sats: thor_sats,
+                confs: self.min_confirmations,
+            });
+        }
+        if candidates.len() != 1 {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: format!(
+                    "observed BTC refund has {} ambiguous custody outputs",
+                    candidates.len()
+                ),
+            });
+        }
+        let utxo = candidates[0];
         let utxo_sats = utxo.value.to_sat();
         if utxo_sats.abs_diff(thor_sats) > self.tolerance_sats {
             return Err(StreamedSettlementCrossCheckError::BtcAmountMismatch {
@@ -1105,7 +1623,108 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
                 reason: "BTC refund UTXO not funded by the live Asgard vault".to_string(),
             });
         }
+
+        let physical_hash = B256::from(utxo.txid.to_raw_hash().to_byte_array());
+        let claim = self
+            .native_inflows
+            .consume(
+                xindex_shared::chain_registry::ChainId::Btc,
+                physical_hash,
+                utxo.vout,
+                NativeInflowClaim {
+                    kind: NativeFlowKind::RedemptionRefund,
+                    lifecycle_id: redemption_id,
+                    leg_index,
+                },
+                observation_time()?,
+            )
+            .await?;
+        if matches!(claim, NativeInflowOutcome::Conflict { .. }) {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "observed BTC refund output was already consumed by another lifecycle"
+                    .to_string(),
+            });
+        }
         Ok(Some(utxo_sats))
+    }
+
+    /// Verify a finalized redemption outcome against the exact snapshots a
+    /// production observer already quorum-agreed and persisted as evidence.
+    /// No `THORNode` or Ethereum RPC call occurs in this method; only the
+    /// independently configured Bitcoin client and durable one-shot ledgers
+    /// are consulted.
+    ///
+    /// # Errors
+    /// Any mismatch, ambiguity, missing confirmation, or ledger conflict.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the API explicitly binds every agreed THOR/Ethereum snapshot and on-chain lifecycle identity"
+    )]
+    pub async fn verify_from_snapshot(
+        &self,
+        resp: &TxResponse,
+        details: &TxDetailsResponse,
+        vault: &InboundAddress,
+        arrivals: &[Erc20Arrival],
+        btc_txid: &str,
+        index_token: EthAddress,
+        redemption_id: B256,
+        leg_index: u32,
+    ) -> Result<StreamedOutcome, StreamedSettlementCrossCheckError> {
+        if redemption_id == B256::ZERO || index_token == EthAddress::ZERO {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "zero redemption or destination identity".to_string(),
+            });
+        }
+        if resp.observed_tx.status != "done"
+            || resp.observed_tx.tx.chain != "BTC"
+            || !resp.observed_tx.tx.id.eq_ignore_ascii_case(btc_txid)
+        {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "agreed THOR snapshot is not the completed requested BTC inbound"
+                    .to_string(),
+            });
+        }
+        if vault.chain != "BTC"
+            || vault.address.is_empty()
+            || vault.halted
+            || vault.chain_trading_paused
+            || vault.global_trading_paused
+            || vault.chain_lp_actions_paused
+        {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "agreed BTC vault is missing, halted, or LP-paused".to_string(),
+            });
+        }
+        let delivered = self
+            .verify_delivery_leg(
+                resp,
+                details,
+                arrivals,
+                index_token,
+                redemption_id,
+                leg_index,
+            )
+            .await?;
+        let refunded = self
+            .verify_refund_leg(resp, details, vault, redemption_id, leg_index)
+            .await?;
+        match (delivered, refunded) {
+            (None, None) => Err(StreamedSettlementCrossCheckError::NoSettlement),
+            (delivery, refund) => {
+                let outcome = StreamedOutcome {
+                    delivered_usdt_1e6: delivery.unwrap_or(0),
+                    refunded_sats: refund.unwrap_or(0),
+                };
+                info!(
+                    btc_txid,
+                    delivered_usdt_1e6 = outcome.delivered_usdt_1e6,
+                    refunded_sats = outcome.refunded_sats,
+                    "snapshot-bound streamed-settlement cross-check OK"
+                );
+                Ok(outcome)
+            }
+        }
     }
 }
 
@@ -1121,31 +1740,24 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> StreamedSettlement
         leg_index: u32,
     ) -> Result<StreamedOutcome, StreamedSettlementCrossCheckError> {
         let resp = self.thor.tx_status(btc_txid).await?;
-        if resp.observed_tx.status != "done" {
-            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
-                reason: format!("observed_tx.status = {}", resp.observed_tx.status),
-            });
-        }
-        let delivered = self
-            .verify_delivery_leg(&resp, btc_txid, index_token, redemption_id, leg_index)
-            .await?;
-        let refunded = self.verify_refund_leg(&resp).await?;
-        match (delivered, refunded) {
-            (None, None) => Err(StreamedSettlementCrossCheckError::NoSettlement),
-            (d, r) => {
-                let outcome = StreamedOutcome {
-                    delivered_usdt_1e6: d.unwrap_or(0),
-                    refunded_sats: r.unwrap_or(0),
-                };
-                info!(
-                    btc_txid,
-                    delivered_usdt_1e6 = outcome.delivered_usdt_1e6,
-                    refunded_sats = outcome.refunded_sats,
-                    "streamed-settlement cross-check OK"
-                );
-                Ok(outcome)
+        let details = self.thor.tx_details(btc_txid).await?;
+        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+            StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "no BTC inbound address from THORChain".to_string(),
             }
-        }
+        })?;
+        let arrivals = self.erc20.transfers_to(self.usdt_token, index_token)?;
+        self.verify_from_snapshot(
+            &resp,
+            &details,
+            &vault,
+            &arrivals,
+            btc_txid,
+            index_token,
+            redemption_id,
+            leg_index,
+        )
+        .await
     }
 }
 
@@ -1196,7 +1808,10 @@ mod tests {
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
                     "chain": "BTC", "pub_key": "thorpub1addwnpepq", "address": vault_addr,
-                    "halted": halted
+                    "halted": halted,
+                    "global_trading_paused": false,
+                    "chain_trading_paused": false,
+                    "chain_lp_actions_paused": false
                 }])),
             )
             .mount(server)
@@ -1656,6 +2271,45 @@ mod tests {
             .await;
     }
 
+    async fn mount_streamed_tx_details(
+        server: &wiremock::MockServer,
+        hash: &str,
+        eth_to: EthAddress,
+        eth_amount_1e8: Option<&str>,
+        refund_sats: Option<&str>,
+    ) {
+        let mut outbounds = Vec::new();
+        if let Some(amount) = eth_amount_1e8 {
+            outbounds.push(serde_json::json!({
+                "id": out_hash_hex(),
+                "chain": "ETH",
+                "to_address": eth_addr_lc(eth_to),
+                "coins": [{
+                    "asset": "ETH.USDT-0XDAC17F958D2EE523A2206206994597C13D831EC7",
+                    "amount": amount
+                }]
+            }));
+        }
+        if let Some(amount) = refund_sats {
+            outbounds.push(serde_json::json!({
+                "id": "0000000000000000000000000000000000000000000000000000000000000abc",
+                "chain": "BTC",
+                "to_address": test_address().to_string(),
+                "coins": [{ "asset": "BTC.BTC", "amount": amount }]
+            }));
+        }
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/details/{hash}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "out_txs": outbounds })),
+            )
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn confirm_erc20_arrival_filters_value_confs_and_hash() {
@@ -1977,7 +2631,14 @@ mod tests {
             .lock()
             .expect("lock")
             .push(arrival(70_000_000, 6));
-        mount_tx_details(&server, "streamed-in", idx_token()).await;
+        mount_streamed_tx_details(
+            &server,
+            "streamed-in",
+            idx_token(),
+            Some("7000000000"),
+            Some("30000000"),
+        )
+        .await;
         let btc = StubBtc::default();
         btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid: Txid::from_str(
@@ -2043,7 +2704,14 @@ mod tests {
             .lock()
             .expect("lock")
             .push(arrival(90_000_000, 6));
-        mount_tx_details(&server, "streamed-in", idx_token()).await;
+        mount_streamed_tx_details(
+            &server,
+            "streamed-in",
+            idx_token(),
+            Some("9000000000"),
+            None,
+        )
+        .await;
         let policy = ThorUtxoStreamedSettlementPolicy::new(
             thor,
             erc20,
@@ -2081,6 +2749,8 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_streamed_tx_details(&server, "streamed-in", idx_token(), None, None).await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let policy = ThorUtxoStreamedSettlementPolicy::new(
             thor,

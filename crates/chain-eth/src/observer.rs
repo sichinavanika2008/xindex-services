@@ -34,6 +34,8 @@ use xindex_shared::signer_wire::{
 };
 use xindex_signer::{RicSigner, SignerError};
 
+const MAX_HALT_BODY: usize = 64 * 1024;
+
 /// The on-chain facts of one redemption leg, read from the observer's
 /// OWN Ethereum RPC via the `RedeemDispatched` event. These are the
 /// amount / memo / final-destination the certificate binds; the Asgard
@@ -81,6 +83,34 @@ pub trait RedeemLegSource {
         redemption_id: B256,
         leg_index: u32,
     ) -> impl std::future::Future<Output = Result<Option<ObservedLeg>, String>> + Send;
+}
+
+/// Independent source of a fresh, fail-closed Asgard inbound. Production
+/// implementations may apply complete Mimir/pool/consensus policy and durable
+/// advancing-tip checks; the legacy [`xindex_chain_thor::AsgardAgreement`]
+/// adapter remains available for development tests.
+pub trait AsgardSource {
+    /// Resolve one chain's current inbound address at `now_unix`.
+    ///
+    /// # Errors
+    /// Incomplete/stale/disagreeing source evidence or a halted route.
+    fn resolve_asgard(
+        &self,
+        chain: &str,
+        now_unix: u64,
+    ) -> impl std::future::Future<Output = Result<xindex_chain_thor::InboundAddress, String>> + Send;
+}
+
+impl AsgardSource for xindex_chain_thor::AsgardAgreement {
+    async fn resolve_asgard(
+        &self,
+        chain: &str,
+        _now_unix: u64,
+    ) -> Result<xindex_chain_thor::InboundAddress, String> {
+        self.resolve_agreed(chain)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// In-memory [`RedeemLegSource`] backed by a shared map the observer's
@@ -181,6 +211,26 @@ impl InMemoryCancelSource {
         }
     }
 
+    /// Atomically replace the compatibility view from the durable canonical
+    /// store after restart or reorg rollback.
+    ///
+    /// # Errors
+    /// Poisoned lock or duplicate cancellation identity in the supplied rows.
+    pub fn replace_all(&self, rows: Vec<(B256, ObservedCancel)>) -> Result<(), String> {
+        let mut replacement = std::collections::HashMap::with_capacity(rows.len());
+        for (cancel_id, observed) in rows {
+            if replacement.insert(cancel_id, observed).is_some() {
+                return Err(format!("duplicate canonical cancel {cancel_id:#x}"));
+            }
+        }
+        let mut map = self
+            .facts
+            .write()
+            .map_err(|error| format!("cancel map poisoned: {error}"))?;
+        *map = replacement;
+        Ok(())
+    }
+
     fn get(&self, cancel_id: B256) -> Result<Option<ObservedCancel>, String> {
         let map = self
             .facts
@@ -218,6 +268,7 @@ impl HaltSource for NeverHalted {
 pub struct HttpHaltSource {
     url: String,
     guard: Address,
+    block_tag: &'static str,
     client: reqwest::Client,
 }
 
@@ -237,6 +288,19 @@ impl HttpHaltSource {
         Self {
             url,
             guard,
+            block_tag: "latest",
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Production form: evaluate the guard at the execution client's
+    /// consensus-finalized tag, matching finalized event ingestion.
+    #[must_use]
+    pub fn finalized(url: String, guard: Address) -> Self {
+        Self {
+            url,
+            guard,
+            block_tag: "finalized",
             client: reqwest::Client::new(),
         }
     }
@@ -254,7 +318,7 @@ impl HaltSource for HttpHaltSource {
                     "to": format!("{:#x}", self.guard),
                     "data": format!("0x{}", alloy_primitives::hex::encode(selector)),
                 },
-                "latest"
+                self.block_tag
             ]
         });
         let resp = self
@@ -268,12 +332,21 @@ impl HaltSource for HttpHaltSource {
         if !status.is_success() {
             return Err(format!("halt eth_call http {}", status.as_u16()));
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("halt eth_call body: {}", transport_class(&e)))?;
-        if bytes.len() > 64 * 1024 {
+        if resp
+            .content_length()
+            .is_some_and(|length| length > MAX_HALT_BODY as u64)
+        {
             return Err("halt eth_call response exceeds 64 KiB".to_string());
+        }
+        let mut bytes = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let chunk =
+                chunk.map_err(|e| format!("halt eth_call body: {}", transport_class(&e)))?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_HALT_BODY {
+                return Err("halt eth_call response exceeds 64 KiB".to_string());
+            }
+            bytes.extend_from_slice(&chunk);
         }
         let v: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| "halt eth_call body is malformed json".to_string())?;
@@ -290,6 +363,9 @@ impl HaltSource for HttpHaltSource {
                 "halt eth_call: result length {} != 32 (guard mis-addressed?)",
                 raw.len()
             ));
+        }
+        if raw[..31].iter().any(|byte| *byte != 0) || !matches!(raw[31], 0 | 1) {
+            return Err("halt eth_call returned a non-canonical bool".to_string());
         }
         Ok(raw[31] == 1)
     }
@@ -460,33 +536,28 @@ const MAX_MEMO_BYTES: usize = 80;
 
 /// One operator's redemption observer.
 #[derive(Debug)]
-pub struct Observer<L, S, G> {
+pub struct Observer<L, S, G, A = xindex_chain_thor::AsgardAgreement> {
     config: ObserverConfig,
-    asgard: xindex_chain_thor::AsgardAgreement,
+    asgard: A,
     legs: L,
     cancels: InMemoryCancelSource,
     signer: std::sync::Arc<S>,
     halt: G,
 }
 
-impl<L, S, G> Observer<L, S, G>
+impl<L, S, G, A> Observer<L, S, G, A>
 where
     L: RedeemLegSource,
     S: RicSigner,
     G: HaltSource,
+    A: AsgardSource,
 {
     /// Build an observer over its leg source, diverse-source Asgard
     /// gate, its own Set-B signer, and the on-chain halt source
     /// (`DL-CTD-E`). The mint-cancel record starts empty — the event
     /// loop writes into the handle [`Observer::cancel_source`] returns.
     #[must_use]
-    pub fn new(
-        config: ObserverConfig,
-        asgard: xindex_chain_thor::AsgardAgreement,
-        legs: L,
-        signer: S,
-        halt: G,
-    ) -> Self {
+    pub fn new(config: ObserverConfig, asgard: A, legs: L, signer: S, halt: G) -> Self {
         Self {
             config,
             asgard,
@@ -572,9 +643,9 @@ where
 
         let asgard_address = self
             .asgard
-            .resolve_agreed(thor_chain_name(self.config.chain))
+            .resolve_asgard(thor_chain_name(self.config.chain), now_unix)
             .await
-            .map_err(|e| ObserverError::AsgardUnavailable(e.to_string()))?
+            .map_err(ObserverError::AsgardUnavailable)?
             .address;
         let immediate_target_hash = self.immediate_target_hash(&asgard_address)?;
 
@@ -691,9 +762,9 @@ where
 
         let asgard_address = self
             .asgard
-            .resolve_agreed(thor_chain_name(self.config.chain))
+            .resolve_asgard(thor_chain_name(self.config.chain), now_unix)
             .await
-            .map_err(|e| ObserverError::AsgardUnavailable(e.to_string()))?
+            .map_err(ObserverError::AsgardUnavailable)?
             .address;
         let immediate_target_hash = self.immediate_target_hash(&asgard_address)?;
 

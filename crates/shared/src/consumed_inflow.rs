@@ -61,6 +61,12 @@ pub enum InflowConsumeOutcome {
         /// The leg of that redemption.
         existing_leg_index: u32,
     },
+    /// This logical leg already selected a different physical transfer. A
+    /// changing upstream view cannot change the amount after first claim.
+    ConflictByOtherInflow {
+        existing_tx_hash: B256,
+        existing_log_index: u64,
+    },
 }
 
 /// Operations the redemption cross-check needs to make each physical inflow
@@ -105,9 +111,19 @@ impl ConsumedInflowStore for InMemoryConsumedInflow {
         tx_hash: B256,
         log_index: u64,
     ) -> Result<InflowConsumeOutcome, ConsumedInflowError> {
+        validate_identity(redemption_id, tx_hash)?;
         let mut guard = self.inner.lock().await;
         match guard.get(&(tx_hash, log_index)) {
             None => {
+                if let Some((&(existing_tx_hash, existing_log_index), _)) = guard
+                    .iter()
+                    .find(|(_, owner)| **owner == (redemption_id, leg_index))
+                {
+                    return Ok(InflowConsumeOutcome::ConflictByOtherInflow {
+                        existing_tx_hash,
+                        existing_log_index,
+                    });
+                }
                 guard.insert((tx_hash, log_index), (redemption_id, leg_index));
                 Ok(InflowConsumeOutcome::Consumed)
             }
@@ -166,6 +182,7 @@ impl ConsumedInflowStore for SqliteConsumedInflow {
         tx_hash: B256,
         log_index: u64,
     ) -> Result<InflowConsumeOutcome, ConsumedInflowError> {
+        validate_identity(redemption_id, tx_hash)?;
         let log_i = i64::try_from(log_index).map_err(|e| {
             ConsumedInflowError::Decode(format!("u64→i64 overflow on log_index: {e}"))
         })?;
@@ -196,11 +213,35 @@ impl ConsumedInflowStore for SqliteConsumedInflow {
         .bind(log_i)
         .fetch_optional(&self.pool)
         .await?;
-        let (existing_id_bytes, existing_leg) = row.ok_or_else(|| {
-            ConsumedInflowError::Decode(
-                "INSERT OR IGNORE was ignored but no conflicting row was found".to_string(),
+        let Some((existing_id_bytes, existing_leg)) = row else {
+            let logical: Option<(Vec<u8>, i64)> = sqlx::query_as(
+                "SELECT tx_hash, log_index FROM consumed_inflow
+                 WHERE redemption_id = ? AND leg_index = ?",
             )
-        })?;
+            .bind(redemption_id.as_slice())
+            .bind(i64::from(leg_index))
+            .fetch_optional(&self.pool)
+            .await?;
+            let (existing_tx, existing_log) = logical.ok_or_else(|| {
+                ConsumedInflowError::Decode(
+                    "ignored inflow claim has no physical or logical conflict row".to_string(),
+                )
+            })?;
+            let existing_tx_hash = B256::try_from(existing_tx.as_slice()).map_err(|error| {
+                ConsumedInflowError::Decode(format!(
+                    "stored logical inflow tx hash is not bytes32: {error}"
+                ))
+            })?;
+            let existing_log_index = u64::try_from(existing_log).map_err(|error| {
+                ConsumedInflowError::Decode(format!(
+                    "stored logical inflow log index is invalid: {error}"
+                ))
+            })?;
+            return Ok(InflowConsumeOutcome::ConflictByOtherInflow {
+                existing_tx_hash,
+                existing_log_index,
+            });
+        };
         let existing_redemption_id = B256::try_from(existing_id_bytes.as_slice()).map_err(|e| {
             ConsumedInflowError::Decode(format!("stored redemption_id not 32 bytes: {e}"))
         })?;
@@ -216,6 +257,15 @@ impl ConsumedInflowStore for SqliteConsumedInflow {
             })
         }
     }
+}
+
+fn validate_identity(redemption_id: B256, tx_hash: B256) -> Result<(), ConsumedInflowError> {
+    if redemption_id == B256::ZERO || tx_hash == B256::ZERO {
+        return Err(ConsumedInflowError::Decode(
+            "consumed inflow contains a zero identity".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Concrete store dispatch shared by the redemption-attest binary and the
@@ -288,6 +338,17 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| unreachable!("{e}")),
             InflowConsumeOutcome::AlreadyByThisLeg
+        );
+        // The same logical leg cannot switch to another physical inflow.
+        assert_eq!(
+            store
+                .consume_inflow(RID_A, 0, B256::repeat_byte(0x22), 8)
+                .await
+                .unwrap_or_else(|e| unreachable!("{e}")),
+            InflowConsumeOutcome::ConflictByOtherInflow {
+                existing_tx_hash: TXH,
+                existing_log_index: 7,
+            }
         );
         // A different redemption claiming the SAME inflow is refused.
         assert_eq!(

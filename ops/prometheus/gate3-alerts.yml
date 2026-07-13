@@ -1,0 +1,213 @@
+groups:
+  - name: xindex-gate3-availability
+    interval: 30s
+    rules:
+      - alert: XindexGate3ServiceDown
+        expr: up{job=~"xindex-(signer|price-signer|price-collector|registry-signer|registry-coordinator|finalized-observer|settlement-collector|redeem)"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Xindex Gate-3 service is unreachable"
+          runbook: "docs/runbooks/gate3-operations.md#service-or-monitoring-loss"
+
+      - alert: XindexObserverSyncStale
+        expr: time() - xindex_observer_last_sync_timestamp_seconds > 120
+        for: 2m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Finalized observer has not converged recently"
+          runbook: "docs/runbooks/gate3-operations.md#observer-finality-or-source-incident"
+
+      - alert: XindexObserverFinalizedLag
+        expr: xindex_observer_finalized_head_height - xindex_observer_checkpoint_height > 2
+        for: 2m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Finalized observer journal is behind its pinned finalized head"
+          runbook: "docs/runbooks/gate3-operations.md#observer-finality-or-source-incident"
+
+      - alert: XindexRegistryPublicationStale
+        expr: time() - xindex_registry_last_success_timestamp_seconds{kind=~"inbound_sign|inbound_post"} > 600
+        for: 2m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "THORChain registry state has stopped signing or posting"
+          runbook: "docs/runbooks/gate3-operations.md#registry-source-or-publication-incident"
+
+      - alert: XindexPricePublicationStale
+        expr: time() - xindex_price_signer_last_success_timestamp_seconds > 600
+        for: 2m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Price signer has not produced a current epoch"
+          runbook: "docs/runbooks/gate3-operations.md#price-source-or-anomaly-incident"
+
+      - alert: XindexCustodyBroadcastPending
+        expr: xindex_executor_pending_broadcasts > 0
+        for: 30m
+        labels:
+          severity: warning
+          gate: "3"
+        annotations:
+          summary: "Custody transaction remains pending"
+          runbook: "docs/runbooks/gate3-operations.md#custody-or-broadcast-incident"
+
+  - name: xindex-gate3-safety
+    interval: 30s
+    rules:
+      - alert: XindexSignerHsmOrServiceError
+        expr: sum by (job, instance, role) (increase(xindex_signer_requests_total{result="error"}[5m])) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Custody/attestation signer returned a service error"
+          runbook: "docs/runbooks/gate3-operations.md#signer-or-hsm-incident"
+
+      - alert: XindexSignerPolicyRefusalBurst
+        expr: sum by (job, instance, role) (increase(xindex_signer_requests_total{result="refused"}[10m])) >= 3
+        labels:
+          severity: warning
+          gate: "3"
+        annotations:
+          summary: "Signer policy refusals indicate bad coordination or hostile input"
+          runbook: "docs/runbooks/gate3-operations.md#signer-or-hsm-incident"
+
+      - alert: XindexPriceSignerHsmError
+        expr: increase(xindex_price_signer_rounds_total{result="hsm_error"}[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Price signer HSM call or recovery verification failed"
+          runbook: "docs/runbooks/gate3-operations.md#price-source-or-anomaly-incident"
+
+      - alert: XindexPriceAnomalyStreak
+        expr: xindex_price_signer_anomaly_streak > 0
+        for: 3m
+        labels:
+          severity: warning
+          gate: "3"
+        annotations:
+          summary: "Price signer is repeatedly refusing source/TWAP observations"
+          runbook: "docs/runbooks/gate3-operations.md#price-source-or-anomaly-incident"
+
+      - alert: XindexPricePublicationError
+        expr: increase(xindex_price_signer_rounds_total{result=~"evidence_error|state_error|publish_error|latched"}[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Price signer stopped on durable-state, evidence, delivery, or anomaly latch"
+          runbook: "docs/runbooks/gate3-operations.md#price-source-or-anomaly-incident"
+
+      - alert: XindexPriceCollectorPostFailure
+        expr: increase(xindex_price_post_attempts_total{result=~"conflict|revert|error"}[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Exact price quorum could not be posted safely"
+          runbook: "docs/runbooks/gate3-operations.md#price-source-or-anomaly-incident"
+
+      - alert: XindexRegistryEvidenceFailure
+        expr: increase(xindex_registry_evidence_failures_total[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Pre-sign evidence could not be persisted"
+          runbook: "docs/runbooks/gate3-operations.md#evidence-retention-or-integrity-incident"
+
+      - alert: XindexRegistrySourceSafetyFailure
+        expr: increase(xindex_registry_source_polls_total{result=~"source_error|policy_error|stale_tip"}[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "THORChain source agreement or freshness failed"
+          runbook: "docs/runbooks/gate3-operations.md#registry-source-or-publication-incident"
+
+      - alert: XindexRegistryCollectorDeliveryFailure
+        expr: increase(xindex_registry_collector_deliveries_total{result="error"}[5m]) > 0
+        labels:
+          severity: warning
+          gate: "3"
+        annotations:
+          summary: "A redundant registry collector rejected or missed a message"
+          runbook: "docs/runbooks/gate3-operations.md#registry-source-or-publication-incident"
+
+      - alert: XindexRegistryPauseObserved
+        expr: xindex_registry_pause_flags != 0
+        for: 1m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "A THORChain halt, LP pause, or route pause is active"
+          runbook: "docs/runbooks/gate3-operations.md#registry-source-or-publication-incident"
+
+      - alert: XindexObserverFinalityRollback
+        expr: increase(xindex_observer_reorg_rollbacks_total[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "A previously finalized Ethereum checkpoint changed"
+          runbook: "docs/runbooks/gate3-operations.md#observer-finality-or-source-incident"
+
+      - alert: XindexObserverPolicyError
+        expr: increase(xindex_observer_events_total{result=~"refused|error"}[5m]) > 0
+        labels:
+          severity: warning
+          gate: "3"
+        annotations:
+          summary: "Finalized settlement evidence was refused or failed"
+          runbook: "docs/runbooks/gate3-operations.md#observer-finality-or-source-incident"
+
+      - alert: XindexCustodyOneShotConflict
+        expr: increase(xindex_custody_one_shot_conflicts_total[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "A custody identity was reused with a conflicting transaction"
+          runbook: "docs/runbooks/gate3-operations.md#custody-or-broadcast-incident"
+
+      - alert: XindexCustodyDispatchFailure
+        expr: increase(xindex_custody_dispatches_total{result="error"}[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Custody reserve, sign, persist, or broadcast path failed"
+          runbook: "docs/runbooks/gate3-operations.md#custody-or-broadcast-incident"
+
+      - alert: XindexCustodyRebroadcastFailure
+        expr: increase(xindex_executor_rebroadcasts_total{result="error"}[5m]) > 0
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Exact-byte custody rebroadcast failed"
+          runbook: "docs/runbooks/gate3-operations.md#custody-or-broadcast-incident"
+
+      - alert: XindexRedemptionSettlementStuck
+        expr: xindex_redeem_relayer_stuck > 0
+        for: 30m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Redemption has neither delivery nor refund evidence"
+          runbook: "docs/runbooks/redemption-stuck-SD-B.md"
