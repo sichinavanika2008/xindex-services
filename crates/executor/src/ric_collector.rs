@@ -9,7 +9,7 @@
 //! The collector is UNTRUSTED ([[DL-M2B-1]]/`DL-CTD-1`): it performs no
 //! cryptography and is purely a fan-in. Every observer derives the
 //! certified fields from its OWN sources (its Ethereum RPC + its
-//! diverse ≥2 `THORChain` sources) and signs with its OWN Set-B daemon;
+//! fullnode plus two public `THORChain` sources) and signs with its OWN Set-B daemon;
 //! the custody daemon then re-verifies the assembled proof statelessly.
 //! A compromised collector can only fail to assemble a proof — it can
 //! never forge one, because it cannot produce k-of-n Set-B signatures
@@ -88,11 +88,20 @@ pub enum RicCollectError {
 
 /// Posts certify requests to the operators' observer services and
 /// assembles the k-of-n [`IntentProof`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RicCollector {
     observer_urls: Vec<String>,
     quorum: usize,
     http: reqwest::blocking::Client,
+}
+
+impl std::fmt::Debug for RicCollector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RicCollector")
+            .field("observer_count", &self.observer_urls.len())
+            .field("quorum", &self.quorum)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RicCollector {
@@ -159,12 +168,12 @@ impl RicCollector {
             vault_resolved_at,
         };
         let mut responses: Vec<ObserverCertifyResponse> = Vec::new();
-        for url in &self.observer_urls {
+        for (observer_index, url) in self.observer_urls.iter().enumerate() {
             match self.certify_one(url, &req) {
                 Ok(resp) => responses.push(resp),
                 // One observer down/disagreeing is tolerated up to
                 // n - quorum; log and keep collecting.
-                Err(e) => warn!(observer = %url, error = %e, "observer certify failed; skipping"),
+                Err(e) => warn!(observer_index, error = %e, "observer certify failed; skipping"),
             }
         }
         let proof = assemble_intent_proof(&responses, self.quorum)?;
@@ -209,11 +218,11 @@ impl RicCollector {
             vault_resolved_at,
         };
         let mut responses: Vec<ObserverCertifyAccResponse> = Vec::new();
-        for url in &self.observer_urls {
+        for (observer_index, url) in self.observer_urls.iter().enumerate() {
             match self.certify_acc_one(url, &req) {
                 Ok(resp) => responses.push(resp),
                 Err(e) => {
-                    warn!(observer = %url, error = %e, "observer certify-acc failed; skipping");
+                    warn!(observer_index, error = %e, "observer certify-acc failed; skipping");
                 }
             }
         }
@@ -243,17 +252,13 @@ impl RicCollector {
             .post(&url)
             .json(req)
             .send()
-            .map_err(|e| format!("transport: {e}"))?;
+            .map_err(|e| format!("transport: {}", transport_class(&e)))?;
         let status = resp.status();
         if !status.is_success() {
-            // The observer's typed error code is in the JSON body; we
-            // only log the status + raw body here (the relay never
-            // branches on it — it just needs ≥ quorum agreeing certs).
-            let body = resp.text().unwrap_or_default();
-            return Err(format!("http {}: {body}", status.as_u16()));
+            return Err(format!("http {}", status.as_u16()));
         }
         resp.json::<ObserverCertifyResponse>()
-            .map_err(|e| format!("response json: {e}"))
+            .map_err(|_| "response json malformed".to_string())
     }
 
     /// POST one certify-acc request and pin the response (no signature
@@ -269,14 +274,27 @@ impl RicCollector {
             .post(&url)
             .json(req)
             .send()
-            .map_err(|e| format!("transport: {e}"))?;
+            .map_err(|e| format!("transport: {}", transport_class(&e)))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
-            return Err(format!("http {}: {body}", status.as_u16()));
+            return Err(format!("http {}", status.as_u16()));
         }
         resp.json::<ObserverCertifyAccResponse>()
-            .map_err(|e| format!("response json: {e}"))
+            .map_err(|_| "response json malformed".to_string())
+    }
+}
+
+fn transport_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
     }
 }
 

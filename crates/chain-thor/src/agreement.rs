@@ -4,9 +4,10 @@
 //! the Asgard inbound from its **own, distinct** `THORChain` sources —
 //! on a single shared source, "5 independent observers" collapses to
 //! "1 source, 5 readers" and one MITM'd endpoint poisons every RIC at
-//! once. [`AsgardAgreement`] queries ≥2 configured sources and refuses
-//! to yield a vault unless **every responding source agrees** and at
-//! least [`MIN_AGREEING_SOURCES`] responded.
+//! once. [`AsgardAgreement`] queries an operator-controlled fullnode plus at
+//! least two independent public providers and refuses to yield a vault unless
+//! **every responding source agrees** and at least
+//! [`MIN_AGREEING_SOURCES`] responded.
 //!
 //! Strictness is deliberate (fail closed, loud): a *disagreement*
 //! between an operator's own sources is an incident signal — one of
@@ -24,7 +25,7 @@ use crate::types::InboundAddress;
 /// before a vault resolution is accepted. Hardcoded — not operator-
 /// tunable — so a config mistake cannot quietly reduce the gate to a
 /// single source.
-pub const MIN_AGREEING_SOURCES: usize = 2;
+pub const MIN_AGREEING_SOURCES: usize = 3;
 
 /// Why a diverse-source Asgard resolution was refused.
 #[derive(Debug, thiserror::Error)]
@@ -173,7 +174,11 @@ impl AsgardAgreement {
             }
         }
         for (source, entry) in &entries {
-            if entry.halted || entry.chain_trading_paused || entry.global_trading_paused {
+            if entry.halted
+                || entry.chain_trading_paused
+                || entry.global_trading_paused
+                || entry.chain_lp_actions_paused
+            {
                 return Err(AgreementError::Halted {
                     chain: chain.to_string(),
                     source_idx: *source,
@@ -215,7 +220,8 @@ impl AsgardAgreement {
                         if first_halted.is_none()
                             && (entry.halted
                                 || entry.chain_trading_paused
-                                || entry.global_trading_paused)
+                                || entry.global_trading_paused
+                                || entry.chain_lp_actions_paused)
                         {
                             first_halted = Some(i);
                         }
@@ -300,10 +306,12 @@ mod tests {
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
-    async fn two_agreeing_sources_resolve() {
+    async fn three_agreeing_sources_resolve() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         let vault = gate.resolve_agreed("BTC").await.expect("must agree");
         assert_eq!(vault.address, "bc1qvault");
     }
@@ -313,7 +321,9 @@ mod tests {
     async fn address_disagreement_is_a_hard_refusal() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([btc_entry("bc1qpoisoned", false)])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         let err = gate.resolve_agreed("BTC").await.expect_err("must refuse");
         assert!(matches!(err, AgreementError::Disagreement { .. }), "{err}");
     }
@@ -336,9 +346,10 @@ mod tests {
     #[expect(clippy::expect_used, clippy::panic, reason = "test code")]
     async fn one_source_down_leaves_sub_minimum_and_refuses() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
-        // Source b: unroutable port — transport failure.
+        // Sources b/c: unroutable port — transport failure.
         let b = ThorClient::with_base_url("http://127.0.0.1:1").expect("client");
-        let gate = AsgardAgreement::new(vec![client_for(&a), b]).expect("two sources");
+        let c = ThorClient::with_base_url("http://127.0.0.1:1").expect("client");
+        let gate = AsgardAgreement::new(vec![client_for(&a), b, c]).expect("three sources");
         let err = gate.resolve_agreed("BTC").await.expect_err("must refuse");
         match err {
             AgreementError::NotEnoughResponses {
@@ -347,25 +358,27 @@ mod tests {
                 failures,
             } => {
                 assert_eq!(ok, 1);
-                assert_eq!(total, 2);
-                assert_eq!(failures.len(), 1);
+                assert_eq!(total, 3);
+                assert_eq!(failures.len(), 2);
             }
             other => panic!("wrong error: {other}"),
         }
     }
 
-    /// Two live + one down still resolves: the gate needs ≥2 successful
-    /// agreeing responses, not all-configured-responding.
+    /// Two live + one down is below the production source floor. The required
+    /// fullnode + two-provider topology fails closed if any leg is absent.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
-    async fn third_source_down_with_two_agreeing_still_resolves() {
+    async fn third_source_down_with_two_agreeing_refuses() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let c = ThorClient::with_base_url("http://127.0.0.1:1").expect("client");
         let gate =
             AsgardAgreement::new(vec![client_for(&a), client_for(&b), c]).expect("three sources");
-        let vault = gate.resolve_agreed("BTC").await.expect("two agree");
-        assert_eq!(vault.address, "bc1qvault");
+        assert!(matches!(
+            gate.resolve_agreed("BTC").await,
+            Err(AgreementError::NotEnoughResponses { ok: 2, .. })
+        ));
     }
 
     #[tokio::test]
@@ -373,7 +386,9 @@ mod tests {
     async fn any_halt_flag_refuses() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([btc_entry("bc1qvault", true)])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         let err = gate.resolve_agreed("BTC").await.expect_err("must refuse");
         assert!(matches!(err, AgreementError::Halted { .. }), "{err}");
     }
@@ -383,7 +398,9 @@ mod tests {
     async fn chain_absent_on_any_source_refuses() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         let err = gate.resolve_agreed("BTC").await.expect_err("must refuse");
         assert!(matches!(err, AgreementError::ChainAbsent { .. }), "{err}");
     }
@@ -399,7 +416,9 @@ mod tests {
         e2["gas_rate"] = serde_json::json!("12");
         let a = mock_source(serde_json::json!([e1])).await;
         let b = mock_source(serde_json::json!([e2])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         let vault = gate.resolve_agreed("BTC").await.expect("must agree");
         assert_eq!(vault.address, "bc1qvault");
     }
@@ -409,7 +428,9 @@ mod tests {
     async fn poll_halt_all_live_when_quorum_clean() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         assert_eq!(gate.poll_chain_halt("BTC").await, HaltOutcome::Live);
     }
 
@@ -418,7 +439,9 @@ mod tests {
     async fn poll_halt_any_source_halted_triggers() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([btc_entry("bc1qvault", true)])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         assert!(
             matches!(
                 gate.poll_chain_halt("BTC").await,
@@ -437,7 +460,9 @@ mod tests {
     async fn poll_halt_detected_during_address_churn() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qOLD", true)])).await;
         let b = mock_source(serde_json::json!([btc_entry("bc1qNEW", false)])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qNEW", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         assert!(
             matches!(
                 gate.resolve_agreed("BTC").await,
@@ -454,7 +479,7 @@ mod tests {
         );
     }
 
-    /// A single responding source (the other down) is below quorum — even if
+    /// A single responding source (the other two down) is below quorum — even if
     /// it screams HALTED, the verdict is Indeterminate, never a halt trigger:
     /// one hostile/flaky source must not be able to freeze the protocol.
     #[tokio::test]
@@ -462,7 +487,8 @@ mod tests {
     async fn poll_halt_sub_quorum_is_indeterminate() {
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", true)])).await;
         let b = ThorClient::with_base_url("http://127.0.0.1:1").expect("client");
-        let gate = AsgardAgreement::new(vec![client_for(&a), b]).expect("two sources");
+        let c = ThorClient::with_base_url("http://127.0.0.1:1").expect("client");
+        let gate = AsgardAgreement::new(vec![client_for(&a), b, c]).expect("three sources");
         assert!(
             matches!(
                 gate.poll_chain_halt("BTC").await,
@@ -480,7 +506,9 @@ mod tests {
         paused["chain_trading_paused"] = serde_json::json!(true);
         let a = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
         let b = mock_source(serde_json::json!([paused])).await;
-        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b)]).expect("two sources");
+        let c = mock_source(serde_json::json!([btc_entry("bc1qvault", false)])).await;
+        let gate = AsgardAgreement::new(vec![client_for(&a), client_for(&b), client_for(&c)])
+            .expect("three sources");
         assert!(matches!(
             gate.poll_chain_halt("BTC").await,
             HaltOutcome::Halted { .. }

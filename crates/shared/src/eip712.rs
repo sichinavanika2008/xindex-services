@@ -495,6 +495,154 @@ pub fn price_attestation_signing_hash(att: &PriceAttestation, domain: &Eip712Dom
     att.eip712_signing_hash(domain)
 }
 
+/* -------------------------------------------------------------------------- */
+/*           THORCHAIN INBOUND STATE (vault / Router / pause mirror)          */
+/* -------------------------------------------------------------------------- */
+
+sol! {
+    /// Short-lived snapshot of `THORChain`'s Ethereum inbound state, signed by
+    /// each independent registry observer. Field order and integer widths are
+    /// consensus-critical and mirror
+    /// `ThorchainVaultRegistry.INBOUND_STATE_TYPEHASH` exactly.
+    struct InboundState {
+        address vault;
+        address router;
+        uint8 pauseFlags;
+        uint64 observedAt;
+        uint64 validUntil;
+        uint64 sequence;
+        bytes32 sourceHash;
+    }
+}
+
+/// Verbatim type string from
+/// `ThorchainVaultRegistry.INBOUND_STATE_TYPEHASH`.
+pub const INBOUND_STATE_TYPE_STRING: &[u8] = b"InboundState(address vault,address router,uint8 pauseFlags,uint64 observedAt,uint64 validUntil,uint64 sequence,bytes32 sourceHash)";
+
+/// `keccak256(INBOUND_STATE_TYPE_STRING)`.
+#[must_use]
+pub fn inbound_state_typehash() -> B256 {
+    keccak256(INBOUND_STATE_TYPE_STRING)
+}
+
+/// EIP-712 domain shared by both registry-authorized message families.
+#[must_use]
+pub fn thorchain_registry_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
+    eip712_domain! {
+        name: "Xindex THORChain Inbound Registry",
+        version: "1",
+        chain_id: chain_id,
+        verifying_contract: verifying_contract,
+    }
+}
+
+/// Construct the exact typed inbound-state payload accepted by
+/// `ThorchainVaultRegistry.attestInbound`.
+#[must_use]
+pub fn inbound_state(
+    vault: Address,
+    router: Address,
+    pause_flags: u8,
+    observed_at: u64,
+    valid_until: u64,
+    sequence: u64,
+    source_hash: B256,
+) -> InboundState {
+    InboundState {
+        vault,
+        router,
+        pauseFlags: pause_flags,
+        observedAt: observed_at,
+        validUntil: valid_until,
+        sequence,
+        sourceHash: source_hash,
+    }
+}
+
+/// EIP-712 signing digest returned by the on-chain `attestationDigest` view.
+#[must_use]
+pub fn inbound_state_signing_hash(state: &InboundState, domain: &Eip712Domain) -> B256 {
+    state.eip712_signing_hash(domain)
+}
+
+/* -------------------------------------------------------------------------- */
+/*          THORCHAIN QUOTE AUTHORIZATION (one exact adapter dispatch)         */
+/* -------------------------------------------------------------------------- */
+
+sol! {
+    /// One-time quote authorization consumed by
+    /// `ThorchainVaultRegistry.consumeQuoteAuthorization`. This commits the
+    /// exact adapter call, current inbound-state hash, Router memo, expiry,
+    /// per-originator nonce, and canonical upstream quote evidence.
+    struct QuoteAuthorization {
+        address adapter;
+        address indexToken;
+        address originator;
+        address fundingToken;
+        address targetToken;
+        uint256 amountIn;
+        bytes32 custodyHash;
+        bytes32 inboundStateHash;
+        bytes32 memoHash;
+        uint64 dispatchDeadline;
+        uint64 quoteNonce;
+        bytes32 quoteHash;
+    }
+}
+
+/// Verbatim type string from
+/// `ThorchainVaultRegistry.QUOTE_AUTHORIZATION_TYPEHASH`.
+pub const QUOTE_AUTHORIZATION_TYPE_STRING: &[u8] = b"QuoteAuthorization(address adapter,address indexToken,address originator,address fundingToken,address targetToken,uint256 amountIn,bytes32 custodyHash,bytes32 inboundStateHash,bytes32 memoHash,uint64 dispatchDeadline,uint64 quoteNonce,bytes32 quoteHash)";
+
+/// `keccak256(QUOTE_AUTHORIZATION_TYPE_STRING)`.
+#[must_use]
+pub fn quote_authorization_typehash() -> B256 {
+    keccak256(QUOTE_AUTHORIZATION_TYPE_STRING)
+}
+
+/// Construct the exact typed quote authorization consumed by the registry.
+#[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the registry quote type intentionally binds twelve dispatch fields"
+)]
+pub fn quote_authorization(
+    adapter: Address,
+    index_token: Address,
+    originator: Address,
+    funding_token: Address,
+    target_token: Address,
+    amount_in: U256,
+    custody_hash: B256,
+    inbound_state_hash: B256,
+    memo_hash: B256,
+    dispatch_deadline: u64,
+    quote_nonce: u64,
+    quote_hash: B256,
+) -> QuoteAuthorization {
+    QuoteAuthorization {
+        adapter,
+        indexToken: index_token,
+        originator,
+        fundingToken: funding_token,
+        targetToken: target_token,
+        amountIn: amount_in,
+        custodyHash: custody_hash,
+        inboundStateHash: inbound_state_hash,
+        memoHash: memo_hash,
+        dispatchDeadline: dispatch_deadline,
+        quoteNonce: quote_nonce,
+        quoteHash: quote_hash,
+    }
+}
+
+/// EIP-712 signing digest returned by the on-chain
+/// `quoteAuthorizationDigest` view.
+#[must_use]
+pub fn quote_authorization_signing_hash(quote: &QuoteAuthorization, domain: &Eip712Domain) -> B256 {
+    quote.eip712_signing_hash(domain)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +856,50 @@ mod tests {
         assert_ne!(price_attestation_typehash(), attestation_typehash());
     }
 
+    #[test]
+    fn registry_typehashes_match_solidity_source() {
+        assert_eq!(
+            inbound_state_typehash(),
+            b256!("0x87a96cf35d2ca185a7bc8a9c0cf8a6eab5dcfffeff6624b24e84f588570fa5b2"),
+            "Rust typehash drifted from on-chain INBOUND_STATE_TYPEHASH"
+        );
+        assert_eq!(
+            quote_authorization_typehash(),
+            b256!("0x2d94846c56ab8e8c45bd02c25bcb00d0866c0d34aafc52e628960fb0dff82158"),
+            "Rust typehash drifted from on-chain QUOTE_AUTHORIZATION_TYPEHASH"
+        );
+        assert_eq!(
+            keccak256(InboundState::eip712_root_type().as_bytes()),
+            inbound_state_typehash(),
+            "macro-derived inbound-state typehash drifted"
+        );
+        assert_eq!(
+            keccak256(QuoteAuthorization::eip712_root_type().as_bytes()),
+            quote_authorization_typehash(),
+            "macro-derived quote-authorization typehash drifted"
+        );
+        assert_ne!(inbound_state_typehash(), quote_authorization_typehash());
+        assert_ne!(inbound_state_typehash(), price_attestation_typehash());
+    }
+
+    #[test]
+    fn seven_onchain_report_typehashes_pairwise_distinct() {
+        let all = [
+            attestation_typehash(),
+            redemption_attestation_typehash(),
+            refund_attestation_typehash(),
+            streamed_settlement_typehash(),
+            price_attestation_typehash(),
+            inbound_state_typehash(),
+            quote_authorization_typehash(),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "on-chain report typehash collision");
+            }
+        }
+    }
+
     /// Fixed domain for the golden-digest vectors: chainId 1,
     /// verifyingContract 0xCC..CC. The digests below are the 32 bytes each
     /// k-of-n signer's HSM actually signs; pinning them locks the FULL
@@ -726,6 +918,24 @@ mod tests {
             golden_domain().separator(),
             b256!("0xc3cbe4ff899fabc043257a4b82dc673b5aef398c5429674c85675413c0fed05d"),
             "EIP-712 domain separator drifted — every signing hash moves with it"
+        );
+    }
+
+    #[test]
+    fn price_oracle_domain_separator_pinned() {
+        assert_eq!(
+            price_oracle_domain(1, Address::repeat_byte(0xCC)).separator(),
+            b256!("0xbd686a5912086b4949853704a9723fa28673e930238d3d3ff43357965d447954"),
+            "price-oracle EIP-712 domain separator drifted"
+        );
+    }
+
+    #[test]
+    fn thorchain_registry_domain_separator_pinned() {
+        assert_eq!(
+            thorchain_registry_domain(1, Address::repeat_byte(0xCC)).separator(),
+            b256!("0x996a5a03e4c193b66ae1e12ffa57d5e31fada227204efa31f0362a435054c69e"),
+            "THORChain-registry EIP-712 domain separator drifted"
         );
     }
 
@@ -786,6 +996,65 @@ mod tests {
             streamed_settlement_signing_hash(&s, &golden_domain()),
             b256!("0x03bc753298d69d144eda71e92bc8ebf4de4285d11ce2cc764250e96e9640c374"),
             "streamed-settlement digest drifted"
+        );
+    }
+
+    #[test]
+    fn price_attestation_signing_hash_golden() {
+        let p = price_attestation(
+            B256::repeat_byte(0xAA),
+            U256::from(1_234_567_890_123_456_789u64),
+            U256::from(2_100_000_000_000_000u64),
+            1_800_000_000,
+        );
+        let domain = price_oracle_domain(1, Address::repeat_byte(0xCC));
+        assert_eq!(
+            price_attestation_signing_hash(&p, &domain),
+            b256!("0x9a61c7b4f6b6a6223539ce3b2e0c3fbe225740133d9a96c9e1665624f4517f43"),
+            "price-attestation digest drifted"
+        );
+    }
+
+    #[test]
+    fn inbound_state_signing_hash_golden() {
+        let state = inbound_state(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            0,
+            1_800_000_000,
+            1_800_000_300,
+            42,
+            B256::repeat_byte(0x33),
+        );
+        let domain = thorchain_registry_domain(1, Address::repeat_byte(0xCC));
+        assert_eq!(
+            inbound_state_signing_hash(&state, &domain),
+            b256!("0xa323456ebbd321784271dc2638ce603d5ac218d6b15de7bc80aade6926d6aa02"),
+            "inbound-state digest drifted"
+        );
+    }
+
+    #[test]
+    fn quote_authorization_signing_hash_golden() {
+        let quote = quote_authorization(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x33),
+            Address::repeat_byte(0x44),
+            Address::repeat_byte(0x55),
+            U256::from(1_000_000u64),
+            B256::repeat_byte(0x66),
+            B256::repeat_byte(0x77),
+            B256::repeat_byte(0x88),
+            1_800_000_060,
+            9,
+            B256::repeat_byte(0x99),
+        );
+        let domain = thorchain_registry_domain(1, Address::repeat_byte(0xCC));
+        assert_eq!(
+            quote_authorization_signing_hash(&quote, &domain),
+            b256!("0x357fe06cde537d55739bc06cd25b4b141e47cb09b3003807abc5c500d55b0184"),
+            "quote-authorization digest drifted"
         );
     }
 

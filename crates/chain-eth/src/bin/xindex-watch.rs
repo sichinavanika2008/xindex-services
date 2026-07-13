@@ -20,6 +20,7 @@ use clap::Parser;
 use futures_util::StreamExt;
 use tracing::info;
 use xindex_chain_eth::bindings::IntentQueue;
+use xindex_chain_eth::rpc::redacted_endpoint;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Xindex IntentQueue event watcher (M1)")]
@@ -48,7 +49,7 @@ async fn main() -> Result<()> {
         .context("INTENT_QUEUE_ADDR must be a 20-byte hex address")?;
 
     info!(
-        rpc_url = %args.rpc_url,
+        rpc_endpoint = %redacted_endpoint(&args.rpc_url),
         intent_queue = %intent_queue,
         "xindex-watch starting"
     );

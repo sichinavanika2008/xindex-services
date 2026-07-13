@@ -19,20 +19,30 @@
               stdout for the k-of-n collector; operational status goes to stderr"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::net::IpAddr;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{Address, B256};
-use serde::Deserialize;
+use alloy_primitives::{Address, B256, U256};
+use serde::{Deserialize, Serialize};
 use xindex_shared::eip712::price_oracle_domain;
 use xindex_shared::price_twap::{TwapConfig, TwapSample};
 use xindex_shared::price_wire::SignedPriceMessage;
-use xindex_signer_daemon::price_sign::{produce_signed_price, PricePolicy, ProducerInputs};
-use xindex_signer_daemon::price_supply::{CoinGeckoSupply, SupplyFeed};
-use xindex_signer_daemon::price_venue::{BinanceVenue, CoinbaseVenue, Feed, KrakenVenue};
+use xindex_signer_daemon::price_sign::{
+    produce_signed_price_from_observations, ObservedProducerInputs, PricePolicy,
+};
+use xindex_signer_daemon::price_supply::{
+    source_supply_evidence, CoinCapSupply, CoinGeckoSupply, SupplyFeed,
+};
+use xindex_signer_daemon::price_venue::{
+    source_quote_evidence, BinanceVenue, CoinbaseVenue, Feed, KrakenVenue, SourcedValue,
+};
 use xindex_signer_daemon::web3signer::HttpHsmClient;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct Config {
     /// EIP-712 domain chainId of the `PriceAttestationOracle`.
     oracle_chain_id: u64,
@@ -46,7 +56,8 @@ struct Config {
     min_venues: usize,
     /// Outlier band (bps) for both price and supply medians.
     max_deviation_bps: u32,
-    /// Minimum independent supply sources (typically 1; see `PricePolicy`).
+    /// Independent supply sources required. This build fixes it at 2
+    /// (`CoinGecko` + `CoinCap` on distinct network origins).
     supply_min_venues: usize,
     /// TWAP window (secs): the trailing span the spatial medians are
     /// time-weight-averaged over (OM-4). A transient spike must persist across
@@ -73,6 +84,15 @@ struct Config {
     /// Path to the durable anti-equivocation state file (per-asset last-signed
     /// timestamps); persists the monotonic guard across restarts.
     state_file: String,
+    /// Locked-down directory for append-only, exact raw source-response
+    /// evidence. One create-new JSON file is synced per asset/epoch before HSM
+    /// signing can begin.
+    evidence_dir: String,
+    /// Public operator identifier written into evidence (never a credential).
+    evidence_operator_id: String,
+    /// Consecutive failed rounds for one asset before the process latches shut.
+    /// Must exceed the configured TWAP cold-start sample count.
+    anomaly_failure_threshold: u32,
     /// Base URLs of redundant untrusted collectors. The signer independently
     /// creates the price; collectors receive only an already-signed tuple.
     collector_urls: Vec<String>,
@@ -84,10 +104,11 @@ struct Config {
     coinbase_base: String,
     kraken_base: String,
     coingecko_base: String,
+    coincap_base: String,
     assets: Vec<AssetConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AssetConfig {
     /// Registry asset id (keccak of the `THORChain` asset string), hex.
     asset_id: String,
@@ -98,6 +119,29 @@ struct AssetConfig {
     coinbase: String,
     kraken: String,
     coingecko: String,
+    coincap: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceValue<'a> {
+    source: &'static str,
+    subject: &'a str,
+    normalized_value: String,
+    response_hash: String,
+    raw_response: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPriceEvidence<'a> {
+    schema: &'static str,
+    operator_id: &'a str,
+    signer_address: String,
+    asset_id: String,
+    observation_epoch: u64,
+    price_sources: Vec<EvidenceValue<'a>>,
+    supply_sources: Vec<EvidenceValue<'a>>,
 }
 
 fn now_unix() -> u64 {
@@ -123,15 +167,15 @@ fn load_last_signed(path: &str) -> Result<HashMap<B256, u64>, Box<dyn std::error
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(e) => return Err(format!("cannot read state file {path}: {e}").into()),
+        Err(e) => return Err(format!("cannot read anti-equivocation state: {e}").into()),
     };
     let map: HashMap<String, u64> = serde_json::from_str(&raw)
-        .map_err(|e| format!("corrupt anti-equivocation state {path}: {e} (refusing to start)"))?;
+        .map_err(|e| format!("corrupt anti-equivocation state: {e} (refusing to start)"))?;
     let mut out = HashMap::with_capacity(map.len());
     for (k, v) in map {
         out.insert(
             k.parse::<B256>()
-                .map_err(|e| format!("bad asset id '{k}' in state {path}: {e}"))?,
+                .map_err(|e| format!("bad asset id '{k}' in anti-equivocation state: {e}"))?,
             v,
         );
     }
@@ -143,24 +187,182 @@ fn load_last_signed(path: &str) -> Result<HashMap<B256, u64>, Box<dyn std::error
 fn save_last_signed(path: &str, map: &HashMap<B256, u64>) -> std::io::Result<()> {
     let raw: HashMap<String, u64> = map.iter().map(|(k, v)| (format!("{k:#x}"), *v)).collect();
     let json = serde_json::to_string(&raw).map_err(std::io::Error::other)?;
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+    let path = Path::new(path);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("state path has no file name"))?;
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    if let Err(error) = (|| {
+        file.write_all(json.as_bytes())?;
+        file.sync_all()
+    })() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    std::fs::rename(&tmp, path)?;
+    // Persist the directory entry too. A successful return means a power loss
+    // cannot resurrect the prior epoch map after a signature was published.
+    File::open(parent)?.sync_all()
+}
+
+fn ensure_evidence_directory(path: &str) -> std::io::Result<()> {
+    let path = Path::new(path);
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other("evidence path is not a directory"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::other(
+                "evidence directory must not be group/world accessible",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn evidence_values(observations: &[SourcedValue]) -> Vec<EvidenceValue<'_>> {
+    observations
+        .iter()
+        .map(|observation| EvidenceValue {
+            source: observation.source,
+            subject: &observation.subject,
+            normalized_value: observation.value.to_string(),
+            response_hash: format!("{:#x}", observation.response_hash),
+            raw_response: &observation.raw_response,
+        })
+        .collect()
+}
+
+fn persist_raw_evidence(
+    directory: &str,
+    operator_id: &str,
+    signer_address: Address,
+    asset_id: B256,
+    epoch: u64,
+    price: &[SourcedValue],
+    supply: &[SourcedValue],
+) -> std::io::Result<()> {
+    let evidence = RawPriceEvidence {
+        schema: "xindex.price-source-evidence.v1",
+        operator_id,
+        signer_address: format!("{signer_address:#x}"),
+        asset_id: format!("{asset_id:#x}"),
+        observation_epoch: epoch,
+        price_sources: evidence_values(price),
+        supply_sources: evidence_values(supply),
+    };
+    let encoded = serde_json::to_vec(&evidence).map_err(std::io::Error::other)?;
+    let file_name = format!(
+        "{epoch}-{}.json",
+        alloy_primitives::hex::encode(asset_id.as_slice())
+    );
+    let path = Path::new(directory).join(file_name);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    File::open(directory)?.sync_all()
+}
+
+fn endpoint_origin(
+    label: &str,
+    raw: &str,
+    loopback_only: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let url = reqwest::Url::parse(raw).map_err(|_| format!("{label} must be a valid URL"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            format!("{label} must not contain userinfo, query credentials, or a fragment").into(),
+        );
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("{label} must include a host"))?;
+    let host_ip = host.trim_start_matches('[').trim_end_matches(']');
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if loopback_only && !is_loopback {
+        return Err(format!("{label} must terminate on loopback inside the HSM perimeter").into());
+    }
+    if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback) {
+        return Err(
+            format!("{label} must use HTTPS (plain HTTP is allowed only on loopback)").into(),
+        );
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| format!("{label} has no usable port"))?;
+    Ok(format!(
+        "{}://{}:{port}",
+        url.scheme(),
+        host.to_ascii_lowercase()
+    ))
 }
 
 /// Fail-closed boot-time validation of the venue-consensus + TWAP policy. A
 /// mis-set parameter silently weakens a manipulation guard, so refuse to start.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear fail-closed boot policy keeps every safety parameter visible"
+)]
 fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // G/red-team RT-A-LOW: the aggregator's outlier rejection needs an ODD
     // honest anchor. At min_venues == 2 an even survivor set averages the two
     // middle quotes, so one compromised venue moves the median by (X-P)/2
     // (bounded only by max_deviation_bps). Require >= 3 price venues so a single
     // bad venue is always out-voted by an honest majority.
-    if cfg.min_venues < 3 {
+    if cfg.min_venues != 3 {
         return Err(format!(
-            "min_venues must be >= 3 for single-venue resistance (got {}); an even \
-             survivor set has no honest anchor",
+            "min_venues must be exactly 3 because this build configures three independent price \
+             providers (got {})",
             cfg.min_venues
+        )
+        .into());
+    }
+    if cfg.supply_min_venues != 2 {
+        return Err(format!(
+            "supply_min_venues must be exactly 2 because this build configures CoinGecko and \
+             CoinCap as independent supply providers (got {})",
+            cfg.supply_min_venues
+        )
+        .into());
+    }
+    if cfg.max_deviation_bps == 0 || cfg.max_deviation_bps > 5_000 {
+        return Err(format!(
+            "max_deviation_bps must be in 1..=5000 (got {})",
+            cfg.max_deviation_bps
         )
         .into());
     }
@@ -189,6 +391,86 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     if cfg.publish_attempts == 0 || cfg.publish_timeout_secs == 0 {
         return Err("publish_attempts and publish_timeout_secs must be non-zero".into());
+    }
+    if cfg.collector_urls.len() < 2 {
+        return Err("at least two redundant collector endpoints are required".into());
+    }
+    if cfg.assets.is_empty() {
+        return Err("at least one asset must be configured".into());
+    }
+    if !Path::new(&cfg.state_file).is_absolute() {
+        return Err("state_file must be an absolute path on durable storage".into());
+    }
+    if !Path::new(&cfg.evidence_dir).is_absolute() {
+        return Err("evidence_dir must be an absolute path on durable storage".into());
+    }
+    if cfg.evidence_operator_id.trim().is_empty()
+        || cfg.evidence_operator_id.len() > 128
+        || !cfg
+            .evidence_operator_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("evidence_operator_id must be 1..=128 ASCII letters/digits/_/-".into());
+    }
+    let cold_start_floor = u32::try_from(cfg.twap_min_samples)
+        .unwrap_or(u32::MAX)
+        .saturating_add(2);
+    if cfg.anomaly_failure_threshold < cold_start_floor {
+        return Err(format!(
+            "anomaly_failure_threshold must be at least twap_min_samples + 2 ({cold_start_floor})"
+        )
+        .into());
+    }
+
+    endpoint_origin("hsm_url", &cfg.hsm_url, true)?;
+    let price_origins = [
+        endpoint_origin("binance_base", &cfg.binance_base, false)?,
+        endpoint_origin("coinbase_base", &cfg.coinbase_base, false)?,
+        endpoint_origin("kraken_base", &cfg.kraken_base, false)?,
+    ];
+    if price_origins.iter().collect::<HashSet<_>>().len() != price_origins.len() {
+        return Err("price providers must have distinct network origins".into());
+    }
+    let supply_origins = [
+        endpoint_origin("coingecko_base", &cfg.coingecko_base, false)?,
+        endpoint_origin("coincap_base", &cfg.coincap_base, false)?,
+    ];
+    if supply_origins[0] == supply_origins[1] {
+        return Err("supply providers must have distinct network origins".into());
+    }
+    let collector_origins = cfg
+        .collector_urls
+        .iter()
+        .enumerate()
+        .map(|(index, endpoint)| {
+            endpoint_origin(&format!("collector_urls[{index}]"), endpoint, false)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if collector_origins.iter().collect::<HashSet<_>>().len() != collector_origins.len() {
+        return Err("collector endpoints must have distinct network origins".into());
+    }
+    let mut asset_ids = HashSet::with_capacity(cfg.assets.len());
+    for asset in &cfg.assets {
+        let asset_id = asset
+            .asset_id
+            .parse::<B256>()
+            .map_err(|_| "every asset_id must be a canonical bytes32 hex value")?;
+        if !asset_ids.insert(asset_id) {
+            return Err("duplicate asset_id in signer configuration".into());
+        }
+        if [
+            asset.binance.as_str(),
+            asset.coinbase.as_str(),
+            asset.kraken.as_str(),
+            asset.coingecko.as_str(),
+            asset.coincap.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
+            return Err("every asset requires identifiers for all five independent sources".into());
+        }
     }
     // TWAP (OM-4) window sanity. Ordering: interval <= max_gap <= window, and
     // >= 2 informing samples (a single sample is not a time average).
@@ -243,14 +525,20 @@ async fn publish_to_collector(
             }
             Ok(response) => {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                return Err(format!(
-                    "collector rejected signed tuple: http {status}: {body}"
-                ));
+                return Err(format!("collector rejected signed tuple: http {status}"));
             }
             Err(e) => {
                 if attempt == attempts {
-                    return Err(format!("transport after {attempts} attempt(s): {e}"));
+                    let class = if e.is_timeout() {
+                        "timeout"
+                    } else if e.is_connect() {
+                        "connect"
+                    } else if e.is_body() {
+                        "body"
+                    } else {
+                        "request"
+                    };
+                    return Err(format!("{class} after {attempts} attempt(s)"));
                 }
             }
         }
@@ -261,12 +549,18 @@ async fn publish_to_collector(
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one sequential observe-evidence-sign-persist-publish loop is easier to audit"
+)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
         .ok_or("usage: xindex-price-signer <config.json>")?;
     let cfg: Config = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
     validate_config(&cfg)?;
+    ensure_evidence_directory(&cfg.evidence_dir)
+        .map_err(|error| format!("unsafe/unavailable evidence directory: {error}"))?;
 
     let oracle_contract: Address = cfg.oracle_contract.parse()?;
     let signer_address: Address = cfg.signer_address.parse()?;
@@ -276,7 +570,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|a| Ok::<_, Box<dyn std::error::Error>>((a.asset_id.parse::<B256>()?, a)))
         .collect::<Result<_, _>>()?;
 
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let publish_http = reqwest::Client::builder()
         .timeout(Duration::from_secs(cfg.publish_timeout_secs))
         .build()?;
@@ -284,6 +581,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let coinbase = CoinbaseVenue::new(http.clone(), &cfg.coinbase_base);
     let kraken = KrakenVenue::new(http.clone(), &cfg.kraken_base);
     let coingecko = CoinGeckoSupply::new(http.clone(), &cfg.coingecko_base);
+    let coincap = CoinCapSupply::new(http.clone(), &cfg.coincap_base);
     let hsm = HttpHsmClient::new(cfg.hsm_url.clone());
     let domain = price_oracle_domain(cfg.oracle_chain_id, oracle_contract);
     let policy = PricePolicy {
@@ -306,6 +604,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and the TWAP fails closed (no signing) until it refills across the window
     // — the safe cold-start behaviour, so it needs no durability.
     let mut twap_history: HashMap<B256, Vec<TwapSample>> = HashMap::new();
+    let mut failure_streaks: HashMap<B256, u32> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(cfg.interval_secs));
     loop {
         tick.tick().await;
@@ -325,34 +624,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     symbol: &a.kraken,
                 },
             ];
-            let supply_feeds = [SupplyFeed {
-                source: &coingecko,
-                id: &a.coingecko,
-            }];
-            let input = ProducerInputs {
+            let supply_feeds = [
+                SupplyFeed {
+                    source: &coingecko,
+                    id: &a.coingecko,
+                },
+                SupplyFeed {
+                    source: &coincap,
+                    id: &a.coincap,
+                },
+            ];
+            let price_observations = source_quote_evidence(&price_feeds).await;
+            let supply_observations = source_supply_evidence(&supply_feeds, a.decimals).await;
+            // Persist the exact raw provider bodies BEFORE any HSM call. A
+            // create-new collision or storage failure refuses this round.
+            if let Err(error) = persist_raw_evidence(
+                &cfg.evidence_dir,
+                &cfg.evidence_operator_id,
+                signer_address,
+                *asset_id,
+                now,
+                &price_observations,
+                &supply_observations,
+            ) {
+                return Err(format!(
+                    "raw evidence persistence failed; signing halted before HSM use: {error}"
+                )
+                .into());
+            }
+            let price_quotes: Vec<U256> = price_observations
+                .iter()
+                .map(|observation| observation.value)
+                .collect();
+            let supply_quotes: Vec<U256> = supply_observations
+                .iter()
+                .map(|observation| observation.value)
+                .collect();
+            let input = ObservedProducerInputs {
                 asset_id: *asset_id,
-                decimals: a.decimals,
-                price_feeds: &price_feeds,
-                supply_feeds: &supply_feeds,
+                price_quotes: &price_quotes,
+                supply_quotes: &supply_quotes,
                 timestamp: now,
                 last_signed_at: last_signed.get(asset_id).copied(),
             };
             let history = twap_history.entry(*asset_id).or_default();
-            match produce_signed_price(&hsm, signer_address, &domain, policy, &input, history).await
+            match produce_signed_price_from_observations(
+                &hsm,
+                signer_address,
+                &domain,
+                policy,
+                &input,
+                history,
+            )
+            .await
             {
                 Ok(signed) => {
-                    last_signed.insert(*asset_id, now);
+                    failure_streaks.insert(*asset_id, 0);
+                    let mut next_last_signed = last_signed.clone();
+                    next_last_signed.insert(*asset_id, now);
                     // Persist the guard BEFORE emitting, so a restart cannot
                     // reset it and re-sign a different price at this timestamp.
-                    // The on-chain attestPrice monotonic check backstops the
-                    // narrow sign-then-crash-before-persist window.
-                    if let Err(e) = save_last_signed(&cfg.state_file, &last_signed) {
-                        eprintln!(
-                            "WARN persist anti-equivocation state to {} failed: {e} \
-                             (on-chain monotonic check still backstops)",
-                            cfg.state_file
-                        );
-                    }
+                    // Publication MUST stop if the durable guard cannot be
+                    // committed. Continuing would let a restart sign a
+                    // different payload for the same epoch.
+                    save_last_signed(&cfg.state_file, &next_last_signed).map_err(|e| {
+                        format!("anti-equivocation persistence failed; publication halted: {e}")
+                    })?;
+                    last_signed = next_last_signed;
                     let message = SignedPriceMessage {
                         asset_id: format!("{:#x}", signed.asset_id),
                         price_wad: signed.price_wad.to_string(),
@@ -362,7 +700,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         signature: format!("0x{}", alloy_primitives::hex::encode(signed.signature)),
                     };
                     println!("{}", serde_json::to_string(&message)?);
-                    for collector in &cfg.collector_urls {
+                    let mut delivered = 0usize;
+                    for (collector_index, collector) in cfg.collector_urls.iter().enumerate() {
                         if let Err(e) = publish_to_collector(
                             &publish_http,
                             collector,
@@ -372,12 +711,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                         {
                             eprintln!(
-                                "price-publish {asset_id:#x} epoch {now} to {collector} failed: {e}"
+                                "price-publish {asset_id:#x} epoch {now} collector_index={collector_index} failed: {e}"
                             );
+                        } else {
+                            delivered += 1;
                         }
                     }
+                    if delivered == 0 {
+                        return Err(format!(
+                            "all collectors rejected/unreachable for {asset_id:#x} epoch {now}; anomaly latch halted the signer"
+                        )
+                        .into());
+                    }
                 }
-                Err(e) => eprintln!("price-sign {asset_id:#x} failed (fail-closed): {e}"),
+                Err(e) => {
+                    let streak = failure_streaks
+                        .entry(*asset_id)
+                        .and_modify(|count| *count = count.saturating_add(1))
+                        .or_insert(1);
+                    eprintln!(
+                        "price-sign {asset_id:#x} failed (fail-closed), consecutive_failures={streak}: {e}"
+                    );
+                    if *streak >= cfg.anomaly_failure_threshold {
+                        return Err(format!(
+                            "price anomaly latch tripped for {asset_id:#x} after {streak} consecutive failed rounds"
+                        )
+                        .into());
+                    }
+                }
             }
         }
     }
@@ -424,7 +785,7 @@ mod tests {
             hsm_url: "http://localhost".into(),
             min_venues: 3,
             max_deviation_bps: 5000,
-            supply_min_venues: 1,
+            supply_min_venues: 2,
             twap_window_secs: 1800,
             twap_min_samples: 10,
             twap_max_gap_secs: 300,
@@ -433,14 +794,29 @@ mod tests {
             price_significant_digits: 4,
             supply_significant_digits: 6,
             state_file: "/tmp/xindex-price-signer-state.json".into(),
-            collector_urls: vec!["http://127.0.0.1:9191".into()],
+            evidence_dir: "/tmp".into(),
+            evidence_operator_id: "P01".into(),
+            anomaly_failure_threshold: 12,
+            collector_urls: vec![
+                "http://127.0.0.1:9191".into(),
+                "http://127.0.0.1:9292".into(),
+            ],
             publish_attempts: 3,
             publish_timeout_secs: 5,
-            binance_base: String::new(),
-            coinbase_base: String::new(),
-            kraken_base: String::new(),
-            coingecko_base: String::new(),
-            assets: vec![],
+            binance_base: "https://api.binance.com".into(),
+            coinbase_base: "https://api.coinbase.com".into(),
+            kraken_base: "https://api.kraken.com".into(),
+            coingecko_base: "https://api.coingecko.com".into(),
+            coincap_base: "https://api.coincap.io".into(),
+            assets: vec![AssetConfig {
+                asset_id: format!("{:#x}", B256::repeat_byte(0x11)),
+                decimals: 8,
+                binance: "BTCUSDT".into(),
+                coinbase: "BTC-USD".into(),
+                kraken: "XBTUSD".into(),
+                coingecko: "bitcoin".into(),
+                coincap: "bitcoin".into(),
+            }],
         }
     }
 

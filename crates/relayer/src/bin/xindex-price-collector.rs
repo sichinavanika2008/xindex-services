@@ -12,10 +12,8 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -40,14 +38,16 @@ struct Args {
     #[arg(long, env = "ETH_RPC_URL", default_value = "http://127.0.0.1:8545")]
     rpc_url: String,
 
-    /// Deployed PriceAttestationOracle address.
+    /// Deployed `PriceAttestationOracle` address.
     #[arg(long, env = "PRICE_ORACLE_ADDR")]
     oracle_address: String,
 
-    /// Dedicated gas-paying poster EOA key. The poster has no oracle authority;
-    /// `attestPrice` is permissionless and signatures are the trust boundary.
-    #[arg(long, env = "PRICE_POSTER_KEY")]
-    poster_key: String,
+    /// Dedicated gas-paying poster address. The connected RPC delegates
+    /// signing to an external node-managed signer (for example Clef/HSM); this
+    /// process never accepts private key material. `attestPrice` is
+    /// permissionless, so the poster has no oracle authority.
+    #[arg(long, env = "PRICE_POSTER_ADDRESS")]
+    poster_address: String,
 
     /// Complete comma-separated on-chain price signer set.
     #[arg(long, env = "PRICE_SIGNER_ADDRESSES")]
@@ -186,7 +186,10 @@ async fn run(args: Args) -> Result<()> {
     }
     let oracle_address = Address::from_str(&args.oracle_address).context("PRICE_ORACLE_ADDR")?;
     let signers = parse_signers(&args.signer_addresses)?;
-    let poster: PrivateKeySigner = args.poster_key.parse().context("PRICE_POSTER_KEY")?;
+    let poster_address = Address::from_str(&args.poster_address).context("PRICE_POSTER_ADDRESS")?;
+    if poster_address.is_zero() {
+        anyhow::bail!("PRICE_POSTER_ADDRESS must be non-zero");
+    }
     let listen: SocketAddr = args
         .listen_address
         .parse()
@@ -195,7 +198,6 @@ async fn run(args: Args) -> Result<()> {
     let provider = Arc::new(
         ProviderBuilder::new()
             .with_recommended_fillers()
-            .wallet(EthereumWallet::new(poster))
             .on_http(rpc_url),
     );
     let oracle = PriceAttestationOracle::new(oracle_address, provider.clone());
@@ -291,6 +293,7 @@ async fn run(args: Args) -> Result<()> {
                     ready.signatures.iter().copied().map(Bytes::from).collect();
                 let sent = worker_oracle
                     .attestPrice(p.asset_id, p.price_wad, p.supply, p.timestamp, signatures)
+                    .from(poster_address)
                     .send()
                     .await;
                 match sent {
@@ -376,8 +379,8 @@ mod tests {
     #[test]
     fn retry_delay_is_exponential_and_capped() {
         assert_eq!(retry_delay(1, 500, 10_000), Duration::from_millis(500));
-        assert_eq!(retry_delay(2, 500, 10_000), Duration::from_millis(1_000));
-        assert_eq!(retry_delay(9, 500, 10_000), Duration::from_millis(10_000));
+        assert_eq!(retry_delay(2, 500, 10_000), Duration::from_secs(1));
+        assert_eq!(retry_delay(9, 500, 10_000), Duration::from_secs(10));
     }
 
     #[test]

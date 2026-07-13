@@ -11,11 +11,11 @@
 //! feed's JSON number → decimal string → [`decimal_to_scaled`] is exact at
 //! realistic magnitudes (the scale-by-decimals happens in `U256`).
 
-use alloy_primitives::U256;
+use alloy_primitives::{keccak256, U256};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::price_venue::{decimal_to_scaled, VenueError};
+use crate::price_venue::{decimal_to_scaled, http_get, SourcedValue, VenueError};
 
 /// One circulating-supply source for an asset.
 #[async_trait]
@@ -24,7 +24,11 @@ pub trait SupplySource: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &'static str;
     /// Fetch `id`'s circulating supply in RAW token units (scaled by
     /// `decimals`).
-    async fn circulating_supply_raw(&self, id: &str, decimals: u8) -> Result<U256, VenueError>;
+    async fn circulating_supply_observation(
+        &self,
+        id: &str,
+        decimals: u8,
+    ) -> Result<SourcedValue, VenueError>;
 }
 
 /// A `(source, id)` supply feed: one asset on one source (ids differ per
@@ -41,9 +45,23 @@ pub struct SupplyFeed<'a> {
 /// failures (logged at WARN). Returns the successful raw-unit supplies; the
 /// caller medians them via `aggregate_price`.
 pub async fn source_supply(feeds: &[SupplyFeed<'_>], decimals: u8) -> Vec<U256> {
+    source_supply_evidence(feeds, decimals)
+        .await
+        .into_iter()
+        .map(|observation| observation.value)
+        .collect()
+}
+
+/// Query supply providers and return exact successful observations for the
+/// append-only evidence writer.
+pub async fn source_supply_evidence(feeds: &[SupplyFeed<'_>], decimals: u8) -> Vec<SourcedValue> {
     let mut out = Vec::with_capacity(feeds.len());
     for feed in feeds {
-        match feed.source.circulating_supply_raw(feed.id, decimals).await {
+        match feed
+            .source
+            .circulating_supply_observation(feed.id, decimals)
+            .await
+        {
             Ok(s) => out.push(s),
             Err(e) => tracing::warn!(
                 source = feed.source.name(),
@@ -57,10 +75,17 @@ pub async fn source_supply(feeds: &[SupplyFeed<'_>], decimals: u8) -> Vec<U256> 
 }
 
 /// `coingecko` circulating-supply source.
-#[derive(Debug)]
 pub struct CoinGeckoSupply {
     client: reqwest::Client,
     base: String,
+}
+
+impl std::fmt::Debug for CoinGeckoSupply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoinGeckoSupply")
+            .field("base", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl CoinGeckoSupply {
@@ -101,25 +126,88 @@ impl SupplySource for CoinGeckoSupply {
     fn name(&self) -> &'static str {
         "coingecko"
     }
-    async fn circulating_supply_raw(&self, id: &str, decimals: u8) -> Result<U256, VenueError> {
+    async fn circulating_supply_observation(
+        &self,
+        id: &str,
+        decimals: u8,
+    ) -> Result<SourcedValue, VenueError> {
         let url = format!(
             "{}/api/v3/coins/{id}?localization=false&tickers=false&community_data=false&developer_data=false",
             self.base
         );
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| VenueError::Http(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(VenueError::Http(format!("status {}", resp.status())));
+        let body = http_get(&self.client, &url).await?;
+        Ok(SourcedValue {
+            source: self.name(),
+            subject: id.to_string(),
+            value: Self::parse_supply(&body, decimals)?,
+            response_hash: keccak256(body.as_bytes()),
+            raw_response: body,
+        })
+    }
+}
+
+/// `CoinCap` circulating-supply source. This is intentionally a provider
+/// independent from `CoinGecko` so production can require two agreeing supply
+/// observations instead of treating one API as an oracle.
+pub struct CoinCapSupply {
+    client: reqwest::Client,
+    base: String,
+}
+
+impl std::fmt::Debug for CoinCapSupply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoinCapSupply")
+            .field("base", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CoinCapSupply {
+    /// Construct against the `CoinCap` API (override `base` for tests).
+    #[must_use]
+    pub fn new(client: reqwest::Client, base: impl Into<String>) -> Self {
+        Self {
+            client,
+            base: base.into(),
         }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| VenueError::Http(e.to_string()))?;
-        Self::parse_supply(&body, decimals)
+    }
+
+    /// Parse `{"data":{"supply":"19500000.0"}}` into raw token
+    /// units (multiplied by `10^decimals`).
+    ///
+    /// # Errors
+    /// [`VenueError::Parse`] if `data.supply` is absent or malformed.
+    pub fn parse_supply(body: &str, decimals: u8) -> Result<U256, VenueError> {
+        let v: Value = serde_json::from_str(body).map_err(|e| VenueError::Parse(e.to_string()))?;
+        let supply = v
+            .get("data")
+            .and_then(|data| data.get("supply"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| VenueError::Parse("missing string data.supply".to_string()))?;
+        decimal_to_scaled(supply, decimals)
+    }
+}
+
+#[async_trait]
+impl SupplySource for CoinCapSupply {
+    fn name(&self) -> &'static str {
+        "coincap"
+    }
+
+    async fn circulating_supply_observation(
+        &self,
+        id: &str,
+        decimals: u8,
+    ) -> Result<SourcedValue, VenueError> {
+        let url = format!("{}/v2/assets/{id}", self.base);
+        let body = http_get(&self.client, &url).await?;
+        Ok(SourcedValue {
+            source: self.name(),
+            subject: id.to_string(),
+            value: Self::parse_supply(&body, decimals)?,
+            response_hash: keccak256(body.as_bytes()),
+            raw_response: body,
+        })
     }
 }
 
@@ -127,6 +215,7 @@ impl SupplySource for CoinGeckoSupply {
 mod tests {
     #![expect(clippy::expect_used, reason = "test code")]
     use super::*;
+    use alloy_primitives::B256;
 
     #[test]
     fn parses_coingecko_supply_scaled_by_decimals() {
@@ -142,6 +231,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_coincap_supply_scaled_by_decimals() {
+        let body = r#"{"data":{"id":"bitcoin","supply":"19500000.0"}}"#;
+        let got = CoinCapSupply::parse_supply(body, 8).expect("parse");
+        assert_eq!(got, U256::from(19_500_000u64) * U256::from(100_000_000u64));
+        assert!(CoinCapSupply::parse_supply("{}", 8).is_err());
+        assert!(CoinCapSupply::parse_supply(r#"{"data":{"supply":null}}"#, 8).is_err());
+    }
+
     #[derive(Debug)]
     struct MockSupply {
         name: &'static str,
@@ -152,12 +250,19 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        async fn circulating_supply_raw(
+        async fn circulating_supply_observation(
             &self,
-            _id: &str,
+            id: &str,
             _decimals: u8,
-        ) -> Result<U256, VenueError> {
+        ) -> Result<SourcedValue, VenueError> {
             self.result
+                .map(|value| SourcedValue {
+                    source: self.name,
+                    subject: id.to_string(),
+                    value,
+                    response_hash: B256::repeat_byte(1),
+                    raw_response: "mock".to_string(),
+                })
                 .map_err(|()| VenueError::Http("mock down".to_string()))
         }
     }

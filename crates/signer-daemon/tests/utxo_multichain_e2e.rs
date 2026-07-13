@@ -1,8 +1,7 @@
 #![expect(
     clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::items_after_statements,
     clippy::doc_markdown,
+    clippy::too_many_lines,
     reason = "integration test fixtures fail loudly on malformed cryptographic state"
 )]
 //! BTC + LTC UTXO-family end-to-end coverage (P3.1-9/P3.1-10).
@@ -26,16 +25,15 @@ use bitcoin::{
     ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
 };
 use xindex_chain_utxo::{
-    BchCodec, BtcCodec, DogeCodec, LtcCodec, ScriptKind, UtxoAddressCodec, UtxoParams,
-    ZecCodec,
+    BchCodec, BtcCodec, DogeCodec, LtcCodec, ScriptKind, UtxoAddressCodec, UtxoParams, ZecCodec,
 };
 use xindex_executor::remote_cosigner::RemoteMultisigCosigner;
 use xindex_executor::{ExpectedOutputs, MultisigCosigner, SpendCertificate};
+use xindex_multisig::psbt::SighashFlavor;
 use xindex_multisig::{
     build_spending_psbt, finalize_psbt, sign_psbt_input, MultisigDescriptor, MultisigUtxo,
     MultisigUtxoSpend, SignError,
 };
-use xindex_multisig::psbt::SighashFlavor;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::IntentProof;
 use xindex_signer_daemon::psbt::UtxoSignerConfig;
@@ -162,8 +160,11 @@ fn build_chain_spend(fixture: &ChainFixture, outpoint_tag: u8) -> BuiltSpend {
         .require_network(Network::Bitcoin)
         .expect("recipient network");
     let destination_spk = recipient.script_pubkey();
-    let memo = format!("=:ETH.USDT:0x{:040x}:0", u8::from(fixture.chain == ChainId::Ltc))
-        .into_bytes();
+    let memo = format!(
+        "=:ETH.USDT:0x{:040x}:0",
+        u8::from(fixture.chain == ChainId::Ltc)
+    )
+    .into_bytes();
     let utxo = MultisigUtxo {
         outpoint: OutPoint {
             txid: Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array([outpoint_tag; 32])),
@@ -205,7 +206,11 @@ fn assert_finalized_spend(spend: &BuiltSpend, tx: &bitcoin::Transaction) {
     assert_eq!(tx.output[2].script_pubkey, spend.change_spk);
     assert!(tx.input[0].script_sig.is_empty(), "P2WSH has no scriptSig");
     assert!(!tx.input[0].witness.is_empty(), "finalized P2WSH witness");
-    let output_total = tx.output.iter().map(|output| output.value.to_sat()).sum::<u64>();
+    let output_total = tx
+        .output
+        .iter()
+        .map(|output| output.value.to_sat())
+        .sum::<u64>();
     assert_eq!(INPUT_SATS - output_total, 1_000, "exact implied miner fee");
 }
 
@@ -330,7 +335,10 @@ fn btc_and_ltc_psbt_round_trip_uses_chain_params_and_codecs() {
         }
         assert_eq!(
             fixture.decode_multisig_address(&canonical),
-            fixture.descriptor.script_pubkey().expect("descriptor script")
+            fixture
+                .descriptor
+                .script_pubkey()
+                .expect("descriptor script")
         );
         canonical_addresses.push(canonical);
 
@@ -355,7 +363,9 @@ fn btc_and_ltc_psbt_round_trip_uses_chain_params_and_codecs() {
 fn doge_p2sh_legacy_psbt_round_trip_uses_chain_params_and_codec() {
     let secp = Secp256k1::new();
     let custody_keys = (0..5u8)
-        .map(|offset| SecretKey::from_slice(&[0x61u8.saturating_add(offset); 32]).expect("custody key"))
+        .map(|offset| {
+            SecretKey::from_slice(&[0x61u8.saturating_add(offset); 32]).expect("custody key")
+        })
         .collect::<Vec<_>>();
     let custody_pubkeys = custody_keys
         .iter()
@@ -387,7 +397,10 @@ fn doge_p2sh_legacy_psbt_round_trip_uses_chain_params_and_codec() {
     let destination_address = codec
         .encode(&destination_spk)
         .expect("DOGE destination address");
-    assert_eq!(codec.decode(&custody_address).expect("decode custody"), custody_spk);
+    assert_eq!(
+        codec.decode(&custody_address).expect("decode custody"),
+        custody_spk
+    );
     assert_eq!(
         codec
             .decode(&destination_address)
@@ -583,11 +596,7 @@ fn bch_qualification_rejects_unimplemented_forkid_sighash() {
 
 #[test]
 fn zec_qualification_rejects_unimplemented_sapling_sighash() {
-    assert_unimplemented_legacy_chain_fails_closed(
-        ChainId::Zec,
-        SighashFlavor::ZcashBlake2b,
-        0x91,
-    );
+    assert_unimplemented_legacy_chain_fails_closed(ChainId::Zec, SighashFlavor::ZcashBlake2b, 0x91);
 }
 
 #[tokio::test]
@@ -599,7 +608,8 @@ async fn one_daemon_routes_btc_and_ltc_with_chain_scoped_replay() {
             .with_key(btc.hsm_address, btc.keys[0])
             .with_key(ltc.hsm_address, ltc.keys[0]),
     );
-    let url = spawn_two_chain_daemon(btc.signer_config(), ltc.signer_config(), Arc::clone(&hsm)).await;
+    let url =
+        spawn_two_chain_daemon(btc.signer_config(), ltc.signer_config(), Arc::clone(&hsm)).await;
 
     // Deliberately reuse the same outpoint tuple. Both requests must sign:
     // replay/slashing identity includes ChainId, while each role validates a
@@ -637,7 +647,8 @@ async fn one_daemon_routes_btc_and_ltc_with_chain_scoped_replay() {
     btc_psbt.inputs[0]
         .partial_sigs
         .insert(btc_pubkey, btc_signature);
-    sign_psbt_input(&mut btc_psbt, 0, &btc.keys[1], btc.descriptor.secp()).expect("BTC second signer");
+    sign_psbt_input(&mut btc_psbt, 0, &btc.keys[1], btc.descriptor.secp())
+        .expect("BTC second signer");
     let btc_tx = finalize_psbt(&mut btc_psbt, &btc.descriptor).expect("BTC finalize");
     assert_finalized_spend(&btc_spend, &btc_tx);
 
@@ -645,7 +656,8 @@ async fn one_daemon_routes_btc_and_ltc_with_chain_scoped_replay() {
     ltc_psbt.inputs[0]
         .partial_sigs
         .insert(ltc_pubkey, ltc_signature);
-    sign_psbt_input(&mut ltc_psbt, 0, &ltc.keys[1], ltc.descriptor.secp()).expect("LTC second signer");
+    sign_psbt_input(&mut ltc_psbt, 0, &ltc.keys[1], ltc.descriptor.secp())
+        .expect("LTC second signer");
     let ltc_tx = finalize_psbt(&mut ltc_psbt, &ltc.descriptor).expect("LTC finalize");
     assert_finalized_spend(&ltc_spend, &ltc_tx);
 
@@ -665,7 +677,10 @@ async fn one_daemon_routes_btc_and_ltc_with_chain_scoped_replay() {
     )
     .await
     .expect_err("wrong descriptor must fail");
-    assert!(error.contains("422"), "expected wrong-role 422, got: {error}");
+    assert!(
+        error.contains("422"),
+        "expected wrong-role 422, got: {error}"
+    );
     assert_eq!(
         hsm.invocation_count(ltc.hsm_address),
         1,

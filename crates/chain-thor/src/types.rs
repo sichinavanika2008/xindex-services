@@ -6,6 +6,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Missing upstream safety fields are ambiguous, never affirmative evidence
+/// that trading is available. Default every halt flag to `true` so a schema
+/// regression or partial provider response stops signing instead of silently
+/// clearing a registry pause bit.
+const fn default_paused() -> bool {
+    true
+}
+
 /// One entry in the response of `GET /thorchain/inbound_addresses`.
 ///
 /// One row per supported chain. The vault `address` rotates per
@@ -27,13 +35,13 @@ pub struct InboundAddress {
     pub router: Option<String>,
     /// Per-chain halt flags. When any of these is true, deposits via
     /// `THORChain` to / from this chain are paused.
-    #[serde(default)]
+    #[serde(default = "default_paused")]
     pub halted: bool,
-    #[serde(default)]
+    #[serde(default = "default_paused")]
     pub global_trading_paused: bool,
-    #[serde(default)]
+    #[serde(default = "default_paused")]
     pub chain_trading_paused: bool,
-    #[serde(default)]
+    #[serde(default = "default_paused")]
     pub chain_lp_actions_paused: bool,
     /// Recommended outbound gas rate, asset-specific units.
     #[serde(default)]
@@ -256,5 +264,48 @@ impl TxStatusResponse {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "test code")]
+
+    use super::*;
+
+    #[test]
+    fn missing_inbound_halt_fields_fail_closed() {
+        let entry: InboundAddress = serde_json::from_value(serde_json::json!({
+            "chain": "ETH",
+            "pub_key": "thorpub1example",
+            "address": "0x1111111111111111111111111111111111111111",
+            "router": "0x2222222222222222222222222222222222222222"
+        }))
+        .expect("minimal inbound-address fixture");
+
+        assert!(entry.halted);
+        assert!(entry.global_trading_paused);
+        assert!(entry.chain_trading_paused);
+        assert!(entry.chain_lp_actions_paused);
+    }
+
+    #[test]
+    fn explicit_false_inbound_halt_fields_remain_false() {
+        let entry: InboundAddress = serde_json::from_value(serde_json::json!({
+            "chain": "ETH",
+            "pub_key": "thorpub1example",
+            "address": "0x1111111111111111111111111111111111111111",
+            "router": "0x2222222222222222222222222222222222222222",
+            "halted": false,
+            "global_trading_paused": false,
+            "chain_trading_paused": false,
+            "chain_lp_actions_paused": false
+        }))
+        .expect("complete inbound-address fixture");
+
+        assert!(!entry.halted);
+        assert!(!entry.global_trading_paused);
+        assert!(!entry.chain_trading_paused);
+        assert!(!entry.chain_lp_actions_paused);
     }
 }

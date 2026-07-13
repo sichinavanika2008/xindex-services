@@ -22,7 +22,7 @@
 //! Usage: `xindex-signer-daemon <config.json> [--dev]`.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ use xindex_signer_daemon::web3signer::{HsmDigestSigner, HttpHsmClient};
 /// The on-disk JSON config. Parsed into the runtime `DaemonConfig` +
 /// signing roles by the `build_*` helpers below (the runtime types are not
 /// `Deserialize` — they hold parsed alloy/bitcoin primitives).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct FileConfig {
     /// EIP-712 domain chain id the daemon signs attestations for.
     chain_id: u64,
@@ -91,7 +91,7 @@ struct CertVolumeFile {
     caps: HashMap<String, u128>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct HsmFile {
     kind: HsmKind,
     /// `http` backend: HSM frontend base URL (e.g. `http://127.0.0.1:9000`).
@@ -109,7 +109,7 @@ enum HsmKind {
     Software,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SoftwareKeysFile {
     /// 32-byte hex Ethereum (Set-B) secret key.
     eth_secret_key: String,
@@ -202,10 +202,7 @@ async fn main() -> Result<()> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config {config_path}"))?;
     let file: FileConfig = serde_json::from_str(&raw).context("parse config json")?;
-
-    if file.hsm.kind == HsmKind::Software && !dev {
-        bail!("hsm.kind=\"software\" requires --dev; a production daemon must front an HSM (hsm.kind=\"http\")");
-    }
+    validate_runtime_mode(&file, dev)?;
 
     let cfg = build_daemon_config(&file)?;
     let utxo = file.utxo.as_ref().map(build_utxo).transpose()?;
@@ -245,6 +242,60 @@ async fn main() -> Result<()> {
 
 fn warn_in_memory() {
     warn!("no database_url — using IN-MEMORY replay store; replay/equivocation state is LOST on restart (dev only)");
+}
+
+/// Enforce the properties that live outside [`DaemonState`]: the concrete
+/// replay backend, the transport to the HSM frontend, and the outer mTLS
+/// listener. These checks run before opening the database or binding a socket.
+fn validate_runtime_mode(file: &FileConfig, dev: bool) -> Result<()> {
+    if file.hsm.kind == HsmKind::Software && !dev {
+        bail!("hsm.kind=\"software\" requires --dev; a production daemon must front an HSM (hsm.kind=\"http\")");
+    }
+    if file.hsm.kind == HsmKind::Http {
+        validate_hsm_url(
+            file.hsm
+                .url
+                .as_deref()
+                .context("hsm.kind=\"http\" requires hsm.url")?,
+        )?;
+    }
+    if !dev {
+        if file.database_url.is_none() {
+            bail!("database_url is required outside --dev; production replay/equivocation state must survive restart");
+        }
+        if file.tls.is_none() {
+            bail!("mTLS config (`tls`) is required outside --dev; a production daemon must not serve plain HTTP");
+        }
+    }
+    Ok(())
+}
+
+/// Production HSM traffic is process-local. Refuse credentials in the URL and
+/// refuse DNS names other than `localhost`, so an operator cannot accidentally
+/// send signing requests (including digests and key aliases) over a routed
+/// network.
+fn validate_hsm_url(raw: &str) -> Result<()> {
+    let url = reqwest::Url::parse(raw).context("hsm.url must be a valid URL (value redacted)")?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("hsm.url must not contain userinfo, a query, or a fragment");
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("hsm.url must use http or https on loopback");
+    }
+    let host = url.host_str().context("hsm.url must include a host")?;
+    let host_ip = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if !loopback {
+        bail!("hsm.url must terminate on loopback inside the HSM perimeter");
+    }
+    Ok(())
 }
 
 // ───────────────────────────── builders ─────────────────────────────
@@ -348,7 +399,8 @@ fn parse_addr(s: &str) -> Result<Address> {
 
 fn hex32(s: &str) -> Result<[u8; 32]> {
     let stripped = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = alloy_primitives::hex::decode(stripped).with_context(|| format!("bad hex {s}"))?;
+    let bytes =
+        alloy_primitives::hex::decode(stripped).context("bad secret hex (value redacted)")?;
     bytes
         .as_slice()
         .try_into()
@@ -372,5 +424,33 @@ fn parse_network(s: &str) -> Result<Network> {
         "signet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
         other => bail!("unknown bitcoin network '{other}'"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used, reason = "test code")]
+
+    use super::*;
+
+    #[test]
+    fn hsm_url_is_strictly_loopback_and_redacted() {
+        assert!(validate_hsm_url("http://127.0.0.1:9000").is_ok());
+        assert!(validate_hsm_url("https://[::1]:9000").is_ok());
+        assert!(validate_hsm_url("https://localhost:9000").is_ok());
+        assert!(validate_hsm_url("https://hsm.example:9000").is_err());
+        assert!(validate_hsm_url("http://user:secret@127.0.0.1:9000").is_err());
+
+        let secret_url = "not-a-url-containing-secret-123";
+        let error = validate_hsm_url(secret_url).expect_err("invalid URL must fail");
+        assert!(!error.to_string().contains(secret_url));
+    }
+
+    #[test]
+    fn malformed_software_secret_is_redacted() {
+        let secret = "not-hex-secret-456";
+        let error = hex32(secret).expect_err("malformed secret must fail");
+        assert!(!error.to_string().contains(secret));
+        assert!(error.to_string().contains("redacted"));
     }
 }

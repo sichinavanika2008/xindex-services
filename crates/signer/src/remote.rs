@@ -33,11 +33,20 @@ const DEFAULT_TIMEOUT_SECS: u64 = 5;
 /// Cheap to clone (the `reqwest::blocking::Client` is internally
 /// `Arc`-shared); each coordinator host holds one per signer party in
 /// the configured 3-of-5 set.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RemoteHsmBackend {
     base_url: String,
     eth_address: Address,
     inner: reqwest::blocking::Client,
+}
+
+impl std::fmt::Debug for RemoteHsmBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteHsmBackend")
+            .field("base_url", &"<redacted>")
+            .field("eth_address", &self.eth_address)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RemoteHsmBackend {
@@ -78,23 +87,19 @@ impl RemoteHsmBackend {
         body: &T,
     ) -> Result<[u8; 65], SignerError> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .inner
-            .post(&url)
-            .json(body)
-            .send()
-            .map_err(|e| SignerError::Backend(format!("daemon transport: {e}")))?;
+        let resp = self.inner.post(&url).json(body).send().map_err(|e| {
+            SignerError::Backend(format!("daemon transport: {}", transport_class(&e)))
+        })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(SignerError::Backend(format!(
-                "daemon http {}: {body}",
+                "daemon http {}",
                 status.as_u16()
             )));
         }
         let parsed: Eip712SignResponse = resp
             .json()
-            .map_err(|e| SignerError::Backend(format!("daemon response json: {e}")))?;
+            .map_err(|_| SignerError::Backend("daemon response json malformed".to_string()))?;
         // Pin: coordinator MUST verify the daemon signed with the
         // configured public key. A mis-pointed daemon returning the
         // wrong signer is a hard fail, never silently aggregated.
@@ -183,6 +188,20 @@ impl RemoteHsmBackend {
             vault_resolved_at: acc.vaultResolvedAt,
         };
         self.post_sign("/api/v1/sign/eip712-acc", &req)
+    }
+}
+
+fn transport_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
     }
 }
 

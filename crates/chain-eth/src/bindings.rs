@@ -39,36 +39,26 @@ sol!(
     "../shared/abi/CustodyGuard.json"
 );
 
-// Kept inline instead of depending on a stale generated artifact: this is the
-// deliberately narrow surface the price collector/poster needs. The EIP-712
-// struct/hash itself remains pinned in `xindex-shared::eip712`.
-sol! {
+sol!(
     #[sol(rpc)]
-    interface PriceAttestationOracle {
-        function attestPrice(
-            bytes32 assetId,
-            uint256 priceWad,
-            uint256 supply,
-            uint64 timestamp,
-            bytes[] calldata signatures
-        ) external;
-
-        function pendingQuote(bytes32 assetId)
-            external
-            view
-            returns (uint256 priceWad, uint256 supply, uint64 updatedAt);
-
-        function isSigner(address account) external view returns (bool);
-        function signerCount() external view returns (uint256);
-        function threshold() external view returns (uint256);
-        function setPriceBounds(bytes32 assetId, uint256 floorWad, uint256 ceilWad) external;
-    }
-}
+    PriceAttestationOracle,
+    "../shared/abi/PriceAttestationOracle.json"
+);
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "ThorchainAdapter constructor has 8 args; the sol! macro expansion exposes them"
+    reason = "the exact quote authorization ABI deliberately binds thirteen independent fields"
 )]
+mod thorchain_vault_registry_binding {
+    use alloy::sol;
+    sol!(
+        #[sol(rpc)]
+        ThorchainVaultRegistry,
+        "../shared/abi/ThorchainVaultRegistry.json"
+    );
+}
+pub use thorchain_vault_registry_binding::ThorchainVaultRegistry;
+
 mod thorchain_adapter_binding {
     use alloy::sol;
     sol!(

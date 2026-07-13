@@ -30,6 +30,7 @@ use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
+use xindex_chain_eth::rpc::redacted_endpoint;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::EsploraClient;
 use xindex_shared::eip712::{attestation, attestation_oracle_domain};
@@ -60,6 +61,13 @@ enum CrossCheckMode {
 #[derive(Parser, Debug, Clone)]
 #[command(version, about = "Xindex k-of-n attestation signer + poster (M2)")]
 struct Args {
+    /// Required acknowledgement that this legacy quorum-collapsing
+    /// coordinator is local-development scaffolding. Production uses one
+    /// independent observer/HSM producer per operator and an untrusted
+    /// signature collector.
+    #[arg(long, env = "XINDEX_DEV", default_value_t = false)]
+    dev: bool,
+
     /// WebSocket RPC endpoint (Anvil default `ws://127.0.0.1:8545`).
     #[arg(long, env = "ETH_RPC_URL", default_value = "ws://127.0.0.1:8545")]
     rpc_url: String,
@@ -191,7 +199,7 @@ fn build_signers(args: &Args) -> Result<Vec<AnyHsmBackend>> {
             let mut out = Vec::new();
             for k in keys.split(',') {
                 let s = SoftwareSigner::from_hex(k.trim())
-                    .with_context(|| format!("invalid SIGNER_KEYS entry: {k}"))?;
+                    .context("invalid SIGNER_KEYS entry (value redacted)")?;
                 out.push(AnyHsmBackend::Software(s));
             }
             Ok(out)
@@ -232,6 +240,11 @@ fn build_signers(args: &Args) -> Result<Vec<AnyHsmBackend>> {
     reason = "single sequential pipeline; splitting fights alloy 0.8's deeply nested fillers generic"
 )]
 async fn run(args: Args) -> Result<()> {
+    if !args.dev {
+        anyhow::bail!(
+            "xindex-attest is legacy quorum-collapsing scaffolding and refuses to run without --dev"
+        );
+    }
     let intent_queue = Address::from_str(&args.intent_queue)
         .context("INTENT_QUEUE_ADDR must be a 20-byte hex address")?;
     let attestation_oracle = Address::from_str(&args.attestation_oracle)
@@ -259,7 +272,7 @@ async fn run(args: Args) -> Result<()> {
     }
 
     info!(
-        rpc_url = %args.rpc_url,
+        rpc_endpoint = %redacted_endpoint(&args.rpc_url),
         intent_queue = %intent_queue,
         attestation_oracle = %attestation_oracle,
         signer_count = signers.len(),

@@ -1,29 +1,35 @@
 # xindex-services
 
-Off-chain Rust services for the [Xindex](../Xindex/) omnichain portfolio
-protocol. Sibling repo to the Solidity layer; independent git history,
-CI, and audit scope.
+Off-chain Rust services for the [Xindex](../) portfolio protocol. This is a
+separate Git repository nested inside the Solidity workspace, with independent
+history, CI and audit scope.
 
-The on-chain (Solidity) layer cannot finalize a single async mint or
-settle a single redeem until the services in this repo ship. Read the
-[shared Codex/GPT project guide](../Xindex/AGENTS.md) and this repository's
-[local guide](AGENTS.md) before making changes. They replace prior AI-session
-plans as the active operating context; current source, tests, the recent
-findings, and the Turnkey runbook are authoritative.
+Read the [shared repository guide](../AGENTS.md), this repository's
+[local guide](AGENTS.md), and the recent sections of [KNOWN_FINDINGS.md](KNOWN_FINDINGS.md)
+before changing a security-sensitive path. Current source and reproduced tests
+take precedence over historical milestone prose.
 
-## Crates
+## Current status
 
-| Crate | Role |
-|---|---|
-| `shared` | Domain types: `IntentId`, `AttestationDigest`, EIP-712 typed-data structs mirroring `AttestationOracle.sol`; alloy `sol!` bindings re-exports. |
-| `chain-eth` | Ethereum provider, log-stream, contract bindings. RPC redundancy + reorg handling. Hosts the `xindex-watch` binary. |
-| `chain-thor` | THORChain Tendermint RPC client. Polls `/inbound_addresses`, `/pools`, `/tx/<hash>`. |
-| `chain-btc` | Bitcoin Core RPC + Esplora fallback. UTXO watching, confirmation tracking, PSBT construction via `bdk`. |
-| `signer` | 3-of-5 attestation signer daemon. `HsmBackend` trait with software-key impl (dev) and YubiHSM2 impl (prod). EIP-712 sign + post. |
-| `multisig` | Bitcoin multisig signer. PSBT in, partially-signed PSBT out, HSM-backed key. |
-| `relayer` | Watches `IntentQueue`. Retries THORChain Router calls on partner-side failure. Triggers `cancelMint` on deadline expiry. |
-| `executor` | Watches `RedeemDispatched` events. Constructs Bitcoin PSBTs, coordinates 3-of-5 multisig signing rounds, broadcasts. |
-| `ops` | Prometheus metrics, structured tracing/logging, alerting glue, on-call runbook. |
+The workspace contains 24 packages spanning shared protocol types, EVM and
+native-chain clients, signers, custody, executors, relayers and operations.
+The 2026-07-13 Gate-3 delta adds:
+
+- eight manifested current Solidity ABIs and an exact drift gate;
+- all seven current EIP-712 report types with Rust/Solidity vectors;
+- durable registry signature reservation and quote-nonce state;
+- exact inbound-state/quote signer and collector cores;
+- fail-closed three-source THOR agreement;
+- a multi-source price signer and exact untrusted collector/poster with raw
+  evidence and anomaly refusal; and
+- production-profile checks that require durable state, mTLS and an external
+  HSM boundary while keeping software/raw-key paths dev-only.
+
+Gate 3 nevertheless remains **FAIL/open**. The current tree does not provide a
+complete live inbound/quote producer/poster, every current mint/redemption
+observer/poster, finalized/reorg-safe state, a policy-complete native custody
+executor, demonstrated production monitoring, independent operator/HSM/source
+records, or an independent audit. Do not connect it to value-bearing systems.
 
 ## Historical milestone snapshot
 
@@ -43,23 +49,31 @@ readiness or launch gates.
 ## Local development
 
 ```bash
-# Strict gate (matches CI):
+# Static and compile-only no-key audit gate:
+./scripts/check-abi.sh --solidity-root ..
+./scripts/check-production-profile.sh
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo clippy --offline --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --offline --locked --workspace --all-features --no-run
 cargo deny check
-cargo audit
+cargo audit --no-fetch --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0185
 ```
+
+`--no-run` compiles signer and custody tests but does not execute signature
+operations. See `just gate` and CI for the full authorized test gate.
 
 ## End-to-end against local Anvil
 
 ```bash
-just e2e-anvil  # spins up Anvil, deploys Phase 1+2, runs xindex-watch
+just anvil      # separate terminal; deterministic local chain only
+just e2e-anvil  # deploys local fixtures and runs xindex-watch
 ```
 
-See `justfile` for individual recipes.
+These recipes use public deterministic Anvil keys and `--dev` service paths.
+They are local fixtures, not production evidence. See `justfile` for individual
+recipes.
 
 ## Toolchain
 
-Pinned via `rust-toolchain.toml` (currently `stable`). Re-pin to a
-specific version once M1 ships and audit reproducibility matters.
+Pinned to Rust 1.95.0 in `rust-toolchain.toml`; CI mirrors the same version and
+pins action revisions to immutable SHAs.

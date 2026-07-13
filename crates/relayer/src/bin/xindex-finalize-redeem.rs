@@ -36,11 +36,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::eips::BlockNumberOrTag;
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, Bytes};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -64,9 +62,11 @@ struct Args {
     #[arg(long, env = "INTENT_QUEUE_ADDR")]
     intent_queue: String,
 
-    /// EOA that submits + pays gas for finalize/cancel txs.
-    #[arg(long, env = "POSTER_KEY")]
-    poster_key: String,
+    /// Gas-paying address for permissionless finalize calls. The connected RPC
+    /// delegates signing to a node-managed external signer; this process never
+    /// accepts raw private key material.
+    #[arg(long, env = "POSTER_ADDRESS")]
+    poster_address: String,
 
     #[arg(long, env = "SCAN_INTERVAL_SECS", default_value_t = 60)]
     scan_interval_secs: u64,
@@ -149,24 +149,27 @@ async fn run<T: RedemptionTrackerStore>(
         Address::from_str(&args.intent_queue).context("INTENT_QUEUE_ADDR invalid")?;
     let erc20_hint = parse_hint(&args.erc20_swap_hint_hex)?;
 
-    let poster: PrivateKeySigner = args.poster_key.parse().context("invalid POSTER_KEY")?;
-    let wallet = EthereumWallet::new(poster);
+    let poster_address =
+        Address::from_str(&args.poster_address).context("POSTER_ADDRESS invalid")?;
+    if poster_address.is_zero() {
+        anyhow::bail!("POSTER_ADDRESS must be non-zero");
+    }
     let endpoints = WsEndpointList::from_csv(&args.rpc_url).context("parse ETH_RPC_URL list")?;
     let (used_url, provider) = endpoints
-        .connect_first_working(|url| {
-            let wallet = wallet.clone();
-            async move {
-                ProviderBuilder::new()
-                    .with_recommended_fillers()
-                    .wallet(wallet)
-                    .on_ws(WsConnect::new(&url))
-                    .await
-            }
+        .connect_first_working(|url| async move {
+            ProviderBuilder::new()
+                .with_recommended_fillers()
+                .on_ws(WsConnect::new(&url))
+                .await
         })
         .await
         .map_err(|e| anyhow::anyhow!("connect WS provider: {e}"))?;
     let provider = Arc::new(provider);
-    info!(rpc_url = %used_url, intent_queue = %intent_queue, "xindex-finalize-redeem starting");
+    info!(
+        rpc_endpoint = %xindex_chain_eth::rpc::redacted_endpoint(&used_url),
+        intent_queue = %intent_queue,
+        "xindex-finalize-redeem starting"
+    );
 
     let created = IntentQueue::RedemptionIntentCreated::SIGNATURE_HASH;
     let attested = IntentQueue::LegAttested::SIGNATURE_HASH;
@@ -226,7 +229,12 @@ async fn run<T: RedemptionTrackerStore>(
                         return;
                     }
                 };
-                match token.finalizeBurn(rid, hints).send().await {
+                match token
+                    .finalizeBurn(rid, hints)
+                    .from(poster_address)
+                    .send()
+                    .await
+                {
                     Ok(p) => match p.get_receipt().await {
                         Ok(r) => {
                             metrics
@@ -290,7 +298,12 @@ async fn run<T: RedemptionTrackerStore>(
                         return;
                     }
                 };
-                match token.finalizeBurn(rid, hints).send().await {
+                match token
+                    .finalizeBurn(rid, hints)
+                    .from(poster_address)
+                    .send()
+                    .await
+                {
                     Ok(p) => match p.get_receipt().await {
                         Ok(r) => {
                             metrics

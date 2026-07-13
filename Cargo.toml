@@ -27,11 +27,10 @@ anyhow = "1"
 # Tracing / logs
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# DB (placeholder — first user is M2). `default-features = false` drops
-# sqlx-mysql / sqlx-postgres / `any` driver bundle we don't use, which
-# also removes the transitive `rsa` crate (RUSTSEC-2023-0071: Marvin
-# timing-sidechannel; no fixed upgrade upstream) and the unmaintained
-# `derivative` (RUSTSEC-2024-0388).
+# Durable SQLite state for observations, signer reservations, reconciliation
+# and serialized quote nonces. `default-features = false` keeps MySQL/Postgres
+# code out of the compiled graph; their optional lockfile-only dependencies are
+# still evaluated and explicitly dispositioned by the cargo-audit gate.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate"] }
 # CLI + tests
 clap = { version = "4", features = ["derive", "env"] }

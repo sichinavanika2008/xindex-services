@@ -10,7 +10,7 @@
 //! move the signed price. Each client splits a PURE `parse_price` (unit-tested
 //! against canned bodies) from the thin reqwest fetch.
 
-use alloy_primitives::U256;
+use alloy_primitives::{keccak256, B256, U256};
 use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
@@ -26,13 +26,30 @@ pub enum VenueError {
     Parse(String),
 }
 
+/// One successful source observation plus the exact response retained for
+/// audit evidence. URLs and credentials are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcedValue {
+    /// Stable provider name.
+    pub source: &'static str,
+    /// Provider-specific public asset symbol/id.
+    pub subject: String,
+    /// Normalized integer value used by aggregation.
+    pub value: U256,
+    /// Hash of the exact UTF-8 response body.
+    pub response_hash: B256,
+    /// Exact bounded response body. The evidence writer persists this before
+    /// a corresponding signature can be published.
+    pub raw_response: String,
+}
+
 /// One independent price venue.
 #[async_trait]
 pub trait PriceVenue: Send + Sync + std::fmt::Debug {
     /// Human venue name (logging / diagnostics).
     fn name(&self) -> &'static str;
     /// Fetch the spot price for `symbol`, scaled to a WAD (1e18) `U256`.
-    async fn fetch_price_wad(&self, symbol: &str) -> Result<U256, VenueError>;
+    async fn fetch_price_observation(&self, symbol: &str) -> Result<SourcedValue, VenueError>;
 }
 
 /// A `(venue, symbol)` feed: one asset on one venue (symbols differ per venue,
@@ -50,9 +67,19 @@ pub struct Feed<'a> {
 /// quotes; the caller passes them to `aggregate_price`, which enforces the
 /// minimum-venue floor and rejects outliers.
 pub async fn source_quotes(feeds: &[Feed<'_>]) -> Vec<U256> {
+    source_quote_evidence(feeds)
+        .await
+        .into_iter()
+        .map(|observation| observation.value)
+        .collect()
+}
+
+/// Query every feed and return the exact successful observations for durable
+/// evidence. Failed feeds are logged by stable provider name only.
+pub async fn source_quote_evidence(feeds: &[Feed<'_>]) -> Vec<SourcedValue> {
     let mut quotes = Vec::with_capacity(feeds.len());
     for feed in feeds {
-        match feed.venue.fetch_price_wad(feed.symbol).await {
+        match feed.venue.fetch_price_observation(feed.symbol).await {
             Ok(q) => quotes.push(q),
             Err(e) => tracing::warn!(
                 venue = feed.venue.name(),
@@ -143,25 +170,57 @@ fn json_price(body: &str, path: &[&str]) -> Result<U256, VenueError> {
 }
 
 /// Shared reqwest GET → body text, mapping transport/status to [`VenueError`].
-async fn http_get(client: &reqwest::Client, url: &str) -> Result<String, VenueError> {
+pub(crate) async fn http_get(client: &reqwest::Client, url: &str) -> Result<String, VenueError> {
+    const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
     let resp = client
         .get(url)
         .send()
         .await
-        .map_err(|e| VenueError::Http(e.to_string()))?;
+        .map_err(|e| VenueError::Http(transport_class(&e).to_string()))?;
     if !resp.status().is_success() {
         return Err(VenueError::Http(format!("status {}", resp.status())));
     }
-    resp.text()
+    let bytes = resp
+        .bytes()
         .await
-        .map_err(|e| VenueError::Http(e.to_string()))
+        .map_err(|e| VenueError::Http(transport_class(&e).to_string()))?;
+    if bytes.len() > MAX_BODY_BYTES {
+        return Err(VenueError::Http("response body exceeds 2 MiB".to_string()));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| VenueError::Http("response body is not UTF-8".to_string()))
+}
+
+/// Classify a reqwest failure without copying its display string. Reqwest
+/// errors may include the complete credential-bearing request URL.
+pub(crate) fn transport_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
+    }
 }
 
 /// `binance` spot-price venue client.
-#[derive(Debug)]
 pub struct BinanceVenue {
     client: reqwest::Client,
     base: String,
+}
+
+impl std::fmt::Debug for BinanceVenue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinanceVenue")
+            .field("base", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl BinanceVenue {
@@ -188,17 +247,31 @@ impl PriceVenue for BinanceVenue {
     fn name(&self) -> &'static str {
         "binance"
     }
-    async fn fetch_price_wad(&self, symbol: &str) -> Result<U256, VenueError> {
+    async fn fetch_price_observation(&self, symbol: &str) -> Result<SourcedValue, VenueError> {
         let url = format!("{}/api/v3/ticker/price?symbol={symbol}", self.base);
-        Self::parse_price(&http_get(&self.client, &url).await?)
+        let body = http_get(&self.client, &url).await?;
+        Ok(SourcedValue {
+            source: self.name(),
+            subject: symbol.to_string(),
+            value: Self::parse_price(&body)?,
+            response_hash: keccak256(body.as_bytes()),
+            raw_response: body,
+        })
     }
 }
 
 /// `coinbase` spot-price venue client.
-#[derive(Debug)]
 pub struct CoinbaseVenue {
     client: reqwest::Client,
     base: String,
+}
+
+impl std::fmt::Debug for CoinbaseVenue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoinbaseVenue")
+            .field("base", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl CoinbaseVenue {
@@ -225,17 +298,31 @@ impl PriceVenue for CoinbaseVenue {
     fn name(&self) -> &'static str {
         "coinbase"
     }
-    async fn fetch_price_wad(&self, symbol: &str) -> Result<U256, VenueError> {
+    async fn fetch_price_observation(&self, symbol: &str) -> Result<SourcedValue, VenueError> {
         let url = format!("{}/v2/prices/{symbol}/spot", self.base);
-        Self::parse_price(&http_get(&self.client, &url).await?)
+        let body = http_get(&self.client, &url).await?;
+        Ok(SourcedValue {
+            source: self.name(),
+            subject: symbol.to_string(),
+            value: Self::parse_price(&body)?,
+            response_hash: keccak256(body.as_bytes()),
+            raw_response: body,
+        })
     }
 }
 
 /// `kraken` spot-price venue client.
-#[derive(Debug)]
 pub struct KrakenVenue {
     client: reqwest::Client,
     base: String,
+}
+
+impl std::fmt::Debug for KrakenVenue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KrakenVenue")
+            .field("base", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl KrakenVenue {
@@ -275,9 +362,16 @@ impl PriceVenue for KrakenVenue {
     fn name(&self) -> &'static str {
         "kraken"
     }
-    async fn fetch_price_wad(&self, symbol: &str) -> Result<U256, VenueError> {
+    async fn fetch_price_observation(&self, symbol: &str) -> Result<SourcedValue, VenueError> {
         let url = format!("{}/0/public/Ticker?pair={symbol}", self.base);
-        Self::parse_price(&http_get(&self.client, &url).await?)
+        let body = http_get(&self.client, &url).await?;
+        Ok(SourcedValue {
+            source: self.name(),
+            subject: symbol.to_string(),
+            value: Self::parse_price(&body)?,
+            response_hash: keccak256(body.as_bytes()),
+            raw_response: body,
+        })
     }
 }
 
@@ -370,8 +464,15 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
-        async fn fetch_price_wad(&self, _symbol: &str) -> Result<U256, VenueError> {
+        async fn fetch_price_observation(&self, symbol: &str) -> Result<SourcedValue, VenueError> {
             self.result
+                .map(|value| SourcedValue {
+                    source: self.name,
+                    subject: symbol.to_string(),
+                    value,
+                    response_hash: B256::repeat_byte(1),
+                    raw_response: "mock".to_string(),
+                })
                 .map_err(|()| VenueError::Http("mock down".to_string()))
         }
     }

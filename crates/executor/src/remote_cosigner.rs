@@ -30,12 +30,22 @@ const DEFAULT_TIMEOUT_SECS: u64 = 10;
 /// against every daemon response. Bound to one UTXO chain (since U8 —
 /// daemons are multi-role internally but each cosigner instance speaks
 /// for one chain on behalf of the coordinator).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RemoteMultisigCosigner {
     chain_id: ChainId,
     base_url: String,
     expected_pubkey: bitcoin::PublicKey,
     inner: reqwest::blocking::Client,
+}
+
+impl std::fmt::Debug for RemoteMultisigCosigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteMultisigCosigner")
+            .field("chain_id", &self.chain_id)
+            .field("base_url", &"<redacted>")
+            .field("expected_pubkey", &self.expected_pubkey)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RemoteMultisigCosigner {
@@ -118,18 +128,19 @@ impl MultisigCosigner for RemoteMultisigCosigner {
             .post(format!("{}/api/v1/sign/psbt-input", self.base_url))
             .json(&req)
             .send()
-            .map_err(|e| ExecuteError::InvalidMemo(format!("daemon transport: {e}")))?;
+            .map_err(|e| {
+                ExecuteError::InvalidMemo(format!("daemon transport: {}", transport_class(&e)))
+            })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(ExecuteError::InvalidMemo(format!(
-                "daemon http {}: {body}",
+                "daemon http {}",
                 status.as_u16()
             )));
         }
         let parsed: PsbtSignResponse = resp
             .json()
-            .map_err(|e| ExecuteError::InvalidMemo(format!("daemon response json: {e}")))?;
+            .map_err(|_| ExecuteError::InvalidMemo("daemon response json malformed".to_string()))?;
 
         // Pin the pubkey: a misdirected daemon returning a different
         // signer is a hard fail.
@@ -151,6 +162,20 @@ impl MultisigCosigner for RemoteMultisigCosigner {
         let btc_sig = BtcEcdsaSig::from_slice(&sig_bytes)
             .map_err(|e| ExecuteError::InvalidMemo(format!("daemon signature: {e}")))?;
         Ok((pk, btc_sig))
+    }
+}
+
+fn transport_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
     }
 }
 

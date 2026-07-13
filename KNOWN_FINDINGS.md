@@ -874,6 +874,49 @@ Verify: `custody-core` 44, `custody-node` 32 (+recompute/TK-04 regressions),
 + deny + audit) run before commit. SOL-01 (the only live finding) is Solidity — see
 `Xindex/KNOWN_FINDINGS.md`.
 
+## Gate-3 parent-protocol compatibility delta (2026-07-13)
+
+The parent-repository audit initially assessed clean `main@365d9b4` and found
+4 Critical, 5 High and 2 Medium production-readiness findings. Local `main` was
+then fast-forwarded, from already-present objects and without fetch/push, to
+`1de7114`; the current feature branch contains the remediation delta.
+
+Closed or materially hardened at code level:
+
+- all eight current parent ABIs are manifested and drift-checked;
+- all seven current EIP-712 report types have Rust vectors, with four pure
+  Solidity cross-language checks;
+- registry signing reserves durable state before HSM release, refuses
+  conflicts/equivocation, supports cached retry and serializes/reconciles quote
+  nonces;
+- registry collector input is fully parsed, digest-recomputed,
+  low-S/recovery/allowlist checked and deterministically grouped;
+- price startup requires three distinct price origins, two distinct supply
+  origins and two collector origins; exact bounded raw responses are persisted
+  before signing and anomaly/source failure halts publication;
+- THOR agreement requires all three sources and treats missing halt/LP-pause
+  fields as unsafe;
+- reviewed raw software/Turnkey signer paths and centralized legacy attesters
+  are dev-only, production signer startup requires durable state + mTLS + an
+  external HSM boundary, and permissionless posters accept managed addresses
+  rather than local private keys; and
+- credential-bearing endpoints, malformed secret inputs and upstream response
+  bodies are redacted across the reviewed paths.
+
+Gate disposition remains **FAIL/open**. The exact registry components are
+libraries rather than a complete live inbound/quote producer/poster. Current
+mint/delivery/refund/streamed observation, finalized checkpoints/reorg rollback,
+consumed-inflow/custody-spend coverage, a full native transaction-policy
+executor, production metrics/alerts, independent operator/HSM/source records,
+and independent review remain absent.
+
+Key-free verification: eight-ABI and production-profile gates pass; 75 selected
+Rust tests and four pure Solidity vectors pass; fmt, locked/offline all-target
+Clippy and compile-only tests pass; cargo-deny and policy-configured cargo-audit
+pass with documented warnings. No signer, custody, key, deployment, broadcast
+or external transaction was used. The authoritative report is
+`../memory/GATE-3-SIGNER-SERVICE-AUDIT.md`.
+
 ## When this file gets updated
 
 - New audit pass (internal or external) → add a section

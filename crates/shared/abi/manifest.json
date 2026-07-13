@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "canonicalization": "jq -cS 'if type == \"array\" then . else .abi end'",
+  "solidity": {
+    "version": "0.8.28",
+    "viaIR": true,
+    "evmVersion": "cancun",
+    "optimizerRuns": 200
+  },
+  "contracts": {
+    "AttestationOracle": "d30fe052512d96293b3b7daf50cfc99715a6c669b2d0c24bc742eac4a89dfa11",
+    "CustodyGuard": "21d865fe93ab548ebb656b74e73f213667b464f297b33f0c39d3471277aeabc0",
+    "IndexFactory": "95d750160af03dfa840dc674092a572d7282744df0d196998e96c4e3016648e7",
+    "IndexToken": "0881d4897f4c0f0cf02ea3f94ef927e9fe2e15f914c14a2bdcfa36613968d8a6",
+    "IntentQueue": "73ddc4537e5a1584b1b6db9ff329a67d16110233b14788fc00be88e57e2e3620",
+    "PriceAttestationOracle": "a14c8042d2a90e30b4121f5a45791b8aea396fac25566fc0fb2a6406279aecba",
+    "ThorchainAdapter": "63a2f13f0426b66961a3e175a87156269ce433d692df030cca240e0c678b7727",
+    "ThorchainVaultRegistry": "34bb473b097f489145b804dd73a0c3a720448c0b7c4b31939f76c2c35fae1629"
+  }
+}

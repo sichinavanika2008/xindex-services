@@ -1,7 +1,7 @@
 //! Fail-closed Cobo development-environment qualification gate.
 //!
 //! This binary is deliberately separate from the active Turnkey custody wire.
-//! It can inspect the pinned Cobo OpenAPI surface and locally validate captured
+//! It can inspect the pinned Cobo `OpenAPI` surface and locally validate captured
 //! evidence without credentials. A complete PASS additionally requires an
 //! authenticated call to the hard-coded Cobo development API plus live Cobo
 //! transaction records for the BTC, EVM, and negative-test artifacts.
@@ -53,7 +53,7 @@ const REQUIRED_NEGATIVE_CASES: [&str; 5] = [
     about = "Fail-closed, evidence-producing Cobo development gate"
 )]
 struct Args {
-    /// Official Cobo SDK OpenAPI YAML snapshot (release 1.39).
+    /// Official Cobo SDK `OpenAPI` YAML snapshot (release 1.39).
     #[arg(long, default_value = DEFAULT_OPENAPI)]
     openapi: PathBuf,
     /// Captured dev-environment evidence JSON. Omit for schema-only offline mode.
@@ -209,6 +209,10 @@ struct CallbackEvidence {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "evidence shape mirrors four independent captured yes/no facts"
+)]
 struct NegativeEvidence {
     case: String,
     cobo_transaction_id: String,
@@ -277,7 +281,7 @@ impl std::fmt::Debug for CoboDevClient {
         f.debug_struct("CoboDevClient")
             .field("api_base", &API_BASE)
             .field("api_key_fingerprint", &self.signer.api_key_fingerprint())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -402,6 +406,10 @@ fn schema_property_names(block: &str) -> BTreeSet<String> {
     names
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear fail-closed inspection report keeps evidence checks auditable"
+)]
 fn inspect_openapi(path: &Path) -> (OpenApiSource, Vec<Check>, bool) {
     let mut source = OpenApiSource {
         sdk_release: OPENAPI_RELEASE,
@@ -427,20 +435,17 @@ fn inspect_openapi(path: &Path) -> (OpenApiSource, Vec<Check>, bool) {
     let actual_sha256 = sha256_hex(&bytes);
     let source_matches = actual_sha256 == OPENAPI_SHA256;
     source.sha256 = Some(actual_sha256.clone());
-    let yaml = match std::str::from_utf8(&bytes) {
-        Ok(yaml) => yaml,
-        Err(_) => {
-            return (
-                source,
-                vec![Check::new(
-                    "OPENAPI-01",
-                    true,
-                    GateStatus::Fail,
-                    "OpenAPI snapshot is not UTF-8",
-                )],
-                false,
-            );
-        }
+    let Ok(yaml) = std::str::from_utf8(&bytes) else {
+        return (
+            source,
+            vec![Check::new(
+                "OPENAPI-01",
+                true,
+                GateStatus::Fail,
+                "OpenAPI snapshot is not UTF-8",
+            )],
+            false,
+        );
     };
 
     let mut checks = vec![Check::new(
@@ -1293,6 +1298,10 @@ async fn evaluate_btc(
     ]
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear evidence checklist is clearer than split stateful helpers"
+)]
 async fn evaluate_evm(
     evidence: Option<&GateEvidence>,
     client: Option<&CoboDevClient>,
@@ -1612,7 +1621,9 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let complete = evaluate_assets(Some(&ids));
         assert_eq!(complete.len(), 15);
-        assert!(complete.iter().all(|asset| asset.status == GateStatus::Pass));
+        assert!(complete
+            .iter()
+            .all(|asset| asset.status == GateStatus::Pass));
 
         assert!(ids.remove("NOBLE"));
         let missing = evaluate_assets(Some(&ids));
@@ -1695,14 +1706,16 @@ mod tests {
             std::process::id(),
             now_millis()
         ));
-        fs::write(&path, serde_json::to_vec(&base).expect("serialize")).expect("write valid evidence");
+        fs::write(&path, serde_json::to_vec(&base).expect("serialize"))
+            .expect("write valid evidence");
         let (evidence, check) = load_evidence(Some(path.as_path()));
         assert!(evidence.is_some());
         assert_eq!(check.status, GateStatus::Pass);
 
         let mut invalid = base;
         invalid["unexpected"] = Value::Bool(true);
-        fs::write(&path, serde_json::to_vec(&invalid).expect("serialize")).expect("write invalid evidence");
+        fs::write(&path, serde_json::to_vec(&invalid).expect("serialize"))
+            .expect("write invalid evidence");
         let (evidence, check) = load_evidence(Some(path.as_path()));
         assert!(evidence.is_none());
         assert_eq!(check.status, GateStatus::Fail);
@@ -1765,7 +1778,10 @@ mod tests {
             evm: None,
         };
         invalid.wallet.threshold = 1;
-        assert_eq!(evaluate_wallet(Some(&invalid), None).await.status, GateStatus::Fail);
+        assert_eq!(
+            evaluate_wallet(Some(&invalid), None).await.status,
+            GateStatus::Fail
+        );
     }
 
     #[test]

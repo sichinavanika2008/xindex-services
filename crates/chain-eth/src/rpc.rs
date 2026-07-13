@@ -34,7 +34,7 @@
 //!         WsConnect::new(&url).connect().await
 //!     })
 //!     .await?;
-//! info!(rpc_url = %used_url, "connected");
+//! info!(rpc_endpoint = %redacted_endpoint(&used_url), "connected");
 //! ```
 
 use std::time::Duration;
@@ -142,12 +142,12 @@ impl WsEndpointList {
         E: std::fmt::Display,
     {
         let mut last_err: Option<(String, E)> = None;
-        for url in &self.urls {
+        for (endpoint_index, url) in self.urls.iter().enumerate() {
             match connect(url.clone()).await {
                 Ok(p) => {
                     if last_err.is_some() {
                         tracing::info!(
-                            url = %url,
+                            endpoint_index,
                             "RPC fallover succeeded after primary(s) failed"
                         );
                     }
@@ -155,19 +155,15 @@ impl WsEndpointList {
                 }
                 Err(e) => {
                     if is_transient_rpc_error(&e) {
-                        tracing::warn!(
-                            url = %url,
-                            error = %e,
-                            "transient RPC error; trying next endpoint"
-                        );
-                        last_err = Some((url.clone(), e));
+                        tracing::warn!(endpoint_index, "transient RPC error; trying next endpoint");
+                        last_err = Some((redacted_endpoint(url), e));
                     } else {
                         // Permanent error — propagate immediately rather
                         // than mask it behind a fallover. Bad credentials,
                         // wrong chain id, malformed URL: these need
                         // operator attention, not silent fallover.
                         return Err(ConnectAttempt::Permanent {
-                            url: url.clone(),
+                            url: redacted_endpoint(url),
                             source: e,
                         });
                     }
@@ -179,6 +175,17 @@ impl WsEndpointList {
             last: last_err,
         })
     }
+}
+
+/// Return a credential-safe endpoint label for structured logs and errors.
+/// RPC URLs routinely embed API keys in userinfo, path, query, or even a
+/// provider-specific hostname, so the only safe reusable detail is the scheme.
+#[must_use]
+pub fn redacted_endpoint(raw: &str) -> String {
+    let scheme = raw
+        .split_once("://")
+        .map_or("unknown", |(scheme, _)| scheme);
+    format!("{scheme}://<redacted>")
 }
 
 /// Failure surfaced by [`WsEndpointList::connect_first_working`]. Splits
@@ -353,6 +360,16 @@ mod tests {
             WsEndpointList::from_csv("   "),
             Err(EndpointError::Empty)
         ));
+    }
+
+    #[test]
+    fn endpoint_redaction_never_leaks_credentials_or_host() {
+        let raw = "wss://user:secret@api-key.provider.example/v3/token?key=other#fragment";
+        let label = redacted_endpoint(raw);
+        assert_eq!(label, "wss://<redacted>");
+        for secret in ["user", "secret", "api-key", "provider", "token", "other"] {
+            assert!(!label.contains(secret));
+        }
     }
 
     /// String-error wrapper for the classifier tests — we don't need

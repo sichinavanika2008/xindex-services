@@ -17,10 +17,16 @@ fill Solana values for mainnet.
 | `IntentPolicy` | `IntentPolicy::validate()` | empty/duplicate Set-B whitelist, zero quorum, quorum > whitelist, zero `ric_max_age_secs` |
 | `CertVolumePolicy` | `CertVolumePolicy::validate()` | `window_secs == 0`, any cap `== 0` |
 | **Production metering** | `DaemonState::assert_production_safe()` → `CertVolumePolicy::assert_metered_for(served)` | **any served RIC-gated chain (BTC/EVM/Cosmos/XRP/TRON) has no positive cap** — `unmetered()` is dev/test ONLY |
+| **Durable replay** | binary startup | `database_url` is absent outside `--dev` |
+| **Signer perimeter** | binary startup | software HSM, missing outer mTLS, or a non-loopback/credential-bearing HSM URL is configured |
 
 A production launcher MUST call `DaemonState::assert_production_safe()` after
 constructing state and before serving. `unmetered()` + an in-process HSM stub
 are the dev/test opt-out and must never reach mainnet.
+
+The checked-in binary now performs these launcher checks itself before opening
+the database or binding a socket. The database, HSM frontend and TLS files are
+operator-provisioned ceremony inputs; none is populated in this repository.
 
 ## 1. Signer daemon (per operator, per key role)
 
@@ -48,10 +54,20 @@ cert_caps = {                                         # ≈10% of per-chain cust
 tls_server_cert        = /etc/xindex/tls/server.pem   # this daemon's server cert chain
 tls_server_key         = /etc/xindex/tls/server.key
 tls_pinned_client_cert = /etc/xindex/tls/coordinator.pem  # the SELF-SIGNED coordinator cert(s) to pin
+
+# ── durable anti-replay/equivocation state ──
+database_url            = sqlite:///var/lib/xindex/signer-daemon.db
 ```
 
 - Build the rustls server via `signer-daemon::tls::server_config(load_cert_chain(server), load_private_key(key), pinned_root_store([coordinator]))` and serve with `serve_mtls`. An unpinned client is dropped at the handshake.
 - `cert_caps` must contain a positive cap for **every** chain this daemon has a signing role for, or `assert_production_safe()` refuses to boot.
+- `hsm_url` may name only `localhost` or a literal loopback address and may not
+  contain URL userinfo, a query or a fragment. Keep HSM authentication out of
+  the URL and inside the local HSM perimeter.
+- The current concrete `xindex-signer-daemon` launcher accepts only the BTC
+  UTXO role in `parse_chain_id`; other family libraries are not evidence of a
+  production-wired daemon. Do not mark those families enabled until their
+  launchers and rehearsals land.
 
 ## 2. Coordinator / observer (`xindex-observe-redeem`, `xindex-attest*`, `xindex-redeem-*`)
 
@@ -91,3 +107,8 @@ key ceremony (`*-key-ceremony.md`) · testnet/signet rehearsal · the byte-match
 gate green · `cert_caps` + on-chain `CustodyGuard` caps filled · the daemon
 boots past `assert_production_safe()`. Cosmos additionally: `--nosort-pubkeys`
 at the ceremony (the gaiad multisig-address fund-safety fix).
+
+The standalone Turnkey drivers and approver are rehearsal-only and now require
+`--dev` before reading their software P-256 API-stamping key. They are not an
+alternative production profile. A future production Turnkey path requires a
+remote/HSM request stamper and a separate reviewed wire integration.

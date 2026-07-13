@@ -1,3 +1,8 @@
+#![expect(
+    clippy::too_many_lines,
+    reason = "ignored release fixture drives the complete local oracle lifecycle"
+)]
+
 //! Runnable ignored end-to-end gate for the NAV price quorum path.
 //!
 //! Run explicitly (requires `anvil`, `forge`, and the sibling Solidity repo):

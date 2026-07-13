@@ -5,7 +5,7 @@
 This repository contains Xindex's off-chain Rust services: observers,
 attestations, custody, native-chain execution, relaying, and operational tools.
 
-Read the [shared protocol guide](../Xindex/AGENTS.md) first. This file is its
+Read the [shared protocol guide](../AGENTS.md) first. This file is its
 Rust-specific supplement and the active local working context for Codex/GPT
 agents. Legacy AI plans, memories, and out-of-tree paths are archival context
 only; they are not required to understand or work on this repository.
@@ -16,7 +16,7 @@ only; they are not required to understand or work on this repository.
 2. The recent sections of this repository's KNOWN_FINDINGS.md.
 3. docs/runbooks/turnkey-custody-devenv.md for the provisional Turnkey wire and
    its validation gates.
-4. ../Xindex/AGENTS.md and this file.
+4. ../AGENTS.md and this file.
 5. Older README milestone tables and historical plans.
 
 Code wins when documentation conflicts. Do not represent a historical custody
@@ -47,10 +47,14 @@ the relevant runbook.
 - signer-daemon, observer, relayer, and shared contain the EIP-712 and
   cross-chain attestation paths. Preserve domain separation, quorum checks,
   finality handling, and replay defenses.
-- The price-signing code has a production-completion gap: no implemented
-  collector/poster submits attestPrice, signer output omits supply, and quorum
-  signers need a deliberate byte-identical message-coordination mechanism.
-  Treat that as a fail-closed functionality blocker.
+- The price path now includes supply, exact raw evidence, multi-source
+  median/TWAP signing, byte-identical tuple collection and a permissionless
+  `attestPrice` poster. Production operator/source independence, metrics/alerts,
+  retention exercises and independent review remain gates.
+- The current registry path has exact EIP-712 signer and collector cores plus
+  durable signature/nonce state, but no complete live inbound-state/quote
+  policy producer and poster. Treat that as a fail-closed functionality
+  blocker.
 
 ## Working rules
 

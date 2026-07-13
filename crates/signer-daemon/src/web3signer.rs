@@ -38,8 +38,8 @@ pub enum HsmError {
     Transport(String),
 
     /// Non-2xx response from the HSM frontend.
-    #[error("http {status}: {body}")]
-    Status { status: u16, body: String },
+    #[error("http {status}")]
+    Status { status: u16 },
 
     /// Response did not decode into the expected shape, or the returned
     /// signature was not 65 bytes hex.
@@ -86,10 +86,19 @@ pub struct SignResponseBody {
 /// production deployment runs the HSM frontend on loopback inside the
 /// daemon's own mTLS perimeter — no operator credential, no public
 /// network exposure.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpHsmClient {
     base_url: String,
-    inner: reqwest::Client,
+    inner: Option<reqwest::Client>,
+}
+
+impl std::fmt::Debug for HttpHsmClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpHsmClient")
+            .field("base_url", &"<redacted>")
+            .field("configured", &self.inner.is_some())
+            .finish()
+    }
 }
 
 impl HttpHsmClient {
@@ -103,10 +112,7 @@ impl HttpHsmClient {
 
     #[must_use]
     pub fn with_timeout(base_url: impl Into<String>, timeout: std::time::Duration) -> Self {
-        let inner = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let inner = reqwest::Client::builder().timeout(timeout).build().ok();
         Self {
             base_url: base_url.into(),
             inner,
@@ -121,26 +127,41 @@ impl HsmDigestSigner for HttpHsmClient {
             address: format!("{address:#x}"),
             digest: format!("{digest:#x}"),
         };
-        let resp = self
+        let inner = self
             .inner
+            .as_ref()
+            .ok_or_else(|| HsmError::Transport("client configuration".to_string()))?;
+        let resp = inner
             .post(format!("{}/sign", self.base_url))
             .json(&req)
             .send()
             .await
-            .map_err(|e| HsmError::Transport(e.to_string()))?;
+            .map_err(|e| HsmError::Transport(transport_class(&e).to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(HsmError::Status {
                 status: status.as_u16(),
-                body,
             });
         }
         let body: SignResponseBody = resp
             .json()
             .await
-            .map_err(|e| HsmError::Decode(format!("response json: {e}")))?;
+            .map_err(|_| HsmError::Decode("malformed response json".to_string()))?;
         parse_signature_hex(&body.signature)
+    }
+}
+
+fn transport_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else {
+        "unknown"
     }
 }
 

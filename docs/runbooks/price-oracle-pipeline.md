@@ -23,7 +23,7 @@ venue connectivity. Example shape (values are development placeholders):
   "hsm_url": "http://127.0.0.1:9000",
   "min_venues": 3,
   "max_deviation_bps": 5000,
-  "supply_min_venues": 1,
+  "supply_min_venues": 2,
   "twap_window_secs": 1800,
   "twap_min_samples": 10,
   "twap_max_gap_secs": 300,
@@ -32,13 +32,20 @@ venue connectivity. Example shape (values are development placeholders):
   "price_significant_digits": 4,
   "supply_significant_digits": 6,
   "state_file": "/var/lib/xindex/price-signer-last-epoch.json",
-  "collector_urls": ["http://127.0.0.1:9191"],
+  "evidence_dir": "/var/lib/xindex/price-evidence",
+  "evidence_operator_id": "operator-01",
+  "anomaly_failure_threshold": 12,
+  "collector_urls": [
+    "http://127.0.0.1:9191",
+    "http://127.0.0.1:9192"
+  ],
   "publish_attempts": 3,
   "publish_timeout_secs": 5,
   "binance_base": "https://api.binance.com",
   "coinbase_base": "https://api.coinbase.com",
   "kraken_base": "https://api.kraken.com",
   "coingecko_base": "https://api.coingecko.com",
+  "coincap_base": "https://api.coincap.io",
   "assets": [
     {
       "asset_id": "0x_______________________________________________",
@@ -46,7 +53,8 @@ venue connectivity. Example shape (values are development placeholders):
       "binance": "BTCUSDT",
       "coinbase": "BTC-USD",
       "kraken": "XBTUSD",
-      "coingecko": "bitcoin"
+      "coingecko": "bitcoin",
+      "coincap": "bitcoin"
     }
   ]
 }
@@ -54,9 +62,20 @@ venue connectivity. Example shape (values are development placeholders):
 
 `epoch_secs` must equal `interval_secs`; this makes every signer commit to the
 same floored unix epoch instead of its arbitrary observation second. Four price
-significant digits bounds deterministic flooring below 10 bps. A corrupt
-anti-equivocation state file refuses startup. Persist the state directory on a
-durable volume.
+significant digits bounds deterministic flooring below 10 bps. The build
+requires exactly three distinct price-provider origins, two distinct supply
+origins, and at least two distinct collector origins. A corrupt
+anti-equivocation state file refuses startup. Both paths must be absolute and
+live on durable storage; create the evidence directory ahead of time with mode
+`0700` (group/world access is rejected).
+
+For every asset/epoch, the signer writes one create-new, mode-`0600` evidence
+file containing each exact raw provider response, normalized value and response
+hash, then fsyncs the file and directory before asking the HSM to sign. It signs
+the values from those persisted observations, not a second fetch. A persistence
+failure stops publication. Repeated observation failures latch the process shut
+at `anomaly_failure_threshold`; the threshold must be at least
+`twap_min_samples + 2`. If every collector is unavailable, the signer exits.
 
 Run one producer per independent signer:
 
@@ -64,19 +83,23 @@ Run one producer per independent signer:
 cargo run -p xindex-signer-daemon --bin xindex-price-signer -- /etc/xindex/price-signer.json
 ```
 
-Stdout remains a complete JSON-lines audit stream and includes supply and the
-recovered signer address. Collector delivery retries only transient HTTP
-failures; alert on an exhausted publish or a deterministic 4xx rejection.
+Stdout emits the signed wire tuple and includes supply and the recovered signer
+address; the raw audit record is the locked evidence file. Collector delivery
+retries only transient HTTP failures. Alert on an exhausted publish, a
+deterministic 4xx rejection, any evidence/state persistence error, source
+disagreement, or the anomaly latch exiting the process.
 
 ## Collector/poster
 
 Keep the default loopback bind unless an authenticated private service mesh is
-in front of the endpoint. Do not put the poster key in argv or a config file.
+in front of the endpoint. The collector has no private-key input. Its connected
+RPC must delegate `eth_sendTransaction` signing for the configured address to a
+node-managed external signer such as Clef/HSM.
 
 ```sh
 export ETH_RPC_URL=http://127.0.0.1:8545
 export PRICE_ORACLE_ADDR=0x________________________________________
-export PRICE_POSTER_KEY=0x________________________________________
+export PRICE_POSTER_ADDRESS=0x____________________________________
 export PRICE_SIGNER_ADDRESSES=0xSigner1,0xSigner2,0xSigner3
 export PRICE_THRESHOLD=2
 
@@ -105,3 +128,6 @@ accepting a quorum it can no longer enqueue.
 - Configure production L1 bounds, Chainlink gates, heartbeat, challenge window,
   and alerts before the first price.
 - Include the final pipeline and operating configuration in external audit.
+- Wire Prometheus health/metrics for this binary and demonstrate the alert
+  routes and evidence-retention policy. Structured logs and fail-closed exits
+  exist, but that is not by itself monitoring evidence.

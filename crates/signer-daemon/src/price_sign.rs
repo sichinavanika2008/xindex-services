@@ -244,6 +244,19 @@ pub struct ProducerInputs<'a> {
     pub last_signed_at: Option<u64>,
 }
 
+/// Already-sourced observations plus the exact signing identity. The binary
+/// uses this shape after durably persisting the raw provider responses, so the
+/// values aggregated here are provably the values present in its evidence
+/// bundle rather than a second HTTP fetch.
+#[derive(Debug)]
+pub struct ObservedProducerInputs<'a> {
+    pub asset_id: B256,
+    pub price_quotes: &'a [U256],
+    pub supply_quotes: &'a [U256],
+    pub timestamp: u64,
+    pub last_signed_at: Option<u64>,
+}
+
 /// The full self-driven producer step for one asset: source price + supply from
 /// the configured venues, spatially median each (outlier-rejected, fail-closed),
 /// record the price sample into the per-asset TWAP `history`, temporally average
@@ -272,12 +285,47 @@ pub async fn produce_signed_price<H: HsmDigestSigner>(
     let price_quotes = crate::price_venue::source_quotes(input.price_feeds).await;
     let supply_quotes =
         crate::price_supply::source_supply(input.supply_feeds, input.decimals).await;
+    produce_signed_price_from_observations(
+        hsm,
+        signer_address,
+        domain,
+        policy,
+        &ObservedProducerInputs {
+            asset_id: input.asset_id,
+            price_quotes: &price_quotes,
+            supply_quotes: &supply_quotes,
+            timestamp: input.timestamp,
+            last_signed_at: input.last_signed_at,
+        },
+        history,
+    )
+    .await
+}
+
+/// Aggregate, TWAP and sign values whose exact raw source responses were
+/// already persisted by the caller.
+///
+/// # Errors
+/// Same fail-closed errors as [`produce_signed_price`].
+pub async fn produce_signed_price_from_observations<H: HsmDigestSigner>(
+    hsm: &H,
+    signer_address: Address,
+    domain: &Eip712Domain,
+    policy: PricePolicy,
+    input: &ObservedProducerInputs<'_>,
+    history: &mut Vec<TwapSample>,
+) -> Result<SignedPrice, PriceSignError> {
+    validate_canonical_digits(policy)?;
     // Spatial layer: median across venues, outlier-rejected (fail-closed). A
     // consensus failure returns BEFORE recording a sample, so a bad round never
     // pollutes the TWAP buffer.
-    let spatial = aggregate_price(&price_quotes, policy.min_venues, policy.max_deviation_bps)?;
+    let spatial = aggregate_price(
+        input.price_quotes,
+        policy.min_venues,
+        policy.max_deviation_bps,
+    )?;
     let supply = aggregate_price(
-        &supply_quotes,
+        input.supply_quotes,
         policy.supply_min_venues,
         policy.max_deviation_bps,
     )?;
@@ -494,11 +542,17 @@ mod tests {
         fn name(&self) -> &'static str {
             "fixed"
         }
-        async fn fetch_price_wad(
+        async fn fetch_price_observation(
             &self,
-            _symbol: &str,
-        ) -> Result<U256, crate::price_venue::VenueError> {
-            Ok(self.0)
+            symbol: &str,
+        ) -> Result<crate::price_venue::SourcedValue, crate::price_venue::VenueError> {
+            Ok(crate::price_venue::SourcedValue {
+                source: "fixed",
+                subject: symbol.to_string(),
+                value: self.0,
+                response_hash: B256::repeat_byte(1),
+                raw_response: "fixed".to_string(),
+            })
         }
     }
 
@@ -509,12 +563,18 @@ mod tests {
         fn name(&self) -> &'static str {
             "fixed"
         }
-        async fn circulating_supply_raw(
+        async fn circulating_supply_observation(
             &self,
-            _id: &str,
+            id: &str,
             _decimals: u8,
-        ) -> Result<U256, crate::price_venue::VenueError> {
-            Ok(self.0)
+        ) -> Result<crate::price_venue::SourcedValue, crate::price_venue::VenueError> {
+            Ok(crate::price_venue::SourcedValue {
+                source: "fixed",
+                subject: id.to_string(),
+                value: self.0,
+                response_hash: B256::repeat_byte(1),
+                raw_response: "fixed".to_string(),
+            })
         }
     }
 

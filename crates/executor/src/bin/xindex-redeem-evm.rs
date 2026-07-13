@@ -148,6 +148,11 @@ struct SafeArgs {
 /// (hex) — never an argv flag.
 #[derive(Debug, ClapArgs)]
 struct TurnkeyEvmArgs {
+    /// Required rehearsal mode. This backend reads a software P-256 Turnkey
+    /// API stamping key, so it is not part of the production profile.
+    #[arg(long, env = "XINDEX_DEV", default_value_t = false)]
+    dev: bool,
+
     /// Destination EVM chain (eth / bsc / avax / base / pol).
     #[arg(long)]
     chain: String,
@@ -523,6 +528,11 @@ async fn run_safe(args: SafeArgs) -> Result<()> {
 /// the shared prepare store, sign the tx hash via Turnkey (gated by the
 /// approver-watcher), assemble the raw signed tx, and submit it.
 async fn run_turnkey(args: TurnkeyEvmArgs) -> Result<()> {
+    if !args.dev {
+        anyhow::bail!(
+            "refusing production startup: the Turnkey backend reads a software API stamping key; pass --dev only for an authorized rehearsal"
+        );
+    }
     let chain = parse_chain(&args.chain)?;
     let custody_address = parse_addr("--custody-address", &args.custody_address)?;
     let vault = parse_addr("--vault", &args.vault)?;

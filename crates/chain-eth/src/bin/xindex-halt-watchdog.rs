@@ -7,7 +7,8 @@
 //! vault *freshness* — there is no off-chain "refuse to mint into a halted
 //! chain" lever. This daemon adds one.
 //!
-//! It polls the operator's OWN ≥2 distinct `THORChain` sources for the
+//! It polls the operator's OWN fullnode plus two independent public
+//! `THORChain` providers for the
 //! per-chain halt/pause flags and, once a halt is observed on
 //! `--halt-confirmations` consecutive polls, engages the on-chain
 //! `CustodyGuard.halt()` containment — which fail-closes BOTH new mint
@@ -19,7 +20,7 @@
 //! UN-halts — that is a deliberate quorum action via `voteUnhalt`.
 //!
 //! Trigger posture is fail-closed but bounded:
-//! - the multi-source poll requires ≥2 sources to agree the chain is present
+//! - the multi-source poll requires all three source roles to agree the chain is present
 //!   before any verdict, so one hostile/flaky source can force a (bounded,
 //!   reversible) pause but can never SUPPRESS a real halt;
 //! - `Indeterminate` reads (transport failure / sub-quorum) never trigger — a
@@ -34,10 +35,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::{ProviderBuilder, WsConnect};
-use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::time::interval;
@@ -59,14 +58,14 @@ struct Args {
     #[arg(long, env = "CUSTODY_GUARD_ADDR")]
     custody_guard: String,
 
-    /// This operator's roster EOA key — MUST be one of `CustodyGuard`'s
-    /// operators, else every `halt()` submission reverts `OnlyOperator`.
-    #[arg(long, env = "OPERATOR_KEY")]
-    operator_key: String,
+    /// This operator's roster address. The authenticated Ethereum RPC/HSM
+    /// submits `eth_sendTransaction`; this process never accepts a raw key.
+    #[arg(long, env = "OPERATOR_ADDRESS")]
+    operator_address: String,
 
-    /// Comma-separated `THORNode` REST base URLs — the operator's OWN ≥2
-    /// DISTINCT sources (diverse-source halt signal; a single source is
-    /// refused at startup, mirroring the RIC observer floor).
+    /// Comma-separated `THORNode` REST base URLs — operator-controlled
+    /// fullnode first, followed by at least two independently administered
+    /// public providers. Fewer than three responses fail closed.
     #[arg(long, env = "THORNODE_URLS")]
     thornode_urls: String,
 
@@ -115,16 +114,21 @@ async fn run(args: Args) -> Result<()> {
     for url in &urls {
         clients.push(
             ThorClient::with_base_url(url.clone())
-                .with_context(|| format!("build THORNode client for {url}"))?,
+                .context("build THORNode client (endpoint redacted)")?,
         );
     }
     // Refuses < MIN_AGREEING_SOURCES — a single-source watchdog is as
     // poisonable as a single-source RIC.
     let agreement = AsgardAgreement::new(clients)
-        .context("build AsgardAgreement (need ≥2 distinct THORNODE_URLS)")?;
+        .context("build AsgardAgreement (need fullnode + two public THORNODE_URLS)")?;
 
-    let operator: PrivateKeySigner = args.operator_key.parse().context("invalid OPERATOR_KEY")?;
-    let operator_addr = operator.address();
+    let operator_addr: Address = args
+        .operator_address
+        .parse()
+        .context("invalid OPERATOR_ADDRESS")?;
+    if operator_addr.is_zero() {
+        anyhow::bail!("OPERATOR_ADDRESS must be non-zero");
+    }
     let guard_addr =
         Address::from_str(&args.custody_guard).context("CUSTODY_GUARD_ADDR invalid")?;
 
@@ -132,7 +136,6 @@ async fn run(args: Args) -> Result<()> {
     let provider = Arc::new(
         ProviderBuilder::new()
             .with_recommended_fillers()
-            .wallet(EthereumWallet::new(operator))
             .on_ws(ws)
             .await
             .context("connect WS provider")?,
@@ -190,7 +193,7 @@ async fn run(args: Args) -> Result<()> {
                     }
                     Ok(_) => {
                         info!("engaging CustodyGuard.halt() (sustained THORChain halt)");
-                        match guard.halt().send().await {
+                        match guard.halt().from(operator_addr).send().await {
                             Ok(p) => match p.get_receipt().await {
                                 Ok(r) => {
                                     info!(tx = %r.transaction_hash, "CustodyGuard.halt() mined");

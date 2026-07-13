@@ -42,6 +42,7 @@ use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::ThorchainAdapter;
+use xindex_chain_eth::rpc::redacted_endpoint;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::{EsploraClient, UtxoChainClient, UtxoParams};
 use xindex_executor::remote_cosigner::RemoteMultisigCosigner;
@@ -68,6 +69,11 @@ use xindex_shared::redemption_dispatch::{AnyRedemptionDispatch, RedemptionDispat
 #[derive(Parser, Debug, Clone)]
 #[command(version, about = "Xindex redemption executor (M3)")]
 struct Args {
+    /// Enable local/test scaffolding, including software keys and in-memory
+    /// replay state. Omit for the fail-closed production profile.
+    #[arg(long, env = "XINDEX_DEV", default_value_t = false)]
+    dev: bool,
+
     /// WebSocket Ethereum RPC endpoint. Anvil default is `ws://127.0.0.1:8545`;
     /// Sepolia uses an Alchemy/Infura WSS URL.
     #[arg(long, env = "ETH_RPC_URL", default_value = "ws://127.0.0.1:8545")]
@@ -232,6 +238,40 @@ struct Args {
     rebroadcast_final_depth: u32,
 }
 
+impl Args {
+    fn assert_production_safe(&self) -> Result<()> {
+        if self.dev {
+            return Ok(());
+        }
+        if self.signer_mode != SignerMode::Remote || self.multisig_secret_keys.is_some() {
+            anyhow::bail!("production requires remote HSM cosigners and prohibits raw secret keys");
+        }
+        if self.chain != "btc" || !matches!(self.btc_network.as_str(), "bitcoin" | "mainnet") {
+            anyhow::bail!("the reviewed production profile enables Bitcoin mainnet only");
+        }
+        if self.multisig_threshold < 3 {
+            anyhow::bail!("production custody threshold must be at least 3");
+        }
+        if self.broadcast_database_url.is_none() || self.redemption_database_url.is_none() {
+            anyhow::bail!("production requires durable broadcast and redemption SQLite stores");
+        }
+        let observers = self
+            .observer_urls
+            .as_deref()
+            .map_or(0, |s| s.split(',').filter(|v| !v.trim().is_empty()).count());
+        let quorum = self.intent_quorum.unwrap_or(0);
+        if observers < 5 || quorum < 3 || quorum <= observers / 2 {
+            anyhow::bail!(
+                "production requires at least five observer endpoints and a strict-majority quorum"
+            );
+        }
+        if self.cosigner_daemon_urls.is_none() || self.cosigner_pubkeys.is_none() {
+            anyhow::bail!("production requires pinned remote cosigner endpoints and public keys");
+        }
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -243,10 +283,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    args.assert_production_safe()?;
     // Static dispatch on the broadcast registry impl. Persistent
     // (SQLite) for prod; in-memory for dev.
     if let Some(db_url) = args.broadcast_database_url.clone() {
-        info!(db_url = %db_url, "using SqliteBroadcastRegistry (persistent)");
+        info!("using SqliteBroadcastRegistry (persistent)");
         let registry = Arc::new(
             SqliteBroadcastRegistry::connect(&db_url)
                 .await
@@ -558,9 +599,9 @@ where
         .address(network)
         .context("derive multisig address")?;
     info!(
-        rpc_url = %args.rpc_url,
+        rpc_endpoint = %redacted_endpoint(&args.rpc_url),
         thorchain_adapter = %adapter_addr,
-        esplora_url = %args.esplora_url,
+        esplora_endpoint = %redacted_endpoint(&args.esplora_url),
         btc_network = ?network,
         multisig_address = %multisig_addr,
         threshold = args.multisig_threshold,

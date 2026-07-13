@@ -180,7 +180,7 @@ impl std::fmt::Debug for EsploraClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EsploraClient")
             .field("network", &self.network)
-            .field("base_url", &self.base_url)
+            .field("base_url", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -307,7 +307,7 @@ impl UtxoChainClient for EsploraClient {
             let txs = self
                 .inner
                 .scripthash_txs(script.as_script(), last_seen)
-                .map_err(|e| UtxoError::Transport(e.to_string()))?;
+                .map_err(|_| UtxoError::Transport("esplora request failed".to_string()))?;
             if txs.is_empty() {
                 break;
             }
@@ -346,7 +346,7 @@ impl UtxoChainClient for EsploraClient {
             let status = self
                 .inner
                 .get_output_status(&c.txid, u64::from(c.vout))
-                .map_err(|e| UtxoError::Transport(e.to_string()))?;
+                .map_err(|_| UtxoError::Transport("esplora request failed".to_string()))?;
             let is_spent = status.is_some_and(|s| s.spent);
             if is_spent {
                 continue;
@@ -366,7 +366,7 @@ impl UtxoChainClient for EsploraClient {
         let status = self
             .inner
             .get_tx_status(txid)
-            .map_err(|e| UtxoError::Transport(e.to_string()))?;
+            .map_err(|_| UtxoError::Transport("esplora request failed".to_string()))?;
         let tip = self.get_tip_height()?;
         Ok(UtxoTxStatus {
             txid: *txid,
@@ -380,13 +380,13 @@ impl UtxoChainClient for EsploraClient {
     fn get_tip_height(&self) -> Result<u32, UtxoError> {
         self.inner
             .get_height()
-            .map_err(|e| UtxoError::Transport(e.to_string()))
+            .map_err(|_| UtxoError::Transport("esplora request failed".to_string()))
     }
 
     fn broadcast(&self, tx: &Transaction) -> Result<Txid, UtxoError> {
         self.inner
             .broadcast(tx)
-            .map_err(|e| UtxoError::Upstream(e.to_string()))?;
+            .map_err(|_| UtxoError::Upstream("broadcast rejected or unavailable".to_string()))?;
         Ok(tx.compute_txid())
     }
 
@@ -394,7 +394,7 @@ impl UtxoChainClient for EsploraClient {
         let estimates = self
             .inner
             .get_fee_estimates()
-            .map_err(|e| UtxoError::Transport(e.to_string()))?;
+            .map_err(|_| UtxoError::Transport("esplora request failed".to_string()))?;
         pick_fee_estimate(&estimates, target_blocks)
             .ok_or_else(|| UtxoError::Upstream("esplora returned no fee estimates".to_string()))
     }
@@ -403,7 +403,7 @@ impl UtxoChainClient for EsploraClient {
         let tx = self
             .inner
             .get_tx_info(txid)
-            .map_err(|e| UtxoError::Transport(e.to_string()))?
+            .map_err(|_| UtxoError::Transport("esplora request failed".to_string()))?
             .ok_or_else(|| UtxoError::Decode(format!("tx {txid} not found")))?;
         let mut addresses = Vec::with_capacity(tx.vin.len());
         for vin in tx.vin {

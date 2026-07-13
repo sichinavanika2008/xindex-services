@@ -26,7 +26,7 @@ const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub enum ThorError {
     /// Network / transport failure (DNS, TLS, connect, body read).
     #[error("transport error: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(&'static str),
     /// `THORNode` returned a non-2xx status.
     #[error("HTTP {status}: {body}")]
     Http { status: u16, body: String },
@@ -43,10 +43,18 @@ pub enum ThorError {
 ///
 /// Construct with [`ThorClient::new`] (mainnet default base URL),
 /// [`ThorClient::stagenet`], or [`ThorClient::with_base_url`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ThorClient {
     base_url: String,
     http: Client,
+}
+
+impl std::fmt::Debug for ThorClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThorClient")
+            .field("base_url", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ThorClient {
@@ -75,7 +83,10 @@ impl ThorClient {
     /// # Errors
     /// Returns [`ThorError::Transport`] if reqwest client construction fails.
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self, ThorError> {
-        let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let http = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| ThorError::Transport(transport_class(&e)))?;
         Ok(Self {
             base_url: base_url.into(),
             http,
@@ -90,7 +101,10 @@ impl ThorClient {
     /// must propagate — silent fallback would leave the previous timeout
     /// in place with no signal.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, ThorError> {
-        self.http = Client::builder().timeout(timeout).build()?;
+        self.http = Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|e| ThorError::Transport(transport_class(&e)))?;
         Ok(self)
     }
 
@@ -173,8 +187,13 @@ impl ThorClient {
         path: &str,
     ) -> Result<T, ThorError> {
         let url = format!("{}{}", self.base_url, path);
-        tracing::debug!(url = %url, "thornode GET");
-        let resp = self.http.get(&url).send().await?;
+        tracing::debug!(path, "thornode GET");
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ThorError::Transport(transport_class(&e)))?;
         let status = resp.status();
         let body = read_body_capped(resp).await?;
         if !status.is_success() {
@@ -198,7 +217,7 @@ async fn read_body_capped(resp: reqwest::Response) -> Result<String, ThorError> 
     let mut bytes = Vec::with_capacity(8 * 1024);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|e| ThorError::Transport(transport_class(&e)))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
             return Err(ThorError::ResponseTooLarge {
                 limit: MAX_RESPONSE_BODY_BYTES,
@@ -207,6 +226,24 @@ async fn read_body_capped(resp: reqwest::Response) -> Result<String, ThorError> 
         bytes.extend_from_slice(&chunk);
     }
     String::from_utf8(bytes).map_err(|e| ThorError::Decode(format!("non-utf8 body: {e}")))
+}
+
+/// Classify a reqwest failure without copying its display string: reqwest
+/// errors may embed the complete credential-bearing request URL.
+fn transport_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
+    }
 }
 
 #[cfg(test)]

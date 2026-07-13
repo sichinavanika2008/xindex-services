@@ -9,7 +9,7 @@ anvil:
 
 # ── Solidity deployment (against running Anvil) ───────────────────────────────
 
-XINDEX := "../Xindex"
+XINDEX := ".."
 RPC := "http://127.0.0.1:8545"
 WS_RPC := "ws://127.0.0.1:8545"
 # Anvil's deterministic accounts.
@@ -113,7 +113,7 @@ attest:
     THRESHOLD=2 \
     POSTER_KEY={{DEPLOYER_KEY}} \
     ETH_RPC_URL={{WS_RPC}} \
-    cargo run -p xindex-chain-eth --bin xindex-attest
+    cargo run -p xindex-chain-eth --bin xindex-attest -- --dev
 
 # Verify: read IntentQueue.getIntent(intentId).state and assert FINALIZED (== 2).
 # Run AFTER the attest binary has had time to post all slot attestations
@@ -150,24 +150,34 @@ finalize-m2:
 
 # ── Maintenance ───────────────────────────────────────────────────────────────
 
-# Re-pull vendored ABIs from the Solidity build output.
-#
-# Most contracts are vendored as full Foundry artifacts (abi + bytecode).
-# `IndexToken` is the exception: post-P3-1 (EIP-170 refactor) it delegatecalls
-# the external `AsyncMintLib`, so its artifact contains unlinked bytecode
-# with a `__$..$__` placeholder which alloy's `sol!` macro refuses to parse.
-# The off-chain stack never deploys IndexToken (no `::deploy` use), so we
-# vendor only the `.abi` array for that one contract.
+# Re-pull all eight protocol ABIs from the adjacent Solidity repository.
+# ABI arrays only: the services never deploy contracts, and excluding bytecode
+# avoids unlinked-library placeholders. Update manifest.json in the same
+# reviewed change when a deliberate Solidity ABI change occurs.
 sync-abi:
-    cd {{XINDEX}} && forge build
-    cp {{XINDEX}}/out/IntentQueue.sol/IntentQueue.json crates/shared/abi/
-    python3 -c 'import json,sys; json.dump(json.load(open(sys.argv[1]))["abi"], open(sys.argv[2],"w"))' \
-        {{XINDEX}}/out/IndexToken.sol/IndexToken.json crates/shared/abi/IndexToken.json
-    cp {{XINDEX}}/out/AttestationOracle.sol/AttestationOracle.json crates/shared/abi/
-    cp {{XINDEX}}/out/IndexFactory.sol/IndexFactory.json crates/shared/abi/
-    cp {{XINDEX}}/out/ThorchainAdapter.sol/ThorchainAdapter.json crates/shared/abi/
-    cp {{XINDEX}}/out/CustodyGuard.sol/CustodyGuard.json crates/shared/abi/
-    @echo "ABIs vendored to crates/shared/abi/"
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{XINDEX}}
+    forge build --offline
+    for contract in AttestationOracle CustodyGuard IndexFactory IndexToken IntentQueue PriceAttestationOracle ThorchainAdapter ThorchainVaultRegistry; do
+        jq -cS '.abi' "out/$contract.sol/$contract.json" > "xindex services/crates/shared/abi/$contract.json.tmp"
+        mv "xindex services/crates/shared/abi/$contract.json.tmp" "xindex services/crates/shared/abi/$contract.json"
+    done
+    cd "xindex services"
+    ./scripts/check-abi.sh --solidity-root ..
+
+# Verify the vendored ABIs against the reviewed manifest. The source variant
+# additionally compares the adjacent, freshly-built Solidity artifacts.
+check-abi:
+    ./scripts/check-abi.sh
+
+check-abi-source:
+    ./scripts/check-abi.sh --solidity-root {{XINDEX}}
+
+# Static regression gate for production-mode key isolation and durable-state
+# startup checks. It never reads a key or starts a signer.
+check-production-profile:
+    ./scripts/check-production-profile.sh
 
 # Strict gate: matches CI exactly. Run before every commit.
 #
@@ -185,6 +195,8 @@ sync-abi:
 # not reachable. Same class/disposition as the rsa entry above. Revisit when
 # the upstream dep bumps quinn ≥ the patched release.
 gate:
+    ./scripts/check-abi.sh
+    ./scripts/check-production-profile.sh
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --workspace

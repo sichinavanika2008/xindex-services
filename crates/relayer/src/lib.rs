@@ -15,6 +15,7 @@
 pub mod hint_builder;
 pub mod price_collector;
 pub mod redemption_store;
+pub mod registry_collector;
 pub mod store;
 pub mod tracker;
 

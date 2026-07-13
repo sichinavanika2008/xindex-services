@@ -38,6 +38,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: ABI manifest
+        run: ./scripts/check-abi.sh
+
+      - name: production profile guards
+        run: ./scripts/check-production-profile.sh
+
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -88,4 +94,4 @@ jobs:
       # cargo-deny's feature-resolved graph is NOT a superset — see deny.toml).
       # -n/--no-fetch uses the pre-fetched DB above.
       - name: cargo audit
-        run: cargo audit --no-fetch --db advisory-db --ignore RUSTSEC-2023-0071
+        run: cargo audit --no-fetch --db advisory-db --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0185

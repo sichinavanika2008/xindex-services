@@ -38,6 +38,11 @@ use xindex_turnkey_client::{TurnkeyClient, TurnkeyStamper, TURNKEY_API_BASE};
 #[derive(Debug, Parser)]
 #[command(name = "xindex-redeem-turnkey-solana", version)]
 struct Args {
+    /// Required rehearsal mode. This binary reads a software P-256 Turnkey
+    /// API stamping key, so it is not part of the production profile.
+    #[arg(long, env = "XINDEX_DEV", default_value_t = false)]
+    dev: bool,
+
     /// Solana custody chain.
     #[arg(long, default_value = "sol")]
     chain: String,
@@ -110,6 +115,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    if !args.dev {
+        anyhow::bail!(
+            "refusing production startup: the standalone Turnkey driver reads a software API stamping key; pass --dev only for an authorized rehearsal"
+        );
+    }
     let chain: ChainId = args
         .chain
         .parse()

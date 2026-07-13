@@ -1,3 +1,11 @@
+#![expect(
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value,
+    clippy::panic_in_result_fn,
+    clippy::too_many_lines,
+    reason = "single ignored integration fixture stages and exercises the canonical Safe runtime"
+)]
+
 //! Canonical Safe v1.4.1 on-chain submission qualification.
 //!
 //! This test is deliberately RPC-independent. It stages the exact published
@@ -10,7 +18,7 @@ use std::time::Duration;
 
 use alloy::node_bindings::Anvil;
 use alloy::signers::{local::PrivateKeySigner, Signer, SignerSync};
-use alloy_primitives::{keccak256, Address, B256, Bytes, U256};
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_sol_types::{sol, SolCall};
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -139,7 +147,10 @@ async fn call_word(client: &Client, endpoint: &str, to: Address, data: &[u8]) ->
     )?;
     let bytes = decode_data(&result)?;
     if bytes.len() != 32 {
-        bail!("eth_call returned {} bytes, expected one ABI word", bytes.len());
+        bail!(
+            "eth_call returned {} bytes, expected one ABI word",
+            bytes.len()
+        );
     }
     Ok(U256::from_be_slice(&bytes))
 }
@@ -178,7 +189,9 @@ async fn canonical_safe_v141_executes_3_of_3_and_rejects_replay_on_local_anvil()
     let singleton: Address = SAFE_SINGLETON.parse().context("Safe singleton address")?;
     let factory: Address = SAFE_PROXY_FACTORY.parse().context("Safe factory address")?;
     let singleton_hash: B256 = SAFE_SINGLETON_CODE_HASH.parse().context("singleton hash")?;
-    let factory_hash: B256 = SAFE_PROXY_FACTORY_CODE_HASH.parse().context("factory hash")?;
+    let factory_hash: B256 = SAFE_PROXY_FACTORY_CODE_HASH
+        .parse()
+        .context("factory hash")?;
     let singleton_runtime = decode_data(SAFE_RUNTIME.trim())?;
     let factory_runtime = decode_data(SAFE_PROXY_FACTORY_RUNTIME.trim())?;
 
@@ -345,14 +358,8 @@ async fn canonical_safe_v141_executes_3_of_3_and_rejects_replay_on_local_anvil()
         max_priority_fee_per_gas: 1_000_000_000,
         gas_price: 0,
     };
-    let request = build_safe_exec_tx_request(
-        ChainId::Eth,
-        submitter,
-        proxy,
-        exec_calldata,
-        fee,
-    )
-    .context("build Safe wrapper request")?;
+    let request = build_safe_exec_tx_request(ChainId::Eth, submitter, proxy, exec_calldata, fee)
+        .context("build Safe wrapper request")?;
     assert_eq!(request.from, Some(submitter));
     assert_eq!(request.to, Some(proxy.into()));
     assert_eq!(request.chain_id, Some(1));
@@ -399,17 +406,14 @@ async fn canonical_safe_v141_executes_3_of_3_and_rejects_replay_on_local_anvil()
     // Re-submitting the exact signed payload binds to stale Safe nonce 0 and
     // must revert. The Safe nonce and balances remain unchanged.
     let replay_hash = rpc_string(
-        rpc(
-            &client,
-            &endpoint,
-            "eth_sendTransaction",
-            json!([wrapper]),
-        )
-        .await?,
+        rpc(&client, &endpoint, "eth_sendTransaction", json!([wrapper])).await?,
         "replay transaction hash",
     )?;
     let replay_receipt = wait_for_receipt(&client, &endpoint, &replay_hash).await?;
-    assert_eq!(replay_receipt.get("status").and_then(Value::as_str), Some("0x0"));
+    assert_eq!(
+        replay_receipt.get("status").and_then(Value::as_str),
+        Some("0x0")
+    );
     assert_eq!(
         call_word(&client, &endpoint, proxy, &nonceCall {}.abi_encode()).await?,
         U256::from(1)

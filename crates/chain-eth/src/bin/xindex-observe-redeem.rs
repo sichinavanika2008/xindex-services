@@ -8,7 +8,7 @@
 //!      facts in memory.
 //!   2. Exposes `POST /api/v1/certify-ric`: on each request it resolves
 //!      the Asgard inbound from the operator's OWN diverse `THORChain`
-//!      sources (cross-confirmed across ≥2, refinement 1), rebuilds the
+//!      sources (fullnode + two public providers), rebuilds the
 //!      canonical Redemption Intent Certificate from its own observations,
 //!      and asks its OWN Set-B daemon to sign it.
 //!   3. Exposes `POST /api/v1/certify-acc` (Slice C tail): the
@@ -22,9 +22,10 @@
 //! custody daemon re-verifies the assembled proof statelessly. This is
 //! the "teeth" Slice A's mechanism was built for.
 //!
-//! Trust note: in `software` signer mode the Set-B key is held in this
-//! process (DEV / Anvil only). Production MUST use `remote` so the key
-//! lives in the operator's HSM-backed daemon.
+//! This implementation is explicitly development-only because its event facts
+//! are still held in memory and its backfill/live handoff has no finalized
+//! checkpoint/reorg rollback. It refuses to boot without `--dev`; a production
+//! successor must replace the event source with the durable observer store.
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -72,6 +73,11 @@ enum SignerMode {
     about = "Xindex per-operator redemption observer (CTD-1 Slice B)"
 )]
 struct Args {
+    /// Explicit development acknowledgement. Required because this binary's
+    /// event source is in-memory and not reorg-safe.
+    #[arg(long, env = "XINDEX_DEV", default_value_t = false)]
+    dev: bool,
+
     /// This operator's OWN WebSocket Ethereum RPC — the source of
     /// `RedeemDispatched` leg facts. Each operator MUST use its own
     /// distinct endpoint (the per-operator-observer trust model).
@@ -89,9 +95,9 @@ struct Args {
     attestation_oracle: String,
 
     /// This operator's OWN, DISTINCT `THORNode` REST base URLs —
-    /// comma-separated, ≥2 (refinement 1: the k-of-n floor is illusory
-    /// on a single shared source). Asgard is cross-confirmed across
-    /// these before any certification.
+    /// comma-separated: operator-controlled fullnode plus at least two
+    /// independently administered public providers. Asgard is cross-confirmed
+    /// across all three roles before any certification.
     #[arg(long, env = "THORNODE_URLS")]
     thornode_urls: String,
 
@@ -196,7 +202,7 @@ fn parse_btc_network(s: &str) -> Result<Network> {
 }
 
 /// Build the diverse-source Asgard agreement gate from the operator's
-/// comma-separated `THORNode` URLs (≥2 required; the gate's constructor
+/// comma-separated `THORNode` URLs (≥3 required; the gate's constructor
 /// rejects fewer).
 fn build_agreement(spec: &str) -> Result<AsgardAgreement> {
     let mut clients = Vec::new();
@@ -204,7 +210,9 @@ fn build_agreement(spec: &str) -> Result<AsgardAgreement> {
         clients.push(ThorClient::with_base_url(url.to_string()).context("thornode client")?);
     }
     AsgardAgreement::new(clients).map_err(|e| {
-        anyhow::anyhow!("diverse-source Asgard gate: {e} (configure ≥2 THORNode URLs)")
+        anyhow::anyhow!(
+            "diverse-source Asgard gate: {e} (configure fullnode + two public THORNode URLs)"
+        )
     })
 }
 
@@ -266,6 +274,11 @@ fn build_halt_source(args: &Args) -> Result<AnyHaltSource> {
     reason = "single sequential setup + inlined event loop (alloy provider-generic friction forces the inline)"
 )]
 async fn run(args: Args) -> Result<()> {
+    if !args.dev {
+        anyhow::bail!(
+            "xindex-observe-redeem is development-only until finalized checkpoints, reorg rollback, and durable event facts replace its in-memory source; pass --dev only for local rehearsal"
+        );
+    }
     let adapter =
         Address::from_str(&args.thorchain_adapter).context("THORCHAIN_ADAPTER_ADDR invalid")?;
     let oracle =

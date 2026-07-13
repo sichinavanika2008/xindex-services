@@ -34,6 +34,7 @@ use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
+use xindex_chain_eth::rpc::redacted_endpoint;
 use xindex_chain_eth::RpcErc20LogClient;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::EsploraClient;
@@ -73,6 +74,12 @@ enum CrossCheckMode {
 #[derive(Parser, Debug, Clone)]
 #[command(version, about = "Xindex redemption attestation poster")]
 struct Args {
+    /// Required acknowledgement that this legacy central-observation
+    /// coordinator is development scaffolding. Production uses independent
+    /// per-operator observer/HSM producers and an untrusted collector.
+    #[arg(long, env = "XINDEX_DEV", default_value_t = false)]
+    dev: bool,
+
     /// WebSocket RPC (events + tx submission). Anvil: <ws://127.0.0.1:8545>.
     #[arg(long, env = "ETH_RPC_URL", default_value = "ws://127.0.0.1:8545")]
     rpc_url: String,
@@ -347,8 +354,8 @@ fn build_signers(args: &Args) -> Result<Vec<AnyHsmBackend>> {
                 .ok_or_else(|| anyhow::anyhow!("--signer-keys required in software mode"))?;
             let mut out = Vec::new();
             for k in keys.split(',') {
-                let s =
-                    SoftwareSigner::from_hex(k.trim()).with_context(|| format!("bad key: {k}"))?;
+                let s = SoftwareSigner::from_hex(k.trim())
+                    .context("invalid SIGNER_KEYS entry (value redacted)")?;
                 out.push(AnyHsmBackend::Software(s));
             }
             Ok(out)
@@ -450,6 +457,11 @@ async fn try_settle_streamed(
     reason = "single sequential pipeline; splitting fights alloy 0.8's nested fillers generic"
 )]
 async fn run(args: Args) -> Result<()> {
+    if !args.dev {
+        anyhow::bail!(
+            "xindex-attest-redeem is a central-observation coordinator and refuses to run without --dev"
+        );
+    }
     let intent_queue =
         Address::from_str(&args.intent_queue).context("INTENT_QUEUE_ADDR invalid")?;
     let attestation_oracle =
@@ -509,7 +521,12 @@ async fn run(args: Args) -> Result<()> {
     let chain_id = provider.get_chain_id().await.context("chain id")?;
     let domain = attestation_oracle_domain(chain_id, attestation_oracle);
     let oracle = AttestationOracle::new(attestation_oracle, provider.clone());
-    info!(chain_id, mode = ?args.cross_check_mode, "xindex-attest-redeem starting");
+    info!(
+        chain_id,
+        mode = ?args.cross_check_mode,
+        rpc_endpoint = %redacted_endpoint(&args.rpc_url),
+        "xindex-attest-redeem starting"
+    );
 
     let process = async |ev: &IntentQueue::RedemptionIntentCreated| {
         let rid = ev.redemptionId;

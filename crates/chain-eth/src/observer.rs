@@ -5,7 +5,8 @@
 //!   1. reads the `RedeemDispatched` leg facts (amount / memo / final
 //!      destination) from its OWN Ethereum RPC ([`RedeemLegSource`]);
 //!   2. resolves the Asgard inbound from its OWN diverse `THORChain`
-//!      sources, cross-confirmed across ≥2 ([`AsgardAgreement`],
+//!      sources, cross-confirmed across a fullnode plus two providers
+//!      ([`AsgardAgreement`],
 //!      refinement 1) — a single poisoned endpoint cannot drive a sign;
 //!   3. builds the canonical [`RedemptionIntentCertificate`] and asks
 //!      its OWN Set-B daemon to sign it ([`RicSigner`]).
@@ -213,11 +214,20 @@ impl HaltSource for NeverHalted {
 /// deployed `CustodyGuard`, via the operator's own HTTP endpoint.
 /// Deliberately raw JSON-RPC (not an alloy provider) so it stays
 /// generic-free and wiremock-testable.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpHaltSource {
     url: String,
     guard: Address,
     client: reqwest::Client,
+}
+
+impl std::fmt::Debug for HttpHaltSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpHaltSource")
+            .field("url", &"<redacted>")
+            .field("guard", &self.guard)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HttpHaltSource {
@@ -253,15 +263,24 @@ impl HaltSource for HttpHaltSource {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("halt eth_call: {e}"))?;
-        let v: serde_json::Value = resp
-            .json()
+            .map_err(|e| format!("halt eth_call transport: {}", transport_class(&e)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("halt eth_call http {}", status.as_u16()));
+        }
+        let bytes = resp
+            .bytes()
             .await
-            .map_err(|e| format!("halt eth_call body: {e}"))?;
+            .map_err(|e| format!("halt eth_call body: {}", transport_class(&e)))?;
+        if bytes.len() > 64 * 1024 {
+            return Err("halt eth_call response exceeds 64 KiB".to_string());
+        }
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "halt eth_call body is malformed json".to_string())?;
         let result = v
             .get("result")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("halt eth_call: no result ({v})"))?;
+            .ok_or_else(|| "halt eth_call: no result".to_string())?;
         let raw = alloy_primitives::hex::decode(result.trim_start_matches("0x"))
             .map_err(|e| format!("halt eth_call hex: {e}"))?;
         // A mis-addressed guard returns `0x` — fail CLOSED, never read
@@ -273,6 +292,20 @@ impl HaltSource for HttpHaltSource {
             ));
         }
         Ok(raw[31] == 1)
+    }
+}
+
+fn transport_class(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
     }
 }
 
