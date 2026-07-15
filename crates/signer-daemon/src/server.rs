@@ -35,7 +35,7 @@ use xindex_shared::eip712::{
     acquire_cancel_certificate, acquire_cancel_signing_hash, attestation,
     attestation_oracle_domain, attestation_signing_hash, redemption_attestation,
     redemption_attestation_signing_hash, redemption_intent_certificate, refund_attestation,
-    refund_attestation_signing_hash, ric_signing_hash, streamed_settlement,
+    refund_attestation_signing_hash, ric_signing_hash, settlement_context, streamed_settlement,
     streamed_settlement_signing_hash,
 };
 use xindex_shared::signer_wire::{
@@ -67,6 +67,8 @@ use crate::xrp_tx::{handle_xrp_tx, XrpSignerConfig};
 
 const PRODUCTION_INTENT_SIGNER_COUNT: usize = 5;
 const PRODUCTION_INTENT_THRESHOLD: usize = 3;
+const MAX_SETTLEMENT_VALIDITY_SECS: u64 = 300;
+const SETTLEMENT_FUTURE_SKEW_SECS: u64 = 15;
 
 /// Static daemon configuration. Loaded once at startup; never mutated.
 #[derive(Debug, Clone)]
@@ -109,21 +111,32 @@ impl DaemonConfig {
     }
 }
 
-/// CTD-1 Slice E (`DL-CTD-E`): per-chain Set-B certification volume
-/// caps — the containment teeth at the k-of-n floor. Caps are ABSOLUTE
-/// native smallest-unit amounts per fixed `window_secs` bucket; a chain
-/// absent from `caps` is UNMETERED (deploy-safe dev/test default —
-/// production MUST set ≈10% of per-chain custody for every served
-/// chain and re-tune as custody grows). A compromised coordinator that
-/// somehow obtains k-of-n observer cooperation is still bounded to one
-/// window's cap per chain, because each operator's Set-B daemon meters
-/// independently and refuses beyond its cap.
+/// Fixed buckets longer than 31 days are operationally unsupported. The
+/// production profile remains 24 hours; the upper bound prevents a malformed
+/// value from becoming an effectively permanent quota bucket while retaining
+/// room for conservative staging policies.
+pub const MAX_CERT_VOLUME_WINDOW_SECS: u64 = 31 * 86_400;
+const MAX_CERT_VOLUME_WINDOW_SECS_I64: i64 = 31 * 86_400;
+
+/// CTD-1 Slice E (`DL-CTD-E`): per-chain Set-B certification volume caps.
+///
+/// Caps are absolute native-smallest-unit amounts per fixed `window_secs`
+/// bucket. A chain absent from `caps` is rejected unless the process was
+/// explicitly built in unmetered dev/test mode. Production sets approximately
+/// 10% of per-chain custody for every served chain and re-tunes as custody
+/// grows. A compromised coordinator that somehow obtains k-of-n observer
+/// cooperation is still bounded to one window's cap per chain because every
+/// operator meters independently.
 #[derive(Debug, Clone)]
 pub struct CertVolumePolicy {
-    /// Fixed window bucket length in seconds (production: 86 400).
-    pub window_secs: u64,
-    /// Per-chain cap in native smallest units; absent = unmetered.
+    /// Validated signed bucket length consumed directly by `SQLite` arithmetic.
+    window_secs: i64,
+    /// Per-chain cap in native smallest units; absent is allowed only when
+    /// [`Self::allow_unmetered`] is true.
     pub caps: HashMap<ChainId, u128>,
+    /// Explicit dev/test escape hatch. Production construction sets this
+    /// false, making a missing per-chain cap a request-time hard failure.
+    pub allow_unmetered: bool,
 }
 
 impl CertVolumePolicy {
@@ -133,24 +146,73 @@ impl CertVolumePolicy {
         Self {
             window_secs: 86_400,
             caps: HashMap::new(),
+            allow_unmetered: true,
         }
+    }
+
+    /// Construct a policy from the unsigned on-disk configuration value.
+    ///
+    /// # Errors
+    /// Returns the exact window/cap validation error rather than narrowing or
+    /// substituting a fallback duration.
+    pub fn try_new(
+        window_secs: u64,
+        caps: HashMap<ChainId, u128>,
+        allow_unmetered: bool,
+    ) -> Result<Self, String> {
+        let policy = Self {
+            window_secs: Self::validate_window_secs(window_secs)?,
+            caps,
+            allow_unmetered,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Validate and losslessly convert the unsigned config duration to the
+    /// signed representation used by `SQLite` and bucket arithmetic.
+    ///
+    /// # Errors
+    /// Zero, values above the 31-day operational maximum, and values outside
+    /// the signed database-duration range are rejected with no fallback.
+    pub fn validate_window_secs(window_secs: u64) -> Result<i64, String> {
+        let signed = i64::try_from(window_secs).map_err(|_| {
+            "cert_volume.window_secs does not fit signed database duration".to_string()
+        })?;
+        if signed == 0 {
+            return Err("cert_volume.window_secs must be > 0".to_string());
+        }
+        if signed > MAX_CERT_VOLUME_WINDOW_SECS_I64 {
+            return Err(format!(
+                "cert_volume.window_secs must be <= {MAX_CERT_VOLUME_WINDOW_SECS} (31 days)"
+            ));
+        }
+        Ok(signed)
+    }
+
+    /// Validated signed window consumed by runtime bucket/database arithmetic.
+    #[must_use]
+    pub const fn window_secs(&self) -> i64 {
+        self.window_secs
     }
 
     /// Fail-closed startup validation — construction sites call this,
     /// mirroring [`IntentPolicy::validate`].
     ///
     /// # Errors
-    /// `window_secs == 0` (the bucket arithmetic needs a positive
-    /// length) or any cap of `0` (a zero cap can never authorize —
-    /// remove the chain to unmeter instead).
+    /// A non-positive or greater-than-31-day window, or any cap of `0` (a zero
+    /// cap can never authorize).
     pub fn validate(&self) -> Result<(), String> {
-        if self.window_secs == 0 {
+        if self.window_secs <= 0 {
             return Err("cert_volume.window_secs must be > 0".to_string());
         }
+        if self.window_secs > MAX_CERT_VOLUME_WINDOW_SECS_I64 {
+            return Err(format!(
+                "cert_volume.window_secs must be <= {MAX_CERT_VOLUME_WINDOW_SECS} (31 days)"
+            ));
+        }
         if self.caps.values().any(|cap| *cap == 0) {
-            return Err(
-                "cert_volume cap of 0 can never authorize; remove the chain to unmeter".to_string(),
-            );
+            return Err("cert_volume cap of 0 can never authorize".to_string());
         }
         Ok(())
     }
@@ -167,6 +229,12 @@ impl CertVolumePolicy {
     /// positive cap.
     pub fn assert_metered_for(&self, served: &[ChainId]) -> Result<(), String> {
         self.validate()?;
+        if self.allow_unmetered {
+            return Err(
+                "cert_volume.allow_unmetered is dev/test only and must be false in production"
+                    .to_string(),
+            );
+        }
         for chain in served {
             if self.caps.get(chain).is_none_or(|cap| *cap == 0) {
                 return Err(format!(
@@ -558,59 +626,51 @@ fn now_unix_secs() -> i64 {
         })
 }
 
-/// Canonical payload hash = `keccak256(field1_bytes || field2_bytes ||
-/// …)`, fixed encoding per request kind. The raw JSON is not used as
-/// input (deliberate — JSON field-reordering or whitespace must not
-/// be able to change the replay-DB key).
-fn hash_attestation_payload(intent_id: B256, slot_index: U256, attested_amount: U256) -> [u8; 32] {
-    let mut buf = [0u8; 96];
-    buf[..32].copy_from_slice(intent_id.as_slice());
-    buf[32..64].copy_from_slice(&slot_index.to_be_bytes::<32>());
-    buf[64..96].copy_from_slice(&attested_amount.to_be_bytes::<32>());
-    alloy_primitives::keccak256(buf).into()
+#[derive(Clone, Copy)]
+struct SettlementContextInput<'a> {
+    evidence_hash: &'a str,
+    observed_at: u64,
+    valid_until: u64,
+    source_chain_id: u64,
+    source_block_number: u64,
+    source_block_hash: &'a str,
+    observation_epoch: u64,
 }
 
-/// Per-leg replay-key payload hash. The replay DB keys redemptions on
-/// `(redemption_id, leg_index)` (audit H2) and applies a delivery-XOR-
-/// refund mutex WITHIN each leg. This hash binds the `leg_index`,
-/// `asset_id`, and amount, so re-signing the SAME leg with a different
-/// amount is a `Conflict`, while different legs of one redemption are
-/// independent slots (matching the on-chain `IntentQueue::_legForUpdate`
-/// per-leg mutex).
-fn hash_leg_payload(
-    redemption_id: B256,
-    leg_index: U256,
-    asset_id: B256,
-    amount: U256,
-) -> [u8; 32] {
-    let mut buf = [0u8; 128];
-    buf[..32].copy_from_slice(redemption_id.as_slice());
-    buf[32..64].copy_from_slice(&leg_index.to_be_bytes::<32>());
-    buf[64..96].copy_from_slice(asset_id.as_slice());
-    buf[96..128].copy_from_slice(&amount.to_be_bytes::<32>());
-    alloy_primitives::keccak256(buf).into()
-}
-
-/// Like [`hash_leg_payload`] but for the COMBINED streamed settlement,
-/// binding BOTH the delivered-USDT and refunded-native amounts so that
-/// re-signing the same leg with a different `(delivered, refunded)` pair
-/// is a `Conflict`. The wider buffer (160 vs 128 bytes) also means a
-/// streamed payload hash can never collide with a plain delivery/refund
-/// payload hash for the same leg/amount.
-fn hash_streamed_payload(
-    redemption_id: B256,
-    leg_index: U256,
-    asset_id: B256,
-    delivered_usdt: U256,
-    refunded_native: U256,
-) -> [u8; 32] {
-    let mut buf = [0u8; 160];
-    buf[..32].copy_from_slice(redemption_id.as_slice());
-    buf[32..64].copy_from_slice(&leg_index.to_be_bytes::<32>());
-    buf[64..96].copy_from_slice(asset_id.as_slice());
-    buf[96..128].copy_from_slice(&delivered_usdt.to_be_bytes::<32>());
-    buf[128..160].copy_from_slice(&refunded_native.to_be_bytes::<32>());
-    alloy_primitives::keccak256(buf).into()
+/// Parse and fail-close the signed settlement source/freshness envelope before
+/// replay reservation or HSM work.
+fn checked_settlement_context(
+    config: &DaemonConfig,
+    input: SettlementContextInput<'_>,
+) -> Result<xindex_shared::eip712::SettlementContext, (StatusCode, Json<ErrorBody>)> {
+    let evidence_hash = parse_b256(input.evidence_hash, "evidence_hash")?;
+    let source_block_hash = parse_b256(input.source_block_hash, "source_block_hash")?;
+    let now = u64::try_from(now_unix_secs()).unwrap_or(0);
+    let lifetime = input.valid_until.checked_sub(input.observed_at);
+    if evidence_hash == B256::ZERO
+        || source_block_hash == B256::ZERO
+        || input.source_chain_id == 0
+        || input.source_chain_id != config.chain_id
+        || input.source_block_number == 0
+        || input.observed_at == 0
+        || input.observed_at > now.saturating_add(SETTLEMENT_FUTURE_SKEW_SECS)
+        || now >= input.valid_until
+        || lifetime.is_none_or(|seconds| seconds == 0 || seconds > MAX_SETTLEMENT_VALIDITY_SECS)
+    {
+        return Err(unprocessable(
+            error_codes::SETTLEMENT_CONTEXT_INVALID,
+            "invalid signed settlement source/freshness envelope",
+        ));
+    }
+    Ok(settlement_context(
+        evidence_hash,
+        input.observed_at,
+        input.valid_until,
+        U256::from(input.source_chain_id),
+        input.source_block_number,
+        source_block_hash,
+        input.observation_epoch,
+    ))
 }
 
 fn render_signature(state: &DaemonConfig, sig: [u8; 65]) -> Eip712SignResponse {
@@ -654,7 +714,21 @@ where
     let intent_id = parse_b256(&req.intent_id, "intent_id")?;
     let slot_index = parse_u256(&req.slot_index, "slot_index")?;
     let attested_amount = parse_u256(&req.attested_amount, "attested_amount")?;
-    let payload_hash = hash_attestation_payload(intent_id, slot_index, attested_amount);
+    let context = checked_settlement_context(
+        &state.config,
+        SettlementContextInput {
+            evidence_hash: &req.evidence_hash,
+            observed_at: req.observed_at,
+            valid_until: req.valid_until,
+            source_chain_id: req.source_chain_id,
+            source_block_number: req.source_block_number,
+            source_block_hash: &req.source_block_hash,
+            observation_epoch: req.observation_epoch,
+        },
+    )?;
+    let att = attestation(intent_id, slot_index, attested_amount, context);
+    let digest = attestation_signing_hash(&att, &state.config.domain());
+    let payload_hash = digest.0;
 
     let outcome = state
         .replay
@@ -724,8 +798,6 @@ where
             }
         }
     }
-    let att = attestation(intent_id, slot_index, attested_amount);
-    let digest = attestation_signing_hash(&att, &state.config.domain());
     let sig = state
         .hsm
         .sign_digest(state.config.eth_address, digest)
@@ -787,10 +859,27 @@ where
     let leg_index = parse_u256(&req.leg_index, "leg_index")?;
     let asset_id = parse_b256(&req.asset_id, "asset_id")?;
     let delivered_amount = parse_u256(&req.delivered_amount, "delivered_amount")?;
-    // Replay key generalizes to (redemption_id, leg_index): a second
-    // delivery attestation for the same leg with a different amount is
-    // a Conflict, never re-signed.
-    let payload_hash = hash_leg_payload(redemption_id, leg_index, asset_id, delivered_amount);
+    let context = checked_settlement_context(
+        &state.config,
+        SettlementContextInput {
+            evidence_hash: &req.evidence_hash,
+            observed_at: req.observed_at,
+            valid_until: req.valid_until,
+            source_chain_id: req.source_chain_id,
+            source_block_number: req.source_block_number,
+            source_block_hash: &req.source_block_hash,
+            observation_epoch: req.observation_epoch,
+        },
+    )?;
+    let message = redemption_attestation(
+        redemption_id,
+        leg_index,
+        asset_id,
+        delivered_amount,
+        context,
+    );
+    let digest = redemption_attestation_signing_hash(&message, &state.config.domain());
+    let payload_hash = digest.0;
     let leg = u32::try_from(leg_index)
         .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
 
@@ -800,10 +889,7 @@ where
         leg,
         RedemptionKind::Delivery,
         payload_hash,
-        || {
-            let m = redemption_attestation(redemption_id, leg_index, asset_id, delivered_amount);
-            redemption_attestation_signing_hash(&m, &state.config.domain())
-        },
+        || digest,
     )
     .await
 }
@@ -820,7 +906,21 @@ where
     let leg_index = parse_u256(&req.leg_index, "leg_index")?;
     let asset_id = parse_b256(&req.asset_id, "asset_id")?;
     let refunded_amount = parse_u256(&req.refunded_amount, "refunded_amount")?;
-    let payload_hash = hash_leg_payload(redemption_id, leg_index, asset_id, refunded_amount);
+    let context = checked_settlement_context(
+        &state.config,
+        SettlementContextInput {
+            evidence_hash: &req.evidence_hash,
+            observed_at: req.observed_at,
+            valid_until: req.valid_until,
+            source_chain_id: req.source_chain_id,
+            source_block_number: req.source_block_number,
+            source_block_hash: &req.source_block_hash,
+            observation_epoch: req.observation_epoch,
+        },
+    )?;
+    let message = refund_attestation(redemption_id, leg_index, asset_id, refunded_amount, context);
+    let digest = refund_attestation_signing_hash(&message, &state.config.domain());
+    let payload_hash = digest.0;
     let leg = u32::try_from(leg_index)
         .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
 
@@ -830,10 +930,7 @@ where
         leg,
         RedemptionKind::Refund,
         payload_hash,
-        || {
-            let m = refund_attestation(redemption_id, leg_index, asset_id, refunded_amount);
-            refund_attestation_signing_hash(&m, &state.config.domain())
-        },
+        || digest,
     )
     .await
 }
@@ -859,15 +956,28 @@ where
     let asset_id = parse_b256(&req.asset_id, "asset_id")?;
     let delivered_usdt = parse_u256(&req.delivered_usdt, "delivered_usdt")?;
     let refunded_native = parse_u256(&req.refunded_native, "refunded_native")?;
-    // The combined settlement binds BOTH amounts: re-signing the same leg
-    // with a different (delivered, refunded) pair is a Conflict.
-    let payload_hash = hash_streamed_payload(
+    let context = checked_settlement_context(
+        &state.config,
+        SettlementContextInput {
+            evidence_hash: &req.evidence_hash,
+            observed_at: req.observed_at,
+            valid_until: req.valid_until,
+            source_chain_id: req.source_chain_id,
+            source_block_number: req.source_block_number,
+            source_block_hash: &req.source_block_hash,
+            observation_epoch: req.observation_epoch,
+        },
+    )?;
+    let message = streamed_settlement(
         redemption_id,
         leg_index,
         asset_id,
         delivered_usdt,
         refunded_native,
+        context,
     );
+    let digest = streamed_settlement_signing_hash(&message, &state.config.domain());
+    let payload_hash = digest.0;
     let leg = u32::try_from(leg_index)
         .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
 
@@ -877,16 +987,7 @@ where
         leg,
         RedemptionKind::Streamed,
         payload_hash,
-        || {
-            let m = streamed_settlement(
-                redemption_id,
-                leg_index,
-                asset_id,
-                delivered_usdt,
-                refunded_native,
-            );
-            streamed_settlement_signing_hash(&m, &state.config.domain())
-        },
+        || digest,
     )
     .await
 }
@@ -1512,9 +1613,50 @@ fn window_start_for(now: i64, window: i64) -> i64 {
     now - now.rem_euclid(window)
 }
 
+/// Resolve certificate asset metadata through the canonical registry. The
+/// caller's chain selector is only an assertion: replay, quota, and signed
+/// native-chain binding all use the derived value returned here.
+fn certificate_native_chain(
+    request_chain: ChainId,
+    asset_id: B256,
+    amount_decimals: u8,
+) -> Result<ChainId, (StatusCode, Json<ErrorBody>)> {
+    let native_chain = ChainId::from_asset_id(asset_id).ok_or_else(|| {
+        unprocessable(
+            error_codes::CERTIFICATE_ASSET_INVALID,
+            "asset_id is absent from the canonical chain registry",
+        )
+    })?;
+    if request_chain != native_chain || amount_decimals != native_chain.decimals() {
+        return Err(unprocessable(
+            error_codes::CERTIFICATE_ASSET_INVALID,
+            format!(
+                "certificate metadata mismatch: selector={request_chain}, asset={native_chain}, \
+                 decimals={amount_decimals}, expected_decimals={}",
+                native_chain.decimals()
+            ),
+        ));
+    }
+    Ok(native_chain)
+}
+
+/// Reject an uncapped production request before replay/database mutation.
+fn ensure_cert_volume_configured(
+    policy: &CertVolumePolicy,
+    chain_id: ChainId,
+) -> Result<(), (StatusCode, Json<ErrorBody>)> {
+    if policy.caps.contains_key(&chain_id) || policy.allow_unmetered {
+        return Ok(());
+    }
+    Err(unprocessable(
+        error_codes::VOLUME_CAP_MISSING,
+        format!("no certification volume cap configured for canonical chain {chain_id}"),
+    ))
+}
+
 /// CTD-1 Slice E (`DL-CTD-E`): consume Set-B certification volume for
-/// `chain_id` before the HSM is touched. Unmetered chains (no
-/// configured cap) pass through. Runs strictly AFTER the equivocation
+/// `chain_id` before the HSM is touched. Only explicit dev/test unmetered
+/// mode permits a missing cap. Runs strictly AFTER the equivocation
 /// pre-flight returns `FirstTime`, so an idempotent retry never
 /// double-consumes. Consume-before-HSM mirrors the RIC one-shot
 /// posture: an HSM failure after consume burns window capacity until
@@ -1529,7 +1671,7 @@ where
     H: HsmDigestSigner + 'static,
 {
     let Some(cap) = state.config.cert_volume.caps.get(&chain_id).copied() else {
-        return Ok(());
+        return ensure_cert_volume_configured(&state.config.cert_volume, chain_id);
     };
     let amount = u128::try_from(amount).map_err(|_| {
         unprocessable(
@@ -1538,9 +1680,9 @@ where
         )
     })?;
     let now = now_unix_secs();
-    // Validated > 0 at startup; an absurd >i64::MAX config falls back
-    // to the 24h production bucket rather than panicking.
-    let window = i64::try_from(state.config.cert_volume.window_secs).unwrap_or(86_400);
+    // The private field is converted and bounded before construction; runtime
+    // and SQLite consume that exact signed duration with no narrowing/fallback.
+    let window = state.config.cert_volume.window_secs;
     let window_start = window_start_for(now, window);
     match state
         .replay
@@ -1607,17 +1749,19 @@ where
     S: ReplayStore + 'static,
     H: HsmDigestSigner + 'static,
 {
-    if req.chain_id == ChainId::Sol {
-        return Err(unprocessable(
-            error_codes::RIC_CHAIN_FORBIDDEN,
-            "solana legs are CTD-1 hard-gated (RA-2): no on-chain destination root to certify",
-        ));
-    }
     let redemption_id = parse_b256(&req.redemption_id, "redemption_id")?;
     let leg_index = parse_u256(&req.leg_index, "leg_index")?;
     let leg = u32::try_from(leg_index)
         .map_err(|_| bad(error_codes::BAD_REQUEST, "leg_index exceeds u32"))?;
     let asset_id = parse_b256(&req.asset_id, "asset_id")?;
+    let native_chain = certificate_native_chain(req.chain_id, asset_id, req.amount_decimals)?;
+    if native_chain == ChainId::Sol {
+        return Err(unprocessable(
+            error_codes::RIC_CHAIN_FORBIDDEN,
+            "solana legs are CTD-1 hard-gated (RA-2): no on-chain destination root to certify",
+        ));
+    }
+    ensure_cert_volume_configured(&state.config.cert_volume, native_chain)?;
     let amount = parse_u256(&req.amount, "amount")?;
     let immediate_target_hash = parse_b256(&req.immediate_target_hash, "immediate_target_hash")?;
     let memo_hash = parse_b256(&req.memo_hash, "memo_hash")?;
@@ -1628,6 +1772,7 @@ where
         redemption_id,
         leg_index,
         asset_id,
+        native_chain.native_chain_id_hash(),
         amount,
         req.amount_decimals,
         immediate_target_hash,
@@ -1640,7 +1785,7 @@ where
 
     let outcome = state
         .replay
-        .check_ric_cert(req.chain_id, redemption_id, leg, payload_hash)
+        .check_ric_cert(native_chain, redemption_id, leg, payload_hash)
         .await
         .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
     if let Some(resp) = ric_cert_cached(&state.config, outcome) {
@@ -1649,7 +1794,7 @@ where
     if let Err(e) = state
         .replay
         .record_ric_cert(
-            req.chain_id,
+            native_chain,
             redemption_id,
             leg,
             payload_hash,
@@ -1666,7 +1811,7 @@ where
         }
         let outcome = state
             .replay
-            .check_ric_cert(req.chain_id, redemption_id, leg, payload_hash)
+            .check_ric_cert(native_chain, redemption_id, leg, payload_hash)
             .await
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
         if matches!(outcome, CheckOutcome::FirstTime) {
@@ -1683,7 +1828,7 @@ where
     // A crash retry of the same pending digest may consume twice, reducing
     // liveness but never bypassing the configured cap or permitting a
     // different certificate for this tuple.
-    consume_cert_volume_gate(&state, req.chain_id, amount).await?;
+    consume_cert_volume_gate(&state, native_chain, amount).await?;
     let sig = state
         .hsm
         .sign_digest(state.config.eth_address, digest)
@@ -1693,7 +1838,7 @@ where
     if let Err(e) = state
         .replay
         .record_ric_cert(
-            req.chain_id,
+            native_chain,
             redemption_id,
             leg,
             payload_hash,
@@ -1708,7 +1853,7 @@ where
         // L10: lost the write race; return the winner's record.
         let outcome = state
             .replay
-            .check_ric_cert(req.chain_id, redemption_id, leg, payload_hash)
+            .check_ric_cert(native_chain, redemption_id, leg, payload_hash)
             .await
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
         return ric_cert_cached(&state.config, outcome).unwrap_or_else(|| {
@@ -1743,12 +1888,6 @@ where
     S: ReplayStore + 'static,
     H: HsmDigestSigner + 'static,
 {
-    if req.chain_id == ChainId::Sol {
-        return Err(unprocessable(
-            error_codes::RIC_CHAIN_FORBIDDEN,
-            "solana legs are CTD-1 hard-gated (RA-2): no on-chain destination root to certify",
-        ));
-    }
     let cancel_id = parse_b256(&req.cancel_id, "cancel_id")?;
     let intent_id = parse_b256(&req.intent_id, "intent_id")?;
     // Slot index is bound into the certified digest (so a cert for slot 0
@@ -1756,6 +1895,14 @@ where
     // `cancel_id` alone — no separate slot sub-key.
     let slot_index = parse_u256(&req.slot_index, "slot_index")?;
     let asset_id = parse_b256(&req.asset_id, "asset_id")?;
+    let native_chain = certificate_native_chain(req.chain_id, asset_id, req.amount_decimals)?;
+    if native_chain == ChainId::Sol {
+        return Err(unprocessable(
+            error_codes::RIC_CHAIN_FORBIDDEN,
+            "solana legs are CTD-1 hard-gated (RA-2): no on-chain destination root to certify",
+        ));
+    }
+    ensure_cert_volume_configured(&state.config.cert_volume, native_chain)?;
     let amount = parse_u256(&req.amount, "amount")?;
     let immediate_target_hash = parse_b256(&req.immediate_target_hash, "immediate_target_hash")?;
     let memo_hash = parse_b256(&req.memo_hash, "memo_hash")?;
@@ -1767,6 +1914,7 @@ where
         intent_id,
         slot_index,
         asset_id,
+        native_chain.native_chain_id_hash(),
         amount,
         req.amount_decimals,
         immediate_target_hash,
@@ -1779,7 +1927,7 @@ where
 
     let outcome = state
         .replay
-        .check_ac_cert(req.chain_id, cancel_id, payload_hash)
+        .check_ac_cert(native_chain, cancel_id, payload_hash)
         .await
         .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
     if let Some(resp) = ric_cert_cached(&state.config, outcome) {
@@ -1788,7 +1936,7 @@ where
     if let Err(e) = state
         .replay
         .record_ac_cert(
-            req.chain_id,
+            native_chain,
             cancel_id,
             payload_hash,
             Vec::new(),
@@ -1804,7 +1952,7 @@ where
         }
         let outcome = state
             .replay
-            .check_ac_cert(req.chain_id, cancel_id, payload_hash)
+            .check_ac_cert(native_chain, cancel_id, payload_hash)
             .await
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
         if matches!(outcome, CheckOutcome::FirstTime) {
@@ -1819,7 +1967,7 @@ where
     }
     // Slice E: the mint-cancel swap-back consumes the SAME per-chain
     // window as redemptions — the cancel path cannot bypass the breaker.
-    consume_cert_volume_gate(&state, req.chain_id, amount).await?;
+    consume_cert_volume_gate(&state, native_chain, amount).await?;
     let sig = state
         .hsm
         .sign_digest(state.config.eth_address, digest)
@@ -1829,7 +1977,7 @@ where
     if let Err(e) = state
         .replay
         .record_ac_cert(
-            req.chain_id,
+            native_chain,
             cancel_id,
             payload_hash,
             sig.to_vec(),
@@ -1842,7 +1990,7 @@ where
         }
         let outcome = state
             .replay
-            .check_ac_cert(req.chain_id, cancel_id, payload_hash)
+            .check_ac_cert(native_chain, cancel_id, payload_hash)
             .await
             .map_err(|e| bad(error_codes::BAD_REQUEST, format!("replay db: {e}")))?;
         return ric_cert_cached(&state.config, outcome).unwrap_or_else(|| {
@@ -1869,7 +2017,7 @@ mod tests {
     use crate::replay::InMemoryReplayStore;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use tower::ServiceExt;
 
     /// Fixed test key whose address is the configured `eth_address`, so
@@ -1923,11 +2071,65 @@ mod tests {
         (DaemonState::new(cfg(), replay, hsm.clone()), hsm)
     }
 
+    fn test_settlement_context() -> xindex_shared::eip712::SettlementContext {
+        static CONTEXT: OnceLock<xindex_shared::eip712::SettlementContext> = OnceLock::new();
+        *CONTEXT.get_or_init(|| {
+            let observed_at = u64::try_from(now_unix_secs())
+                .unwrap_or(1)
+                .saturating_sub(1);
+            settlement_context(
+                B256::repeat_byte(0x88),
+                observed_at,
+                observed_at.saturating_add(MAX_SETTLEMENT_VALIDITY_SECS),
+                U256::from(31_337u64),
+                20_000_000,
+                B256::repeat_byte(0x99),
+                0,
+            )
+        })
+    }
+
     async fn post_json(
         app: &Router,
         path: &str,
-        body: serde_json::Value,
+        mut body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        if matches!(
+            path,
+            "/api/v1/sign/eip712-attestation"
+                | "/api/v1/sign/eip712-redemption-delivery"
+                | "/api/v1/sign/eip712-refund"
+                | "/api/v1/sign/eip712-streamed-settlement"
+        ) {
+            let context = test_settlement_context();
+            let Some(object) = body.as_object_mut() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({"error": "test request body must be a JSON object"}),
+                );
+            };
+            object
+                .entry("evidence_hash")
+                .or_insert_with(|| serde_json::json!(format!("{:#x}", context.evidence_hash)));
+            object
+                .entry("observed_at")
+                .or_insert_with(|| serde_json::json!(context.observed_at));
+            object
+                .entry("valid_until")
+                .or_insert_with(|| serde_json::json!(context.valid_until));
+            object
+                .entry("source_chain_id")
+                .or_insert_with(|| serde_json::json!(31_337u64));
+            object
+                .entry("source_block_number")
+                .or_insert_with(|| serde_json::json!(context.source_block_number));
+            object
+                .entry("source_block_hash")
+                .or_insert_with(|| serde_json::json!(format!("{:#x}", context.source_block_hash)));
+            object
+                .entry("observation_epoch")
+                .or_insert_with(|| serde_json::json!(context.observation_epoch));
+        }
         #[expect(clippy::expect_used, reason = "test code")]
         let resp = app
             .clone()
@@ -1963,25 +2165,19 @@ mod tests {
     }
 
     #[test]
-    fn hash_leg_payload_binds_all_fields() {
+    fn settlement_digest_binds_signed_context_fields() {
         let rid = B256::repeat_byte(0x11);
         let leg = U256::from(2u64);
         let asset = B256::repeat_byte(0x33);
         let amount = U256::from(1_000_000u64);
-        // Independent recomputation of the documented 128-byte layout — a
-        // `-> [0; 32]` body or a layout change diverges from this.
-        let mut buf = [0u8; 128];
-        buf[..32].copy_from_slice(rid.as_slice());
-        buf[32..64].copy_from_slice(&leg.to_be_bytes::<32>());
-        buf[64..96].copy_from_slice(asset.as_slice());
-        buf[96..128].copy_from_slice(&amount.to_be_bytes::<32>());
-        let want: [u8; 32] = alloy_primitives::keccak256(buf).into();
-        assert_eq!(hash_leg_payload(rid, leg, asset, amount), want);
-        assert_ne!(want, [0u8; 32]);
-        // Re-signing the same leg with a different amount is a different slot.
+        let context = test_settlement_context();
+        let first = redemption_attestation(rid, leg, asset, amount, context);
+        let mut changed = context;
+        changed.source_block_hash = B256::repeat_byte(0x44);
+        let second = redemption_attestation(rid, leg, asset, amount, changed);
         assert_ne!(
-            hash_leg_payload(rid, leg, asset, U256::from(999u64)),
-            hash_leg_payload(rid, leg, asset, amount)
+            redemption_attestation_signing_hash(&first, &cfg().domain()),
+            redemption_attestation_signing_hash(&second, &cfg().domain())
         );
     }
 
@@ -2063,7 +2259,12 @@ mod tests {
 
         // The digest seen by the HSM MUST be the canonical EIP-712 hash
         // — recompute locally and compare.
-        let att = attestation(intent_id, slot_index, attested_amount);
+        let att = attestation(
+            intent_id,
+            slot_index,
+            attested_amount,
+            test_settlement_context(),
+        );
         let expected = attestation_signing_hash(&att, &state.config.domain());
         #[expect(clippy::unwrap_used, reason = "test code")]
         let seen = hsm.seen.lock().unwrap();
@@ -2106,12 +2307,17 @@ mod tests {
         let intent_id = B256::repeat_byte(0x6c);
         let slot_index = U256::from(0u8);
         let attested_amount = U256::from(1_000_000u32);
-        let payload_hash = hash_attestation_payload(intent_id, slot_index, attested_amount);
+        let context = test_settlement_context();
+        let digest = attestation_signing_hash(
+            &attestation(intent_id, slot_index, attested_amount, context),
+            &attestation_oracle_domain(31337, Address::repeat_byte(0xab)),
+        );
+        let payload_hash = digest.0;
 
         // The winner already recorded a valid 65-byte signature.
         let winner_sig: [u8; 65] = {
             use alloy::signers::SignerSync;
-            let att = attestation(intent_id, slot_index, attested_amount);
+            let att = attestation(intent_id, slot_index, attested_amount, context);
             let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
             let digest = attestation_signing_hash(&att, &domain);
             test_key().sign_hash_sync(&digest).expect("sign").as_bytes()
@@ -2238,11 +2444,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let expected_refund = refund_attestation_signing_hash(
-            &refund_attestation(red, U256::ZERO, asset, amt),
+            &refund_attestation(red, U256::ZERO, asset, amt, test_settlement_context()),
             &state.config.domain(),
         );
         let unexpected_delivery = redemption_attestation_signing_hash(
-            &redemption_attestation(red, U256::ZERO, asset, amt),
+            &redemption_attestation(red, U256::ZERO, asset, amt, test_settlement_context()),
             &state.config.domain(),
         );
         // Typehash separation: the refund digest MUST NOT equal the
@@ -2286,11 +2492,18 @@ mod tests {
         // digest for the same (id, leg, asset, amount): the 4-way typehash
         // separation mirrored from the on-chain oracle.
         let expected = streamed_settlement_signing_hash(
-            &streamed_settlement(red, U256::ZERO, asset, delivered, refunded),
+            &streamed_settlement(
+                red,
+                U256::ZERO,
+                asset,
+                delivered,
+                refunded,
+                test_settlement_context(),
+            ),
             &state.config.domain(),
         );
         let delivery_digest = redemption_attestation_signing_hash(
-            &redemption_attestation(red, U256::ZERO, asset, delivered),
+            &redemption_attestation(red, U256::ZERO, asset, delivered, test_settlement_context()),
             &state.config.domain(),
         );
         assert_ne!(
@@ -2330,6 +2543,7 @@ mod tests {
         let metered = CertVolumePolicy {
             window_secs: 86_400,
             caps,
+            allow_unmetered: false,
         };
         assert!(metered.assert_metered_for(&[ChainId::Tron]).is_ok());
         assert!(
@@ -2982,7 +3196,7 @@ mod tests {
                 "chain_id": "btc",
                 "redemption_id": format!("0x{}", "ab".repeat(32)),
                 "leg_index": leg,
-                "asset_id": format!("0x{}", "a1".repeat(32)),
+                "asset_id": format!("{:#x}", ChainId::Btc.asset_id_hash()),
                 "amount": "100000000",
                 "amount_decimals": 8,
                 "immediate_target_hash": format!("0x{}", "cd".repeat(32)),
@@ -2999,7 +3213,7 @@ mod tests {
                 "cancel_id": format!("0x{}", "77".repeat(32)),
                 "intent_id": format!("0x{}", "88".repeat(32)),
                 "slot_index": "0",
-                "asset_id": format!("0x{}", "a1".repeat(32)),
+                "asset_id": format!("{:#x}", ChainId::Btc.asset_id_hash()),
                 "amount": "100000000",
                 "amount_decimals": 8,
                 "immediate_target_hash": format!("0x{}", "cd".repeat(32)),
@@ -3087,30 +3301,241 @@ mod tests {
             zero_cap.caps.insert(ChainId::Btc, 0);
             assert!(zero_cap.validate().is_err());
         }
+
+        #[test]
+        #[expect(clippy::expect_used, reason = "test code")]
+        fn policy_window_bounds_are_fail_closed() {
+            let validate = |window_secs| {
+                CertVolumePolicy::try_new(window_secs, HashMap::new(), true).map(|_| ())
+            };
+
+            assert_eq!(
+                validate(0).expect_err("zero must fail"),
+                "cert_volume.window_secs must be > 0"
+            );
+            let maximum =
+                CertVolumePolicy::try_new(MAX_CERT_VOLUME_WINDOW_SECS, HashMap::new(), true)
+                    .expect("maximum must be representable");
+            assert_eq!(maximum.window_secs(), MAX_CERT_VOLUME_WINDOW_SECS_I64);
+            assert_eq!(
+                validate(MAX_CERT_VOLUME_WINDOW_SECS + 1).expect_err("maximum plus one must fail"),
+                "cert_volume.window_secs must be <= 2678400 (31 days)"
+            );
+            assert_eq!(
+                validate(u64::try_from(i64::MAX).expect("i64::MAX fits u64"))
+                    .expect_err("i64::MAX must exceed the operational maximum"),
+                "cert_volume.window_secs must be <= 2678400 (31 days)"
+            );
+            assert_eq!(
+                validate(u64::MAX).expect_err("u64::MAX must not silently fall back"),
+                "cert_volume.window_secs does not fit signed database duration"
+            );
+        }
     }
 
     /// CTD-1 Slice A.7 — `/api/v1/sign/eip712-ric` (Set-B certifies a
     /// redemption leg's custody-spend intent).
     mod ric_sign_tests {
         use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct RefusingSigner {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl HsmDigestSigner for RefusingSigner {
+            async fn sign_digest(
+                &self,
+                _address: Address,
+                _digest: B256,
+            ) -> Result<[u8; 65], HsmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err(HsmError::Decode("must not be called".to_string()))
+            }
+        }
+
+        fn guard_state() -> (
+            DaemonState<InMemoryReplayStore, RefusingSigner>,
+            Arc<RefusingSigner>,
+        ) {
+            let config = DaemonConfig {
+                chain_id: 31337,
+                verifying_contract: Address::repeat_byte(0xab),
+                eth_address: Address::repeat_byte(0x42),
+                intent_policy: crate::test_support::ric::policy(),
+                cert_volume: CertVolumePolicy::unmetered(),
+            };
+            let hsm = Arc::new(RefusingSigner::default());
+            (
+                DaemonState::new(config, Arc::new(InMemoryReplayStore::new()), hsm.clone()),
+                hsm,
+            )
+        }
 
         fn fresh_now() -> u64 {
             u64::try_from(now_unix_secs()).unwrap_or(0)
         }
 
-        fn ric_body(chain: &str, vault_resolved_at: u64) -> serde_json::Value {
+        fn ric_body(chain: ChainId, vault_resolved_at: u64) -> serde_json::Value {
             serde_json::json!({
                 "chain_id": chain,
                 "redemption_id": format!("0x{}", "ab".repeat(32)),
                 "leg_index": "1",
-                "asset_id": format!("0x{}", "a1".repeat(32)),
+                "asset_id": format!("{:#x}", chain.asset_id_hash()),
                 "amount": "100000000",
-                "amount_decimals": 8,
+                "amount_decimals": chain.decimals(),
                 "immediate_target_hash": format!("0x{}", "cd".repeat(32)),
                 "memo_hash": format!("0x{}", "ef".repeat(32)),
                 "final_destination_hash": format!("0x{}", "12".repeat(32)),
                 "vault_resolved_at": vault_resolved_at,
             })
+        }
+
+        fn acc_body(chain: ChainId, vault_resolved_at: u64) -> serde_json::Value {
+            serde_json::json!({
+                "chain_id": chain,
+                "cancel_id": format!("0x{}", "77".repeat(32)),
+                "intent_id": format!("0x{}", "88".repeat(32)),
+                "slot_index": "0",
+                "asset_id": format!("{:#x}", chain.asset_id_hash()),
+                "amount": "100000000",
+                "amount_decimals": chain.decimals(),
+                "immediate_target_hash": format!("0x{}", "cd".repeat(32)),
+                "memo_hash": format!("0x{}", "ef".repeat(32)),
+                "final_destination_hash": format!("0x{}", "12".repeat(32)),
+                "vault_resolved_at": vault_resolved_at,
+            })
+        }
+
+        fn settlement_body() -> serde_json::Value {
+            serde_json::json!({
+                "intent_id": format!("{:#x}", B256::repeat_byte(0x91)),
+                "slot_index": "0",
+                "attested_amount": "1000000",
+            })
+        }
+
+        /// External-audit H-04 reproduction: rollback/freshness metadata is
+        /// validated before replay reservation or any HSM call. Deadlines are
+        /// strict, so a report is invalid at `now == valid_until`.
+        #[tokio::test]
+        async fn settlement_context_rejections_are_key_free_and_fail_closed() {
+            let now = fresh_now();
+            let cases = [
+                ("valid_until", serde_json::json!(now)),
+                (
+                    "observed_at",
+                    serde_json::json!(now.saturating_add(SETTLEMENT_FUTURE_SKEW_SECS + 1)),
+                ),
+                ("source_chain_id", serde_json::json!(1u64)),
+                (
+                    "source_block_hash",
+                    serde_json::json!(format!("{:#x}", B256::ZERO)),
+                ),
+            ];
+            for (field, value) in cases {
+                let (state, hsm) = guard_state();
+                let app = router(state);
+                let mut body = settlement_body();
+                body[field] = value;
+                if field == "valid_until" {
+                    body["observed_at"] = serde_json::json!(now.saturating_sub(30));
+                } else if field == "observed_at" {
+                    body["valid_until"] = serde_json::json!(now.saturating_add(100));
+                }
+                let (status, response) =
+                    post_json(&app, "/api/v1/sign/eip712-attestation", body).await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+                assert_eq!(
+                    response["code"].as_str().unwrap_or(""),
+                    error_codes::SETTLEMENT_CONTEXT_INVALID
+                );
+                assert_eq!(hsm.calls.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        /// External-audit H-03 reproduction: the unsigned request chain,
+        /// signed asset, and signed decimals must agree before any HSM work.
+        #[test]
+        fn certificate_asset_registry_covers_every_supported_chain() {
+            for &chain in xindex_shared::chain_registry::ALL_CHAINS {
+                assert_eq!(
+                    certificate_native_chain(chain, chain.asset_id_hash(), chain.decimals())
+                        .map_err(|_| ()),
+                    Ok(chain)
+                );
+                let relabeled = if chain == ChainId::Btc {
+                    ChainId::Eth
+                } else {
+                    ChainId::Btc
+                };
+                assert!(certificate_native_chain(
+                    relabeled,
+                    chain.asset_id_hash(),
+                    chain.decimals()
+                )
+                .is_err());
+                assert!(certificate_native_chain(
+                    chain,
+                    chain.asset_id_hash(),
+                    chain.decimals().wrapping_add(1)
+                )
+                .is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn certificate_sign_rejects_asset_policy_mismatch_before_hsm() {
+            let canonical_btc = format!("{:#x}", ChainId::Btc.asset_id_hash());
+            for (chain, asset_id, decimals) in [
+                (ChainId::Eth, canonical_btc.clone(), 8u8),
+                (ChainId::Btc, format!("{:#x}", B256::repeat_byte(0xff)), 8u8),
+                (ChainId::Btc, canonical_btc.clone(), 7u8),
+            ] {
+                for endpoint in ["/api/v1/sign/eip712-ric", "/api/v1/sign/eip712-acc"] {
+                    let (state, hsm) = guard_state();
+                    let app = router(state);
+                    let mut body = if endpoint.ends_with("ric") {
+                        ric_body(chain, fresh_now() - 5)
+                    } else {
+                        acc_body(chain, fresh_now() - 5)
+                    };
+                    body["asset_id"] = serde_json::json!(asset_id);
+                    body["amount_decimals"] = serde_json::json!(decimals);
+                    let (status, response) = post_json(&app, endpoint, body).await;
+                    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+                    assert_eq!(
+                        response["code"].as_str().unwrap_or(""),
+                        error_codes::CERTIFICATE_ASSET_INVALID
+                    );
+                    assert_eq!(hsm.calls.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
+
+        /// Production mode cannot silently turn quota enforcement off for a
+        /// canonical chain omitted from the cap map.
+        #[tokio::test]
+        async fn certificate_sign_rejects_missing_cap_before_replay_or_hsm() {
+            for endpoint in ["/api/v1/sign/eip712-ric", "/api/v1/sign/eip712-acc"] {
+                let (mut state, hsm) = guard_state();
+                state.config.cert_volume.allow_unmetered = false;
+                let app = router(state);
+                let body = if endpoint.ends_with("ric") {
+                    ric_body(ChainId::Btc, fresh_now() - 5)
+                } else {
+                    acc_body(ChainId::Btc, fresh_now() - 5)
+                };
+                let (status, response) = post_json(&app, endpoint, body).await;
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+                assert_eq!(
+                    response["code"].as_str().unwrap_or(""),
+                    error_codes::VOLUME_CAP_MISSING
+                );
+                assert_eq!(hsm.calls.load(Ordering::SeqCst), 0);
+            }
         }
 
         /// The single most important property: the daemon hands the HSM
@@ -3125,7 +3550,7 @@ mod tests {
             let (status, body) = post_json(
                 &app,
                 "/api/v1/sign/eip712-ric",
-                ric_body("btc", resolved_at),
+                ric_body(ChainId::Btc, resolved_at),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "body: {body}");
@@ -3139,7 +3564,8 @@ mod tests {
             let expected_ric = redemption_intent_certificate(
                 B256::repeat_byte(0xab),
                 U256::from(1u8),
-                B256::repeat_byte(0xa1),
+                ChainId::Btc.asset_id_hash(),
+                ChainId::Btc.native_chain_id_hash(),
                 U256::from(100_000_000_u64),
                 8,
                 B256::repeat_byte(0xcd),
@@ -3161,7 +3587,7 @@ mod tests {
         async fn ric_sign_identical_retry_is_idempotent() {
             let (state, hsm) = build_state();
             let app = router(state);
-            let body = ric_body("btc", fresh_now() - 5);
+            let body = ric_body(ChainId::Btc, fresh_now() - 5);
 
             let (s1, b1) = post_json(&app, "/api/v1/sign/eip712-ric", body.clone()).await;
             let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", body).await;
@@ -3184,12 +3610,12 @@ mod tests {
             let (s1, _) = post_json(
                 &app,
                 "/api/v1/sign/eip712-ric",
-                ric_body("btc", resolved_at),
+                ric_body(ChainId::Btc, resolved_at),
             )
             .await;
             assert_eq!(s1, StatusCode::OK);
 
-            let mut second = ric_body("btc", resolved_at);
+            let mut second = ric_body(ChainId::Btc, resolved_at);
             second["amount"] = serde_json::json!("200000000");
             let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", second).await;
             assert_eq!(s2, StatusCode::CONFLICT);
@@ -3214,13 +3640,13 @@ mod tests {
             let (s1, _) = post_json(
                 &app,
                 "/api/v1/sign/eip712-ric",
-                ric_body("btc", resolved_at),
+                ric_body(ChainId::Btc, resolved_at),
             )
             .await;
             let (s2, _) = post_json(
                 &app,
                 "/api/v1/sign/eip712-ric",
-                ric_body("ltc", resolved_at),
+                ric_body(ChainId::Ltc, resolved_at),
             )
             .await;
             assert_eq!(s1, StatusCode::OK);
@@ -3236,7 +3662,7 @@ mod tests {
             let (status, body) = post_json(
                 &app,
                 "/api/v1/sign/eip712-ric",
-                ric_body("sol", fresh_now()),
+                ric_body(ChainId::Sol, fresh_now()),
             )
             .await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -3257,7 +3683,7 @@ mod tests {
             let app = router(state);
             let now = fresh_now();
 
-            let stale = ric_body("btc", now - RIC_SIGN_MAX_AGE_SECS - 30);
+            let stale = ric_body(ChainId::Btc, now - RIC_SIGN_MAX_AGE_SECS - 30);
             let (s1, b1) = post_json(&app, "/api/v1/sign/eip712-ric", stale).await;
             assert_eq!(s1, StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(
@@ -3266,7 +3692,7 @@ mod tests {
             );
 
             let future = ric_body(
-                "btc",
+                ChainId::Btc,
                 now + crate::intent::RIC_FUTURE_SKEW_TOLERANCE_SECS + 30,
             );
             let (s2, b2) = post_json(&app, "/api/v1/sign/eip712-ric", future).await;
@@ -3287,17 +3713,17 @@ mod tests {
             let app = router(state);
             let now = fresh_now();
 
-            let mut bad_rid = ric_body("btc", now - 5);
+            let mut bad_rid = ric_body(ChainId::Btc, now - 5);
             bad_rid["redemption_id"] = serde_json::json!("0x1234");
             let (s1, _) = post_json(&app, "/api/v1/sign/eip712-ric", bad_rid).await;
             assert_eq!(s1, StatusCode::BAD_REQUEST);
 
-            let mut big_leg = ric_body("btc", now - 5);
+            let mut big_leg = ric_body(ChainId::Btc, now - 5);
             big_leg["leg_index"] = serde_json::json!("4294967296");
             let (s2, _) = post_json(&app, "/api/v1/sign/eip712-ric", big_leg).await;
             assert_eq!(s2, StatusCode::BAD_REQUEST);
 
-            let mut bad_amount = ric_body("btc", now - 5);
+            let mut bad_amount = ric_body(ChainId::Btc, now - 5);
             bad_amount["amount"] = serde_json::json!("12x");
             let (s3, _) = post_json(&app, "/api/v1/sign/eip712-ric", bad_amount).await;
             assert_eq!(s3, StatusCode::BAD_REQUEST);

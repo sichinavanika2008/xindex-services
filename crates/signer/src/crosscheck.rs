@@ -43,7 +43,10 @@ use std::str::FromStr;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use xindex_chain_thor::{InboundAddress, ThorClient, ThorError, TxDetailsResponse, TxResponse};
+use xindex_chain_thor::{
+    HistoricalAsgardMembership, InboundAddress, ThorClient, ThorError, TxDetailsResponse,
+    TxResponse,
+};
 use xindex_chain_utxo::{UtxoChainClient, UtxoError};
 use xindex_shared::consumed_inflow::{
     AnyConsumedInflow, ConsumedInflowError, ConsumedInflowStore, InflowConsumeOutcome,
@@ -222,12 +225,17 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
     ///
     /// # Errors
     /// The same fail-closed policy errors as [`Self::observe_settlement`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the snapshot API binds transaction views, current halt state, historical membership, and lifecycle identity"
+    )]
     pub async fn observe_settlement_from_snapshot(
         &self,
         thor_inbound_tx_hash: &str,
         status: &TxResponse,
         details: &TxDetailsResponse,
-        vault: &InboundAddress,
+        current_vault: &InboundAddress,
+        historical_membership: &HistoricalAsgardMembership,
         intent_id: B256,
         slot_index: u32,
     ) -> Result<u64, CrossCheckError> {
@@ -235,7 +243,8 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
             thor_inbound_tx_hash,
             status,
             details,
-            vault,
+            current_vault,
+            historical_membership,
             None,
             intent_id,
             slot_index,
@@ -252,7 +261,11 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
     ) -> Result<u64, CrossCheckError> {
         let status = self.thor.tx_status(thor_inbound_tx_hash).await?;
         let details = self.thor.tx_details(thor_inbound_tx_hash).await?;
-        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+        let historical_membership = self
+            .thor
+            .historical_asgard_membership(&status, "BTC")
+            .await?;
+        let current_vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
             CrossCheckError::ThorNotReady {
                 reason: "no BTC inbound address from THORChain".to_string(),
             }
@@ -261,7 +274,8 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
             thor_inbound_tx_hash,
             &status,
             &details,
-            &vault,
+            &current_vault,
+            &historical_membership,
             expected_sats,
             lifecycle_id,
             slot_index,
@@ -279,7 +293,8 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
         thor_inbound_tx_hash: &str,
         resp: &TxResponse,
         details: &TxDetailsResponse,
-        vault: &InboundAddress,
+        current_vault: &InboundAddress,
+        historical_membership: &HistoricalAsgardMembership,
         expected_sats: Option<u64>,
         lifecycle_id: B256,
         slot_index: u32,
@@ -370,15 +385,24 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
             }
         })?;
 
-        if vault.chain != "BTC"
-            || vault.address.is_empty()
-            || vault.halted
-            || vault.chain_trading_paused
-            || vault.global_trading_paused
-            || vault.chain_lp_actions_paused
+        if current_vault.chain != "BTC"
+            || current_vault.address.is_empty()
+            || current_vault.halted
+            || current_vault.chain_trading_paused
+            || current_vault.global_trading_paused
+            || current_vault.chain_lp_actions_paused
         {
             return Err(CrossCheckError::ThorNotReady {
                 reason: "BTC trading or LP actions halted on THORChain".to_string(),
+            });
+        }
+        if historical_membership.chain != "BTC"
+            || historical_membership.addresses.is_empty()
+            || resp.historical_asgard_height().ok() != Some(historical_membership.height)
+        {
+            return Err(CrossCheckError::ThorNotReady {
+                reason: "historical BTC Asgard membership does not match finalised height"
+                    .to_string(),
             });
         }
 
@@ -416,9 +440,13 @@ impl<C: UtxoChainClient + Send + Sync> ThorUtxoPolicy<C> {
             }
         }
         let funders = self.btc.tx_input_addresses(&utxo.txid)?;
-        if !funders.iter().any(|funder| funder == &vault.address) {
+        if !funders
+            .iter()
+            .any(|funder| historical_membership.contains(funder))
+        {
             return Err(CrossCheckError::ThorNotReady {
-                reason: "BTC UTXO not funded by the live Asgard vault".to_string(),
+                reason: "BTC UTXO not funded by historical active/retiring Asgard membership"
+                    .to_string(),
             });
         }
 
@@ -1108,17 +1136,24 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
                 reason: format!("observed BTC refund txid is invalid: {error}"),
             })?;
 
-        // Resolve the live Asgard vault — the refund UTXO MUST originate
-        // there (sender binding, P3.3-9 for BTC). Refuse while BTC trading
-        // is halted on THORChain.
-        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+        // Bind sender identity to the active/retiring Asgard set at the
+        // finalized settlement height. Current inbound state is consulted
+        // separately and only for the live halt gate.
+        let historical_membership = self.thor.historical_asgard_membership(&resp, "BTC").await?;
+        let current_vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
             RefundCrossCheckError::ThorNotReady {
                 reason: "no BTC inbound address from THORChain".to_string(),
             }
         })?;
-        if vault.halted || vault.chain_trading_paused || vault.global_trading_paused {
+        if current_vault.chain != "BTC"
+            || current_vault.address.is_empty()
+            || current_vault.halted
+            || current_vault.chain_trading_paused
+            || current_vault.global_trading_paused
+            || current_vault.chain_lp_actions_paused
+        {
             return Err(RefundCrossCheckError::ThorNotReady {
-                reason: "BTC trading halted on THORChain".to_string(),
+                reason: "BTC trading or LP actions halted on THORChain".to_string(),
             });
         }
 
@@ -1144,11 +1179,16 @@ impl<C: UtxoChainClient + Send + Sync> RefundCrossCheck for ThorUtxoRefundPolicy
             });
         }
 
-        // Bind the refund UTXO's funding inputs to the live Asgard vault.
+        // Bind the refund UTXO's funding inputs to the historical set.
         let funders = self.btc.tx_input_addresses(&utxo.txid)?;
-        if !funders.iter().any(|f| f == &vault.address) {
+        if !funders
+            .iter()
+            .any(|funder| historical_membership.contains(funder))
+        {
             return Err(RefundCrossCheckError::ThorNotReady {
-                reason: "BTC refund UTXO not funded by the live Asgard vault".to_string(),
+                reason:
+                    "BTC refund UTXO not funded by historical active/retiring Asgard membership"
+                        .to_string(),
             });
         }
         let lifecycle_id =
@@ -1495,7 +1535,7 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
         &self,
         resp: &TxResponse,
         details: &TxDetailsResponse,
-        vault: &InboundAddress,
+        historical_membership: &HistoricalAsgardMembership,
         redemption_id: B256,
         leg_index: u32,
     ) -> Result<Option<u64>, StreamedSettlementCrossCheckError> {
@@ -1575,17 +1615,6 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
             }
         })?;
 
-        if vault.chain != "BTC"
-            || vault.address.is_empty()
-            || vault.halted
-            || vault.chain_trading_paused
-            || vault.global_trading_paused
-            || vault.chain_lp_actions_paused
-        {
-            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
-                reason: "BTC trading or LP actions halted on THORChain".to_string(),
-            });
-        }
         let utxos = self.btc.get_address_utxos(&self.btc_multisig_address)?;
         let candidates: Vec<_> = utxos
             .iter()
@@ -1618,9 +1647,14 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
             });
         }
         let funders = self.btc.tx_input_addresses(&utxo.txid)?;
-        if !funders.iter().any(|f| f == &vault.address) {
+        if !funders
+            .iter()
+            .any(|funder| historical_membership.contains(funder))
+        {
             return Err(StreamedSettlementCrossCheckError::ThorNotReady {
-                reason: "BTC refund UTXO not funded by the live Asgard vault".to_string(),
+                reason:
+                    "BTC refund UTXO not funded by historical active/retiring Asgard membership"
+                        .to_string(),
             });
         }
 
@@ -1664,7 +1698,8 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
         &self,
         resp: &TxResponse,
         details: &TxDetailsResponse,
-        vault: &InboundAddress,
+        current_vault: &InboundAddress,
+        historical_membership: &HistoricalAsgardMembership,
         arrivals: &[Erc20Arrival],
         btc_txid: &str,
         index_token: EthAddress,
@@ -1685,15 +1720,24 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
                     .to_string(),
             });
         }
-        if vault.chain != "BTC"
-            || vault.address.is_empty()
-            || vault.halted
-            || vault.chain_trading_paused
-            || vault.global_trading_paused
-            || vault.chain_lp_actions_paused
+        if current_vault.chain != "BTC"
+            || current_vault.address.is_empty()
+            || current_vault.halted
+            || current_vault.chain_trading_paused
+            || current_vault.global_trading_paused
+            || current_vault.chain_lp_actions_paused
         {
             return Err(StreamedSettlementCrossCheckError::ThorNotReady {
                 reason: "agreed BTC vault is missing, halted, or LP-paused".to_string(),
+            });
+        }
+        if historical_membership.chain != "BTC"
+            || historical_membership.addresses.is_empty()
+            || resp.historical_asgard_height().ok() != Some(historical_membership.height)
+        {
+            return Err(StreamedSettlementCrossCheckError::ThorNotReady {
+                reason: "historical BTC Asgard membership does not match finalised height"
+                    .to_string(),
             });
         }
         let delivered = self
@@ -1707,7 +1751,13 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync>
             )
             .await?;
         let refunded = self
-            .verify_refund_leg(resp, details, vault, redemption_id, leg_index)
+            .verify_refund_leg(
+                resp,
+                details,
+                historical_membership,
+                redemption_id,
+                leg_index,
+            )
             .await?;
         match (delivered, refunded) {
             (None, None) => Err(StreamedSettlementCrossCheckError::NoSettlement),
@@ -1741,7 +1791,8 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> StreamedSettlement
     ) -> Result<StreamedOutcome, StreamedSettlementCrossCheckError> {
         let resp = self.thor.tx_status(btc_txid).await?;
         let details = self.thor.tx_details(btc_txid).await?;
-        let vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
+        let historical_membership = self.thor.historical_asgard_membership(&resp, "BTC").await?;
+        let current_vault = self.thor.vault_for_chain("BTC").await?.ok_or_else(|| {
             StreamedSettlementCrossCheckError::ThorNotReady {
                 reason: "no BTC inbound address from THORChain".to_string(),
             }
@@ -1750,7 +1801,8 @@ impl<E: Erc20ArrivalClient, C: UtxoChainClient + Send + Sync> StreamedSettlement
         self.verify_from_snapshot(
             &resp,
             &details,
-            &vault,
+            &current_vault,
+            &historical_membership,
             &arrivals,
             btc_txid,
             index_token,
@@ -1799,10 +1851,23 @@ mod tests {
     /// Mainnet bech32 address standing in for the live Asgard vault that
     /// funds every BTC UTXO `StubBtc` reports.
     const ASGARD_BTC: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    /// Canonical `THORChain` inbound transaction ID used by mint-policy
+    /// fixtures. Keeping this bytes32-shaped prevents negative tests from
+    /// short-circuiting at the request-shape gate before reaching the policy
+    /// branch they intend to exercise.
+    const THOR_INBOUND_HASH: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// Observed BTC outbound selected by the `tx/details` fixture.
+    const BTC_OUTBOUND_TXID: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
 
     /// Mock `GET /thorchain/inbound_addresses` returning a single BTC vault
     /// with the given address + halted flag.
-    async fn mount_btc_inbound(server: &wiremock::MockServer, vault_addr: &str, halted: bool) {
+    async fn mount_btc_current_inbound(
+        server: &wiremock::MockServer,
+        vault_addr: &str,
+        halted: bool,
+    ) {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/thorchain/inbound_addresses"))
             .respond_with(
@@ -1818,12 +1883,67 @@ mod tests {
             .await;
     }
 
+    /// Mock the exact source-height active/retiring Asgard set used for
+    /// historical settlement identity.
+    async fn mount_btc_historical_asgard(
+        server: &wiremock::MockServer,
+        height: u64,
+        vault_addr: &str,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/thorchain/vaults/asgard"))
+            .and(wiremock::matchers::query_param(
+                "height",
+                height.to_string(),
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "pub_key": "thorpub1historical",
+                    "type": "AsgardVault",
+                    "status": "ActiveVault",
+                    "status_since": height.saturating_sub(10),
+                    "addresses": [{ "chain": "BTC", "address": vault_addr }]
+                }])),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Default fixture where current and historical membership have not
+    /// rotated. Rotation regressions mount the two snapshots separately.
+    async fn mount_btc_inbound(server: &wiremock::MockServer, vault_addr: &str, halted: bool) {
+        mount_btc_current_inbound(server, vault_addr, halted).await;
+        mount_btc_historical_asgard(server, 100, vault_addr).await;
+    }
+
     #[expect(clippy::expect_used, reason = "test code")]
     fn test_address() -> Address {
         Address::from_str("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
             .expect("addr")
             .require_network(Network::Bitcoin)
             .expect("network")
+    }
+
+    /// Mount the observed BTC outbound required by the settlement policy.
+    /// Tests choose the amount explicitly so action, details, and on-chain
+    /// fixtures cannot silently drift apart.
+    async fn mount_btc_outbound_details(server: &wiremock::MockServer, amount_sats: u64) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/details/{THOR_INBOUND_HASH}"
+            )))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "out_txs": [{
+                        "id": BTC_OUTBOUND_TXID,
+                        "chain": "BTC",
+                        "to_address": test_address().to_string(),
+                        "coins": [{ "asset": "BTC.BTC", "amount": amount_sats.to_string() }]
+                    }]
+                })),
+            )
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]
@@ -1838,34 +1958,38 @@ mod tests {
         // Stub a thor client that succeeds; stub BTC has no UTXOs.
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "done"
                     },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain": "BTC",
                         "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
                         "coin": { "asset": "BTC.BTC", "amount": "100000" },
-                        "memo": "OUT:abc",
+                        "memo": format!("OUT:{THOR_INBOUND_HASH}"),
                         "max_gas": []
                     }]
                 })),
             )
             .mount(&server)
             .await;
+        mount_btc_outbound_details(&server, 100_000).await;
         mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
-            .verify("abc", 100_000)
+            .verify(THOR_INBOUND_HASH, 100_000)
             .await
             .expect_err("should reject");
         assert!(matches!(err, CrossCheckError::BtcNotReady { .. }));
@@ -1876,34 +2000,39 @@ mod tests {
     async fn thor_btc_policy_amount_mismatch() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "done"
                     },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain": "BTC",
                         "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
                         "coin": { "asset": "BTC.BTC", "amount": "50000" },
-                        "memo": "OUT:abc",
+                        "memo": format!("OUT:{THOR_INBOUND_HASH}"),
                         "max_gas": []
                     }]
                 })),
             )
             .mount(&server)
             .await;
+        mount_btc_outbound_details(&server, 50_000).await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         // Claim is 100_000 sats but `THORChain` says 50_000 → mismatch.
         let err = policy
-            .verify("abc", 100_000)
+            .verify(THOR_INBOUND_HASH, 100_000)
             .await
             .expect_err("should reject");
         assert!(matches!(err, CrossCheckError::AmountMismatch { .. }));
@@ -1921,17 +2050,20 @@ mod tests {
     async fn thor_btc_policy_rejects_wrong_chain_action() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "done"
                     },
+                    "finalised_height": 100,
                     "actions": [{
                         // chain is ETH (not BTC) but to_address matches
                         // our multisig string. `&&` filter rejects;
@@ -1939,18 +2071,20 @@ mod tests {
                         "chain": "ETH",
                         "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
                         "coin": { "asset": "ETH.ETH", "amount": "1000000000000000000" },
-                        "memo": "OUT:abc",
+                        "memo": format!("OUT:{THOR_INBOUND_HASH}"),
                         "max_gas": []
                     }]
                 })),
             )
             .mount(&server)
             .await;
+        mount_btc_outbound_details(&server, 100_000).await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
-            .verify("abc", 100_000)
+            .verify(THOR_INBOUND_HASH, 100_000)
             .await
             .expect_err("should reject wrong-chain action");
         assert!(
@@ -1967,34 +2101,39 @@ mod tests {
     async fn thor_btc_policy_rejects_wrong_address_action() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "done"
                     },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain": "BTC",
                         // Different bc1... address than test_address().
                         "to_address": "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
                         "coin": { "asset": "BTC.BTC", "amount": "100000" },
-                        "memo": "OUT:abc",
+                        "memo": format!("OUT:{THOR_INBOUND_HASH}"),
                         "max_gas": []
                     }]
                 })),
             )
             .mount(&server)
             .await;
+        mount_btc_outbound_details(&server, 100_000).await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
-            .verify("abc", 100_000)
+            .verify(THOR_INBOUND_HASH, 100_000)
             .await
             .expect_err("should reject wrong-address action");
         assert!(
@@ -2008,27 +2147,32 @@ mod tests {
     async fn thor_btc_policy_thor_not_done() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "incomplete"
                     },
+                    "finalised_height": 100,
                     "actions": []
                 })),
             )
             .mount(&server)
             .await;
+        mount_btc_outbound_details(&server, 100_000).await;
+        mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
-            .verify("abc", 100_000)
+            .verify(THOR_INBOUND_HASH, 100_000)
             .await
             .expect_err("should reject");
         assert!(matches!(err, CrossCheckError::ThorNotReady { .. }));
@@ -2039,35 +2183,41 @@ mod tests {
     async fn thor_btc_policy_full_success() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "done"
                     },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain": "BTC",
                         "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
                         "coin": { "asset": "BTC.BTC", "amount": "100000" },
-                        "memo": "OUT:abc",
+                        "memo": format!("OUT:{THOR_INBOUND_HASH}"),
                         "max_gas": []
                     }]
                 })),
             )
             .mount(&server)
             .await;
-        mount_btc_inbound(&server, ASGARD_BTC, false).await;
+        mount_btc_outbound_details(&server, 100_000).await;
+        // The settlement happened at height 100 while vault A was active.
+        // Current membership has already rotated to vault B at height 101.
+        mount_btc_historical_asgard(&server, 100, ASGARD_BTC).await;
+        mount_btc_current_inbound(&server, "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh", false)
+            .await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
         // Seed BTC stub with a confirmed UTXO matching the claim.
-        let txid =
-            Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
-                .expect("txid");
+        let txid = Txid::from_str(BTC_OUTBOUND_TXID).expect("txid");
         btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid,
             vout: 0,
@@ -2076,46 +2226,53 @@ mod tests {
             block_hash: None,
         });
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
-        policy.verify("abc", 100_000).await.expect("should pass");
+        policy
+            .verify(THOR_INBOUND_HASH, 100_000)
+            .await
+            .expect("should pass");
     }
 
-    /// Sender binding (audit M4): the UTXO arrives at our multisig with the
-    /// right amount + confs, but its funding inputs come from a DIFFERENT
-    /// address than the live Asgard vault → `ThorNotReady`.
+    /// M03 negative rotation case: an address absent from the historical
+    /// height-100 set stays ineligible even if it is the current vault later.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn thor_btc_policy_rejects_utxo_not_from_asgard() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "done"
                     },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain": "BTC",
                         "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
                         "coin": { "asset": "BTC.BTC", "amount": "100000" },
-                        "memo": "OUT:abc",
+                        "memo": format!("OUT:{THOR_INBOUND_HASH}"),
                         "max_gas": []
                     }]
                 })),
             )
             .mount(&server)
             .await;
-        // Inbound reports a DIFFERENT vault than StubBtc::tx_input_addresses.
-        mount_btc_inbound(&server, "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh", false).await;
+        mount_btc_outbound_details(&server, 100_000).await;
+        mount_btc_historical_asgard(&server, 100, "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh")
+            .await;
+        // StubBtc reports ASGARD_BTC as funder, and it became current only
+        // after the settlement height.
+        mount_btc_current_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        let txid =
-            Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
-                .expect("txid");
+        let txid = Txid::from_str(BTC_OUTBOUND_TXID).expect("txid");
         btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid,
             vout: 0,
@@ -2125,7 +2282,7 @@ mod tests {
         });
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
-            .verify("abc", 100_000)
+            .verify(THOR_INBOUND_HASH, 100_000)
             .await
             .expect_err("must reject UTXO not from Asgard");
         assert!(
@@ -2141,34 +2298,36 @@ mod tests {
     async fn thor_btc_policy_rejects_when_btc_halted() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/abc"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "observed_tx": {
                         "tx": {
-                            "id": "abc", "chain": "ETH",
+                            "id": THOR_INBOUND_HASH, "chain": "ETH",
                             "from_address": "0xUser", "to_address": "0xRouter",
                             "coins": [], "memo": ""
                         },
                         "status": "done"
                     },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain": "BTC",
                         "to_address": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
                         "coin": { "asset": "BTC.BTC", "amount": "100000" },
-                        "memo": "OUT:abc",
+                        "memo": format!("OUT:{THOR_INBOUND_HASH}"),
                         "max_gas": []
                     }]
                 })),
             )
             .mount(&server)
             .await;
+        mount_btc_outbound_details(&server, 100_000).await;
         mount_btc_inbound(&server, ASGARD_BTC, true).await; // halted
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
-        let txid =
-            Txid::from_str("1111111111111111111111111111111111111111111111111111111111111111")
-                .expect("txid");
+        let txid = Txid::from_str(BTC_OUTBOUND_TXID).expect("txid");
         btc.utxos.lock().expect("lock").push(UtxoEntry {
             txid,
             vout: 0,
@@ -2178,7 +2337,7 @@ mod tests {
         });
         let policy = ThorUtxoPolicy::new(thor, btc, test_address(), 1, 0, Network::Bitcoin);
         let err = policy
-            .verify("abc", 100_000)
+            .verify(THOR_INBOUND_HASH, 100_000)
             .await
             .expect_err("must reject while halted");
         assert!(
@@ -2555,21 +2714,32 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let multisig = test_address().to_string();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/btc-in"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "observed_tx": { "tx": { "id":"btc-in","chain":"BTC",
+                    "observed_tx": { "tx": { "id":THOR_INBOUND_HASH,"chain":"BTC",
                         "from_address":"bc1qour","to_address":"thor-asgard",
                         "coins":[],"memo":"" }, "status":"done" },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain":"BTC", "to_address": multisig,
                         "coin": { "asset":"BTC.BTC","amount":"99990000" }, // sats == 1e8
-                        "memo":"REFUND:btc-in", "max_gas":[]
+                        "memo":format!("REFUND:{THOR_INBOUND_HASH}"), "max_gas":[]
                     }]
                 })),
             )
             .mount(&server)
             .await;
+        mount_streamed_tx_details(
+            &server,
+            THOR_INBOUND_HASH,
+            idx_token(),
+            None,
+            Some("99990000"),
+        )
+        .await;
         mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
@@ -2584,7 +2754,7 @@ mod tests {
             block_hash: None,
         });
         let policy = ThorUtxoRefundPolicy::new(thor, btc, test_address(), 1, 0);
-        let attested = policy.verify("btc-in").await.expect("ok");
+        let attested = policy.verify(THOR_INBOUND_HASH).await.expect("ok");
         assert_eq!(attested, 99_990_000, "attest the on-chain UTXO sats");
     }
 
@@ -2606,6 +2776,7 @@ mod tests {
                     "observed_tx": { "tx": { "id":"streamed-in","chain":"BTC",
                         "from_address":"bc1qour","to_address":"thor-asgard",
                         "coins":[],"memo":"" }, "status":"done" },
+                    "finalised_height": 100,
                     "actions": [
                         {
                             "chain":"ETH", "to_address": to_lc,
@@ -2686,6 +2857,7 @@ mod tests {
                     "observed_tx": { "tx": { "id":"streamed-in","chain":"BTC",
                         "from_address":"bc1qour","to_address":"thor-asgard",
                         "coins":[],"memo":"" }, "status":"done" },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain":"ETH", "to_address": to_lc,
                         "coin": { "asset":"ETH.USDT-0XDAC17F958D2EE523A2206206994597C13D831EC7",
@@ -2744,6 +2916,7 @@ mod tests {
                     "observed_tx": { "tx": { "id":"streamed-in","chain":"BTC",
                         "from_address":"bc1qour","to_address":"thor-asgard",
                         "coins":[],"memo":"" }, "status":"done" },
+                    "finalised_height": 100,
                     "actions": []
                 })),
             )
@@ -2945,12 +3118,15 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         let multisig = test_address().to_string();
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/thorchain/tx/btc-in"))
+            .and(wiremock::matchers::path(format!(
+                "/thorchain/tx/{THOR_INBOUND_HASH}"
+            )))
             .respond_with(
                 wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "observed_tx": { "tx": { "id":"btc-in","chain":"BTC",
+                    "observed_tx": { "tx": { "id":THOR_INBOUND_HASH,"chain":"BTC",
                         "from_address":"bc1qour","to_address":"thor-asgard",
                         "coins":[],"memo":"" }, "status":"done" },
+                    "finalised_height": 100,
                     "actions": [
                         { "chain":"ETH", "to_address":"0xfoo",
                           "coin": { "asset":"ETH.ETH","amount":"1" },
@@ -2960,12 +3136,20 @@ mod tests {
                           "memo":"OUT:btc-in", "max_gas":[] },
                         { "chain":"BTC", "to_address": multisig,
                           "coin": { "asset":"BTC.BTC","amount":"99990000" },
-                          "memo":"REFUND:btc-in", "max_gas":[] }
+                          "memo":format!("REFUND:{THOR_INBOUND_HASH}"), "max_gas":[] }
                     ]
                 })),
             )
             .mount(&server)
             .await;
+        mount_streamed_tx_details(
+            &server,
+            THOR_INBOUND_HASH,
+            idx_token(),
+            None,
+            Some("99990000"),
+        )
+        .await;
         mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
@@ -2981,7 +3165,7 @@ mod tests {
         });
         let policy = ThorUtxoRefundPolicy::new(thor, btc, test_address(), 1, 0);
         let attested = policy
-            .verify("btc-in")
+            .verify(THOR_INBOUND_HASH)
             .await
             .expect("ETH-non-USDT + foreign USDT must not block refund");
         assert_eq!(attested, 99_990_000);
@@ -3040,9 +3224,9 @@ mod tests {
         }
     }
 
-    /// Refund amount gate `abs_diff(utxo, thor) > tolerance`. A diff
-    /// strictly greater than tolerance must reject with `AmountMismatch`;
-    /// `>`→`<` would accept it. Tolerance 5, diff 10.
+    /// A refund UTXO outside the configured amount tolerance is not an
+    /// eligible observation. Tolerance 5, diff 10, so the policy must remain
+    /// not-ready rather than selecting the mismatched output.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn thor_btc_refund_amount_gate_is_greater_than() {
@@ -3055,6 +3239,7 @@ mod tests {
                     "observed_tx": { "tx": { "id":"btc-in","chain":"BTC",
                         "from_address":"bc1qour","to_address":"thor-asgard",
                         "coins":[],"memo":"" }, "status":"done" },
+                    "finalised_height": 100,
                     "actions": [{
                         "chain":"BTC", "to_address": multisig,
                         "coin": { "asset":"BTC.BTC","amount":"100000" },
@@ -3064,6 +3249,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        mount_streamed_tx_details(&server, "btc-in", idx_token(), None, Some("100000")).await;
         mount_btc_inbound(&server, ASGARD_BTC, false).await;
         let thor = ThorClient::with_base_url(server.uri()).expect("thor");
         let btc = StubBtc::default();
@@ -3083,8 +3269,8 @@ mod tests {
             .await
             .expect_err("diff 10 > tolerance 5 must reject");
         assert!(
-            matches!(err, RefundCrossCheckError::AmountMismatch { .. }),
-            "expected AmountMismatch, got {err:?}"
+            matches!(err, RefundCrossCheckError::BtcNotReady { .. }),
+            "expected BtcNotReady, got {err:?}"
         );
     }
 }
@@ -4150,7 +4336,10 @@ pub mod evm {
                         "chain": "ETH", "pub_key": "thorpub1addwnpepq",
                         "address": "0xeAf72A36ec9F0F8D90C0E5e3b9C2A95eAfBcDef0",
                         "router": "0xD37BbE5744D730a1d98d8DC97c42F0Ca46aD7146",
-                        "halted": halted
+                        "halted": halted,
+                        "global_trading_paused": false,
+                        "chain_trading_paused": false,
+                        "chain_lp_actions_paused": false
                     }]),
                 ))
                 .mount(server)
@@ -5000,7 +5189,10 @@ pub mod cosmos {
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                     serde_json::json!([{
                         "chain": "GAIA", "pub_key": "thorpub1addwnpepq", "address": ASGARD,
-                        "halted": halted
+                        "halted": halted,
+                        "global_trading_paused": false,
+                        "chain_trading_paused": false,
+                        "chain_lp_actions_paused": false
                     }]),
                 ))
                 .mount(server)
@@ -5696,7 +5888,10 @@ pub mod xrp {
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                     serde_json::json!([{
                         "chain": "XRP", "pub_key": "thorpub1addwnpepq", "address": ASGARD,
-                        "halted": halted
+                        "halted": halted,
+                        "global_trading_paused": false,
+                        "chain_trading_paused": false,
+                        "chain_lp_actions_paused": false
                     }]),
                 ))
                 .mount(server)

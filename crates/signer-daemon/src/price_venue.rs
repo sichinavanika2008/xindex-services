@@ -14,6 +14,7 @@ use alloy_primitives::{keccak256, B256, U256};
 use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
+use xindex_ops::network::{read_bounded_async, NetworkError};
 
 /// Why a venue fetch / parse failed (per-venue, tolerated by [`source_quotes`]).
 #[derive(Debug, Error)]
@@ -180,15 +181,15 @@ pub(crate) async fn http_get(client: &reqwest::Client, url: &str) -> Result<Stri
     if !resp.status().is_success() {
         return Err(VenueError::Http(format!("status {}", resp.status())));
     }
-    let bytes = resp
-        .bytes()
+    let bytes = read_bounded_async(resp, MAX_BODY_BYTES)
         .await
-        .map_err(|e| VenueError::Http(transport_class(&e).to_string()))?;
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err(VenueError::Http("response body exceeds 2 MiB".to_string()));
-    }
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| VenueError::Http("response body is not UTF-8".to_string()))
+        .map_err(|error| match error {
+            NetworkError::ResponseTooLarge { .. } => {
+                VenueError::Http("response body exceeds 2 MiB".to_string())
+            }
+            _ => VenueError::Http("body".to_string()),
+        })?;
+    String::from_utf8(bytes).map_err(|_| VenueError::Http("response body is not UTF-8".to_string()))
 }
 
 /// Classify a reqwest failure without copying its display string. Reqwest

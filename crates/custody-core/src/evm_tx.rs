@@ -1,7 +1,7 @@
 //! Shared EVM unsigned-tx construction + signing hash.
 //!
-//! The single builder used by BOTH the Turnkey EVM executor (to compute the
-//! payload it asks the enclave to sign) and the approver (to independently
+//! The single builder used by BOTH the custody executor (to compute the
+//! requested signing payload) and the callback policy (to independently
 //! recompute that payload from the RIC-bound prepared fields and assert it
 //! equals the signing request — TK-01). Keeping one builder guarantees the two
 //! sides cannot silently diverge and false-reject an honest spend.

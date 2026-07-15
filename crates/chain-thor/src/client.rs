@@ -12,8 +12,9 @@ use reqwest::Client;
 use thiserror::Error;
 
 use crate::types::{
-    ConsensusStatusResponse, ConsensusTip, InboundAddress, Mimir, OutboundEntry, Pool,
-    SwapQuoteRequest, SwapQuoteResponse, TxDetailsResponse, TxResponse, TxStatusResponse,
+    AsgardMembershipError, AsgardVault, ConsensusStatusResponse, ConsensusTip,
+    HistoricalAsgardMembership, InboundAddress, Mimir, OutboundEntry, Pool, SwapQuoteRequest,
+    SwapQuoteResponse, TxDetailsResponse, TxResponse, TxStatusResponse,
 };
 
 /// Maximum response body size accepted from `THORNode` (16 MiB). A
@@ -39,6 +40,10 @@ pub enum ThorError {
     /// Successful response that didn't deserialize.
     #[error("decode error: {0}")]
     Decode(String),
+    /// A finalized transaction did not yield an exact, eligible historical
+    /// Asgard membership set.
+    #[error("historical Asgard membership: {0}")]
+    AsgardMembership(#[from] AsgardMembershipError),
 }
 
 /// Exact upstream response retained for evidence-before-signing workflows.
@@ -95,7 +100,9 @@ impl ThorClient {
     /// Returns [`ThorError::Transport`] if reqwest client construction fails.
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self, ThorError> {
         let http = Client::builder()
+            .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ThorError::Transport(transport_class(&e)))?;
         Ok(Self {
@@ -113,7 +120,9 @@ impl ThorClient {
     /// in place with no signal.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, ThorError> {
         self.http = Client::builder()
+            .connect_timeout(timeout.min(Duration::from_secs(3)))
             .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ThorError::Transport(transport_class(&e)))?;
         Ok(self)
@@ -235,6 +244,55 @@ impl ThorClient {
     /// As [`ThorClient::fetch_inbound_addresses`].
     pub async fn inbound_evidence(&self) -> Result<RawResponse<Vec<InboundAddress>>, ThorError> {
         self.get_evidence("/thorchain/inbound_addresses").await
+    }
+
+    /// Fetch active/retiring Asgard membership at the finalized `THORChain`
+    /// height bound by `status`, retaining the exact vault response body for
+    /// pre-sign evidence.
+    ///
+    /// Historical membership is used only for settlement sender/destination
+    /// identity. Callers must separately consult current inbound rows for live
+    /// halt and routing policy.
+    ///
+    /// # Errors
+    /// Fails on a missing/invalid finalized height, transport/HTTP/schema
+    /// failure, or if the historical response has no eligible address for
+    /// `chain`.
+    pub async fn historical_asgard_membership_evidence(
+        &self,
+        status: &TxResponse,
+        chain: &str,
+    ) -> Result<RawResponse<HistoricalAsgardMembership>, ThorError> {
+        let height = status.historical_asgard_height()?;
+        let base = format!("{}/thorchain/vaults/asgard", self.base_url);
+        let mut url = reqwest::Url::parse(&base)
+            .map_err(|error| ThorError::Decode(format!("invalid Asgard endpoint: {error}")))?;
+        url.query_pairs_mut()
+            .append_pair("height", &height.to_string());
+        let response: RawResponse<Vec<AsgardVault>> = self
+            .get_evidence_url(url, "/thorchain/vaults/asgard")
+            .await?;
+        let membership = HistoricalAsgardMembership::from_vaults(height, chain, &response.value)?;
+        Ok(RawResponse {
+            value: membership,
+            raw_body: response.raw_body,
+            response_hash: response.response_hash,
+        })
+    }
+
+    /// Historical Asgard membership without raw evidence retention.
+    ///
+    /// # Errors
+    /// As [`Self::historical_asgard_membership_evidence`].
+    pub async fn historical_asgard_membership(
+        &self,
+        status: &TxResponse,
+        chain: &str,
+    ) -> Result<HistoricalAsgardMembership, ThorError> {
+        Ok(self
+            .historical_asgard_membership_evidence(status, chain)
+            .await?
+            .value)
     }
 
     /// Fetch Mimir while retaining exact raw evidence.
@@ -372,7 +430,9 @@ impl ThorConsensusClient {
     /// [`ThorError::Transport`] if the HTTP client cannot be built.
     pub fn with_base_url(base_url: impl Into<String>) -> Result<Self, ThorError> {
         let http = Client::builder()
+            .connect_timeout(Duration::from_secs(3))
             .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| ThorError::Transport(transport_class(&error)))?;
         Ok(Self {
@@ -679,6 +739,60 @@ mod tests {
         );
         let none = client.vault_for_chain("DOESNT_EXIST").await.expect("query");
         assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn historical_asgard_membership_queries_exact_finalised_height() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/thorchain/vaults/asgard"))
+            .and(query_param("height", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "pub_key": "thorpub1active",
+                    "type": "AsgardVault",
+                    "status": "ActiveVault",
+                    "status_since": 90,
+                    "addresses": [{ "chain": "BTC", "address": "bc1qvault-a" }]
+                },
+                {
+                    "pub_key": "thorpub1retiring",
+                    "type": "AsgardVault",
+                    "status": "RetiringVault",
+                    "status_since": 95,
+                    "addresses": [{ "chain": "BTC", "address": "bc1qvault-r" }]
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let status: TxResponse = serde_json::from_value(serde_json::json!({
+            "observed_tx": {
+                "tx": {
+                    "id": "ABC", "chain": "BTC", "from_address": "from",
+                    "to_address": "to", "coins": [], "memo": ""
+                },
+                "status": "done"
+            },
+            "actions": [],
+            "finalised_height": 100
+        }))
+        .expect("status fixture");
+
+        let client = ThorClient::with_base_url(server.uri()).expect("client");
+        let evidence = client
+            .historical_asgard_membership_evidence(&status, "BTC")
+            .await
+            .expect("membership");
+        assert_eq!(evidence.value.height, 100);
+        assert_eq!(
+            evidence.value.addresses,
+            vec!["bc1qvault-a".to_string(), "bc1qvault-r".to_string()]
+        );
+        assert_eq!(
+            evidence.response_hash,
+            keccak256(evidence.raw_body.as_bytes())
+        );
     }
 
     #[tokio::test]

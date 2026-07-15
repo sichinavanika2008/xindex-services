@@ -11,10 +11,11 @@
 
 `burn()` moves BTC from our 3-of-5 P2WSH multisig to the THORChain
 Asgard vault and opens a `RedemptionIntent` (the per-basket lock, R3).
-It resolves on exactly one of two k-of-n attestations:
+Each async leg resolves through one of the signed settlement outcomes:
 
 - **delivery** → `attestRedemption` → relayer `finalizeBurn`
-- **refund**   → `attestRefund`     → relayer `cancelBurn`
+- **refund** → `attestRefund` → relayer `finalizeBurn` with share re-minting
+- **streamed** → `attestStreamedSettlement` → relayer `finalizeBurn`
 
 THORChain ground truth (THORNode source): a halted vault produces
 **neither** a delivery `out_tx` **nor** a `REFUND:<inbound_txid>`
@@ -25,17 +26,20 @@ did not happen.
 
 ## Detection (automated, no auto-action)
 
-`xindex-finalize-redeem` tracks every `RedemptionIntentCreated`. A
-redemption with **no terminal THORChain state after `STUCK_AFTER_BLOCKS`
-Ethereum blocks** past `createdAt` is flagged:
+`xindex-finalize-redeem` copies every `RedemptionIntentCreated` from the
+canonical finalized-observer journal into its durable local cursor/outbox. A
+redemption with **no finalized delivery, refund, or streamed settlement at
+`now >= deadline`** is flagged:
 
-- Prometheus gauge `redeem_relayer_stuck` is set to the count.
+- Prometheus gauge `xindex_redeem_relayer_stuck` is set to the count.
 - A `WARN` line is emitted per stuck `redemptionId`.
-- **No `cancelBurn`, no `finalizeBurn`, no on-chain write fires.** Cancel
-  is authorized by a *refund attestation*, never by elapsed time
-  (verify-the-refund, PART 3). Stuck detection is alert-only.
+- **No terminal write is authorized by this timer.** The worker calls
+  `finalizeBurn` only after a finalized signed settlement event; stuck
+  detection itself is alert-only.
 
-Wire an alert: `redeem_relayer_stuck > 0 for 30m` → PagerDuty.
+The checked-in alert uses
+`xindex_redeem_relayer_stuck{job="xindex-finalize-redeem"} > 0 for 30m` and
+separately fires if either the worker or this metric series is absent.
 
 ## Incident procedure (multi-party, manual)
 
@@ -45,7 +49,7 @@ Roles: **on-call** (declares + drives), **two signer operators**
 1. **Confirm the stuck condition.**
    - `redemptionId` from the alert. Query the F2 dispatch store for its
      `btc_txid` (`redemption_dispatch` table / `RedemptionDispatchStore`).
-   - `GET /thorchain/tx/{btc_txid}` on ≥2 independent THORChain nodes.
+   - `GET /thorchain/tx/{btc_txid}` on ≥3 independent THORChain nodes.
    - Confirm: status not `done`; **no** outbound action with a delivery
      `out_tx` to the index token; **no** action with
      `memo == "REFUND:<btc_txid>"`. If a terminal state *does* exist, this
@@ -87,8 +91,8 @@ Roles: **on-call** (declares + drives), **two signer operators**
      Signers attest the **observed on-chain sats**, never an asserted
      figure. This re-uses the verify-the-refund machinery; it does not
      bypass it.
-   - `cancelBurn` then fires through the ordinary refund-attested path
-     (`attestRefund` → relayer), re-crediting the *attested* `refundedBtc`
+   - `finalizeBurn` then runs through the ordinary refund-attested terminal
+     (`attestRefund` → finalized journal → terminal worker), re-crediting the *attested* `refundedBtc`
      and re-minting the *dilution-safe* share count (SD-A: the user bears
      the round-trip fee; other holders' per-share NAV is non-decreasing).
 

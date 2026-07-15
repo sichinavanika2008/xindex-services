@@ -160,11 +160,23 @@ SAFE_ADDRESS_BSC=0x… \
 SAFE_ADDRESS_AVAX=0x… \
 SAFE_ADDRESS_BASE=0x… \
 SAFE_ADDRESS_POL=0x… \
+CEREMONY_SAFE_ADDRESS_ETH=0x… \
+CEREMONY_SAFE_ADDRESS_BSC=0x… \
+CEREMONY_SAFE_ADDRESS_AVAX=0x… \
+CEREMONY_SAFE_ADDRESS_BASE=0x… \
+CEREMONY_SAFE_ADDRESS_POL=0x… \
 forge script script/DeployPhase32Adapters.s.sol \
   --rpc-url $ETH_RPC_URL \
   --private-key $XINDEX_DEPLOYER_KEY \
   --broadcast
 ```
+
+The `SAFE_ADDRESS_*` values are deployment inputs. The matching
+`CEREMONY_SAFE_ADDRESS_*` values are pins copied from the independently
+reviewed Step 6 ceremony record, through a separate operator/reviewer handoff.
+The script canonicalizes both sets, rejects missing, malformed or zero values,
+and reverts before broadcast if any configured address differs from its pin.
+Do not derive both sets from the same unreviewed shell source.
 
 This deploys 5 new `ThorchainAdapter` instances on Ethereum (one per
 EVM destination chain, each pointing at its Safe via

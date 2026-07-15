@@ -6,19 +6,22 @@
 > mean a mis-filled config refuses to boot rather than running with a safety
 > feature silently off.
 
-Each of the 5 signer operators runs one signer daemon per key role + an
-observer per chain. Solana is **excluded** from v1 (CTD-1-OPEN, RA-2) — do not
-fill Solana values for mainnet.
+> **Custody status: historical / disabled.** The custody portions of this runbook describe the historical remote-HSM 3-of-5 baseline and are not the selected BTC custody architecture. The selected-but-disabled BitGo native-P2WSH 2-of-3 model and its external gates are canonical in [`../../../memory/BITGO-CUSTODY.md`](../../../memory/BITGO-CUSTODY.md). Registry, observation, RIC, settlement-certification, and price quorum material below remains a separate non-custody domain.
+
+The historical Gate-3 baseline assumed five signer operators, one signer daemon
+per key role, and one observer per chain. Do not populate or launch its custody
+role as a substitute for the selected BitGo boundary. Non-BTC production
+custody remains unselected and disabled.
 
 ## 0. Startup checks (already enforced in code)
 
 | Setting | Validator | Fails closed when |
 |---|---|---|
 | `IntentPolicy` | `IntentPolicy::validate()` + `DaemonState::assert_production_safe()` | empty/duplicate Set-B whitelist, zero quorum, quorum > whitelist, zero `ric_max_age_secs`, or a production roster other than exact 3-of-5 |
-| `CertVolumePolicy` | `CertVolumePolicy::validate()` | `window_secs == 0`, any cap `== 0` |
+| `CertVolumePolicy` | `CertVolumePolicy::try_new()` + `validate()` | `window_secs == 0`, unsigned→signed conversion failure, `window_secs > 2,678,400` (31 days), or any cap `== 0` |
 | **Production metering** | `DaemonState::assert_production_safe()` → `CertVolumePolicy::assert_metered_for(served)` | **any served RIC-gated chain (BTC/EVM/Cosmos/XRP/TRON) has no positive cap** — `unmetered()` is dev/test ONLY |
 | **Durable replay** | binary startup | `database_url` is absent outside `--dev`, is not an absolute SQLite path under an owner-only non-symlink directory, or names an existing unsafe/symlinked/hard-linked database |
-| **Signer perimeter** | binary startup | software HSM, missing outer mTLS, a non-loopback/credential-bearing HSM URL, an unsafe config/TLS-key file, a zero identity, or a production custody descriptor other than exact 3-of-5 is configured |
+| **Historical signer perimeter** | binary startup | the retained remote-HSM baseline sees software HSM, missing outer mTLS, a non-loopback/credential-bearing HSM URL, an unsafe config/TLS-key file, a zero identity, or a custody descriptor other than its exact historical 3-of-5 shape |
 
 A production launcher MUST call `DaemonState::assert_production_safe()` after
 constructing state and before serving. `unmetered()` + an in-process HSM stub
@@ -43,7 +46,7 @@ intent_quorum          = 3                          # k of the k-of-n (3-of-5)
 ric_max_age_secs       = 5400                        # < THORChain vault-retirement window (~hours)
 
 # ── CTD-1 Slice E containment (CertVolumePolicy) — MANDATORY in prod ──
-cert_window_secs       = 86400                        # 24h bucket
+cert_window_secs       = 86400                        # 24h bucket; valid range 1..=2,678,400s (31 days)
 cert_caps = {                                         # ≈10% of per-chain custody / 24h; re-tune as custody grows
   "btc":  ____,  "ltc": ____, "bch": ____, "doge": ____, "zec": ____,
   "eth":  ____,  "avax": ____, "bsc": ____, "base": ____, "pol": ____,
@@ -53,14 +56,14 @@ cert_caps = {                                         # ≈10% of per-chain cust
 # ── mTLS (DL-M5-5) — the coordinator-cert pin allowlist ──
 tls_server_cert        = /etc/xindex/tls/server.pem   # this daemon's server cert chain
 tls_server_key         = /etc/xindex/tls/server.key
-tls_pinned_client_cert = /etc/xindex/tls/coordinator.pem  # the SELF-SIGNED coordinator cert(s) to pin
+tls_pinned_client_cert = /etc/xindex/tls/coordinator.pem  # leaf-first exact coordinator peer bundle
 
 # ── durable anti-replay/equivocation state ──
 database_url            = sqlite:///var/lib/xindex/signer-daemon.db
 metrics_bind             = 127.0.0.1:9090
 ```
 
-- Build the rustls server via `signer-daemon::tls::server_config(load_cert_chain(server), load_private_key(key), pinned_root_store([coordinator]))` and serve with `serve_mtls`. An unpinned client is dropped at the handshake.
+- Build the rustls server via `signer-daemon::tls::server_config(load_cert_chain(server), load_private_key(key), pinned_cert_store([coordinator]))` and serve with `serve_mtls`. Each configured entry is leaf-first: the first certificate is the exact SHA-256 peer pin and the last is its explicit WebPKI trust anchor. The peer presents any intermediates. A CA-only entry pins that CA certificate itself and does not authorize sibling leaves. Use separate entries for an intentional certificate-rotation overlap; an unpinned client is dropped at the handshake.
 - `cert_caps` must contain a positive cap for **every** chain this daemon has a signing role for, or `assert_production_safe()` refuses to boot.
 - `hsm_url` may name only `localhost` or a literal loopback address and may not
   contain URL userinfo, a query or a fragment. Keep HSM authentication out of
@@ -75,7 +78,8 @@ metrics_bind             = 127.0.0.1:9090
 The production path uses `xindex-finalized-observer`,
 `xindex-settlement-collector`, `xindex-registry-signer`,
 `xindex-registry-coordinator`, `xindex-price-signer`,
-`xindex-price-collector`, and the Bitcoin-only `xindex-redeem`. The historical
+`xindex-price-collector`, the Bitcoin-only custody executor `xindex-redeem`,
+and the permissionless terminal worker `xindex-finalize-redeem`. The historical
 `xindex-observe-redeem` and centralized `xindex-attest*` binaries are dev-only
 and are not production alternatives.
 
@@ -93,19 +97,58 @@ and are not production alternatives.
 
 Every service uses a distinct durable SQLite database/evidence directory and a
 distinct loopback metrics port. Service-to-service traffic uses explicit mTLS
-client identities and CA/certificate pins with system roots disabled. The
+client identities and leaf-first exact peer bundles with system roots disabled.
+The standard chain, time, purpose and server-hostname checks run before the
+exact end-entity certificate comparison. Some legacy JSON/CLI keys still say
+`ca_pem`; those paths must contain the exact peer bundle described above, not a
+generic CA allowlist. The
 finalized observer, event journal, source pollers, API, poster, metrics and
 exact-byte rebroadcast tasks are supervised; an unexpected exit terminates the
 owning process.
 
-The price collector additionally requires the approved 7-of-11 roster. The
-registry, settlement-observer and custody roles are each 3-of-5. Validate the
-real dual-reviewed operator/HSM/source registry with `xindex-topology-check`;
-see [`gate3-operations.md`](gate3-operations.md). A checked-in example roster
-is intentionally absent because placeholders are not production evidence.
+`xindex-finalize-redeem` is mandatory, not a best-effort keeper. It consumes
+the canonical block journal written by one local `xindex-finalized-observer`,
+mirrors every block into a dedicated transactional cursor/outbox, and retains
+each `finalizeBurn` responsibility until a finalized terminal event is
+journaled. Its source and outbox databases are required absolute owner-only
+SQLite files; in-memory state and websocket ingestion are rejected.
 
-The coordinator presents its client cert to each daemon:
-`reqwest::Client::builder().use_preconfigured_tls(signer-daemon::tls::client_config(client_chain, client_key, pinned_server_root))` — the pinned coordinator identity from §1's `tls_pinned_client_cert`.
+```sh
+ETH_RPC_URL=https://execution.example.invalid \
+EXPECTED_CHAIN_ID=1 \
+INTENT_QUEUE_ADDR=0x____________________ \
+POSTER_ADDRESS=0x____________________ \
+OBSERVER_DATABASE_URL=sqlite:///var/lib/xindex/finalized-observer-op1.db \
+OBSERVER_ID=op1-btc \
+DATABASE_URL=sqlite:///var/lib/xindex/finalize-redeem.db \
+START_BLOCK=________ \
+POLL_INTERVAL_MILLIS=1000 \
+RETRY_BASE_MILLIS=1000 \
+RETRY_MAX_MILLIS=60000 \
+METRICS_ADDR=127.0.0.1:9092 \
+  /usr/local/bin/xindex-finalize-redeem
+```
+
+`START_BLOCK` is the deployment-era first block retained by the named source
+observer, not the current head. A missing creation event fails closed instead
+of advancing the terminal cursor. Use the checked-in
+[`xindex-finalize-redeem.service`](../../ops/systemd/xindex-finalize-redeem.service)
+and [`gate3-scrape.example.yml`](../../ops/prometheus/gate3-scrape.example.yml)
+as inventory templates; replace file-discovery paths with the operator's
+reviewed local target files.
+
+The price collector additionally requires the approved 7-of-11 roster.
+Registry, settlement observation, RIC, and settlement certification use
+separate 3-of-5 quorums. The retained remote-HSM custody role is also shaped
+3-of-5 in code but is historical and prohibited as a fallback; future BTC
+custody uses the distinct selected BitGo 2-of-3 role set. Validate any real
+dual-reviewed operator/source registry with `xindex-topology-check`; see
+[`gate3-operations.md`](gate3-operations.md). A checked-in example roster is
+intentionally absent because placeholders are not production evidence.
+
+The coordinator presents its client cert to each daemon through the shared
+`exact_pinned_async_client_builder`; the configured leaf-first peer bundle
+performs normal WebPKI validation followed by an exact end-entity pin.
 
 ## 3. On-chain (deploy script / governance timelock)
 
@@ -113,6 +156,7 @@ The coordinator presents its client cert to each daemon:
 |---|---|---|
 | `CustodyGuard.setVolumeCaps(dispatchCap, attestCap)` | ____ | the on-chain per-period breaker; set BEFORE funds flow, re-tune via timelock |
 | `AttestationOracle` signer set + threshold | the 5 Set-B addresses, 3 | matches §1 `signer_whitelist` / `intent_quorum` |
+| `AttestationOracle.observationEpoch(sourceChainId)` | `0` at launch; governed compare-and-swap advance after each reviewed finalized rollback | must equal every operator's durable local epoch before settlement signing or collection resumes |
 | `PriceAttestationOracle` L1 bounds / L2 Chainlink feed / deviation cap | ____ | per `DL-INDEX-METHOD-ORACLE-1`; the off-chain `xindex-price-signer` feeds it |
 
 The price path is configured separately in
@@ -133,7 +177,12 @@ gate green · `cert_caps` + on-chain `CustodyGuard` caps filled · the daemon
 boots past `assert_production_safe()`. Cosmos additionally: `--nosort-pubkeys`
 at the ceremony (the gaiad multisig-address fund-safety fix).
 
-The standalone Turnkey drivers and approver are rehearsal-only and now require
-`--dev` before reading their software P-256 API-stamping key. They are not an
-alternative production profile. A future production Turnkey path requires a
-remote/HSM request stamper and a separate reviewed wire integration.
+BitGo is the selected future BTC custody provider, using self-custody native
+Bitcoin on-chain 2-of-3 multisig (user, offline backup and BitGo keys) with
+explicit P2WSH addresses. This is not MPC. Turnkey and Cobo code have been
+removed and neither is an alternative or emergency profile. BitGo remains
+disabled. Its key-free request/policy adapter core is present, but live
+Testnet4 qualification, controlled THORChain-devnet rehearsal, durable
+transport/orchestration integration and independent custody review must pass.
+Non-BTC production custody remains disabled pending a separate provider design
+and qualification.

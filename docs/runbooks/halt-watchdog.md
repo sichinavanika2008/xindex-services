@@ -16,14 +16,14 @@
 
 ## How it works
 
-1. Each operator runs ONE instance, configured with that operator's OWN ≥2
+1. Each operator runs ONE instance, configured with that operator's OWN ≥3
    distinct THORNode sources (the refinement-1 rule — a single source is
    refused at startup, same posture as the RIC observers).
 2. Every `--poll-interval-secs` it calls `AsgardAgreement::poll_chain_halt`,
    which reads the `/thorchain/inbound_addresses` halt/pause flags across all
    sources INDEPENDENT of the address-agreement check (so a halt landing during
    a vault churn is not masked by an address `Disagreement`):
-   - `Halted` — ≥2 sources returned the chain and ≥1 reports
+   - `Halted` — ≥3 sources returned the chain and ≥1 reports
      `halted | chain_trading_paused | global_trading_paused`.
    - `Live` — that quorum responded, none halted.
    - `Indeterminate` — sub-quorum (transport failures / chain absent): **never**
@@ -48,7 +48,7 @@ A total outage already fails closed elsewhere (the on-chain vault-freshness gate
   > it automatically and writes `CUSTODY_GUARD_ADDR` to `onchain.env`. Until
   > the guard is deployed + wired on a given network, the watchdog runs and
   > logs verdicts but has no guard to halt.
-- This operator's ≥2 distinct THORNode REST endpoints.
+- This operator's ≥3 distinct THORNode REST endpoints.
 - An ETH RPC (WS) and the operator's roster EOA key.
 
 ## Configuration
@@ -58,7 +58,7 @@ A total outage already fails closed elsewhere (the on-chain vault-freshness gate
 | `ETH_RPC_URL` | `--eth-rpc-url` | `ws://127.0.0.1:8545` | WS RPC for the `halt()` tx |
 | `CUSTODY_GUARD_ADDR` | `--custody-guard` | — | Deployed `CustodyGuard` |
 | `OPERATOR_KEY` | `--operator-key` | — | Roster EOA (signs `halt()`) |
-| `THORNODE_URLS` | `--thornode-urls` | — | ≥2 distinct THORNode base URLs (comma-sep) |
+| `THORNODE_URLS` | `--thornode-urls` | — | ≥3 distinct THORNode base URLs (comma-sep) |
 | `HALT_WATCH_CHAIN` | `--chain` | `BTC` | Chain symbol to watch |
 | `POLL_INTERVAL_SECS` | `--poll-interval-secs` | `30` | Seconds between polls |
 | `HALT_CONFIRMATIONS` | `--halt-confirmations` | `2` | Consecutive HALTED polls before engaging |
@@ -82,7 +82,7 @@ CUSTODY_GUARD_ADDR=0x… OPERATOR_KEY=0x… \
 
 Defaults to two UNREACHABLE loopback THORNode URLs, so the run is hermetic and
 exercises the fail-safe path (sub-quorum → `Indeterminate` → never halts) while
-proving the binary wires together (args → ≥2-source agreement → ETH provider →
+proving the binary wires together (args → ≥3-source agreement → ETH provider →
 poll loop). Override `THORNODE_URLS` with real endpoints for a live-liveness
 check (expect `Live`).
 
@@ -116,6 +116,6 @@ a production drill swaps the mocks for a real stagenet halt.
 - `halt()` auto-expires after 24h; sustain with a quorum `voteExtendHalt`, or
   clear early with a quorum `voteUnhalt`. The watchdog **never** un-halts.
 - Per-operator re-halt cooldown is 48h, so one operator cannot chain-freeze.
-- A persistent `Indeterminate` in the logs means this operator cannot reach ≥2
+- A persistent `Indeterminate` in the logs means this operator cannot reach ≥3
   of its THORNode sources — page the operator. A blind watchdog is a silent gap
   (though the other gates remain fail-closed).

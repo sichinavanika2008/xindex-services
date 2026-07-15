@@ -181,7 +181,7 @@ pub fn serialize_single_sign(
 }
 
 /// Assemble the final submittable SINGLE-sign tx-blob for a single
-/// secp256k1 custody key (the Turnkey enclave key — `DL-CUSTODY-TURNKEY-1`):
+/// secp256k1 custody key (for an MPC-produced regular single signature):
 /// the `Payment` with the custody `SigningPubKey` populated and a top-level
 /// `TxnSignature` (the DER low-S signature over [`crate::signing::single_sign_digest`]
 /// of [`serialize_single_sign`]), and NO `Signers` array. `txn_signature_der`

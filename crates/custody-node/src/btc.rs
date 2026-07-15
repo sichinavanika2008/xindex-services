@@ -3,8 +3,8 @@
 //! Given a prepared [`BindContext`] (the unsigned PSBT + its k-of-n
 //! certificate), verify the certificate and bind the PSBT's output set to it;
 //! APPROVE only if both pass, else a fail-closed [`Decision::Reject`]. The
-//! input-sighash ↔ Cobo callback-request tie-in and the wire adapter land with
-//! the Cobo dev-env reconciliation; this function is address-type-independent
+//! provider request/PSBT correlation and the wire adapter are separate from
+//! this core; this function is address-type-independent
 //! (it inspects outputs + the certificate, the security anchor — the RIC is
 //! k-of-n signed independently of the coordinator that supplied the PSBT).
 
@@ -141,13 +141,13 @@ mod tests {
         Psbt::from_unsigned_tx(tx).expect("unsigned psbt")
     }
 
-    /// The honest 3-output redeem PSBT: certified payout, memo `OP_RETURN`,
-    /// change-to-custody. `change` perturbs the txid for the re-drive test.
+    /// The honest 3-output redeem PSBT: certified payout, change-to-custody,
+    /// memo `OP_RETURN`. `change` perturbs the txid for the re-drive test.
     fn honest_psbt(payout: &ScriptBuf, custody: &ScriptBuf, change: u64) -> Psbt {
         psbt_with(vec![
             out(AMOUNT_SATS, payout.clone()),
-            out(0, op_return(MEMO)),
             out(change, custody.clone()),
+            out(0, op_return(MEMO)),
         ])
     }
 
@@ -196,6 +196,7 @@ mod tests {
             redemption_id,
             U256::ZERO,
             asset_id,
+            ChainId::Btc.native_chain_id_hash(),
             U256::from(amount),
             decimals,
             target_hash,
@@ -265,8 +266,8 @@ mod tests {
         };
         let psbt = psbt_with(vec![
             out(AMOUNT_SATS + 7, payout.clone()),
-            out(0, op_return(MEMO)),
             out(CHANGE_SATS, custody.clone()),
+            out(0, op_return(MEMO)),
         ]);
         let c = ctx(psbt, signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]));
         let replay = InMemoryReplayStore::new();
@@ -307,9 +308,9 @@ mod tests {
         };
         let psbt = psbt_with(vec![
             out(AMOUNT_SATS, payout.clone()),
+            out(CHANGE_SATS, custody.clone()),
             out(0, op_return(MEMO)),
             out(0, op_return(b"injected")),
-            out(CHANGE_SATS, custody.clone()),
         ]);
         let c = ctx(psbt, signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]));
         let replay = InMemoryReplayStore::new();
@@ -330,8 +331,8 @@ mod tests {
         };
         let psbt = psbt_with(vec![
             out(AMOUNT_SATS, payout.clone()),
-            out(0, op_return(MEMO)),
             out(CHANGE_SATS, spk(0xee)), // attacker address, not custody
+            out(0, op_return(MEMO)),
         ]);
         let c = ctx(psbt, signed_ric(&payout, AMOUNT_SATS, &[1, 2, 3]));
         let replay = InMemoryReplayStore::new();

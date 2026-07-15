@@ -44,8 +44,8 @@ venue connectivity. Example shape (values are development placeholders):
   "metrics_address": "127.0.0.1:9095",
   "collector_client_identity_pem": "/etc/xindex/tls/price-signer-client.pem",
   "collector_server_ca_pems": [
-    "/etc/xindex/tls/collector-a-ca.pem",
-    "/etc/xindex/tls/collector-b-ca.pem"
+    "/etc/xindex/tls/collector-a-peer.pem",
+    "/etc/xindex/tls/collector-b-peer.pem"
   ],
   "binance_base": "https://api.binance.com",
   "coinbase_base": "https://api.coinbase.com",
@@ -65,6 +65,11 @@ venue connectivity. Example shape (values are development placeholders):
   ]
 }
 ```
+
+`collector_server_ca_pems` is a legacy field name. Each file is a leaf-first
+exact collector peer bundle: the first certificate is pinned, the last is the
+explicit trust anchor, and the collector must present any intermediates. A
+CA-only file does not authorize certificates issued by that CA.
 
 `epoch_secs` must equal `interval_secs`; this makes every signer commit to the
 same floored unix epoch instead of its arbitrary observation second. Four price

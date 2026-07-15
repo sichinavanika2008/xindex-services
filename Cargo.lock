@@ -3020,18 +3020,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p256"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9863ad85fa8f4460f9c48cb909d38a0d689dba1f6f6988a5e3e0d31071bcd4b"
-dependencies = [
- "ecdsa",
- "elliptic-curve",
- "primeorder",
- "sha2",
-]
-
-[[package]]
 name = "parity-scale-codec"
 version = "3.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3236,15 +3224,6 @@ checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "primeorder"
-version = "0.13.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
-dependencies = [
- "elliptic-curve",
 ]
 
 [[package]]
@@ -5552,6 +5531,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-bitgo-adapter"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "bitcoin",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "xindex-custody-core",
+]
+
+[[package]]
+name = "xindex-bitgo-dev-gate"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "base64",
+ "bitcoin",
+ "clap",
+ "serde",
+ "serde_json",
+ "sha2",
+ "xindex-bitgo-adapter",
+ "xindex-custody-core",
+]
+
+[[package]]
 name = "xindex-chain-cosmos"
 version = "0.0.1"
 dependencies = [
@@ -5682,24 +5689,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xindex-cobo-dev-gate"
-version = "0.0.1"
-dependencies = [
- "alloy",
- "alloy-primitives",
- "anyhow",
- "bitcoin",
- "clap",
- "ed25519-dalek",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "xindex-shared",
-]
-
-[[package]]
 name = "xindex-cosmos-tx"
 version = "0.0.1"
 dependencies = [
@@ -5734,21 +5723,14 @@ version = "0.0.1"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
- "anyhow",
  "bitcoin",
- "clap",
  "k256",
- "serde",
- "serde_json",
  "tokio",
- "tracing",
- "tracing-subscriber",
  "xindex-cosmos-tx",
  "xindex-custody-core",
  "xindex-shared",
  "xindex-solana-tx",
  "xindex-tron-tx",
- "xindex-turnkey-client",
  "xindex-xrp-tx",
 ]
 
@@ -5783,14 +5765,12 @@ dependencies = [
  "xindex-chain-utxo",
  "xindex-chain-xrp",
  "xindex-cosmos-tx",
- "xindex-custody-core",
  "xindex-multisig",
  "xindex-ops",
  "xindex-safe-evm",
  "xindex-shared",
  "xindex-solana-tx",
  "xindex-tron-tx",
- "xindex-turnkey-client",
  "xindex-xrp-tx",
 ]
 
@@ -5808,17 +5788,24 @@ dependencies = [
 name = "xindex-ops"
 version = "0.0.1"
 dependencies = [
+ "alloy-json-rpc",
+ "alloy-transport",
  "anyhow",
  "axum",
+ "hyper",
  "hyper-util",
  "prometheus",
+ "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5902,6 +5889,7 @@ dependencies = [
  "xindex-chain-thor",
  "xindex-chain-utxo",
  "xindex-chain-xrp",
+ "xindex-ops",
  "xindex-shared",
 ]
 
@@ -5977,21 +5965,6 @@ dependencies = [
  "k256",
  "sha2",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "xindex-turnkey-client"
-version = "0.0.1"
-dependencies = [
- "alloy-primitives",
- "base64",
- "p256",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "wiremock",
 ]
 
 [[package]]

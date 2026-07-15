@@ -46,12 +46,24 @@ echo "   IndexToken=$clone  intentId=$intent"
 
 # 2. 3-of-5 MINT attestation from the LIVE daemons (slot 0 = queue async index).
 echo ">> collecting 3-of-5 attestation from daemons (ports 8551-8553)"
+source_chain_id=31337
+source_block="$(cast block-number --rpc-url "$rpc")"
+source_block_hash="$(cast block "$source_block" --field hash --rpc-url "$rpc")"
+evidence_hash="$source_block_hash"
+observed_at="$(date +%s)"
+valid_until="$((observed_at + 120))"
+observation_epoch="$(cast call "$ATTESTATION_ORACLE_ADDR" \
+  "observationEpoch(uint256)(uint64)" "$source_chain_id" --rpc-url "$rpc")"
+observation_epoch="${observation_epoch%% *}"
+context="($evidence_hash,$observed_at,$valid_until,$source_chain_id,$source_block,$source_block_hash,$observation_epoch)"
 signers="$(cargo run -q --manifest-path "$repo/Cargo.toml" \
   -p xindex-signer-daemon --example rehearsal_gen -- --signers-only)"
 IFS=',' read -r s0 s1 s2 _rest <<<"$signers"
 sigs_raw="$(cargo run -q --manifest-path "$repo/Cargo.toml" \
   -p xindex-signer-daemon --example attest_mint -- \
-  31337 "$ATTESTATION_ORACLE_ADDR" "$intent" 0 "$attested_sats" \
+  "$source_chain_id" "$ATTESTATION_ORACLE_ADDR" "$intent" 0 "$attested_sats" \
+  "$evidence_hash" "$observed_at" "$valid_until" "$source_block" \
+  "$source_block_hash" "$observation_epoch" \
   http://127.0.0.1:8551 "$s0" http://127.0.0.1:8552 "$s1" http://127.0.0.1:8553 "$s2")"
 sig0="$(echo "$sigs_raw" | sed -n '1p')"
 sig1="$(echo "$sigs_raw" | sed -n '2p')"
@@ -65,8 +77,9 @@ echo "   collected 3 signatures"
 
 # 3. post the attestation on-chain.
 echo ">> oracle.attest(intent, 0, $attested_sats, [3 sigs])"
-cast send "$ATTESTATION_ORACLE_ADDR" "attest(bytes32,uint256,uint256,bytes[])" \
-  "$intent" 0 "$attested_sats" "[$sig0,$sig1,$sig2]" \
+cast send "$ATTESTATION_ORACLE_ADDR" \
+  "attest(bytes32,uint256,uint256,(bytes32,uint64,uint64,uint256,uint64,bytes32,uint64),bytes[])" \
+  "$intent" 0 "$attested_sats" "$context" "[$sig0,$sig1,$sig2]" \
   --rpc-url "$rpc" --private-key "$deployer" >/dev/null
 echo "   isFullyAttested=$(cast call "$INTENT_QUEUE_ADDR" "isFullyAttested(bytes32)(bool)" "$intent" --rpc-url "$rpc")"
 

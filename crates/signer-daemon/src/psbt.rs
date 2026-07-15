@@ -452,22 +452,21 @@ fn derive_witness_script(descriptor: &MultisigDescriptor) -> Result<bitcoin::Scr
         .map_err(|e| e.to_string())
 }
 
-/// CTD-1 (`DL-CTD-2` / RA-3): bind the PSBT's output set to the
+/// CTD-1 (`DL-CTD-2` / RA-3): bind the PSBT's ordered output set to the
 /// certified spend — produced by EITHER certificate gate (RIC redeem /
 /// ACC mint-cancel swap-back; the binding discipline is identical).
-/// Exact-set — every output must be accounted for:
+/// Exact-set and exact-order:
 ///
-/// - exactly ONE payout output, identified by
+/// - VOUT0 is the one payout output, identified by
 ///   `keccak256(scriptPubKey) == spend.immediate_target_hash` (the
 ///   Asgard inbound the operators independently resolved), paying
 ///   exactly `spend.amount` sats;
-/// - exactly ONE `OP_RETURN`, zero-value, whose full pushed payload
+/// - optional VOUT1 is one non-zero change output back to the descriptor
+///   P2WSH (the VIN0 custody script);
+/// - the final output is exactly one zero-value `OP_RETURN`, whose full payload
 ///   hashes to `spend.memo_hash` — `THORChain` concatenates ALL
 ///   `OP_RETURN`s into the memo, so a second one is memo injection
-///   (RA-3) regardless of content;
-/// - every other output is change back to our own descriptor P2WSH
-///   (unconditional now — the M2b floor's change-to-self no longer
-///   depends on the coordinator pinning a payout).
+///   (RA-3) regardless of content.
 ///
 /// Mismatches report `spend.mismatch_code` (`intent_mismatch` /
 /// `acquire_cancel_mismatch`) so the coordinator can tell which
@@ -477,96 +476,20 @@ fn bind_outputs_to_cert(
     descriptor_spk: &bitcoin::ScriptBuf,
     spend: &CertifiedSpend,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
-    let want_sats = u64::try_from(spend.amount).map_err(|_| {
-        err(
-            spend.mismatch_code,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "certified amount does not fit u64 sats",
-        )
-    })?;
-    let mut payouts = 0usize;
-    let mut op_returns = 0usize;
-    for o in &psbt.unsigned_tx.output {
-        if o.script_pubkey.is_op_return() {
-            op_returns += 1;
-            if o.value.to_sat() != 0 {
-                return Err(err(
-                    spend.mismatch_code,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "OP_RETURN output carries value (memo outputs must be zero-value)",
-                ));
-            }
-            let payload = op_return_payload(&o.script_pubkey).ok_or_else(|| {
-                err(
-                    spend.mismatch_code,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "OP_RETURN output pushes no data",
-                )
-            })?;
-            if alloy_primitives::keccak256(&payload) != spend.memo_hash {
-                return Err(err(
-                    spend.mismatch_code,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "OP_RETURN payload does not hash to the certified memo",
-                ));
-            }
-        } else if alloy_primitives::keccak256(o.script_pubkey.as_bytes())
-            == spend.immediate_target_hash
-        {
-            payouts += 1;
-            if o.value.to_sat() != want_sats {
-                return Err(err(
-                    spend.mismatch_code,
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    format!(
-                        "payout output pays {} sats, certificate authorizes {want_sats}",
-                        o.value.to_sat()
-                    ),
-                ));
-            }
-        } else if o.script_pubkey.as_bytes() != descriptor_spk.as_bytes() {
-            return Err(err(
-                error_codes::PSBT_UNEXPECTED_OUTPUT,
+    let shared_spend = xindex_custody_core::gates::CertifiedSpend {
+        amount: spend.amount,
+        immediate_target_hash: spend.immediate_target_hash,
+        memo_hash: spend.memo_hash,
+        mismatch_code: spend.mismatch_code,
+    };
+    xindex_custody_core::btc_bind::bind_outputs_to_cert(psbt, descriptor_spk, &shared_spend)
+        .map_err(|rejection| {
+            err(
+                rejection.code,
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "output is neither the certified payout, the memo OP_RETURN, nor change-to-self",
-            ));
-        }
-    }
-    if payouts != 1 {
-        return Err(err(
-            spend.mismatch_code,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("expected exactly one certified payout output, found {payouts}"),
-        ));
-    }
-    if op_returns != 1 {
-        return Err(err(
-            spend.mismatch_code,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("expected exactly one OP_RETURN memo output, found {op_returns} (RA-3)"),
-        ));
-    }
-    Ok(())
-}
-
-/// Concatenated pushed payload of an `OP_RETURN` script, or `None` if
-/// the script is not `OP_RETURN`, fails to parse, or pushes nothing.
-fn op_return_payload(script: &bitcoin::Script) -> Option<Vec<u8>> {
-    if !script.is_op_return() {
-        return None;
-    }
-    let mut out = Vec::new();
-    for instr in script.instructions() {
-        match instr {
-            Ok(i) => {
-                if let Some(b) = i.push_bytes() {
-                    out.extend_from_slice(b.as_bytes());
-                }
-            }
-            Err(_) => return None,
-        }
-    }
-    (!out.is_empty()).then_some(out)
+                rejection.message,
+            )
+        })
 }
 
 /// (audit M2) Enforce the optional output constraints carried in the
@@ -1440,8 +1363,8 @@ mod tests {
 
     const M2B_MEMO: &[u8] = b"=:ETH.USDT:0xabc:0";
 
-    /// M2b ACCEPT: payout + zero-value memo + change back to the
-    /// descriptor's own P2WSH → all three are whitelisted, fee is bounded.
+    /// M2b ACCEPT: payout + change back to the descriptor's own P2WSH +
+    /// zero-value memo → all three are ordered and whitelisted, fee is bounded.
     #[tokio::test]
     async fn m2b_change_to_self_is_accepted() {
         let (desc, app) = veto_fixture();
@@ -1461,11 +1384,11 @@ mod tests {
                     value: Amount::from_sat(70_000),
                     script_pubkey: spk.clone(),
                 },
-                op_return_out(M2B_MEMO, Amount::ZERO),
                 TxOut {
                     value: Amount::from_sat(25_000),
                     script_pubkey: change_spk,
                 },
+                op_return_out(M2B_MEMO, Amount::ZERO),
             ],
         );
         let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x65);
@@ -1500,11 +1423,11 @@ mod tests {
                     value: Amount::from_sat(70_000),
                     script_pubkey: spk.clone(),
                 },
-                op_return_out(M2B_MEMO, Amount::ZERO),
                 TxOut {
                     value: Amount::from_sat(25_000),
                     script_pubkey: attacker,
                 },
+                op_return_out(M2B_MEMO, Amount::ZERO),
             ],
         );
         let proof = ric_proof(&spk, 70_000, M2B_MEMO, 0x66);
@@ -1599,7 +1522,7 @@ mod tests {
     /// M2b REJECT: a FUNDED `OP_RETURN` (value > 0) would burn that value
     /// while passing the presence-only memo veto and escaping the fee
     /// check (it is an output, not fee). The zero-value rule catches it →
-    /// `PSBT_UNEXPECTED_OUTPUT`.
+    /// `INTENT_MISMATCH`.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn m2b_funded_op_return_is_rejected() {
@@ -1877,7 +1800,7 @@ mod tests {
     /// CTD-1 / RA-3 exact-set: a SECOND `OP_RETURN` — even zero-value,
     /// even alongside a fully-certified payout+memo — is memo
     /// injection (`THORChain` concatenates ALL `OP_RETURN`s) and is
-    /// refused.
+    /// refused as an unexpected VOUT1 under the canonical ordered shape.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn psbt_second_op_return_is_rejected() {
@@ -1910,7 +1833,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
         assert_eq!(
             body["code"].as_str().expect("code"),
-            error_codes::INTENT_MISMATCH
+            error_codes::PSBT_UNEXPECTED_OUTPUT
         );
     }
 
@@ -1932,7 +1855,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
         assert_eq!(
             body["code"].as_str().expect("code"),
-            error_codes::PSBT_UNEXPECTED_OUTPUT
+            error_codes::INTENT_MISMATCH
         );
     }
 

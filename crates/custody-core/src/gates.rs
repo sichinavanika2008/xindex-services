@@ -3,8 +3,8 @@
 //! The RIC/ACC verification + one-shot consumption that every custody
 //! spend passes through before a signature is produced, decoupled from
 //! any transport. The (transitional) signer-daemon maps [`GateRejection`]
-//! onto its `axum` error body; the Fireblocks co-signer callback maps it
-//! onto an APPROVE/REJECT decision. The kind-specific verification lives in
+//! onto its `axum` error body; a provider adapter maps it onto that provider's
+//! fail-closed pre-sign decision. The kind-specific verification lives in
 //! [`xindex_shared::intent`]; the one-shot replay arm in [`crate::replay`].
 
 use alloy_primitives::{keccak256, Address, B256, U256};

@@ -22,6 +22,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  XINDEX_ASSURANCE_SOURCE: xindex-assurance-source
+  XINDEX_ASSURANCE_MANIFEST: xindex-assurance-source/config/assurance-tools.json
+  XINDEX_ASSURANCE_MANIFEST_SHA256: dc96ed7ac52e7e5a1103b3bc35ca9d7b64107927f3f02c4b50c25893aaa07619
+  XINDEX_ASSURANCE_SCRIPT_SHA256: 27bd1701dd8f6db53a9ff181c32dd590fdcc8dcafb30e672c8a78cd1bde92589
 
 jobs:
   careful:
@@ -32,24 +36,54 @@ jobs:
     # rustup default in override precedence), so cargo-careful fed its sysroot
     # build a stable rustc and the -Z flags errored. RUSTUP_TOOLCHAIN beats the
     # toml file, forcing nightly for both the install and the run here.
-    env:
-      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
+      - name: Check out canonical assurance tool policy
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ github.repository_owner }}/Xindex
+          ref: feat/index-methodology
+          path: xindex-assurance-source
+          persist-credentials: false
+          sparse-checkout: |
+            config/assurance-tools.json
+            scripts/assurance_tools.py
+          sparse-checkout-cone-mode: false
+
+      - name: Verify canonical assurance policy content
+        run: |
+          printf '%s  %s\n' "$XINDEX_ASSURANCE_MANIFEST_SHA256" "$XINDEX_ASSURANCE_MANIFEST" | sha256sum --check --strict
+          printf '%s  %s\n' "$XINDEX_ASSURANCE_SCRIPT_SHA256" "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" | sha256sum --check --strict
+
+      - name: Load reviewed assurance tool pins
+        id: assurance_tools
+        run: python3 "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" export-github >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: nightly
+          toolchain: ${{ steps.assurance_tools.outputs.rust_nightly }}
           components: rust-src
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install cargo-careful
-        run: cargo install cargo-careful --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.assurance_tools.outputs.rust_nightly }}
+        run: cargo install --locked --version "=${{ steps.assurance_tools.outputs.cargo_careful }}" cargo-careful
+
+      - name: Verify assurance tool versions
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.assurance_tools.outputs.rust_nightly }}
+        run: |
+          python3 "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" verify --tool rust_nightly
+          python3 "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" verify --tool cargo_careful
 
       - name: careful test
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.assurance_tools.outputs.rust_nightly }}
         run: cargo careful test --workspace
 
   mutants:
@@ -60,14 +94,40 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check out canonical assurance tool policy
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ github.repository_owner }}/Xindex
+          ref: feat/index-methodology
+          path: xindex-assurance-source
+          persist-credentials: false
+          sparse-checkout: |
+            config/assurance-tools.json
+            scripts/assurance_tools.py
+          sparse-checkout-cone-mode: false
+
+      - name: Verify canonical assurance policy content
+        run: |
+          printf '%s  %s\n' "$XINDEX_ASSURANCE_MANIFEST_SHA256" "$XINDEX_ASSURANCE_MANIFEST" | sha256sum --check --strict
+          printf '%s  %s\n' "$XINDEX_ASSURANCE_SCRIPT_SHA256" "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" | sha256sum --check --strict
+
+      - name: Load reviewed assurance tool pins
+        id: assurance_tools
+        run: python3 "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" export-github >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
-          toolchain: "1.95.0" # keep in sync with rust-toolchain.toml
+          toolchain: ${{ steps.assurance_tools.outputs.rust_stable }}
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked
+        run: cargo install --locked --version "=${{ steps.assurance_tools.outputs.cargo_mutants }}" cargo-mutants
+
+      - name: Verify assurance tool versions
+        run: |
+          python3 "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" verify --tool rust_stable
+          python3 "$XINDEX_ASSURANCE_SOURCE/scripts/assurance_tools.py" verify --tool cargo_mutants
 
       # Scoped to the crypto + CTD-1 core (eip712/RIC and the daemon's
       # intent/psbt gate). Drop the -p flags to run the whole workspace.

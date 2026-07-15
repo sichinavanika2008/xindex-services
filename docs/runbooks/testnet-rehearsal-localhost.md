@@ -1,5 +1,11 @@
 # One-box testnet rehearsal (localhost) — FUNCTIONAL, not the closure gate
 
+> **Historical custody harness.** This one-box harness uses deterministic
+> software keys and the former 3-of-5 native-custody path. It may be used only
+> for separately authorized local functional testing; it is not the selected
+> BitGo custody design and cannot satisfy
+> [`gate4-bitgo-rehearsal.md`](./gate4-bitgo-rehearsal.md).
+
 > **What this is.** A single-machine functional rehearsal of the off-chain
 > signing fleet: five `xindex-signer-daemon` instances + five observers +
 > the coordinator, all on one Mac, with **software keys** and **plain-HTTP
@@ -24,7 +30,7 @@
 **Independence on one box.** The whole point of per-operator observers is
 that a lying coordinator cannot fake the destination because five
 *independent* observers each resolve it. On one machine you preserve the
-**data-source** independence — give each observer a **distinct ETH RPC + ≥2
+**data-source** independence — give each observer a **distinct ETH RPC + ≥3
 distinct THORNode URLs** (the refinement-1 rule, `ctd1-signet-rehearsal.md`
 §1) — but you cannot get host/operator independence. Tag every adversarial
 drill below accordingly.
@@ -145,7 +151,7 @@ trio and the production-safety gate blocks them from mainnet.
    xindex-observe-redeem \
      --rpc-url ws://127.0.0.1:8545 \                   # operator-distinct in spirit
      --thorchain-adapter <ADAPTER> --attestation-oracle <ORACLE> \
-     --thornode-urls <URL_A>,<URL_B> \                 # ≥2 distinct per operator
+     --thornode-urls <URL_A>,<URL_B>,<URL_C> \         # ≥3 distinct per operator
      --chain btc --btc-network signet \
      --signer-mode remote \
      --signer-daemon-url http://127.0.0.1:8551 \

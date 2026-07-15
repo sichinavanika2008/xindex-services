@@ -130,9 +130,10 @@ pub struct MultisigUtxo {
 /// `op_return`: optional null-data memo. The burn → USDT reverse flow
 /// passes the `THORChain` swap memo (`=:ETH.USDT:<indexToken>:<minOut>`)
 /// here so the Asgard deposit carries it. Output order is
-/// `[recipient, OP_RETURN?, change?]` — the vault output is `vout[0]`
-/// (`THORChain` matches the inbound by the vault address, reads the memo
-/// from the `OP_RETURN`). Input order is preserved: `vin[0]` is
+/// `[recipient, change?, OP_RETURN?]` — the vault output is `vout[0]`,
+/// change is `vout[1]` when present, and the memo follows (normally
+/// `vout[2]`). `THORChain` explicitly requires this ordering. Input order is
+/// preserved: `vin[0]` is
 /// `inputs[0]`, which the executor guarantees is a multisig UTXO so
 /// `THORChain` resolves any slip-refund back to our multisig.
 ///
@@ -168,6 +169,14 @@ pub fn build_spending_psbt(
         value: recipient_value,
         script_pubkey: recipient.script_pubkey(),
     }];
+    if let Some(change_addr) = change_to {
+        if change_value > Amount::ZERO {
+            tx_outputs.push(TxOut {
+                value: change_value,
+                script_pubkey: change_addr.script_pubkey(),
+            });
+        }
+    }
     if let Some(memo) = op_return {
         if memo.len() > max_op_return {
             return Err(SignError::MemoTooLong(memo.len()));
@@ -178,14 +187,6 @@ pub fn build_spending_psbt(
             value: Amount::ZERO,
             script_pubkey: ScriptBuf::new_op_return(push),
         });
-    }
-    if let Some(change_addr) = change_to {
-        if change_value > Amount::ZERO {
-            tx_outputs.push(TxOut {
-                value: change_value,
-                script_pubkey: change_addr.script_pubkey(),
-            });
-        }
     }
 
     let unsigned_tx = Transaction {
@@ -416,6 +417,48 @@ mod tests {
         assert!(psbt.inputs[0].witness_utxo.is_some());
         assert!(psbt.inputs[0].witness_script.is_some());
         assert_eq!(psbt.unsigned_tx.output[0].value, Amount::from_sat(950_000));
+    }
+
+    /// `THORChain` requires VOUT0=Asgard, VOUT1=VIN0 change when present,
+    /// `VOUT2=OP_RETURN` memo. This test uses only public scripts and performs no
+    /// signing or private-key generation.
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn build_spending_psbt_preserves_thorchain_output_order() {
+        let recipient = Address::from_str("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")
+            .expect("recipient")
+            .require_network(Network::Bitcoin)
+            .expect("network");
+        let change_spk = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([0xcc; 20]));
+        let change = Address::from_script(&change_spk, Network::Bitcoin).expect("change address");
+        let input = MultisigUtxo {
+            outpoint: dummy_outpoint(),
+            value: Amount::from_sat(200_000),
+            script_pubkey: change_spk.clone(),
+            spend: MultisigUtxoSpend::Witness {
+                witness_script: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        };
+        let memo = b"=:ETH.USDT:0xrecipient:990000";
+
+        let psbt = build_spending_psbt(
+            &[input],
+            &recipient,
+            Amount::from_sat(100_000),
+            Some(&change),
+            Amount::from_sat(90_000),
+            Some(memo),
+            MAX_OP_RETURN_BYTES,
+        )
+        .expect("build");
+
+        assert_eq!(psbt.unsigned_tx.output.len(), 3);
+        assert_eq!(
+            psbt.unsigned_tx.output[0].script_pubkey,
+            recipient.script_pubkey()
+        );
+        assert_eq!(psbt.unsigned_tx.output[1].script_pubkey, change_spk);
+        assert!(psbt.unsigned_tx.output[2].script_pubkey.is_op_return());
     }
 
     #[test]

@@ -15,12 +15,15 @@ use bitcoin::{Address, Network, Txid};
 use serde::Serialize;
 use thiserror::Error;
 use xindex_chain_thor::{
-    InboundAddress, RawResponse, ThorClient, TxDetailsResponse, TxResponse, TxStatusResponse,
+    HistoricalAsgardMembership, InboundAddress, RawResponse, ThorClient, TxDetailsResponse,
+    TxResponse, TxStatusResponse,
 };
 use xindex_chain_utxo::{EsploraClient, UtxoError, UtxoTransactionFacts};
+use xindex_ops::network::BlockingWorkPool;
 use xindex_shared::consumed_inflow::AnyConsumedInflow;
 use xindex_shared::eip712::{
-    attestation, redemption_attestation, refund_attestation, streamed_settlement,
+    attestation, redemption_attestation, refund_attestation, settlement_context,
+    streamed_settlement, SettlementContext,
 };
 use xindex_shared::evidence::{EvidenceError, EvidenceStore};
 use xindex_shared::native_inflow::AnyNativeInflow;
@@ -46,6 +49,10 @@ use crate::finalized_observer::{
 pub struct BtcSettlementConfig {
     /// Safe public operator identifier used in evidence records.
     pub operator_id: String,
+    /// Canonical EVM source-chain id for finalized protocol events.
+    pub source_chain_id: u64,
+    /// Maximum signed settlement lifetime from `observedAt`.
+    pub signature_validity_secs: u64,
     /// Canonical `keccak256("BTC.BTC")` asset id.
     pub asset_id: B256,
     /// Adapter's native-token sentinel.
@@ -106,9 +113,9 @@ pub enum SettlementObserverError {
     /// Signer daemon/HSM refusal or transport failure.
     #[error("signer unavailable: {0}")]
     Signer(#[from] SignerError),
-    /// Blocking worker failed.
-    #[error("blocking worker failed")]
-    Worker,
+    /// Blocking worker admission, deadline, or join failure.
+    #[error("blocking worker failed: {0}")]
+    Worker(String),
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +129,8 @@ struct AgreedThorTx {
     status: TxResponse,
     details: TxDetailsResponse,
     stages: Option<TxStatusResponse>,
-    vault: InboundAddress,
+    current_vault: InboundAddress,
+    historical_membership: HistoricalAsgardMembership,
     raw: Vec<ThorRawEvidence>,
 }
 
@@ -132,7 +140,8 @@ struct ThorSourceObservation {
     status: RawResponse<TxResponse>,
     details: RawResponse<TxDetailsResponse>,
     stages: Option<RawResponse<TxStatusResponse>>,
-    vault: InboundAddress,
+    current_vault: InboundAddress,
+    historical_membership: RawResponse<HistoricalAsgardMembership>,
     inbound_body: String,
 }
 
@@ -144,6 +153,8 @@ struct ThorRawEvidence {
     details_body: String,
     stages_body: Option<String>,
     inbound_body: String,
+    historical_asgard_body: String,
+    historical_asgard_height: u64,
 }
 
 #[derive(Debug)]
@@ -160,13 +171,15 @@ pub struct BtcSettlementObserver {
     config: BtcSettlementConfig,
     store: SqliteFinalizedObserverStore,
     thor_sources: Vec<ThorSource>,
-    mint_policy: ThorUtxoPolicy<EsploraClient>,
-    redemption_policy: ThorUtxoStreamedSettlementPolicy<FinalizedRpcErc20LogClient, EsploraClient>,
+    mint_policy: Arc<ThorUtxoPolicy<EsploraClient>>,
+    redemption_policy:
+        Arc<ThorUtxoStreamedSettlementPolicy<FinalizedRpcErc20LogClient, EsploraClient>>,
     btc_evidence: EsploraClient,
     eth_evidence: FinalizedRpcErc20LogClient,
     signer: RemoteHsmBackend,
     domain: Eip712Domain,
     evidence: EvidenceStore,
+    blocking_work: BlockingWorkPool,
 }
 
 impl std::fmt::Debug for BtcSettlementObserver {
@@ -204,6 +217,9 @@ impl BtcSettlementObserver {
         if thor_sources.len() != 3
             || unique_ids.len() != 3
             || config.operator_id.is_empty()
+            || config.source_chain_id == 0
+            || config.signature_validity_secs == 0
+            || config.signature_validity_secs > 300
             || config.asset_id == B256::ZERO
             || config.target_token == EthAddress::ZERO
             || config.btc_min_confirmations == 0
@@ -215,6 +231,10 @@ impl BtcSettlementObserver {
             ));
         }
         let primary = thor_sources[0].1.clone();
+        let eth_evidence = FinalizedRpcErc20LogClient::new(
+            &config.ethereum_rpc_url,
+            config.ethereum_lookback_blocks,
+        )?;
         let mint_policy = ThorUtxoPolicy::with_native_inflows(
             primary.clone(),
             EsploraClient::with_url(config.btc_network, &config.esplora_url),
@@ -225,10 +245,7 @@ impl BtcSettlementObserver {
         );
         let redemption_policy = ThorUtxoStreamedSettlementPolicy::with_native_inflows(
             primary,
-            FinalizedRpcErc20LogClient::new(
-                &config.ethereum_rpc_url,
-                config.ethereum_lookback_blocks,
-            ),
+            eth_evidence.clone(),
             EsploraClient::with_url(config.btc_network, &config.esplora_url),
             config.usdt_token,
             config.btc_custody_address.clone(),
@@ -240,21 +257,19 @@ impl BtcSettlementObserver {
         );
         Ok(Self {
             btc_evidence: EsploraClient::with_url(config.btc_network, &config.esplora_url),
-            eth_evidence: FinalizedRpcErc20LogClient::new(
-                &config.ethereum_rpc_url,
-                config.ethereum_lookback_blocks,
-            ),
+            eth_evidence,
             config,
             store,
             thor_sources: thor_sources
                 .into_iter()
                 .map(|(id, client)| ThorSource { id, client })
                 .collect(),
-            mint_policy,
-            redemption_policy,
+            mint_policy: Arc::new(mint_policy),
+            redemption_policy: Arc::new(redemption_policy),
             signer,
             domain,
             evidence,
+            blocking_work: BlockingWorkPool::default(),
         })
     }
 
@@ -279,16 +294,25 @@ impl BtcSettlementObserver {
         let inbound_hash = format!("{:x}", record.source_transaction_hash);
         let agreed = self.poll_thor(&inbound_hash, false).await?;
         validate_thor_inbound_id(&agreed.status, &inbound_hash)?;
+        let policy = Arc::clone(&self.mint_policy);
+        let runtime = tokio::runtime::Handle::current();
+        let policy_inbound_hash = inbound_hash.clone();
+        let status = agreed.status.clone();
+        let details = agreed.details.clone();
+        let current_vault = agreed.current_vault.clone();
+        let historical_membership = agreed.historical_membership.clone();
         let amount = self
-            .mint_policy
-            .observe_settlement_from_snapshot(
-                &inbound_hash,
-                &agreed.status,
-                &agreed.details,
-                &agreed.vault,
-                intent_id,
-                slot_index,
-            )
+            .run_blocking(move || {
+                runtime.block_on(policy.observe_settlement_from_snapshot(
+                    &policy_inbound_hash,
+                    &status,
+                    &details,
+                    &current_vault,
+                    &historical_membership,
+                    intent_id,
+                    slot_index,
+                ))
+            })
             .await?;
         let outbound = observed_btc_txid(
             &agreed.details,
@@ -296,10 +320,16 @@ impl BtcSettlementObserver {
             amount,
             self.config.btc_tolerance_sats,
         )?;
-        let btc_facts = self.btc_evidence.transaction_facts(&outbound)?;
+        let btc_facts = self.bitcoin_transaction_facts(outbound).await?;
         let evidence_hash =
             self.persist_mint_evidence(&record, &agreed, &btc_facts, amount, now)?;
-        let payload = attestation(intent_id, U256::from(slot_index), U256::from(amount));
+        let context = self.mint_context(&record, evidence_hash, now).await?;
+        let payload = attestation(
+            intent_id,
+            U256::from(slot_index),
+            U256::from(amount),
+            context,
+        );
         let signature = self.sign_mint(payload).await?;
         Ok(SignedMintSettlement {
             intent_id: format!("{intent_id:#x}"),
@@ -309,6 +339,11 @@ impl BtcSettlementObserver {
             signature: encode_signature(signature),
             evidence_hash: format!("{evidence_hash:#x}"),
             observed_at: now,
+            valid_until: context.valid_until,
+            source_chain_id: self.config.source_chain_id,
+            source_block_number: record.source_block,
+            source_block_hash: format!("{:#x}", record.source_block_hash),
+            observation_epoch: context.observation_epoch,
         })
     }
 
@@ -330,11 +365,15 @@ impl BtcSettlementObserver {
                 "outcome is not non-streaming delivery-only".to_string(),
             ));
         }
+        let context = self
+            .dispatch_context(&observed.dispatch, observed.evidence_hash, now)
+            .await?;
         let payload = redemption_attestation(
             observed.dispatch.redemption_id,
             U256::from(observed.dispatch.leg_index),
             self.config.asset_id,
             U256::from(observed.outcome.delivered_usdt_1e6),
+            context,
         );
         let signature = self.sign_delivery(payload).await?;
         Ok(SignedDeliverySettlement {
@@ -346,6 +385,11 @@ impl BtcSettlementObserver {
             signature: encode_signature(signature),
             evidence_hash: format!("{:#x}", observed.evidence_hash),
             observed_at: now,
+            valid_until: context.valid_until,
+            source_chain_id: self.config.source_chain_id,
+            source_block_number: observed.dispatch.source_block,
+            source_block_hash: format!("{:#x}", observed.dispatch.source_block_hash),
+            observation_epoch: context.observation_epoch,
         })
     }
 
@@ -367,11 +411,15 @@ impl BtcSettlementObserver {
                 "outcome is not non-streaming refund-only".to_string(),
             ));
         }
+        let context = self
+            .dispatch_context(&observed.dispatch, observed.evidence_hash, now)
+            .await?;
         let payload = refund_attestation(
             observed.dispatch.redemption_id,
             U256::from(observed.dispatch.leg_index),
             self.config.asset_id,
             U256::from(observed.outcome.refunded_sats),
+            context,
         );
         let signature = self.sign_refund(payload).await?;
         Ok(SignedRefundSettlement {
@@ -383,6 +431,11 @@ impl BtcSettlementObserver {
             signature: encode_signature(signature),
             evidence_hash: format!("{:#x}", observed.evidence_hash),
             observed_at: now,
+            valid_until: context.valid_until,
+            source_chain_id: self.config.source_chain_id,
+            source_block_number: observed.dispatch.source_block,
+            source_block_hash: format!("{:#x}", observed.dispatch.source_block_hash),
+            observation_epoch: context.observation_epoch,
         })
     }
 
@@ -403,12 +456,16 @@ impl BtcSettlementObserver {
                 "outcome is not a finalized streaming settlement".to_string(),
             ));
         }
+        let context = self
+            .dispatch_context(&observed.dispatch, observed.evidence_hash, now)
+            .await?;
         let payload = streamed_settlement(
             observed.dispatch.redemption_id,
             U256::from(observed.dispatch.leg_index),
             self.config.asset_id,
             U256::from(observed.outcome.delivered_usdt_1e6),
             U256::from(observed.outcome.refunded_sats),
+            context,
         );
         let signature = self.sign_streamed(payload).await?;
         Ok(SignedStreamedSettlement {
@@ -421,7 +478,86 @@ impl BtcSettlementObserver {
             signature: encode_signature(signature),
             evidence_hash: format!("{:#x}", observed.evidence_hash),
             observed_at: now,
+            valid_until: context.valid_until,
+            source_chain_id: self.config.source_chain_id,
+            source_block_number: observed.dispatch.source_block,
+            source_block_hash: format!("{:#x}", observed.dispatch.source_block_hash),
+            observation_epoch: context.observation_epoch,
         })
+    }
+
+    async fn mint_context(
+        &self,
+        record: &FinalizedMintRecord,
+        evidence_hash: B256,
+        observed_at: u64,
+    ) -> Result<SettlementContext, SettlementObserverError> {
+        if self
+            .store
+            .mint(record.intent_id, record.slot_index)
+            .await?
+            .as_ref()
+            != Some(record)
+        {
+            return Err(SettlementObserverError::NotReady(
+                "finalized mint source changed during settlement observation".to_string(),
+            ));
+        }
+        self.context(
+            evidence_hash,
+            observed_at,
+            record.source_block,
+            record.source_block_hash,
+        )
+        .await
+    }
+
+    async fn dispatch_context(
+        &self,
+        record: &FinalizedDispatchRecord,
+        evidence_hash: B256,
+        observed_at: u64,
+    ) -> Result<SettlementContext, SettlementObserverError> {
+        if self
+            .store
+            .dispatch(record.redemption_id, record.leg_index)
+            .await?
+            .as_ref()
+            != Some(record)
+        {
+            return Err(SettlementObserverError::NotReady(
+                "finalized redemption source changed during settlement observation".to_string(),
+            ));
+        }
+        self.context(
+            evidence_hash,
+            observed_at,
+            record.source_block,
+            record.source_block_hash,
+        )
+        .await
+    }
+
+    async fn context(
+        &self,
+        evidence_hash: B256,
+        observed_at: u64,
+        source_block_number: u64,
+        source_block_hash: B256,
+    ) -> Result<SettlementContext, SettlementObserverError> {
+        let valid_until = observed_at
+            .checked_add(self.config.signature_validity_secs)
+            .ok_or_else(|| SettlementObserverError::BadRequest("validity overflow".to_string()))?;
+        let observation_epoch = self.store.observation_epoch().await?;
+        Ok(settlement_context(
+            evidence_hash,
+            observed_at,
+            valid_until,
+            U256::from(self.config.source_chain_id),
+            source_block_number,
+            source_block_hash,
+            observation_epoch,
+        ))
     }
 
     async fn observe_redemption(
@@ -455,40 +591,57 @@ impl BtcSettlementObserver {
             .as_ref()
             .and_then(|status| status.streaming.as_ref())
             .is_some();
-        let btc_facts = self.btc_evidence.transaction_facts(&inbound_txid)?;
+        let btc_facts = self.bitcoin_transaction_facts(inbound_txid).await?;
         validate_redemption_inbound(
             &agreed.status,
-            &agreed.vault,
+            &agreed.current_vault,
+            &agreed.historical_membership,
             &dispatch,
             &self.config.btc_custody_address,
             self.config.btc_network,
             self.config.btc_min_confirmations,
             &btc_facts,
         )?;
+        let eth_evidence = self.eth_evidence.clone();
+        let usdt_token = self.config.usdt_token;
+        let final_destination = dispatch.facts.final_destination;
         let eth_observation = self
-            .eth_evidence
-            .transfers_to_evidence(self.config.usdt_token, dispatch.facts.final_destination)?;
-        let outcome = self
-            .redemption_policy
-            .verify_from_snapshot(
-                &agreed.status,
-                &agreed.details,
-                &agreed.vault,
-                &eth_observation.arrivals,
-                &inbound_hash,
-                dispatch.facts.final_destination,
-                redemption_id,
-                leg_index,
-            )
+            .run_blocking(move || eth_evidence.transfers_to_evidence(usdt_token, final_destination))
             .await?;
-        let refund_facts = observed_refund_txid(
+        let policy = Arc::clone(&self.redemption_policy);
+        let runtime = tokio::runtime::Handle::current();
+        let status = agreed.status.clone();
+        let details = agreed.details.clone();
+        let current_vault = agreed.current_vault.clone();
+        let historical_membership = agreed.historical_membership.clone();
+        let arrivals = eth_observation.arrivals.clone();
+        let policy_inbound_hash = inbound_hash.clone();
+        let outcome = self
+            .run_blocking(move || {
+                runtime.block_on(policy.verify_from_snapshot(
+                    &status,
+                    &details,
+                    &current_vault,
+                    &historical_membership,
+                    &arrivals,
+                    &policy_inbound_hash,
+                    final_destination,
+                    redemption_id,
+                    leg_index,
+                ))
+            })
+            .await?;
+        let refund_txid = observed_refund_txid(
             &agreed.details,
             &self.config.btc_custody_address.to_string(),
             outcome.refunded_sats,
             self.config.btc_tolerance_sats,
-        )?
-        .map(|txid| self.btc_evidence.transaction_facts(&txid))
-        .transpose()?;
+        )?;
+        let refund_facts = if let Some(txid) = refund_txid {
+            Some(self.bitcoin_transaction_facts(txid).await?)
+        } else {
+            None
+        };
         let evidence_hash = self.persist_redemption_evidence(
             &dispatch,
             &inbound_hash,
@@ -536,6 +689,11 @@ impl BtcSettlementObserver {
             } else {
                 None
             };
+            let historical_membership = source
+                .client
+                .historical_asgard_membership_evidence(&status.value, "BTC")
+                .await
+                .map_err(|error| SettlementObserverError::NotReady(error.to_string()))?;
             let inbound = source
                 .client
                 .inbound_evidence()
@@ -559,7 +717,8 @@ impl BtcSettlementObserver {
                 status,
                 details,
                 stages,
-                vault: vaults[0].clone(),
+                current_vault: vaults[0].clone(),
+                historical_membership,
                 inbound_body: inbound.raw_body,
             });
         }
@@ -571,10 +730,12 @@ impl BtcSettlementObserver {
                 || observation.details.value != first.details.value
                 || observation.stages.as_ref().map(|value| &value.value)
                     != first.stages.as_ref().map(|value| &value.value)
-                || observation.vault != first.vault
+                || observation.current_vault != first.current_vault
+                || observation.historical_membership.value != first.historical_membership.value
         }) {
             return Err(SettlementObserverError::NotReady(
-                "THOR sources disagree on transaction status/details/stages/BTC vault".to_string(),
+                "THOR sources disagree on transaction/status/stages/current or historical BTC vault state"
+                    .to_string(),
             ));
         }
         let raw = observations
@@ -588,13 +749,16 @@ impl BtcSettlementObserver {
                     .as_ref()
                     .map(|value| value.raw_body.clone()),
                 inbound_body: observation.inbound_body.clone(),
+                historical_asgard_body: observation.historical_membership.raw_body.clone(),
+                historical_asgard_height: observation.historical_membership.value.height,
             })
             .collect();
         Ok(AgreedThorTx {
             status: first.status.value.clone(),
             details: first.details.value.clone(),
             stages: first.stages.as_ref().map(|value| value.value.clone()),
-            vault: first.vault.clone(),
+            current_vault: first.current_vault.clone(),
+            historical_membership: first.historical_membership.value.clone(),
             raw,
         })
     }
@@ -642,7 +806,8 @@ impl BtcSettlementObserver {
             "attestedAmount": amount.to_string(),
             "ethereum": mint_record_json(record),
             "thorSources": thor.raw,
-            "agreedBtcVault": thor.vault,
+            "currentBtcRoutingState": thor.current_vault,
+            "historicalBtcAsgardMembership": thor.historical_membership,
             "bitcoinOutbound": btc,
         });
         self.persist_value("settlement-mint", &value)
@@ -677,7 +842,8 @@ impl BtcSettlementObserver {
             "inboundTxHash": inbound_hash,
             "ethereum": dispatch_record_json(dispatch),
             "thorSources": thor.raw,
-            "agreedBtcVault": thor.vault,
+            "currentBtcRoutingState": thor.current_vault,
+            "historicalBtcAsgardMembership": thor.historical_membership,
             "bitcoinInbound": inbound_btc,
             "bitcoinRefund": refund_btc,
             "finalizedEthereumObservation": ethereum,
@@ -696,16 +862,23 @@ impl BtcSettlementObserver {
         Ok(hash)
     }
 
+    async fn bitcoin_transaction_facts(
+        &self,
+        txid: Txid,
+    ) -> Result<UtxoTransactionFacts, SettlementObserverError> {
+        let btc_evidence = self.btc_evidence.clone();
+        self.run_blocking(move || btc_evidence.transaction_facts(&txid))
+            .await
+    }
+
     async fn sign_mint(
         &self,
         payload: xindex_shared::eip712::Attestation,
     ) -> Result<[u8; 65], SettlementObserverError> {
         let signer = self.signer.clone();
         let domain = self.domain.clone();
-        tokio::task::spawn_blocking(move || signer.sign_attestation_msg(&domain, &payload))
+        self.run_blocking(move || signer.sign_attestation_msg(&domain, &payload))
             .await
-            .map_err(|_| SettlementObserverError::Worker)?
-            .map_err(Into::into)
     }
 
     async fn sign_delivery(
@@ -714,12 +887,8 @@ impl BtcSettlementObserver {
     ) -> Result<[u8; 65], SettlementObserverError> {
         let signer = self.signer.clone();
         let domain = self.domain.clone();
-        tokio::task::spawn_blocking(move || {
-            signer.sign_redemption_attestation_msg(&domain, &payload)
-        })
-        .await
-        .map_err(|_| SettlementObserverError::Worker)?
-        .map_err(Into::into)
+        self.run_blocking(move || signer.sign_redemption_attestation_msg(&domain, &payload))
+            .await
     }
 
     async fn sign_refund(
@@ -728,10 +897,8 @@ impl BtcSettlementObserver {
     ) -> Result<[u8; 65], SettlementObserverError> {
         let signer = self.signer.clone();
         let domain = self.domain.clone();
-        tokio::task::spawn_blocking(move || signer.sign_refund_attestation_msg(&domain, &payload))
+        self.run_blocking(move || signer.sign_refund_attestation_msg(&domain, &payload))
             .await
-            .map_err(|_| SettlementObserverError::Worker)?
-            .map_err(Into::into)
     }
 
     async fn sign_streamed(
@@ -740,9 +907,20 @@ impl BtcSettlementObserver {
     ) -> Result<[u8; 65], SettlementObserverError> {
         let signer = self.signer.clone();
         let domain = self.domain.clone();
-        tokio::task::spawn_blocking(move || signer.sign_streamed_settlement_msg(&domain, &payload))
+        self.run_blocking(move || signer.sign_streamed_settlement_msg(&domain, &payload))
             .await
-            .map_err(|_| SettlementObserverError::Worker)?
+    }
+
+    async fn run_blocking<F, T, E>(&self, work: F) -> Result<T, SettlementObserverError>
+    where
+        F: FnOnce() -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: Into<SettlementObserverError> + Send + 'static,
+    {
+        self.blocking_work
+            .run(work)
+            .await
+            .map_err(|error| SettlementObserverError::Worker(error.to_string()))?
             .map_err(Into::into)
     }
 }
@@ -831,9 +1009,26 @@ fn observed_refund_txid(
     observed_btc_txid(details, custody, refunded_sats, tolerance).map(Some)
 }
 
+fn historical_asgard_contains(
+    status: &TxResponse,
+    membership: &HistoricalAsgardMembership,
+    chain: &str,
+    address: &str,
+) -> bool {
+    membership.chain == chain
+        && !membership.addresses.is_empty()
+        && status.historical_asgard_height().ok() == Some(membership.height)
+        && membership.contains(address)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the validator binds THOR status, live halt state, historical membership, dispatch, network, and exact Bitcoin facts"
+)]
 fn validate_redemption_inbound(
     status: &TxResponse,
-    vault: &InboundAddress,
+    current_vault: &InboundAddress,
+    historical_membership: &HistoricalAsgardMembership,
     dispatch: &FinalizedDispatchRecord,
     custody: &Address,
     network: Network,
@@ -848,13 +1043,13 @@ fn validate_redemption_inbound(
         || !tx.id.eq_ignore_ascii_case(&btc.txid)
         || tx.chain != "BTC"
         || tx.from_address != custody.to_string()
-        || vault.chain != "BTC"
-        || vault.address.is_empty()
-        || tx.to_address != vault.address
-        || vault.halted
-        || vault.global_trading_paused
-        || vault.chain_trading_paused
-        || vault.chain_lp_actions_paused
+        || current_vault.chain != "BTC"
+        || current_vault.address.is_empty()
+        || current_vault.halted
+        || current_vault.global_trading_paused
+        || current_vault.chain_trading_paused
+        || current_vault.chain_lp_actions_paused
+        || !historical_asgard_contains(status, historical_membership, "BTC", &tx.to_address)
         || tx.memo.as_bytes() != dispatch.facts.memo
         || tx.coins.len() != 1
         || !tx.coins[0].asset.eq_ignore_ascii_case("BTC.BTC")
@@ -939,6 +1134,8 @@ fn encode_signature(signature: [u8; 65]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test code")]
+
     use super::*;
 
     #[test]
@@ -947,5 +1144,53 @@ mod tests {
         assert!(parse_launch_index("slot", "1").is_err());
         assert!(parse_launch_index("slot", "-1").is_err());
         assert!(parse_txid("not-a-txid").is_err());
+    }
+
+    #[test]
+    fn historical_asgard_identity_survives_current_rotation_but_never_backfills() {
+        let status: TxResponse = serde_json::from_value(serde_json::json!({
+            "observed_tx": {
+                "tx": {
+                    "id": "ABC", "chain": "BTC", "from_address": "custody",
+                    "to_address": "vault-a", "coins": [], "memo": ""
+                },
+                "status": "done"
+            },
+            "actions": [],
+            "finalised_height": 100
+        }))
+        .expect("status");
+        let historical = HistoricalAsgardMembership {
+            height: 100,
+            chain: "BTC".to_string(),
+            addresses: vec!["vault-a".to_string()],
+        };
+
+        // At N+1 the live routing row may be vault B; identity still comes
+        // from the immutable N snapshot.
+        assert!(historical_asgard_contains(
+            &status,
+            &historical,
+            "BTC",
+            "vault-a"
+        ));
+        // Becoming current later cannot retroactively make B a member at N.
+        assert!(!historical_asgard_contains(
+            &status,
+            &historical,
+            "BTC",
+            "vault-b"
+        ));
+
+        let wrong_height = HistoricalAsgardMembership {
+            height: 101,
+            ..historical
+        };
+        assert!(!historical_asgard_contains(
+            &status,
+            &wrong_height,
+            "BTC",
+            "vault-a"
+        ));
     }
 }

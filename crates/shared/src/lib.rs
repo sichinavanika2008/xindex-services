@@ -11,6 +11,7 @@ pub mod eip712;
 pub mod evidence;
 pub mod intent;
 pub mod native_inflow;
+pub mod posting_outbox;
 pub mod price_aggregate;
 pub mod price_twap;
 pub mod price_wire;

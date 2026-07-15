@@ -29,6 +29,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy_primitives::{Address, B256, U256};
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
+use xindex_ops::network::{async_client, HttpClientPolicy};
+use xindex_ops::tls::{
+    exact_pinned_async_client_builder, load_cert_chain, load_private_key, pinned_cert_store,
+};
 use xindex_ops::{serve_metrics, Metrics};
 use xindex_shared::eip712::price_oracle_domain;
 use xindex_shared::price_twap::{TwapConfig, TwapSample};
@@ -107,7 +111,8 @@ struct Config {
     metrics_address: SocketAddr,
     /// Combined PEM client certificate/private key presented to collectors.
     collector_client_identity_pem: PathBuf,
-    /// Explicit collector CA/certificate pins. System roots are disabled.
+    /// Legacy-named paths to leaf-first exact collector peer bundles. A
+    /// CA-only file does not authorize certificates issued by that CA.
     collector_server_ca_pems: Vec<PathBuf>,
     binance_base: String,
     coinbase_base: String,
@@ -316,7 +321,7 @@ fn validate_transport_files(cfg: &Config) -> std::io::Result<()> {
     for path in &cfg.collector_server_ca_pems {
         if !std::fs::symlink_metadata(path)?.file_type().is_file() {
             return Err(std::io::Error::other(
-                "collector CA path must be a non-symlink regular file",
+                "collector peer-bundle path must be a non-symlink regular file",
             ));
         }
     }
@@ -492,7 +497,7 @@ fn validate_config(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
         return Err("metrics_address must be a non-zero loopback listener".into());
     }
     if cfg.collector_server_ca_pems.is_empty() {
-        return Err("collector_server_ca_pems must not be empty".into());
+        return Err("collector_server_ca_pems exact-peer allowlist must not be empty".into());
     }
     if cfg.collector_urls.len() < 2 {
         return Err("at least two redundant collector endpoints are required".into());
@@ -657,17 +662,22 @@ async fn publish_to_collector(
 }
 
 fn collector_client(cfg: &Config) -> Result<reqwest::Client, Box<dyn std::error::Error>> {
-    let identity =
-        reqwest::Identity::from_pem(&std::fs::read(&cfg.collector_client_identity_pem)?)?;
-    let mut builder = reqwest::Client::builder()
-        .identity(identity)
-        .timeout(Duration::from_secs(cfg.publish_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_built_in_root_certs(false);
-    for path in &cfg.collector_server_ca_pems {
-        builder =
-            builder.add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(path)?)?);
-    }
+    let identity = std::fs::read(&cfg.collector_client_identity_pem)?;
+    let peers = cfg
+        .collector_server_ca_pems
+        .iter()
+        .map(std::fs::read)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let builder = exact_pinned_async_client_builder(
+        HttpClientPolicy {
+            connect_timeout: Duration::from_secs(cfg.publish_timeout_secs.min(3)),
+            request_timeout: Duration::from_secs(cfg.publish_timeout_secs),
+            max_response_bytes: 256 * 1024,
+        },
+        load_cert_chain(&identity)?,
+        load_private_key(&identity)?,
+        pinned_cert_store(&peers)?,
+    )?;
     Ok(builder.build()?)
 }
 
@@ -711,10 +721,11 @@ async fn run_producer(cfg: Config, metrics: Metrics) -> Result<(), Box<dyn std::
         .map(|a| Ok::<_, Box<dyn std::error::Error>>((a.asset_id.parse::<B256>()?, a)))
         .collect::<Result<_, _>>()?;
 
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let http = async_client(HttpClientPolicy {
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(10),
+        max_response_bytes: 2 * 1024 * 1024,
+    })?;
     let publish_http = collector_client(&cfg)?;
     let binance = BinanceVenue::new(http.clone(), &cfg.binance_base);
     let coinbase = CoinbaseVenue::new(http.clone(), &cfg.coinbase_base);
@@ -1054,7 +1065,7 @@ mod tests {
             publish_timeout_secs: 5,
             metrics_address: SocketAddr::from(([127, 0, 0, 1], 9095)),
             collector_client_identity_pem: "/tmp/collector-identity.pem".into(),
-            collector_server_ca_pems: vec!["/tmp/collector-ca.pem".into()],
+            collector_server_ca_pems: vec!["/tmp/collector-peer.pem".into()],
             binance_base: "https://api.binance.com".into(),
             coinbase_base: "https://api.coinbase.com".into(),
             kraken_base: "https://api.kraken.com".into(),
@@ -1126,5 +1137,42 @@ mod tests {
         let mut above = valid_cfg();
         above.twap_max_gap_secs = above.twap_window_secs + 1; // > window → never trips
         assert!(validate_config(&above).is_err());
+    }
+
+    /// L-04: these mutations exercise the compiled boot policy before state,
+    /// transport identity, HSM, network, or listener I/O is attempted.
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        let mut collapsed_sources = valid_cfg();
+        collapsed_sources.min_venues = 2;
+        assert!(validate_config(&collapsed_sources).is_err());
+
+        let mut public_hsm = valid_cfg();
+        public_hsm.hsm_url = "https://hsm.example".into();
+        assert!(validate_config(&public_hsm).is_err());
+
+        let mut public_metrics = valid_cfg();
+        public_metrics.metrics_address = SocketAddr::from(([0, 0, 0, 0], 9095));
+        assert!(validate_config(&public_metrics).is_err());
+
+        let mut no_peer_pin = valid_cfg();
+        no_peer_pin.collector_server_ca_pems.clear();
+        assert!(validate_config(&no_peer_pin).is_err());
+
+        let mut one_collector = valid_cfg();
+        one_collector.collector_urls.truncate(1);
+        assert!(validate_config(&one_collector).is_err());
+
+        let mut plaintext_collector = valid_cfg();
+        plaintext_collector.collector_urls[0] = "http://127.0.0.1:9000".into();
+        assert!(validate_config(&plaintext_collector).is_err());
+
+        let mut ephemeral_state = valid_cfg();
+        ephemeral_state.state_file = "relative-state.json".into();
+        assert!(validate_config(&ephemeral_state).is_err());
+
+        let mut mismatched_epoch = valid_cfg();
+        mismatched_epoch.epoch_secs = mismatched_epoch.interval_secs + 1;
+        assert!(validate_config(&mismatched_epoch).is_err());
     }
 }

@@ -109,6 +109,7 @@ pub fn proof_at(
         redemption_id,
         U256::from(leg_index),
         chain.asset_id_hash(),
+        chain.native_chain_id_hash(),
         amount,
         chain.decimals(),
         immediate_target_hash,

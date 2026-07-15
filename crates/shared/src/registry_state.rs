@@ -18,6 +18,8 @@ use alloy_primitives::{Address, B256};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 
+type StoredSignatureGenerationRow = (Vec<u8>, Option<Vec<u8>>, i64, String);
+
 /// Durable registry-state failure. All variants are fail-closed at callers.
 #[derive(Debug, Error)]
 pub enum RegistryStateError {
@@ -67,6 +69,7 @@ pub enum SignatureReservation {
     /// This identity is already bound to a different payload.
     Conflict {
         previous_payload_hash: B256,
+        previous_generation: u64,
         reserved_at: u64,
     },
 }
@@ -153,12 +156,14 @@ impl SqliteRegistryState {
     pub async fn reserve_inbound_signature(
         &self,
         sequence: u64,
+        valid_until: u64,
         payload_hash: B256,
         now: u64,
     ) -> Result<SignatureReservation, RegistryStateError> {
         self.reserve_signature(
             RegistrySignatureKind::Inbound,
             sequence.to_be_bytes().to_vec(),
+            valid_until,
             payload_hash,
             now,
         )
@@ -175,12 +180,14 @@ impl SqliteRegistryState {
         &self,
         originator: Address,
         nonce: u64,
+        dispatch_deadline: u64,
         payload_hash: B256,
         now: u64,
     ) -> Result<SignatureReservation, RegistryStateError> {
         self.reserve_signature(
             RegistrySignatureKind::Quote,
             quote_identity(originator, nonce),
+            dispatch_deadline,
             payload_hash,
             now,
         )
@@ -196,6 +203,7 @@ impl SqliteRegistryState {
     pub async fn complete_inbound_signature(
         &self,
         sequence: u64,
+        valid_until: u64,
         payload_hash: B256,
         signature: [u8; 65],
         now: u64,
@@ -203,6 +211,7 @@ impl SqliteRegistryState {
         self.complete_signature(
             RegistrySignatureKind::Inbound,
             sequence.to_be_bytes().to_vec(),
+            valid_until,
             payload_hash,
             signature,
             now,
@@ -219,6 +228,7 @@ impl SqliteRegistryState {
         &self,
         originator: Address,
         nonce: u64,
+        dispatch_deadline: u64,
         payload_hash: B256,
         signature: [u8; 65],
         now: u64,
@@ -226,6 +236,7 @@ impl SqliteRegistryState {
         self.complete_signature(
             RegistrySignatureKind::Quote,
             quote_identity(originator, nonce),
+            dispatch_deadline,
             payload_hash,
             signature,
             now,
@@ -242,14 +253,18 @@ impl SqliteRegistryState {
         &self,
         kind: RegistrySignatureKind,
         identity: &[u8],
+        generation: u64,
         payload_hash: B256,
     ) -> Result<bool, RegistryStateError> {
         let result = sqlx::query(
-            "DELETE FROM registry_signature_reservations
-             WHERE kind = ? AND identity = ? AND payload_hash = ? AND signature IS NULL",
+            "UPDATE registry_signature_generations
+             SET state = 'superseded', updated_at = reserved_at
+             WHERE kind = ? AND identity = ? AND generation = ?
+               AND payload_hash = ? AND state = 'reserved' AND signature IS NULL",
         )
         .bind(kind.as_str())
         .bind(identity)
+        .bind(to_i64(generation, "signature generation")?)
         .bind(payload_hash.as_slice())
         .execute(&self.pool)
         .await?;
@@ -264,6 +279,10 @@ impl SqliteRegistryState {
     /// # Errors
     /// Returns [`RegistryStateError`] on invalid transitions, corrupt durable
     /// state, or database failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one serialized transition reconciles consumption, exact expiry, contention and next-nonce allocation"
+    )]
     pub async fn reserve_quote_nonce(
         &self,
         originator: Address,
@@ -298,6 +317,7 @@ impl SqliteRegistryState {
             self.active_quote_reservation(originator).await?
         {
             let nonce = from_i64(nonce_i, "active quote nonce")?;
+            let existing_expiry = from_i64(existing_expiry, "active quote expiry")?;
             if nonce <= finalized_onchain_nonce {
                 sqlx::query(
                     "UPDATE quote_nonce_reservations
@@ -306,6 +326,17 @@ impl SqliteRegistryState {
                 )
                 .bind(to_i64(now, "current time")?)
                 .bind(id)
+                .execute(&self.pool)
+                .await?;
+            } else if existing_expiry <= now {
+                sqlx::query(
+                    "UPDATE quote_nonce_reservations
+                     SET state = 'expired', updated_at = ?
+                     WHERE id = ? AND state = 'reserved' AND expires_at <= ?",
+                )
+                .bind(to_i64(now, "current time")?)
+                .bind(id)
+                .bind(to_i64(now, "current time")?)
                 .execute(&self.pool)
                 .await?;
             } else {
@@ -325,7 +356,7 @@ impl SqliteRegistryState {
                 }
                 return Ok(QuoteNonceReservation::Busy {
                     nonce,
-                    expires_at: from_i64(existing_expiry, "active quote expiry")?,
+                    expires_at: existing_expiry,
                     payload_hash: existing_hash,
                 });
             }
@@ -558,89 +589,183 @@ impl SqliteRegistryState {
         Ok(outcome)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one serialized transition keeps generation expiry, idempotency, live conflicts and monotonic replacement adjacent"
+    )]
     async fn reserve_signature(
         &self,
         kind: RegistrySignatureKind,
         identity: Vec<u8>,
+        generation: u64,
         payload_hash: B256,
         now: u64,
     ) -> Result<SignatureReservation, RegistryStateError> {
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO registry_signature_reservations
-                (kind, identity, payload_hash, signature, reserved_at, signed_at)
-             VALUES (?, ?, ?, NULL, ?, NULL)",
+        if generation <= now {
+            return Err(RegistryStateError::InvalidTransition(
+                "signature generation is already expired".to_string(),
+            ));
+        }
+        let generation_i = to_i64(generation, "signature generation")?;
+        let now_i = to_i64(now, "reservation time")?;
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE registry_signature_generations
+             SET state = 'expired', updated_at = ?
+             WHERE kind = ? AND identity = ?
+               AND state IN ('reserved', 'signed') AND expires_at <= ?",
+        )
+        .bind(now_i)
+        .bind(kind.as_str())
+        .bind(&identity)
+        .bind(now_i)
+        .execute(&mut *transaction)
+        .await?;
+
+        let exact: Option<StoredSignatureGenerationRow> = sqlx::query_as(
+            "SELECT payload_hash, signature, reserved_at, state
+             FROM registry_signature_generations
+             WHERE kind = ? AND identity = ? AND generation = ?",
         )
         .bind(kind.as_str())
         .bind(&identity)
+        .bind(generation_i)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some((previous_hash, signature, reserved_at_i, state)) = exact {
+            let previous_hash = decode_b256(&previous_hash, "signature payload hash")?;
+            let reserved_at = from_i64(reserved_at_i, "signature reservation time")?;
+            let outcome = if previous_hash != payload_hash
+                || !matches!(state.as_str(), "reserved" | "signed")
+            {
+                SignatureReservation::Conflict {
+                    previous_payload_hash: previous_hash,
+                    previous_generation: generation,
+                    reserved_at,
+                }
+            } else if let Some(bytes) = signature {
+                SignatureReservation::Signed(decode_signature(&bytes)?)
+            } else {
+                SignatureReservation::Pending { reserved_at }
+            };
+            transaction.commit().await?;
+            return Ok(outcome);
+        }
+
+        let active: Option<(i64, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT generation, payload_hash, reserved_at
+             FROM registry_signature_generations
+             WHERE kind = ? AND identity = ? AND state IN ('reserved', 'signed')",
+        )
+        .bind(kind.as_str())
+        .bind(&identity)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some((previous_generation_i, previous_hash, reserved_at_i)) = active {
+            let outcome = SignatureReservation::Conflict {
+                previous_payload_hash: decode_b256(
+                    &previous_hash,
+                    "active signature payload hash",
+                )?,
+                previous_generation: from_i64(
+                    previous_generation_i,
+                    "active signature generation",
+                )?,
+                reserved_at: from_i64(reserved_at_i, "signature reservation time")?,
+            };
+            transaction.commit().await?;
+            return Ok(outcome);
+        }
+
+        let latest: Option<(i64, Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT generation, payload_hash, reserved_at
+             FROM registry_signature_generations
+             WHERE kind = ? AND identity = ?
+             ORDER BY generation DESC LIMIT 1",
+        )
+        .bind(kind.as_str())
+        .bind(&identity)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some((previous_generation_i, previous_hash, reserved_at_i)) = latest {
+            let previous_generation =
+                from_i64(previous_generation_i, "latest signature generation")?;
+            if generation <= previous_generation {
+                let outcome = SignatureReservation::Conflict {
+                    previous_payload_hash: decode_b256(
+                        &previous_hash,
+                        "latest signature payload hash",
+                    )?,
+                    previous_generation,
+                    reserved_at: from_i64(reserved_at_i, "signature reservation time")?,
+                };
+                transaction.commit().await?;
+                return Ok(outcome);
+            }
+        }
+
+        sqlx::query(
+            "INSERT INTO registry_signature_generations
+                (kind, identity, generation, payload_hash, signature, state,
+                 expires_at, reserved_at, signed_at, updated_at)
+             VALUES (?, ?, ?, ?, NULL, 'reserved', ?, ?, NULL, ?)",
+        )
+        .bind(kind.as_str())
+        .bind(&identity)
+        .bind(generation_i)
         .bind(payload_hash.as_slice())
-        .bind(to_i64(now, "reservation time")?)
-        .execute(&self.pool)
+        .bind(generation_i)
+        .bind(now_i)
+        .bind(now_i)
+        .execute(&mut *transaction)
         .await?;
-        if result.rows_affected() == 1 {
-            return Ok(SignatureReservation::Reserved);
-        }
-        let row: Option<(Vec<u8>, Option<Vec<u8>>, i64)> = sqlx::query_as(
-            "SELECT payload_hash, signature, reserved_at
-             FROM registry_signature_reservations
-             WHERE kind = ? AND identity = ?",
-        )
-        .bind(kind.as_str())
-        .bind(&identity)
-        .fetch_optional(&self.pool)
-        .await?;
-        let (previous_hash, signature, reserved_at) = row.ok_or_else(|| {
-            RegistryStateError::Decode(
-                "signature reservation insert lost a race but no winner exists".to_string(),
-            )
-        })?;
-        let previous_hash = decode_b256(&previous_hash, "signature payload hash")?;
-        let reserved_at = from_i64(reserved_at, "signature reservation time")?;
-        if previous_hash != payload_hash {
-            return Ok(SignatureReservation::Conflict {
-                previous_payload_hash: previous_hash,
-                reserved_at,
-            });
-        }
-        match signature {
-            Some(bytes) => Ok(SignatureReservation::Signed(decode_signature(&bytes)?)),
-            None => Ok(SignatureReservation::Pending { reserved_at }),
-        }
+        transaction.commit().await?;
+        Ok(SignatureReservation::Reserved)
     }
 
     async fn complete_signature(
         &self,
         kind: RegistrySignatureKind,
         identity: Vec<u8>,
+        generation: u64,
         payload_hash: B256,
         signature: [u8; 65],
         now: u64,
     ) -> Result<(), RegistryStateError> {
         let result = sqlx::query(
-            "UPDATE registry_signature_reservations
-             SET signature = ?, signed_at = ?
-             WHERE kind = ? AND identity = ? AND payload_hash = ? AND signature IS NULL",
+            "UPDATE registry_signature_generations
+             SET signature = ?, signed_at = ?, state = 'signed', updated_at = ?
+             WHERE kind = ? AND identity = ? AND generation = ?
+               AND payload_hash = ? AND state = 'reserved' AND signature IS NULL",
         )
         .bind(signature.as_slice())
         .bind(to_i64(now, "signature time")?)
+        .bind(to_i64(now, "signature time")?)
         .bind(kind.as_str())
         .bind(&identity)
+        .bind(to_i64(generation, "signature generation")?)
         .bind(payload_hash.as_slice())
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 1 {
             return Ok(());
         }
-        let existing: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT signature FROM registry_signature_reservations
-             WHERE kind = ? AND identity = ? AND payload_hash = ?",
+        let existing: Option<(Option<Vec<u8>>, String)> = sqlx::query_as(
+            "SELECT signature, state FROM registry_signature_generations
+             WHERE kind = ? AND identity = ? AND generation = ? AND payload_hash = ?",
         )
         .bind(kind.as_str())
         .bind(&identity)
+        .bind(to_i64(generation, "signature generation")?)
         .bind(payload_hash.as_slice())
         .fetch_optional(&self.pool)
         .await?;
         match existing {
-            Some(bytes) if decode_signature(&bytes)? == signature => Ok(()),
+            Some((Some(bytes), state))
+                if state == "signed" && decode_signature(&bytes)? == signature =>
+            {
+                Ok(())
+            }
             Some(_) => Err(RegistryStateError::InvalidTransition(
                 "a different signature already completed this payload".to_string(),
             )),
@@ -744,28 +869,28 @@ mod tests {
         let hash = B256::repeat_byte(0x11);
         assert_eq!(
             state
-                .reserve_inbound_signature(7, hash, 100)
+                .reserve_inbound_signature(7, 160, hash, 100)
                 .await
                 .expect("reserve"),
             SignatureReservation::Reserved
         );
         assert_eq!(
             state
-                .reserve_inbound_signature(7, hash, 101)
+                .reserve_inbound_signature(7, 160, hash, 101)
                 .await
                 .expect("pending"),
             SignatureReservation::Pending { reserved_at: 100 }
         );
         assert!(matches!(
             state
-                .reserve_inbound_signature(7, B256::repeat_byte(0x22), 101)
+                .reserve_inbound_signature(7, 160, B256::repeat_byte(0x22), 101)
                 .await
                 .expect("conflict"),
             SignatureReservation::Conflict { .. }
         ));
         let signature = [0xabu8; 65];
         state
-            .complete_inbound_signature(7, hash, signature, 102)
+            .complete_inbound_signature(7, 160, hash, signature, 102)
             .await
             .expect("complete");
         drop(state);
@@ -773,10 +898,17 @@ mod tests {
         let reopened = SqliteRegistryState::connect(&url).await.expect("reopen");
         assert_eq!(
             reopened
-                .reserve_inbound_signature(7, hash, 200)
+                .reserve_inbound_signature(7, 160, hash, 110)
                 .await
-                .expect("cached"),
+                .expect("cached signed generation"),
             SignatureReservation::Signed(signature)
+        );
+        assert_eq!(
+            reopened
+                .reserve_inbound_signature(7, 260, B256::repeat_byte(0x22), 200)
+                .await
+                .expect("new generation after expiry"),
+            SignatureReservation::Reserved
         );
         drop(reopened);
         let _ = std::fs::remove_file(path);
@@ -812,7 +944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quote_nonce_requires_explicit_expiry_before_reuse() {
+    async fn quote_nonce_atomically_expires_before_new_generation() {
         let (state, path) = store("nonce-expiry").await;
         let originator = Address::repeat_byte(0x66);
         let old = B256::repeat_byte(0x77);
@@ -826,20 +958,16 @@ mod tests {
         );
         assert!(matches!(
             state
-                .reserve_quote_nonce(originator, 4, new, 180, 121)
+                .reserve_quote_nonce(originator, 4, new, 180, 119)
                 .await
-                .expect("still busy"),
+                .expect("busy before exact expiry"),
             QuoteNonceReservation::Busy { nonce: 5, .. }
         ));
-        state
-            .expire_quote_nonce(originator, 5, old, 121)
-            .await
-            .expect("explicit expiry");
         assert_eq!(
             state
-                .reserve_quote_nonce(originator, 4, new, 180, 121)
+                .reserve_quote_nonce(originator, 4, new, 180, 120)
                 .await
-                .expect("replacement"),
+                .expect("replacement at exact expiry"),
             QuoteNonceReservation::Reserved { nonce: 5 }
         );
         state
@@ -852,6 +980,52 @@ mod tests {
                 .await
                 .expect("next"),
             QuoteNonceReservation::Reserved { nonce: 6 }
+        );
+        drop(state);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn inbound_generation_blocks_live_conflicts_then_allows_one_newer_winner() {
+        let (state, path) = store("inbound-generation").await;
+        let old = B256::repeat_byte(0x31);
+        let left_hash = B256::repeat_byte(0x32);
+        let right_hash = B256::repeat_byte(0x33);
+        assert_eq!(
+            state
+                .reserve_inbound_signature(9, 120, old, 100)
+                .await
+                .expect("first generation"),
+            SignatureReservation::Reserved
+        );
+        assert!(matches!(
+            state
+                .reserve_inbound_signature(9, 180, left_hash, 119)
+                .await
+                .expect("live conflict"),
+            SignatureReservation::Conflict { .. }
+        ));
+
+        let left = state.clone();
+        let right = state.clone();
+        let (a, b) = tokio::join!(
+            left.reserve_inbound_signature(9, 180, left_hash, 120),
+            right.reserve_inbound_signature(9, 181, right_hash, 120)
+        );
+        let outcomes = [a.expect("left"), b.expect("right")];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, SignatureReservation::Reserved))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, SignatureReservation::Conflict { .. }))
+                .count(),
+            1
         );
         drop(state);
         let _ = std::fs::remove_file(path);

@@ -28,6 +28,7 @@
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use xindex_ops::network::{async_client, read_bounded_async, HttpClientPolicy};
 
 /// Errors surfaced by the HSM frontend client.
 #[derive(Debug, Error)]
@@ -112,7 +113,12 @@ impl HttpHsmClient {
 
     #[must_use]
     pub fn with_timeout(base_url: impl Into<String>, timeout: std::time::Duration) -> Self {
-        let inner = reqwest::Client::builder().timeout(timeout).build().ok();
+        let inner = async_client(HttpClientPolicy {
+            connect_timeout: timeout.min(std::time::Duration::from_secs(1)),
+            request_timeout: timeout,
+            max_response_bytes: 64 * 1024,
+        })
+        .ok();
         Self {
             base_url: base_url.into(),
             inner,
@@ -143,9 +149,10 @@ impl HsmDigestSigner for HttpHsmClient {
                 status: status.as_u16(),
             });
         }
-        let body: SignResponseBody = resp
-            .json()
+        let bytes = read_bounded_async(resp, 64 * 1024)
             .await
+            .map_err(|_| HsmError::Decode("oversized/malformed response body".to_string()))?;
+        let body: SignResponseBody = serde_json::from_slice(&bytes)
             .map_err(|_| HsmError::Decode("malformed response json".to_string()))?;
         parse_signature_hex(&body.signature)
     }

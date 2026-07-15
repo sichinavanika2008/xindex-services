@@ -204,8 +204,7 @@ pub fn build_tx_raw(
 }
 
 /// Assemble the broadcast-ready `TxRaw` bytes for a SINGLE-key `MsgSend`
-/// signed by one secp256k1 custody key (the Turnkey enclave key —
-/// `DL-CUSTODY-TURNKEY-1`).
+/// signed by one secp256k1 custody key (for an MPC-produced single signature).
 ///
 /// The amino `StdSignDoc` (and thus its `SHA-256` sign-bytes) is identical to
 /// the multisig path — only the proto envelope differs: the

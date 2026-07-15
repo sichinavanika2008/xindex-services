@@ -174,10 +174,16 @@ check-abi:
 check-abi-source:
     ./scripts/check-abi.sh --solidity-root {{XINDEX}}
 
-# Static regression gate for production-mode key isolation and durable-state
-# startup checks. It never reads a key or starts a signer.
+# Compiled, key-free behavioral regression gate for production startup policy,
+# followed by supplemental source/document lints. It never reads a key, opens a
+# listener, or starts a signer/custody operation.
 check-production-profile:
     ./scripts/check-production-profile.sh
+
+# Prove that the declared MSRV, pinned toolchain and active compiler are exact,
+# then compile the complete locked workspace with every feature.
+check-msrv:
+    ./scripts/check-msrv.sh
 
 # Strict gate: matches CI exactly. Run before every commit.
 #
@@ -197,6 +203,7 @@ check-production-profile:
 gate:
     ./scripts/check-abi.sh
     ./scripts/check-production-profile.sh
+    ./scripts/check-msrv.sh
     cargo fmt --all -- --check
     cargo clippy --all-targets --all-features -- -D warnings
     cargo test --workspace

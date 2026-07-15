@@ -3,7 +3,7 @@ groups:
     interval: 30s
     rules:
       - alert: XindexGate3ServiceDown
-        expr: up{job=~"xindex-(signer|price-signer|price-collector|registry-signer|registry-coordinator|finalized-observer|settlement-collector|redeem)"} == 0
+        expr: up{job=~"xindex-(signer|price-signer|price-collector|registry-signer|registry-coordinator|finalized-observer|settlement-collector|redeem|finalize-redeem)"} == 0
         for: 2m
         labels:
           severity: critical
@@ -203,7 +203,7 @@ groups:
           runbook: "docs/runbooks/gate3-operations.md#custody-or-broadcast-incident"
 
       - alert: XindexRedemptionSettlementStuck
-        expr: xindex_redeem_relayer_stuck > 0
+        expr: xindex_redeem_relayer_stuck{job="xindex-finalize-redeem"} > 0
         for: 30m
         labels:
           severity: critical
@@ -211,3 +211,13 @@ groups:
         annotations:
           summary: "Redemption has neither delivery nor refund evidence"
           runbook: "docs/runbooks/redemption-stuck-SD-B.md"
+
+      - alert: XindexTerminalRedemptionWorkerMissing
+        expr: absent(up{job="xindex-finalize-redeem"}) or absent(xindex_redeem_relayer_stuck{job="xindex-finalize-redeem"})
+        for: 2m
+        labels:
+          severity: critical
+          gate: "3"
+        annotations:
+          summary: "Terminal redemption worker or its required stuck series is missing"
+          runbook: "docs/runbooks/gate3-operations.md#service-or-monitoring-loss"

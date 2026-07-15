@@ -22,7 +22,8 @@ use crate::chain_registry::{ChainId, CustodyFamily};
 /// `POST /api/v1/sign/eip712-attestation`
 ///
 /// Mint slot attestation. Mirrors the on-chain
-/// `ATTESTATION_TYPEHASH = keccak256("Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)")`.
+/// `ATTESTATION_TYPEHASH`, including the signed freshness, source-block, and
+/// observation-epoch context defined in `eip712::ATTESTATION_TYPE`.
 /// The daemon computes the EIP-712 digest itself from its locally-known
 /// domain — it never trusts a coordinator-supplied digest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +35,13 @@ pub struct AttestationSignRequest {
     pub slot_index: String,
     /// `uint256` attested amount, decimal string.
     pub attested_amount: String,
+    pub evidence_hash: String,
+    pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }
 
 /// `POST /api/v1/sign/eip712-redemption-delivery`
@@ -59,6 +67,13 @@ pub struct RedemptionDeliverySignRequest {
     /// `uint256` delivered amount in the leg's exit-token units (on-chain
     /// USDT 1e6 for `THORChain` rail), decimal string.
     pub delivered_amount: String,
+    pub evidence_hash: String,
+    pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }
 
 /// `POST /api/v1/sign/eip712-refund`
@@ -80,6 +95,13 @@ pub struct RefundSignRequest {
     /// `uint256` refunded amount in the leg's native asset's smallest
     /// units (e.g. sats for BTC), decimal string.
     pub refunded_amount: String,
+    pub evidence_hash: String,
+    pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }
 
 /// `POST /api/v1/sign/eip712-streamed-settlement`
@@ -114,6 +136,13 @@ pub struct StreamedSettlementSignRequest {
     /// `uint256` native asset refunded to our custody (smallest units,
     /// e.g. sats for BTC), decimal string. `"0"` for a full delivery.
     pub refunded_native: String,
+    pub evidence_hash: String,
+    pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }
 
 /// `POST /api/v1/sign/psbt-input`
@@ -947,7 +976,7 @@ pub struct AcquireCancelSignRequest {
 /// trusted data beyond leg identity + the shared issuance stamp: the
 /// observer derives every certified field from its OWN sources (the
 /// `RedeemDispatched` event via its own Ethereum RPC; the Asgard
-/// inbound via its own ≥2-source agreement gate) and refuses if its
+/// inbound via its own ≥3-source agreement gate) and refuses if its
 /// view disagrees. `vault_resolved_at` exists on the wire because all
 /// k observers must sign ONE identical RIC digest (the Set-B daemon
 /// non-equivocates per leg), and the stamp is the only field not
@@ -1033,7 +1062,7 @@ pub struct ObserverCertifyResponse {
 ///
 /// Everything else is observer-derived: `intent_id`/`slot_index` from
 /// its own `AcquireCancelled` record, the Asgard inbound from its own
-/// ≥2-source agreement gate, asset/decimals from the chain registry.
+/// ≥3-source agreement gate, asset/decimals from the chain registry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObserverCertifyAccRequest {
     /// The swap-back leg's native chain (the observer refuses chains it
@@ -1365,12 +1394,26 @@ pub mod error_codes {
     /// mainnet; certifying one would launder the gap behind a k-of-n
     /// signature. HTTP 422.
     pub const RIC_CHAIN_FORBIDDEN: &str = "ric_chain_forbidden";
+    /// External-audit H-03: the certificate request's `asset_id` is unknown,
+    /// its decimals do not match the registry, or its unsigned request chain
+    /// does not equal the chain derived from that asset. HTTP 422, before
+    /// replay reservation, volume accounting, or HSM work.
+    pub const CERTIFICATE_ASSET_INVALID: &str = "certificate_asset_invalid";
     /// CTD-1 Slice E (`DL-CTD-E`): the Set-B per-chain certification
     /// volume window cap would be exceeded — this daemon refuses to
     /// certify more custody outflow this window. RIC and ACC signing
     /// consume from the SAME window (the mint-cancel path cannot
     /// bypass the breaker). HTTP 422.
     pub const VOLUME_CAP_EXCEEDED: &str = "volume_cap_exceeded";
+    /// External-audit H-03: production certification was requested for a
+    /// registered asset whose canonical chain has no configured positive
+    /// volume cap. Dev/test may opt into an explicitly unmetered policy;
+    /// production fails closed. HTTP 422 before replay/HSM work.
+    pub const VOLUME_CAP_MISSING: &str = "volume_cap_missing";
+    /// External-audit H-04: a settlement report carries an expired,
+    /// future-dated, zero, wrong-chain, or otherwise malformed signed source
+    /// and freshness envelope. HTTP 422 before replay/HSM work.
+    pub const SETTLEMENT_CONTEXT_INVALID: &str = "settlement_context_invalid";
     /// CTD-1 Slice C: the PSBT request carried BOTH a RIC
     /// (`intent_proof`) AND an Acquire-Cancel cert (`acquire_cancel_proof`).
     /// The gate is a strict XOR — a redeem spend and a mint-cancel
@@ -1482,6 +1525,13 @@ mod tests {
             intent_id: "0xaa".to_string(),
             slot_index: "0".to_string(),
             attested_amount: "1000000".to_string(),
+            evidence_hash: format!("0x{}", "11".repeat(32)),
+            observed_at: 1_800_000_000,
+            valid_until: 1_800_000_300,
+            source_chain_id: 1,
+            source_block_number: 20_000_000,
+            source_block_hash: format!("0x{}", "22".repeat(32)),
+            observation_epoch: 7,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: AttestationSignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1497,6 +1547,13 @@ mod tests {
             asset_id: "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
                 .to_string(),
             delivered_amount: "70000000".to_string(),
+            evidence_hash: format!("0x{}", "11".repeat(32)),
+            observed_at: 1_800_000_000,
+            valid_until: 1_800_000_300,
+            source_chain_id: 1,
+            source_block_number: 20_000_000,
+            source_block_hash: format!("0x{}", "22".repeat(32)),
+            observation_epoch: 7,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: RedemptionDeliverySignRequest = serde_json::from_str(&s).expect("deserialize");
@@ -1512,6 +1569,13 @@ mod tests {
             asset_id: "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
                 .to_string(),
             refunded_amount: "99990000".to_string(),
+            evidence_hash: format!("0x{}", "11".repeat(32)),
+            observed_at: 1_800_000_000,
+            valid_until: 1_800_000_300,
+            source_chain_id: 1,
+            source_block_number: 20_000_000,
+            source_block_hash: format!("0x{}", "22".repeat(32)),
+            observation_epoch: 7,
         };
         let s = serde_json::to_string(&req).expect("serialize");
         let back: RefundSignRequest = serde_json::from_str(&s).expect("deserialize");

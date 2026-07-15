@@ -19,7 +19,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
 xindex="${XINDEX_SOLIDITY_DIR:-$repo/../Xindex}"
 rpc="http://127.0.0.1:8545"
-chain_id="1"
+# Keep the fork unmistakably local at the EVM layer. The all-adapters script
+# installs simulated custody destinations and deliberately rejects every chain
+# id except Anvil's 31337, including an impersonated mainnet chain id.
+chain_id="31337"
 # Archive-capable fork RPC is REQUIRED: anvil pins the fork block and queries
 # the backend for state at THAT block. A free "latest-128-only" endpoint (e.g.
 # publicnode) starts 403-ing ("Archive requests require a personal token") once
@@ -57,18 +60,18 @@ gen="$repo/target/debug/examples/rehearsal_gen"
 
 export XINDEX_ALLOW_SOFTWARE_KEYS=1
 
-# 1. anvil mainnet-fork (reuse if one is already serving chain 1).
-if ! cast chain-id --rpc-url "$rpc" 2>/dev/null | grep -qx 1; then
-  echo ">> starting anvil mainnet-fork (chain 1, :8545) — pulls real state, ~10-20s"
+# 1. anvil mainnet-fork (reuse if one is already serving the local chain id).
+if ! cast chain-id --rpc-url "$rpc" 2>/dev/null | grep -qx "$chain_id"; then
+  echo ">> starting anvil mainnet-fork (local chain $chain_id, :8545) — pulls real state, ~10-20s"
   pkill -f 'anvil --fork-url' 2>/dev/null || true
   sleep 1
-  nohup anvil --fork-url "$fork_url" --chain-id 1 --port 8545 \
+  nohup anvil --fork-url "$fork_url" --chain-id "$chain_id" --port 8545 \
     --accounts 10 --balance 10000 --disable-block-gas-limit --auto-impersonate \
     >"$out/anvil.log" 2>&1 &
   disown 2>/dev/null || true
-  for _ in $(seq 1 30); do cast chain-id --rpc-url "$rpc" 2>/dev/null | grep -qx 1 && break; sleep 1; done
+  for _ in $(seq 1 30); do cast chain-id --rpc-url "$rpc" 2>/dev/null | grep -qx "$chain_id" && break; sleep 1; done
 fi
-cast chain-id --rpc-url "$rpc" 2>/dev/null | grep -qx 1 || { echo "anvil fork not up on $rpc"; exit 1; }
+cast chain-id --rpc-url "$rpc" 2>/dev/null | grep -qx "$chain_id" || { echo "anvil fork not up on $rpc"; exit 1; }
 echo "   fork up: block $(cast block-number --rpc-url "$rpc")"
 
 # 2. give the whale ETH so it can pay gas for impersonated USDT transfers.
@@ -150,7 +153,7 @@ $chains_js
 EOF
 echo ">> wrote $here/addresses.js"
 
-# 8. launch the 5-daemon fleet against the deployed oracle (chain 1).
+# 8. launch the 5-daemon fleet against the deployed oracle (local chain 31337).
 echo ">> launching 5-daemon fleet"
 pkill -f 'xindex-signer-daemon' 2>/dev/null || true
 sleep 1
@@ -198,7 +201,7 @@ cat <<EOF
   Xindex dApp on a LOCAL ANVIL FORK of Ethereum mainnet
 ================================================================
   dApp:        http://127.0.0.1:$http_port/
-  RPC:         $rpc   (chain 1; REAL USDT/V4/Router, forked)
+  RPC:         $rpc   (local chain $chain_id; REAL USDT/V4/Router, forked)
   USDT:        $USDT  (real Tether; faucet impersonates whale)
   dApp wallet: $deployer_addr  (anvil acct0)
   Logs:        $out/{anvil,keeper,http,daemon-*}.log

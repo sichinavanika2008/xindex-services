@@ -17,13 +17,6 @@ xindex-chain-utxo.workspace = true
 xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
 xindex-safe-evm.workspace = true
-# Shared custody substrate (DL-CUSTODY-TURNKEY-1): the bind-prepare store
-# the executor `put`s unsigned spends into, gated by the approver-watcher.
-xindex-custody-core.workspace = true
-# Turnkey custody redeem reroute (DL-CUSTODY-TURNKEY-1): the Turnkey REST
-# client (raw P-256 signer). The executor builds the tx + sighash, Turnkey
-# signs, the executor assembles + broadcasts.
-xindex-turnkey-client.workspace = true
 xindex-ops.workspace = true
 # C7: Cosmos redeem leg — builds the MsgSend sign-doc + TxRaw and reads
 # account/sequence from the Cosmos chain.
@@ -59,10 +52,10 @@ sqlx.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 base64 = "0.22"
 prometheus.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
-serde_json.workspace = true
 # V7 tests: deterministic k1 signatures so the safe-evm aggregator's
 # recovery cross-check passes against StubCosigner outputs.
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
@@ -74,26 +67,6 @@ path = "src/bin/xindex-redeem.rs"
 [[bin]]
 name = "xindex-redeem-evm"
 path = "src/bin/xindex-redeem-evm.rs"
-
-[[bin]]
-name = "xindex-redeem-turnkey-btc"
-path = "src/bin/xindex-redeem-turnkey-btc.rs"
-
-[[bin]]
-name = "xindex-redeem-turnkey-cosmos"
-path = "src/bin/xindex-redeem-turnkey-cosmos.rs"
-
-[[bin]]
-name = "xindex-redeem-turnkey-xrp"
-path = "src/bin/xindex-redeem-turnkey-xrp.rs"
-
-[[bin]]
-name = "xindex-redeem-turnkey-tron"
-path = "src/bin/xindex-redeem-turnkey-tron.rs"
-
-[[bin]]
-name = "xindex-redeem-turnkey-solana"
-path = "src/bin/xindex-redeem-turnkey-solana.rs"
 
 [[bin]]
 name = "xindex-redeem-cosmos"

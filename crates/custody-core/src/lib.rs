@@ -1,5 +1,5 @@
 //! `xindex-custody-core` — CTD-1 custody-verification primitives shared by
-//! the signer-daemon (transitional), the Fireblocks co-signer callback,
+//! the signer-daemon (transitional), provider-specific custody adapters,
 //! and the Set-B attest-signer.
 //!
 //! Currently holds the replay / one-shot / certification-volume store

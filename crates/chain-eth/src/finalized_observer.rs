@@ -44,6 +44,15 @@ type StoredMintRow = (
     i64,
     i64,
 );
+type StoredRedemptionEventRow = (
+    String,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Vec<u8>,
+    i64,
+    i64,
+);
 
 #[derive(Debug, Error)]
 pub enum FinalizedObserverError {
@@ -143,6 +152,67 @@ pub struct FinalizedCancelEvent {
     pub log_index: u64,
 }
 
+/// One terminal-redemption lifecycle event from the canonical finalized
+/// `IntentQueue` journal. The terminal worker consumes these block-by-block;
+/// it never relies on a websocket or an unfinalized receipt as its cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizedRedemptionEvent {
+    Created {
+        redemption_id: B256,
+        index_token: Address,
+        deadline: u64,
+        transaction_hash: B256,
+        transaction_index: u64,
+        log_index: u64,
+    },
+    LegResolved {
+        redemption_id: B256,
+        transaction_hash: B256,
+        transaction_index: u64,
+        log_index: u64,
+    },
+    Finalized {
+        redemption_id: B256,
+        transaction_hash: B256,
+        transaction_index: u64,
+        log_index: u64,
+    },
+    StuckCancelled {
+        redemption_id: B256,
+        transaction_hash: B256,
+        transaction_index: u64,
+        log_index: u64,
+    },
+}
+
+impl FinalizedRedemptionEvent {
+    #[must_use]
+    pub const fn redemption_id(self) -> B256 {
+        match self {
+            Self::Created { redemption_id, .. }
+            | Self::LegResolved { redemption_id, .. }
+            | Self::Finalized { redemption_id, .. }
+            | Self::StuckCancelled { redemption_id, .. } => redemption_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn log_index(self) -> u64 {
+        match self {
+            Self::Created { log_index, .. }
+            | Self::LegResolved { log_index, .. }
+            | Self::Finalized { log_index, .. }
+            | Self::StuckCancelled { log_index, .. } => log_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizedRedemptionBlock {
+    pub checkpoint: FinalizedCheckpoint,
+    pub events: Vec<FinalizedRedemptionEvent>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteFinalizedObserverStore {
     pool: SqlitePool,
@@ -226,6 +296,7 @@ impl SqliteFinalizedObserverStore {
         mints: &[FinalizedMintEvent],
         legs: &[FinalizedLegEvent],
         cancels: &[FinalizedCancelEvent],
+        redemptions: &[FinalizedRedemptionEvent],
     ) -> Result<(), FinalizedObserverError> {
         validate_checkpoint_input(&checkpoint, observed_at)?;
         let mut transaction = self.pool.begin().await?;
@@ -361,6 +432,49 @@ impl SqliteFinalizedObserverStore {
                 ));
             }
         }
+        for event in redemptions {
+            validate_redemption_event(event)?;
+            let (
+                event_kind,
+                redemption_id,
+                index_token,
+                deadline,
+                transaction_hash,
+                transaction_index,
+                log_index,
+            ) = redemption_event_parts(*event);
+            let index_token = index_token.map(|address| address.to_vec());
+            let result = sqlx::query(
+                "INSERT OR IGNORE INTO evm_observer_redemption_events
+                    (observer_id, event_kind, redemption_id, index_token,
+                     deadline, observed_at, source_block, source_block_hash,
+                     source_transaction_hash, source_transaction_index,
+                     source_log_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&self.observer_id)
+            .bind(event_kind)
+            .bind(redemption_id.as_slice())
+            .bind(index_token.as_deref())
+            .bind(
+                deadline
+                    .map(|value| to_i64(value, "redemption deadline"))
+                    .transpose()?,
+            )
+            .bind(to_i64(observed_at, "observation time")?)
+            .bind(to_i64(checkpoint.block_number, "source block")?)
+            .bind(checkpoint.block_hash.as_slice())
+            .bind(transaction_hash.as_slice())
+            .bind(to_i64(transaction_index, "transaction index")?)
+            .bind(to_i64(log_index, "log index")?)
+            .execute(&mut *transaction)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(FinalizedObserverError::Transition(
+                    "conflicting/repeated terminal redemption event identity".to_string(),
+                ));
+            }
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -408,6 +522,14 @@ impl SqliteFinalizedObserverStore {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
+            "DELETE FROM evm_observer_redemption_events
+             WHERE observer_id = ? AND source_block > ?",
+        )
+        .bind(&self.observer_id)
+        .bind(height)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
             "DELETE FROM evm_observer_blocks
              WHERE observer_id = ? AND block_number > ?",
         )
@@ -415,8 +537,37 @@ impl SqliteFinalizedObserverStore {
         .bind(height)
         .execute(&mut *transaction)
         .await?;
+        // Every finalized-chain rollback revokes all settlement signatures
+        // from the prior observation generation. Operators independently
+        // converge on the same monotonic epoch; governance mirrors it into
+        // AttestationOracle before accepting replacement observations.
+        sqlx::query(
+            "INSERT INTO evm_observer_epochs (observer_id, observation_epoch)
+             VALUES (?, 1)
+             ON CONFLICT(observer_id) DO UPDATE SET
+                 observation_epoch = observation_epoch + 1",
+        )
+        .bind(&self.observer_id)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// Current rollback/revocation generation for settlement signatures.
+    /// Fresh stores begin at epoch zero; each successful [`Self::rollback_to`]
+    /// increments it atomically with canonical-fact deletion.
+    ///
+    /// # Errors
+    /// Database failure or an invalid stored integer.
+    pub async fn observation_epoch(&self) -> Result<u64, FinalizedObserverError> {
+        let value: Option<i64> = sqlx::query_scalar(
+            "SELECT observation_epoch FROM evm_observer_epochs WHERE observer_id = ?",
+        )
+        .bind(&self.observer_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        value.map_or(Ok(0), |epoch| from_i64(epoch, "observation epoch"))
     }
 
     /// All retained canonical cancellation facts, for restoring the observer's
@@ -548,6 +699,98 @@ impl SqliteFinalizedObserverStore {
         .await?;
         rows.into_iter().map(decode_dispatch).collect()
     }
+
+    /// Read one retained canonical checkpoint by height. Terminal workers use
+    /// this to copy a lossless block cursor from the observer journal.
+    ///
+    /// # Errors
+    /// Returns [`FinalizedObserverError`] on database or decode failure.
+    pub async fn checkpoint(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<FinalizedCheckpoint>, FinalizedObserverError> {
+        let row: Option<StoredCheckpointRow> = sqlx::query_as(
+            "SELECT block_number, block_hash, parent_hash,
+                    header_evidence_hash, logs_evidence_hash
+             FROM evm_observer_blocks
+             WHERE observer_id = ? AND block_number = ?",
+        )
+        .bind(&self.observer_id)
+        .bind(to_i64(block_number, "block number")?)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(decode_checkpoint).transpose()
+    }
+
+    /// Read every terminal-redemption event from one retained canonical block
+    /// in exact log order.
+    ///
+    /// # Errors
+    /// Returns [`FinalizedObserverError`] on database or decode failure.
+    pub async fn redemption_events_in_block(
+        &self,
+        block_number: u64,
+    ) -> Result<Vec<FinalizedRedemptionEvent>, FinalizedObserverError> {
+        let rows: Vec<StoredRedemptionEventRow> = sqlx::query_as(
+            "SELECT event_kind, redemption_id, index_token, deadline,
+                    source_transaction_hash, source_transaction_index,
+                    source_log_index
+             FROM evm_observer_redemption_events
+             WHERE observer_id = ? AND source_block = ?
+             ORDER BY source_log_index ASC",
+        )
+        .bind(&self.observer_id)
+        .bind(to_i64(block_number, "block number")?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(decode_redemption_event).collect()
+    }
+
+    /// Read one checkpoint and its terminal events from the same `SQLite`
+    /// snapshot, preventing a concurrent rollback from mixing generations.
+    ///
+    /// # Errors
+    /// Returns [`FinalizedObserverError`] on database or decode failure.
+    pub async fn redemption_block(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<FinalizedRedemptionBlock>, FinalizedObserverError> {
+        let mut transaction = self.pool.begin().await?;
+        let checkpoint: Option<StoredCheckpointRow> = sqlx::query_as(
+            "SELECT block_number, block_hash, parent_hash,
+                    header_evidence_hash, logs_evidence_hash
+             FROM evm_observer_blocks
+             WHERE observer_id = ? AND block_number = ?",
+        )
+        .bind(&self.observer_id)
+        .bind(to_i64(block_number, "block number")?)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(checkpoint) = checkpoint else {
+            transaction.commit().await?;
+            return Ok(None);
+        };
+        let rows: Vec<StoredRedemptionEventRow> = sqlx::query_as(
+            "SELECT event_kind, redemption_id, index_token, deadline,
+                    source_transaction_hash, source_transaction_index,
+                    source_log_index
+             FROM evm_observer_redemption_events
+             WHERE observer_id = ? AND source_block = ?
+             ORDER BY source_log_index ASC",
+        )
+        .bind(&self.observer_id)
+        .bind(to_i64(block_number, "block number")?)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(FinalizedRedemptionBlock {
+            checkpoint: decode_checkpoint(checkpoint)?,
+            events: rows
+                .into_iter()
+                .map(decode_redemption_event)
+                .collect::<Result<Vec<_>, _>>()?,
+        }))
+    }
 }
 
 /// Decode the exact adapter event allowlist from one finalized block. Any
@@ -637,11 +880,131 @@ pub fn decode_adapter_logs(
     Ok((legs, cancels))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exhaustive queue-event decoder keeps every allowed terminal ABI variant fail-closed and adjacent"
+)]
+fn decode_queue_redemption_event(
+    topic: B256,
+    log: &FinalizedLog,
+) -> Result<FinalizedRedemptionEvent, FinalizedObserverError> {
+    let common = |redemption_id| {
+        (
+            redemption_id,
+            log.transaction_hash,
+            log.transaction_index,
+            log.log_index,
+        )
+    };
+    if topic == IntentQueue::RedemptionIntentCreated::SIGNATURE_HASH {
+        let event = IntentQueue::RedemptionIntentCreated::decode_raw_log(
+            log.topics.iter().copied(),
+            &log.data,
+            true,
+        )
+        .map_err(|error| {
+            FinalizedObserverError::Decode(format!(
+                "RedemptionIntentCreated at log {}: {error}",
+                log.log_index
+            ))
+        })?;
+        return Ok(FinalizedRedemptionEvent::Created {
+            redemption_id: event.redemptionId,
+            index_token: event.indexToken,
+            deadline: event.deadline,
+            transaction_hash: log.transaction_hash,
+            transaction_index: log.transaction_index,
+            log_index: log.log_index,
+        });
+    }
+    let redemption_id = if topic == IntentQueue::LegAttested::SIGNATURE_HASH {
+        IntentQueue::LegAttested::decode_raw_log(log.topics.iter().copied(), &log.data, true)
+            .map_err(|error| {
+                FinalizedObserverError::Decode(format!(
+                    "LegAttested at log {}: {error}",
+                    log.log_index
+                ))
+            })?
+            .redemptionId
+    } else if topic == IntentQueue::LegRefunded::SIGNATURE_HASH {
+        IntentQueue::LegRefunded::decode_raw_log(log.topics.iter().copied(), &log.data, true)
+            .map_err(|error| {
+                FinalizedObserverError::Decode(format!(
+                    "LegRefunded at log {}: {error}",
+                    log.log_index
+                ))
+            })?
+            .redemptionId
+    } else if topic == IntentQueue::LegStreamedSettled::SIGNATURE_HASH {
+        IntentQueue::LegStreamedSettled::decode_raw_log(log.topics.iter().copied(), &log.data, true)
+            .map_err(|error| {
+                FinalizedObserverError::Decode(format!(
+                    "LegStreamedSettled at log {}: {error}",
+                    log.log_index
+                ))
+            })?
+            .redemptionId
+    } else if topic == IntentQueue::RedemptionIntentFinalized::SIGNATURE_HASH {
+        let event = IntentQueue::RedemptionIntentFinalized::decode_raw_log(
+            log.topics.iter().copied(),
+            &log.data,
+            true,
+        )
+        .map_err(|error| {
+            FinalizedObserverError::Decode(format!(
+                "RedemptionIntentFinalized at log {}: {error}",
+                log.log_index
+            ))
+        })?;
+        let (redemption_id, transaction_hash, transaction_index, log_index) =
+            common(event.redemptionId);
+        return Ok(FinalizedRedemptionEvent::Finalized {
+            redemption_id,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        });
+    } else if topic == IntentQueue::RedemptionStuckCancelled::SIGNATURE_HASH {
+        let event = IntentQueue::RedemptionStuckCancelled::decode_raw_log(
+            log.topics.iter().copied(),
+            &log.data,
+            true,
+        )
+        .map_err(|error| {
+            FinalizedObserverError::Decode(format!(
+                "RedemptionStuckCancelled at log {}: {error}",
+                log.log_index
+            ))
+        })?;
+        let (redemption_id, transaction_hash, transaction_index, log_index) =
+            common(event.redemptionId);
+        return Ok(FinalizedRedemptionEvent::StuckCancelled {
+            redemption_id,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        });
+    } else {
+        return Err(FinalizedObserverError::Decode(format!(
+            "unexpected intent-queue event topic at log {}",
+            log.log_index
+        )));
+    };
+    let (redemption_id, transaction_hash, transaction_index, log_index) = common(redemption_id);
+    Ok(FinalizedRedemptionEvent::LegResolved {
+        redemption_id,
+        transaction_hash,
+        transaction_index,
+        log_index,
+    })
+}
+
 /// Complete decoded event classes for one finalized protocol block.
 pub type DecodedProtocolLogs = (
     Vec<FinalizedMintEvent>,
     Vec<FinalizedLegEvent>,
     Vec<FinalizedCancelEvent>,
+    Vec<FinalizedRedemptionEvent>,
 );
 
 /// Decode the complete launch-protocol event allowlist and pair each
@@ -667,6 +1030,7 @@ pub fn decode_protocol_logs(
     let mut adapter_settlement_logs = Vec::new();
     let mut acquisitions = Vec::new();
     let mut intents = Vec::new();
+    let mut redemptions = Vec::new();
     for log in logs {
         if !identities.insert((log.transaction_hash, log.log_index)) {
             return Err(FinalizedObserverError::Decode(
@@ -701,24 +1065,22 @@ pub fn decode_protocol_logs(
                 )));
             }
         } else if log.address == intent_queue {
-            if topic != IntentQueue::MintIntentCreated::SIGNATURE_HASH {
-                return Err(FinalizedObserverError::Decode(format!(
-                    "unexpected intent-queue event topic at log {}",
-                    log.log_index
-                )));
+            if topic == IntentQueue::MintIntentCreated::SIGNATURE_HASH {
+                let event = IntentQueue::MintIntentCreated::decode_raw_log(
+                    log.topics.iter().copied(),
+                    &log.data,
+                    true,
+                )
+                .map_err(|error| {
+                    FinalizedObserverError::Decode(format!(
+                        "MintIntentCreated at log {}: {error}",
+                        log.log_index
+                    ))
+                })?;
+                intents.push((event, log));
+            } else {
+                redemptions.push(decode_queue_redemption_event(topic, log)?);
             }
-            let event = IntentQueue::MintIntentCreated::decode_raw_log(
-                log.topics.iter().copied(),
-                &log.data,
-                true,
-            )
-            .map_err(|error| {
-                FinalizedObserverError::Decode(format!(
-                    "MintIntentCreated at log {}: {error}",
-                    log.log_index
-                ))
-            })?;
-            intents.push((event, log));
         } else {
             return Err(FinalizedObserverError::Decode(format!(
                 "unexpected protocol log address at log {}",
@@ -789,7 +1151,8 @@ pub fn decode_protocol_logs(
         ));
     }
     mints.sort_by_key(|event| event.intent_log_index);
-    Ok((mints, legs, cancels))
+    redemptions.sort_by_key(|event| event.log_index());
+    Ok((mints, legs, cancels, redemptions))
 }
 
 impl RedeemLegSource for SqliteFinalizedObserverStore {
@@ -850,6 +1213,96 @@ fn validate_checkpoint_input(
     {
         return Err(FinalizedObserverError::Transition(
             "zero checkpoint hash/time".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+type RedemptionEventParts = (
+    &'static str,
+    B256,
+    Option<Address>,
+    Option<u64>,
+    B256,
+    u64,
+    u64,
+);
+
+fn redemption_event_parts(event: FinalizedRedemptionEvent) -> RedemptionEventParts {
+    match event {
+        FinalizedRedemptionEvent::Created {
+            redemption_id,
+            index_token,
+            deadline,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        } => (
+            "created",
+            redemption_id,
+            Some(index_token),
+            Some(deadline),
+            transaction_hash,
+            transaction_index,
+            log_index,
+        ),
+        FinalizedRedemptionEvent::LegResolved {
+            redemption_id,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        } => (
+            "leg_resolved",
+            redemption_id,
+            None,
+            None,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        ),
+        FinalizedRedemptionEvent::Finalized {
+            redemption_id,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        } => (
+            "finalized",
+            redemption_id,
+            None,
+            None,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        ),
+        FinalizedRedemptionEvent::StuckCancelled {
+            redemption_id,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        } => (
+            "stuck_cancelled",
+            redemption_id,
+            None,
+            None,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        ),
+    }
+}
+
+fn validate_redemption_event(
+    event: &FinalizedRedemptionEvent,
+) -> Result<(), FinalizedObserverError> {
+    let (_, redemption_id, index_token, deadline, transaction_hash, _, _) =
+        redemption_event_parts(*event);
+    if redemption_id == B256::ZERO
+        || transaction_hash == B256::ZERO
+        || index_token.is_some_and(|address| address.is_zero())
+        || deadline == Some(0)
+    {
+        return Err(FinalizedObserverError::Transition(
+            "terminal redemption event contains a zero field".to_string(),
         ));
     }
     Ok(())
@@ -978,6 +1431,65 @@ fn decode_dispatch(
     })
 }
 
+fn decode_redemption_event(
+    row: StoredRedemptionEventRow,
+) -> Result<FinalizedRedemptionEvent, FinalizedObserverError> {
+    let (kind, redemption_id, index_token, deadline, transaction_hash, tx_index, log_index) = row;
+    let redemption_id = decode_b256(&redemption_id, "redemption id")?;
+    let transaction_hash = decode_b256(&transaction_hash, "redemption transaction hash")?;
+    let transaction_index = from_i64(tx_index, "redemption transaction index")?;
+    let log_index = from_i64(log_index, "redemption log index")?;
+    match kind.as_str() {
+        "created" => Ok(FinalizedRedemptionEvent::Created {
+            redemption_id,
+            index_token: decode_address(
+                index_token.as_deref().ok_or_else(|| {
+                    FinalizedObserverError::Decode(
+                        "created redemption lacks index token".to_string(),
+                    )
+                })?,
+                "redemption index token",
+            )?,
+            deadline: from_i64(
+                deadline.ok_or_else(|| {
+                    FinalizedObserverError::Decode("created redemption lacks deadline".to_string())
+                })?,
+                "redemption deadline",
+            )?,
+            transaction_hash,
+            transaction_index,
+            log_index,
+        }),
+        "leg_resolved" if index_token.is_none() && deadline.is_none() => {
+            Ok(FinalizedRedemptionEvent::LegResolved {
+                redemption_id,
+                transaction_hash,
+                transaction_index,
+                log_index,
+            })
+        }
+        "finalized" if index_token.is_none() && deadline.is_none() => {
+            Ok(FinalizedRedemptionEvent::Finalized {
+                redemption_id,
+                transaction_hash,
+                transaction_index,
+                log_index,
+            })
+        }
+        "stuck_cancelled" if index_token.is_none() && deadline.is_none() => {
+            Ok(FinalizedRedemptionEvent::StuckCancelled {
+                redemption_id,
+                transaction_hash,
+                transaction_index,
+                log_index,
+            })
+        }
+        _ => Err(FinalizedObserverError::Decode(
+            "invalid stored terminal redemption event shape".to_string(),
+        )),
+    }
+}
+
 fn decode_checkpoint(
     (number, hash, parent, header_evidence, logs_evidence): StoredCheckpointRow,
 ) -> Result<FinalizedCheckpoint, FinalizedObserverError> {
@@ -1077,11 +1589,32 @@ mod tests {
         }
     }
 
+    fn redemption_created(id: u8, log_index: u64) -> FinalizedRedemptionEvent {
+        FinalizedRedemptionEvent::Created {
+            redemption_id: B256::repeat_byte(id),
+            index_token: Address::repeat_byte(id.saturating_add(1)),
+            deadline: 2_500,
+            transaction_hash: B256::repeat_byte(id.saturating_add(50)),
+            transaction_index: 1,
+            log_index,
+        }
+    }
+
+    fn redemption_resolved(id: u8, log_index: u64) -> FinalizedRedemptionEvent {
+        FinalizedRedemptionEvent::LegResolved {
+            redemption_id: B256::repeat_byte(id),
+            transaction_hash: B256::repeat_byte(id.saturating_add(60)),
+            transaction_index: 1,
+            log_index,
+        }
+    }
+
     #[tokio::test]
     async fn restart_and_reorg_rollback_preserve_only_canonical_facts() {
         let store = SqliteFinalizedObserverStore::connect("sqlite::memory:", "adapter-btc")
             .await
             .expect("store");
+        assert_eq!(store.observation_epoch().await.expect("initial epoch"), 0);
         let block_10 = FinalizedCheckpoint {
             block_number: 10,
             block_hash: B256::repeat_byte(10),
@@ -1090,7 +1623,14 @@ mod tests {
             logs_evidence_hash: B256::repeat_byte(210),
         };
         store
-            .commit_block(block_10, 1_000, &[mint(1, 2)], &[leg(1, 0)], &[])
+            .commit_block(
+                block_10,
+                1_000,
+                &[mint(1, 2)],
+                &[leg(1, 0)],
+                &[],
+                &[redemption_created(1, 4)],
+            )
             .await
             .expect("block 10");
         store
@@ -1106,6 +1646,7 @@ mod tests {
                 &[mint(2, 2)],
                 &[leg(2, 0)],
                 &[],
+                &[redemption_resolved(1, 5)],
             )
             .await
             .expect("block 11");
@@ -1132,15 +1673,35 @@ mod tests {
                 .dispatch_id,
             B256::repeat_byte(22)
         );
+        assert_eq!(
+            store
+                .redemption_events_in_block(11)
+                .await
+                .expect("redemption events"),
+            vec![redemption_resolved(1, 5)]
+        );
         store
             .rollback_to(10, block_10.block_hash)
             .await
             .expect("rollback");
+        assert_eq!(store.observation_epoch().await.expect("revoked epoch"), 1);
         assert!(store
             .leg_facts(B256::repeat_byte(2), 0)
             .await
             .expect("lookup")
             .is_none());
+        assert!(store
+            .redemption_events_in_block(11)
+            .await
+            .expect("rolled-back redemption events")
+            .is_empty());
+        assert_eq!(
+            store
+                .redemption_events_in_block(10)
+                .await
+                .expect("retained redemption events"),
+            vec![redemption_created(1, 4)]
+        );
         assert!(store
             .mint(B256::repeat_byte(2), 0)
             .await
@@ -1218,7 +1779,7 @@ mod tests {
             transaction_index: 1,
             log_index: 5,
         };
-        let (mints, legs, cancels) = decode_protocol_logs(
+        let (mints, legs, cancels, redemptions) = decode_protocol_logs(
             adapter,
             queue,
             0,
@@ -1228,6 +1789,7 @@ mod tests {
         .expect("pair");
         assert!(legs.is_empty());
         assert!(cancels.is_empty());
+        assert!(redemptions.is_empty());
         assert_eq!(mints.len(), 1);
         assert_eq!(mints[0].transaction_hash, tx_hash);
         assert_eq!(mints[0].acquire_log_index, 2);
@@ -1247,5 +1809,64 @@ mod tests {
             decode_protocol_logs(adapter, queue, 0, asset, &[wrong_order, intent_log]).is_err()
         );
         assert!(decode_protocol_logs(adapter, queue, 0, asset, &[acquired_log]).is_err());
+    }
+
+    #[test]
+    fn protocol_decoder_journals_complete_terminal_redemption_lifecycle() {
+        let adapter = Address::repeat_byte(7);
+        let queue = Address::repeat_byte(8);
+        let asset = B256::repeat_byte(0xa1);
+        let redemption_id = B256::repeat_byte(0xb1);
+        let created = IntentQueue::RedemptionIntentCreated {
+            redemptionId: redemption_id,
+            indexToken: Address::repeat_byte(0xb2),
+            originator: Address::repeat_byte(0xb3),
+            shares: U256::from(100u64),
+            deadline: 2_500,
+            legAssetIds: vec![asset],
+            legExpectedExits: vec![U256::from(90u64)],
+        }
+        .encode_log_data();
+        let streamed = IntentQueue::LegStreamedSettled {
+            redemptionId: redemption_id,
+            legIndex: U256::ZERO,
+            assetId: asset,
+            deliveredUsdt: U256::from(80u64),
+            refundedNative: U256::from(10u64),
+        }
+        .encode_log_data();
+        let finalized = IntentQueue::RedemptionIntentFinalized {
+            redemptionId: redemption_id,
+        }
+        .encode_log_data();
+        let make_log = |encoded: alloy_primitives::LogData, log_index| FinalizedLog {
+            address: queue,
+            topics: encoded.topics().to_vec(),
+            data: encoded.data,
+            block_number: 10,
+            block_hash: B256::repeat_byte(10),
+            transaction_hash: B256::repeat_byte(0xc1),
+            transaction_index: log_index,
+            log_index,
+        };
+        let logs = [
+            make_log(created, 1),
+            make_log(streamed, 2),
+            make_log(finalized, 3),
+        ];
+
+        let (mints, legs, cancels, redemptions) =
+            decode_protocol_logs(adapter, queue, 0, asset, &logs).expect("decode terminal events");
+        assert!(mints.is_empty());
+        assert!(legs.is_empty());
+        assert!(cancels.is_empty());
+        assert!(matches!(
+            redemptions.as_slice(),
+            [
+                FinalizedRedemptionEvent::Created { .. },
+                FinalizedRedemptionEvent::LegResolved { .. },
+                FinalizedRedemptionEvent::Finalized { .. }
+            ]
+        ));
     }
 }

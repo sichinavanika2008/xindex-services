@@ -123,6 +123,10 @@ pub struct Metrics {
     /// Delivery of signed registry messages to redundant collectors. Labels:
     /// `kind` ∈ {`inbound`, `quote`}, `result` ∈ {`success`, `error`}.
     pub registry_collector_deliveries: IntCounterVec,
+    /// Registry collector ingestion. Labels: `kind` ∈ {`inbound`, `quote`},
+    /// `result` ∈ {`accepted`, `duplicate`, `quorum`, `refused`, `capacity`,
+    /// `oversized`, `evidence_error`}.
+    pub registry_collector_messages: IntCounterVec,
     /// Evidence records that could not be durably persisted before signing.
     pub registry_evidence_failures: IntCounter,
     /// Unix timestamp of the last successful registry operation. Label:
@@ -334,6 +338,13 @@ impl Metrics {
             ),
             &["kind", "result"],
         )?;
+        let registry_collector_messages = IntCounterVec::new(
+            Opts::new(
+                "xindex_registry_collector_messages_total",
+                "Registry collector ingestion outcomes",
+            ),
+            &["kind", "result"],
+        )?;
         let registry_evidence_failures = IntCounter::new(
             "xindex_registry_evidence_failures_total",
             "Registry evidence records that failed durable persistence",
@@ -454,6 +465,7 @@ impl Metrics {
         registry.register(Box::new(registry_source_polls.clone()))?;
         registry.register(Box::new(registry_signatures.clone()))?;
         registry.register(Box::new(registry_collector_deliveries.clone()))?;
+        registry.register(Box::new(registry_collector_messages.clone()))?;
         registry.register(Box::new(registry_evidence_failures.clone()))?;
         registry.register(Box::new(registry_last_success_timestamp_seconds.clone()))?;
         registry.register(Box::new(registry_pause_flags.clone()))?;
@@ -495,6 +507,7 @@ impl Metrics {
             registry_source_polls,
             registry_signatures,
             registry_collector_deliveries,
+            registry_collector_messages,
             registry_evidence_failures,
             registry_last_success_timestamp_seconds,
             registry_pause_flags,
@@ -540,6 +553,9 @@ mod tests {
         m.registry_signatures
             .with_label_values(&["inbound", "signed"])
             .inc();
+        m.registry_collector_messages
+            .with_label_values(&["quote", "capacity"])
+            .inc();
         m.signer_requests
             .with_label_values(&["psbt", "success"])
             .inc();
@@ -561,6 +577,7 @@ mod tests {
         assert!(names.contains(&"xindex_relayer_intents_resolved_total"));
         assert!(names.contains(&"xindex_rpc_fallover_total"));
         assert!(names.contains(&"xindex_registry_signatures_total"));
+        assert!(names.contains(&"xindex_registry_collector_messages_total"));
         assert!(names.contains(&"xindex_signer_requests_total"));
         assert!(names.contains(&"xindex_price_signer_rounds_total"));
         assert!(names.contains(&"xindex_observer_events_total"));

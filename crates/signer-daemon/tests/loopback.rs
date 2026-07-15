@@ -46,7 +46,7 @@ use xindex_multisig::MultisigDescriptor;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::{
     attestation, attestation_oracle_domain, attestation_signing_hash, redemption_attestation,
-    refund_attestation,
+    refund_attestation, settlement_context,
 };
 use xindex_signer::remote::RemoteHsmBackend;
 use xindex_signer::HsmBackend;
@@ -56,6 +56,21 @@ use xindex_signer_daemon::server::{router, DaemonConfig, DaemonState};
 
 mod ric_common;
 use xindex_signer_daemon::web3signer::{HsmDigestSigner, HsmError};
+
+fn test_context() -> xindex_shared::eip712::SettlementContext {
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |duration| duration.as_secs().saturating_sub(1));
+    settlement_context(
+        B256::repeat_byte(0x88),
+        observed_at,
+        observed_at.saturating_add(300),
+        U256::from(31_337u64),
+        20_000_000,
+        B256::repeat_byte(0x99),
+        0,
+    )
+}
 
 /// Software-keyed HSM frontend. Produces real ECDSA signatures over
 /// the digest the daemon hands it. The daemon-side path expects
@@ -188,6 +203,7 @@ async fn coordinator_to_daemon_eip712_attestation_recovers_to_signer() {
             B256::repeat_byte(0xcd),
             U256::from(0u8),
             U256::from(1_000_000u32),
+            test_context(),
         );
         // sign_attestation_msg triggers the typed wire path.
         backend.sign_attestation_msg(&domain, &a)
@@ -205,6 +221,7 @@ async fn coordinator_to_daemon_eip712_attestation_recovers_to_signer() {
         B256::repeat_byte(0xcd),
         U256::from(0u8),
         U256::from(1_000_000u32),
+        test_context(),
     );
     let digest = attestation_signing_hash(&a, &domain);
     let recovered = sig.recover_address_from_prehash(&digest).expect("recover");
@@ -224,6 +241,7 @@ async fn coordinator_to_daemon_eip712_attestation_recovers_to_signer() {
             B256::repeat_byte(0xcd),
             U256::from(0u8),
             U256::from(1_000_000u32),
+            test_context(),
         );
         backend.sign_attestation_msg(&domain, &a).expect("sign 2")
     })
@@ -248,7 +266,12 @@ async fn coordinator_to_daemon_same_tuple_different_amount_is_409() {
     let _ = tokio::task::spawn_blocking(move || {
         let backend = RemoteHsmBackend::new(url1, eth_addr);
         let domain = attestation_oracle_domain(31337, Address::repeat_byte(0xab));
-        let a = attestation(B256::repeat_byte(0xee), U256::from(0u8), U256::from(100u8));
+        let a = attestation(
+            B256::repeat_byte(0xee),
+            U256::from(0u8),
+            U256::from(100u8),
+            test_context(),
+        );
         backend.sign_attestation_msg(&domain, &a).expect("sign 1")
     })
     .await
@@ -264,6 +287,7 @@ async fn coordinator_to_daemon_same_tuple_different_amount_is_409() {
             B256::repeat_byte(0xee),
             U256::from(0u8),
             U256::from(200u8), // ← different amount
+            test_context(),
         );
         backend.sign_attestation_msg(&domain, &a).err()
     })
@@ -289,6 +313,7 @@ async fn coordinator_to_daemon_redemption_delivery_then_refund_is_mutex_409() {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(70_000_000u64),
+            test_context(),
         );
         backend
             .sign_redemption_attestation_msg(&domain, &a)
@@ -308,6 +333,7 @@ async fn coordinator_to_daemon_redemption_delivery_then_refund_is_mutex_409() {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(99_990_000u64),
+            test_context(),
         );
         backend.sign_refund_attestation_msg(&domain, &r).err()
     })

@@ -1,11 +1,9 @@
 //! The custody decision pipeline — pure, transport-independent.
 //!
 //! Given a prepared-spend lookup key + the prepare store + the replay store,
-//! decide APPROVE/REJECT for a pending custody signature. The Turnkey
-//! approver-watcher ([`crate::bin`]) is a thin shell over this: it observes a
-//! `CONSENSUS_NEEDED` signing activity, supplies the activity's signing
-//! `payload` (the sighash hex) as the lookup key, then maps the [`Decision`]
-//! to `approveActivity` / `rejectActivity`. Everything security-relevant is
+//! decide APPROVE/REJECT for a pending custody signature. A provider-specific
+//! callback supplies the requested signing payload as the lookup key and maps
+//! the [`Decision`] into its signed response. Everything security-relevant is
 //! here and unit-tested without a network.
 //!
 //! Fail-safe by construction — APPROVE requires ALL of: a prepare-context
@@ -31,7 +29,7 @@ use xindex_custody_core::prepare::{PrepareStore, PreparedSpend};
 /// BTC output bind); `None` rejects any BTC spend.
 ///
 /// **SECURITY (TK-01/TK-02):** the executor writes BOTH the store key and the
-/// Turnkey payload, so before binding to the RIC the approver INDEPENDENTLY
+/// requested signing payload, so before binding to the RIC this core INDEPENDENTLY
 /// reconstructs the unsigned tx from the prepared fields, recomputes its signing
 /// hash, and asserts it equals `prepare_key`
 /// ([`crate::recompute::verify_payload_and_fee`]) — a coordinator therefore

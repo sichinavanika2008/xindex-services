@@ -60,13 +60,20 @@ Use these exact scrape job names so the availability rule matches:
 - `xindex-signer`, `xindex-price-signer`, `xindex-price-collector`;
 - `xindex-registry-signer`, `xindex-registry-coordinator`;
 - `xindex-finalized-observer`, `xindex-settlement-collector`; and
-- `xindex-redeem`.
+- `xindex-redeem`, `xindex-finalize-redeem`.
 
 Metrics endpoints bind loopback and are exposed only through the operator's
 authenticated monitoring agent. The API/event loop, metrics server, producer,
 poster and custody rebroadcast worker are supervised together; an unexpected
 exit terminates the process. Configure the process supervisor to page on a
 restart loop, not to mask it indefinitely.
+
+The terminal worker must use the same `OBSERVER_ID` and observer database as
+its selected local finalized observer, plus its own durable outbox database.
+Before reopening traffic after any restart, confirm that its mirrored
+checkpoint catches the source checkpoint and that active jobs remain queued.
+A confirmed `finalizeBurn` receipt is not sufficient evidence to delete a job;
+only the finalized journal event is terminal.
 
 Critical alerts page two independent on-call operators and the security lead.
 Warnings create an incident ticket and page if unresolved for 15 minutes. An
@@ -162,10 +169,39 @@ never "repair" it by deleting a reservation or regenerating evidence.
 
 1. Stop settlement collection and custody dispatch. Preserve the finalized
    head response, block/log bodies and durable checkpoint database.
-2. On any finalized-hash change, keep the service unavailable until the common
-   ancestor and rollback evidence are independently reviewed.
-3. Reconcile logical/physical consumed inflows, native inflow rows, settlement
-   attestations and on-chain state before restoring readiness.
+2. On any finalized-hash change, the journal rollback atomically increments
+   `evm_observer_epochs.observation_epoch`. The observer then refuses every
+   signing endpoint, and the collector refuses quorum acceptance, while that
+   local epoch differs from
+   `AttestationOracle.observationEpoch(sourceChainId)`. Do not bypass this
+   stop or edit the database.
+3. Identify the common ancestor and independently review the canonical-check
+   evidence from every operator. Require all operators to agree on the same
+   new local epoch and bind the immutable rollback-evidence Keccak-256 as
+   `ROLLBACK_EVIDENCE_HASH`; it must be non-zero.
+4. Read the current on-chain epoch and prepare—but do not submit from a service
+   host—the compare-and-swap owner call:
+
+   ```sh
+   cast call "$ATTESTATION_ORACLE" \
+     "observationEpoch(uint256)(uint64)" "$SOURCE_CHAIN_ID" \
+     --rpc-url "$ETHEREUM_RPC_URL"
+
+   cast calldata "advanceObservationEpoch(uint256,uint64,bytes32)" \
+     "$SOURCE_CHAIN_ID" "$CURRENT_ONCHAIN_EPOCH" "$ROLLBACK_EVIDENCE_HASH"
+   ```
+
+   The separately governed oracle owner/Safe or timelock reviews and executes
+   that calldata. The expected-current argument prevents two incident actions
+   from silently skipping an epoch. Preserve the transaction receipt and
+   `ObservationEpochAdvanced` event in the incident bundle.
+5. Confirm the new on-chain epoch exactly equals every operator's durable local
+   epoch. Signatures from the prior branch now fail on-chain; independently,
+   their signed five-minute maximum validity also expires at equality. Restart
+   readiness only after this exact match is observed.
+6. Reconcile logical/physical consumed inflows, native inflow rows, settlement
+   attestations and on-chain state before restoring settlement collection or
+   custody dispatch.
 
 ### Custody or broadcast incident
 

@@ -33,14 +33,15 @@ use bitcoin::Network;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
-use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
+use xindex_chain_eth::bindings::{settlement_context_to_contract, AttestationOracle, IntentQueue};
 use xindex_chain_eth::rpc::redacted_endpoint;
 use xindex_chain_eth::RpcErc20LogClient;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::EsploraClient;
 use xindex_shared::consumed_inflow::AnyConsumedInflow;
 use xindex_shared::eip712::{
-    attestation_oracle_domain, redemption_attestation, refund_attestation, streamed_settlement,
+    attestation_oracle_domain, redemption_attestation, refund_attestation, settlement_context,
+    streamed_settlement, SettlementContext,
 };
 use xindex_shared::redemption_dispatch::{AnyRedemptionDispatch, RedemptionDispatchStore};
 use xindex_signer::crosscheck::{
@@ -69,6 +70,21 @@ enum CrossCheckMode {
     PassThrough,
     /// Production — `THORChain` + on-chain USDT / BTC confirmation.
     ThorBtcUsdt,
+}
+
+fn dev_settlement_context(source_chain_id: u64, evidence_hash: B256) -> SettlementContext {
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |duration| duration.as_secs());
+    settlement_context(
+        evidence_hash,
+        observed_at,
+        observed_at.saturating_add(120),
+        U256::from(source_chain_id),
+        1,
+        evidence_hash,
+        0,
+    )
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -300,7 +316,8 @@ fn build_cross_checks(args: &Args, store: &Arc<AnyConsumedInflow>) -> Result<Cro
             .context("multisig network mismatch")?;
 
             let thor = ThorClient::with_base_url(thor_url.to_string()).context("ThorClient")?;
-            let erc20 = RpcErc20LogClient::new(http, args.eth_lookback_blocks);
+            let erc20 = RpcErc20LogClient::new(http, args.eth_lookback_blocks)
+                .context("build bounded ERC20 client")?;
             let delivery = ThorUtxoToUsdtPolicy::new(
                 thor.clone(),
                 erc20,
@@ -323,7 +340,8 @@ fn build_cross_checks(args: &Args, store: &Arc<AnyConsumedInflow>) -> Result<Cro
             let streamed_confs = args.eth_min_confirmations.max(args.btc_min_confirmations);
             let streamed = ThorUtxoStreamedSettlementPolicy::new(
                 thor.clone(),
-                RpcErc20LogClient::new(http, args.eth_lookback_blocks),
+                RpcErc20LogClient::new(http, args.eth_lookback_blocks)
+                    .context("build bounded streamed ERC20 client")?,
                 EsploraClient::with_url(net, esplora),
                 usdt,
                 multisig,
@@ -636,8 +654,9 @@ async fn run(args: Args) -> Result<()> {
                 StreamedGateResult::Settle(outcome) => {
                     let delivered = U256::from(outcome.delivered_usdt_1e6);
                     let refunded = U256::from(outcome.refunded_sats);
+                    let context = dev_settlement_context(chain_id, rid);
                     let payload =
-                        streamed_settlement(rid, leg_index, asset_id, delivered, refunded);
+                        streamed_settlement(rid, leg_index, asset_id, delivered, refunded, context);
                     let signers_c = Arc::clone(&signers);
                     let threshold = args.threshold;
                     let domain_c = domain.clone();
@@ -666,7 +685,13 @@ async fn run(args: Args) -> Result<()> {
                           "posting attestStreamedSettlement()");
                     match oracle
                         .attestStreamedSettlement(
-                            rid, leg_index, asset_id, delivered, refunded, sigs,
+                            rid,
+                            leg_index,
+                            asset_id,
+                            delivered,
+                            refunded,
+                            settlement_context_to_contract(context),
+                            sigs,
                         )
                         .send()
                         .await
@@ -694,7 +719,8 @@ async fn run(args: Args) -> Result<()> {
         {
             Ok(usdt_1e6) => {
                 let amount = U256::from(usdt_1e6);
-                let payload = redemption_attestation(rid, leg_index, asset_id, amount);
+                let context = dev_settlement_context(chain_id, rid);
+                let payload = redemption_attestation(rid, leg_index, asset_id, amount, context);
                 let signers_c = Arc::clone(&signers);
                 let threshold = args.threshold;
                 let domain_c = domain.clone();
@@ -717,7 +743,14 @@ async fn run(args: Args) -> Result<()> {
                 };
                 info!(redemption_id = %rid, usdt_1e6, "posting attestRedemption()");
                 match oracle
-                    .attestRedemption(rid, leg_index, asset_id, amount, sigs)
+                    .attestRedemption(
+                        rid,
+                        leg_index,
+                        asset_id,
+                        amount,
+                        settlement_context_to_contract(context),
+                        sigs,
+                    )
                     .send()
                     .await
                 {
@@ -736,7 +769,8 @@ async fn run(args: Args) -> Result<()> {
                 match refund_cc.verify(&btc_txid).await {
                     Ok(btc_sats) => {
                         let amount = U256::from(btc_sats);
-                        let payload = refund_attestation(rid, leg_index, asset_id, amount);
+                        let context = dev_settlement_context(chain_id, rid);
+                        let payload = refund_attestation(rid, leg_index, asset_id, amount, context);
                         let signers_c = Arc::clone(&signers);
                         let threshold = args.threshold;
                         let domain_c = domain.clone();
@@ -761,7 +795,14 @@ async fn run(args: Args) -> Result<()> {
                         };
                         info!(redemption_id = %rid, btc_sats, "posting attestRefund()");
                         match oracle
-                            .attestRefund(rid, leg_index, asset_id, amount, sigs)
+                            .attestRefund(
+                                rid,
+                                leg_index,
+                                asset_id,
+                                amount,
+                                settlement_context_to_contract(context),
+                                sigs,
+                            )
                             .send()
                             .await
                         {

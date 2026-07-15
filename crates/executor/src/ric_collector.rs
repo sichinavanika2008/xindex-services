@@ -25,9 +25,14 @@ use std::time::Duration;
 
 use alloy_primitives::B256;
 use tracing::warn;
+use xindex_ops::network::{blocking_client_builder, read_bounded_blocking, HttpClientPolicy};
+use xindex_ops::tls::{
+    exact_pinned_blocking_client_builder, load_cert_chain, load_private_key, pinned_cert_store,
+};
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::ric_relay::{
-    assemble_acquire_cancel_proof, assemble_intent_proof, RelayAssemblyError,
+    assemble_acquire_cancel_proof_with_target, assemble_intent_proof_with_target,
+    RelayAssemblyError,
 };
 use xindex_shared::signer_wire::{
     AcquireCancelProof, IntentProof, ObserverCertifyAccRequest, ObserverCertifyAccResponse,
@@ -35,9 +40,11 @@ use xindex_shared::signer_wire::{
 };
 
 /// Default per-observer HTTP timeout. An observer must resolve Asgard
-/// across ≥2 `THORChain` sources before answering, so the budget is
+/// across ≥3 `THORChain` sources before answering, so the budget is
 /// looser than a bare signing call but still bounded.
 const DEFAULT_TIMEOUT_SECS: u64 = 20;
+const CONNECT_TIMEOUT_SECS: u64 = 3;
+const MAX_OBSERVER_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Path of the per-operator observer's certify endpoint.
 const CERTIFY_PATH: &str = "/api/v1/certify-ric";
@@ -138,10 +145,14 @@ impl RicCollector {
                 quorum,
             });
         }
-        let http = reqwest::blocking::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        let policy = http_policy(timeout);
+        let http = blocking_client_builder(policy)
+            .and_then(|builder| {
+                builder
+                    .build()
+                    .map_err(|_| xindex_ops::network::NetworkError::ClientBuild)
+            })
+            .map_err(|error| RicCollectError::TransportConfiguration(error.to_string()))?;
         Ok(Self {
             observer_urls: observer_urls
                 .into_iter()
@@ -152,8 +163,8 @@ impl RicCollector {
         })
     }
 
-    /// Construct the production collector with a client identity, pinned
-    /// observer roots, HTTPS-only transport, and no system-root fallback.
+    /// Construct the production collector with a client identity, exact
+    /// observer leaf bundle, HTTPS-only transport, and no system-root fallback.
     ///
     /// # Errors
     /// Insufficient endpoints, non-HTTPS URL, malformed PEM, or client build.
@@ -162,7 +173,7 @@ impl RicCollector {
         quorum: usize,
         client_cert_pem: &[u8],
         client_key_pem: &[u8],
-        observer_root_pem: &[u8],
+        observer_peer_bundle_pem: &[u8],
         timeout: Duration,
     ) -> Result<Self, RicCollectError> {
         if quorum == 0 || observer_urls.len() < quorum {
@@ -181,32 +192,22 @@ impl RicCollector {
                 ));
             }
         }
-        let mut identity_pem = Vec::with_capacity(client_cert_pem.len() + client_key_pem.len() + 1);
-        identity_pem.extend_from_slice(client_cert_pem);
-        identity_pem.push(b'\n');
-        identity_pem.extend_from_slice(client_key_pem);
-        let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|_| {
-            RicCollectError::TransportConfiguration(
-                "observer mTLS identity PEM is invalid".to_string(),
-            )
+        let pins = pinned_cert_store(&[observer_peer_bundle_pem.to_vec()]).map_err(|error| {
+            RicCollectError::TransportConfiguration(format!("observer exact pin: {error}"))
         })?;
-        let roots = reqwest::Certificate::from_pem_bundle(observer_root_pem).map_err(|_| {
-            RicCollectError::TransportConfiguration("observer root PEM is invalid".to_string())
+        let builder = exact_pinned_blocking_client_builder(
+            http_policy(timeout),
+            load_cert_chain(client_cert_pem).map_err(|error| {
+                RicCollectError::TransportConfiguration(format!("observer client cert: {error}"))
+            })?,
+            load_private_key(client_key_pem).map_err(|error| {
+                RicCollectError::TransportConfiguration(format!("observer client key: {error}"))
+            })?,
+            pins,
+        )
+        .map_err(|error| {
+            RicCollectError::TransportConfiguration(format!("observer mTLS: {error}"))
         })?;
-        if roots.is_empty() {
-            return Err(RicCollectError::TransportConfiguration(
-                "observer root PEM is empty".to_string(),
-            ));
-        }
-        let mut builder = reqwest::blocking::Client::builder()
-            .timeout(timeout)
-            .https_only(true)
-            .tls_built_in_root_certs(false)
-            .redirect(reqwest::redirect::Policy::none())
-            .identity(identity);
-        for root in roots {
-            builder = builder.add_root_certificate(root);
-        }
         let http = builder.build().map_err(|_| {
             RicCollectError::TransportConfiguration("build observer mTLS client failed".to_string())
         })?;
@@ -250,19 +251,10 @@ impl RicCollector {
                 Err(e) => warn!(observer_index, error = %e, "observer certify failed; skipping"),
             }
         }
-        let proof = assemble_intent_proof(&responses, self.quorum)?;
-        // Recover the agreed plaintext Asgard address from the winning
-        // group (the responses whose certified target hashes to the
-        // assembled proof's). They all carry the same address by
-        // construction; take the first.
-        let asgard_address = responses
-            .iter()
-            .find(|r| r.immediate_target_hash == proof.immediate_target_hash)
-            .map(|r| r.asgard_address.clone())
-            .unwrap_or_default();
+        let assembled = assemble_intent_proof_with_target(&responses, self.quorum)?;
         Ok(CollectedRic {
-            proof,
-            asgard_address,
+            proof: assembled.proof,
+            asgard_address: assembled.asgard_address,
         })
     }
 
@@ -300,15 +292,10 @@ impl RicCollector {
                 }
             }
         }
-        let proof = assemble_acquire_cancel_proof(&responses, self.quorum)?;
-        let asgard_address = responses
-            .iter()
-            .find(|r| r.immediate_target_hash == proof.immediate_target_hash)
-            .map(|r| r.asgard_address.clone())
-            .unwrap_or_default();
+        let assembled = assemble_acquire_cancel_proof_with_target(&responses, self.quorum)?;
         Ok(CollectedAcc {
-            proof,
-            asgard_address,
+            proof: assembled.proof,
+            asgard_address: assembled.asgard_address,
         })
     }
 
@@ -331,8 +318,9 @@ impl RicCollector {
         if !status.is_success() {
             return Err(format!("http {}", status.as_u16()));
         }
-        resp.json::<ObserverCertifyResponse>()
-            .map_err(|_| "response json malformed".to_string())
+        let body = read_bounded_blocking(resp, MAX_OBSERVER_RESPONSE_BYTES)
+            .map_err(|error| error.to_string())?;
+        serde_json::from_slice(&body).map_err(|_| "response json malformed".to_string())
     }
 
     /// POST one certify-acc request and pin the response (no signature
@@ -353,8 +341,17 @@ impl RicCollector {
         if !status.is_success() {
             return Err(format!("http {}", status.as_u16()));
         }
-        resp.json::<ObserverCertifyAccResponse>()
-            .map_err(|_| "response json malformed".to_string())
+        let body = read_bounded_blocking(resp, MAX_OBSERVER_RESPONSE_BYTES)
+            .map_err(|error| error.to_string())?;
+        serde_json::from_slice(&body).map_err(|_| "response json malformed".to_string())
+    }
+}
+
+fn http_policy(timeout: Duration) -> HttpClientPolicy {
+    HttpClientPolicy {
+        connect_timeout: timeout.min(Duration::from_secs(CONNECT_TIMEOUT_SECS)),
+        request_timeout: timeout,
+        max_response_bytes: MAX_OBSERVER_RESPONSE_BYTES,
     }
 }
 
@@ -378,7 +375,12 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn cert_body(signer: u8, sig: u8, target: &str) -> serde_json::Value {
+    fn cert_body_with_raw(
+        signer: u8,
+        sig: u8,
+        target: &str,
+        asgard_address: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "chain_id": "btc",
             "redemption_id": format!("0x{}", "ab".repeat(32)),
@@ -390,7 +392,7 @@ mod tests {
             "memo_hash": format!("0x{}", "ef".repeat(32)),
             "final_destination_hash": format!("0x{}", "12".repeat(32)),
             "vault_resolved_at": 1_750_000_000_u64,
-            "asgard_address": "bc1qvault",
+            "asgard_address": asgard_address,
             "signature": format!("0x{}", format!("{sig:02x}").repeat(65)),
             "signer_address": format!("0x{}", format!("{signer:02x}").repeat(20)),
         })
@@ -399,10 +401,24 @@ mod tests {
     const GOOD: &str = "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
     async fn observer(signer: u8, sig: u8, target: &str) -> MockServer {
+        observer_with_raw(signer, sig, target, "bc1qvault").await
+    }
+
+    async fn observer_with_raw(
+        signer: u8,
+        sig: u8,
+        target: &str,
+        asgard_address: &str,
+    ) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(CERTIFY_PATH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(cert_body(signer, sig, target)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(cert_body_with_raw(
+                signer,
+                sig,
+                target,
+                asgard_address,
+            )))
             .mount(&server)
             .await;
         server
@@ -463,6 +479,31 @@ mod tests {
 
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
+    async fn oversized_valid_observer_response_is_rejected_before_decode() {
+        let server = MockServer::start().await;
+        let mut body = cert_body_with_raw(1, 0xa1, GOOD, "bc1qvault");
+        body["padding"] = serde_json::Value::String("x".repeat(300 * 1024));
+        Mock::given(method("POST"))
+            .and(path(CERTIFY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let url = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            RicCollector::new(vec![url], 1).expect("collector").collect(
+                ChainId::Btc,
+                rid(),
+                0,
+                1_750_000_000,
+            )
+        })
+        .await
+        .expect("join");
+        assert!(matches!(result, Err(RicCollectError::Assembly(_))));
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
     async fn collects_quorum_from_three_agreeing_observers() {
         let a = observer(1, 0xa1, GOOD).await;
         let b = observer(2, 0xa2, GOOD).await;
@@ -482,6 +523,29 @@ mod tests {
         assert_eq!(collected.proof.signatures.len(), 3);
         assert_eq!(collected.proof.immediate_target_hash, GOOD);
         assert_eq!(collected.asgard_address, "bc1qvault");
+    }
+
+    #[tokio::test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    async fn malicious_first_raw_target_cannot_override_byte_identical_quorum() {
+        let malicious = observer_with_raw(3, 0xa3, GOOD, "BC1QNONCANONICAL").await;
+        let honest_a = observer_with_raw(1, 0xa1, GOOD, "bc1qcanonical").await;
+        let honest_b = observer_with_raw(2, 0xa2, GOOD, "bc1qcanonical").await;
+        let urls = vec![malicious.uri(), honest_a.uri(), honest_b.uri()];
+        let collected = tokio::task::spawn_blocking(move || {
+            RicCollector::new(urls, 2).expect("collector").collect(
+                ChainId::Btc,
+                rid(),
+                0,
+                1_750_000_000,
+            )
+        })
+        .await
+        .expect("join")
+        .expect("honest raw quorum");
+
+        assert_eq!(collected.asgard_address, "bc1qcanonical");
+        assert_eq!(collected.proof.signatures.len(), 2);
     }
 
     /// One observer down, two healthy + agreeing, quorum 2 → still

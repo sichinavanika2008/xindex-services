@@ -14,10 +14,12 @@ only; they are not required to understand or work on this repository.
 
 1. Current Rust source, tests, and Git history.
 2. The recent sections of this repository's KNOWN_FINDINGS.md.
-3. docs/runbooks/turnkey-custody-devenv.md for the provisional Turnkey wire and
-   its validation gates.
-4. ../AGENTS.md and this file.
-5. Older README milestone tables and historical plans.
+3. docs/runbooks/bitgo-custody-devenv.md for the selected future BTC custody
+   model and its fail-closed qualification gates.
+4. docs/runbooks/gate4-bitgo-rehearsal.md for the current testnet/failure-drill
+   closure gate and evidence format.
+5. ../AGENTS.md and this file.
+6. Older README milestone tables and historical plans.
 
 Code wins when documentation conflicts. Do not represent a historical custody
 design, test count, or launch claim as current without checking the code and
@@ -25,23 +27,45 @@ the relevant runbook.
 
 ## Security-critical current state
 
-- Turnkey holds one complete key in an attested enclave. It is not MPC and not
-  a key-share split. Independent Xindex approvers must approve signing
-  activity; compromise of the enclave remains an accepted residual risk.
-- The xindex-turnkey-approver binary is deliberately --dev gated. Do not lift
-  that gate, enable production wiring, or configure real custody addresses
-  without explicit founder authorization after the listed validation gates.
-- Before mainnet funds, reconcile the real Turnkey wire, prove BTC signet with
-  the required OP_RETURN, prove EVM Sepolia and tamper rejection, complete the
-  post-June custody audit, and rehearse operations and ceremonies.
+The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); it is disabled and not production-wired.
+Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.
+Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal custody providers.
+
+- This native-P2WSH model is not MPC. The canonical cross-repository decision
+  is [`memory/BITGO-CUSTODY.md`](../memory/BITGO-CUSTODY.md).
+- The BitGo capture validator is offline-only and cannot authenticate
+  caller-supplied provider provenance. It must remain blocked until a reviewed,
+  independently pinned evidence envelope is implemented. Do not create an account,
+  wallet or key, use credentials, configure real custody addresses, fund,
+  sign, approve or broadcast without explicit user authorization.
+- `xindex-bitgo-adapter` is the shared key-free request/policy core. Keep it
+  free of HTTP tokens, private-key inputs, signing, approvals and broadcast;
+  preserve exact build fields, native P2WSH, non-RBF, absolute fee, ordered
+  outputs and cryptographic user/BitGo role checks.
+- No live BitGo account, wallet, key or transaction evidence exists. BitGo is
+  selected but disabled, not production-wired or production-approved.
+- THORChain BTC output order is fund-critical: VOUT0 Asgard, optional VOUT1
+  change to VIN0, final VOUT memo. Preserve `BTC-ORDER-01` regressions and gate
+  every provider-returned unsigned transaction before signing.
+- Before mainnet funds, prove the exact BitGo user/backup/provider key topology,
+  explicit P2WSH and PSBT policy, BTC Testnet4 plus controlled THORChain-devnet
+  execution, recovery and tamper rejection; then complete the custody re-audit,
+  operational rehearsals and ceremonies. Non-BTC custody remains disabled.
+- Gate 4 is not complete. The current BitGo-aware 23-drill
+  `xindex-gate4-check` validates shape and local hashes only, reports
+  `format_valid`, and exits blocked. Closure requires authenticated
+  provider/reviewer provenance, commit resolution, independent review and
+  explicit user acceptance. The older 3-of-5 custody rehearsal is historical
+  and cannot substitute.
 - EVM-family THORChain router addresses in the chain registry are deliberately
   zero-address placeholders. They are not deployment configuration.
 
 ## Important implementation areas
 
-- custody-node and turnkey-client implement the Turnkey signing and approver
-  flow. Preserve reconstructed-payload binding, fee caps, replay protection,
-  one-shot consumption, and fail-closed behavior.
+- custody-node contains the provider-neutral approval decision core. Preserve
+  reconstructed-payload binding, fee caps, replay protection, one-shot
+  consumption, and fail-closed behavior. bitgo-dev-gate qualifies the selected
+  BTC transaction boundary without creating, signing or broadcasting.
 - executor contains chain-family redemption construction. Native custody
   spends must remain bound to independently verified intent evidence.
 - signer-daemon, observer, relayer, and shared contain the EIP-712 and

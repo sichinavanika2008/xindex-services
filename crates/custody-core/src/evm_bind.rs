@@ -1,12 +1,12 @@
 //! CTD-1 (`DL-CTD-2`): EVM redeem-deposit binding, transport-agnostic.
 //!
-//! Under the Cobo MPC custody model the EVM custody key is a plain single-sig
-//! address (no Gnosis Safe), so the honest redemption leg is a direct
+//! For a future plain single-signature EVM custody adapter, the honest
+//! redemption leg is a direct
 //! `Router.depositWithExpiry(vault, address(0), amount, memo, expiry)` call
 //! with `value == amount`. This is the de-Safed sibling of the (transitional)
 //! signer-daemon's `bind_safe_tx_to_cert`: the same router / asset / vault /
-//! amount / memo binds, with no Safe-tx wrapper. Shared by the Cobo callback's
-//! EVM decision and any future EVM custody handler.
+//! amount / memo binds, with no Safe-tx wrapper. No EVM custody provider is
+//! selected or production-wired by this provider-neutral decision core.
 
 use alloy_primitives::{keccak256, Address, U256};
 use alloy_sol_types::SolCall;

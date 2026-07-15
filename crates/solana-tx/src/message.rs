@@ -291,10 +291,10 @@ pub fn system_transfer(from: Pubkey, to: Pubkey, lamports: u64) -> Instruction {
     }
 }
 
-/// Build the legacy `[system_transfer, SPL-Memo]` message a Turnkey Solana
-/// redeem signs, returning both the message and its serialized signing bytes.
-/// Shared by the executor (to compute the payload it asks the enclave to sign)
-/// and the approver (to independently recompute that payload, TK-01), so the
+/// Build the legacy `[system_transfer, SPL-Memo]` message a single-sign Solana
+/// redeem uses, returning both the message and its serialized signing bytes.
+/// Shared by the executor (to compute the requested signing payload)
+/// and the callback policy (to independently recompute that payload, TK-01), so the
 /// two cannot diverge.
 ///
 /// # Errors

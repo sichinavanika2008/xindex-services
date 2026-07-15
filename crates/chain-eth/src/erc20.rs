@@ -15,11 +15,12 @@
 //! pulling a full async provider through the sync boundary.
 
 use std::str::FromStr;
-use std::{collections::HashMap, io::Read};
+use std::{collections::HashMap, time::Duration};
 
 use alloy_primitives::{Address, B256, U256};
 use serde::Serialize;
 use serde_json::json;
+use xindex_ops::network::{blocking_client, read_bounded_blocking, HttpClientPolicy};
 use xindex_signer::crosscheck::{Erc20Arrival, Erc20ArrivalClient, Erc20Error};
 
 /// `keccak256("Transfer(address,address,uint256)")` — the ERC20
@@ -27,6 +28,17 @@ use xindex_signer::crosscheck::{Erc20Arrival, Erc20ArrivalClient, Erc20Error};
 /// and never changes).
 const TRANSFER_TOPIC0: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const MAX_RPC_BODY_BYTES: u64 = 16 * 1024 * 1024;
+const RPC_CONNECT_TIMEOUT_SECS: u64 = 3;
+const RPC_REQUEST_TIMEOUT_SECS: u64 = 15;
+
+fn rpc_client() -> Result<reqwest::blocking::Client, Erc20Error> {
+    blocking_client(HttpClientPolicy {
+        connect_timeout: Duration::from_secs(RPC_CONNECT_TIMEOUT_SECS),
+        request_timeout: Duration::from_secs(RPC_REQUEST_TIMEOUT_SECS),
+        max_response_bytes: usize::try_from(MAX_RPC_BODY_BYTES).map_or(usize::MAX, |value| value),
+    })
+    .map_err(|error| Erc20Error::Rpc(format!("build bounded HTTP client: {error}")))
+}
 
 /// Blocking JSON-RPC `Erc20ArrivalClient`. Scans the last
 /// `lookback_blocks` for `Transfer(_, to, value)` logs of `token`.
@@ -43,13 +55,15 @@ pub struct RpcErc20LogClient {
 impl RpcErc20LogClient {
     /// `http_rpc_url` must be an HTTP(S) endpoint (not WS) — this is a
     /// one-shot blocking request path.
-    #[must_use]
-    pub fn new(http_rpc_url: impl Into<String>, lookback_blocks: u64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Bounded HTTP client construction failure.
+    pub fn new(http_rpc_url: impl Into<String>, lookback_blocks: u64) -> Result<Self, Erc20Error> {
+        Ok(Self {
             http_rpc_url: http_rpc_url.into(),
             lookback_blocks,
-            client: reqwest::blocking::Client::new(),
-        }
+            client: rpc_client()?,
+        })
     }
 
     fn rpc(
@@ -64,9 +78,19 @@ impl RpcErc20LogClient {
             .json(&body)
             .send()
             .map_err(|e| Erc20Error::Rpc(format!("{method} send: {e}")))?;
-        let v: serde_json::Value = resp
-            .json()
-            .map_err(|e| Erc20Error::Rpc(format!("{method} decode: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Erc20Error::Rpc(format!(
+                "{method} HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+        let bytes = read_bounded_blocking(
+            resp,
+            usize::try_from(MAX_RPC_BODY_BYTES).map_or(usize::MAX, |value| value),
+        )
+        .map_err(|error| Erc20Error::Rpc(format!("{method} body: {error}")))?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| Erc20Error::Rpc(format!("{method} decode: {error}")))?;
         if let Some(err) = v.get("error") {
             return Err(Erc20Error::Rpc(format!("{method}: {err}")));
         }
@@ -231,13 +255,15 @@ struct RpcCall {
 
 impl FinalizedRpcErc20LogClient {
     /// Construct a finalized-only transfer observer.
-    #[must_use]
-    pub fn new(http_rpc_url: impl Into<String>, lookback_blocks: u64) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Bounded HTTP client construction failure.
+    pub fn new(http_rpc_url: impl Into<String>, lookback_blocks: u64) -> Result<Self, Erc20Error> {
+        Ok(Self {
             http_rpc_url: http_rpc_url.into(),
             lookback_blocks,
-            client: reqwest::blocking::Client::new(),
-        }
+            client: rpc_client()?,
+        })
     }
 
     fn rpc_evidence(
@@ -246,7 +272,7 @@ impl FinalizedRpcErc20LogClient {
         params: &serde_json::Value,
     ) -> Result<RpcCall, Erc20Error> {
         let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
-        let mut response = self
+        let response = self
             .client
             .post(&self.http_rpc_url)
             .json(&body)
@@ -258,15 +284,11 @@ impl FinalizedRpcErc20LogClient {
                 response.status().as_u16()
             )));
         }
-        let mut bytes = Vec::new();
-        response
-            .by_ref()
-            .take(MAX_RPC_BODY_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|error| Erc20Error::Rpc(format!("{method} body: {error}")))?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_RPC_BODY_BYTES {
-            return Err(Erc20Error::Rpc(format!("{method} response too large")));
-        }
+        let bytes = read_bounded_blocking(
+            response,
+            usize::try_from(MAX_RPC_BODY_BYTES).map_or(usize::MAX, |value| value),
+        )
+        .map_err(|error| Erc20Error::Rpc(format!("{method} body: {error}")))?;
         let response_body = String::from_utf8(bytes)
             .map_err(|error| Erc20Error::Rpc(format!("{method} response is not UTF-8: {error}")))?;
         let value: serde_json::Value = serde_json::from_str(&response_body)

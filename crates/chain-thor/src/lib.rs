@@ -43,6 +43,7 @@ pub use policy::{
 };
 pub use source::{RawSourcePoll, ThorSourceClient};
 pub use types::{
-    ConsensusTip, InboundAddress, Mimir, OutboundEntry, OutboundTx, Pool, SwapQuoteFees,
-    SwapQuoteRequest, SwapQuoteResponse, TxDetailsResponse, TxResponse, TxStatusResponse,
+    AsgardMembershipError, AsgardVault, ConsensusTip, HistoricalAsgardMembership, InboundAddress,
+    Mimir, OutboundEntry, OutboundTx, Pool, SwapQuoteFees, SwapQuoteRequest, SwapQuoteResponse,
+    TxDetailsResponse, TxResponse, TxStatusResponse, VaultAddress,
 };

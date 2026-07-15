@@ -1,9 +1,11 @@
 [toolchain]
-# Pinned for audit reproducibility (2026-06-15). CI mirrors this exact
-# version in the dtolnay toolchain input of .github/workflows/{ci,assurance}.yml
+# Pinned and declared as the workspace MSRV for audit reproducibility. CI
+# mirrors this exact version in .github/workflows/{ci,assurance}.yml and runs
+# scripts/check-msrv.sh against the complete locked all-feature workspace.
 # (the cargo-careful job overrides to nightly — it needs -Z to build its
-# instrumented sysroot). 1.95.0 clears the M1 dep-tree floor (alloy 0.8.x →
-# ruint 1.18+ need 1.90+). Bump here and in those two workflows together.
+# instrumented sysroot). The lockfile's dependency floor is at least 1.90, but
+# 1.95.0 is the lowest whole-workspace compiler reproduced for this snapshot.
+# Bump the manifest, this file, and the workflows together.
 channel = "1.95.0"
 components = ["rustfmt", "clippy", "rust-src", "rust-analyzer"]
 profile = "minimal"

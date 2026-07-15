@@ -48,6 +48,7 @@
 
 pub mod http;
 pub mod metrics;
+pub mod network;
 pub mod tls;
 pub mod topology;
 pub mod tracing_init;

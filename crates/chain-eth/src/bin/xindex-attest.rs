@@ -29,11 +29,13 @@ use bitcoin::Network;
 use clap::{Parser, ValueEnum};
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
-use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
+use xindex_chain_eth::bindings::{settlement_context_to_contract, AttestationOracle, IntentQueue};
 use xindex_chain_eth::rpc::redacted_endpoint;
 use xindex_chain_thor::ThorClient;
 use xindex_chain_utxo::EsploraClient;
-use xindex_shared::eip712::{attestation, attestation_oracle_domain};
+use xindex_shared::eip712::{
+    attestation, attestation_oracle_domain, settlement_context, SettlementContext,
+};
 use xindex_signer::crosscheck::{CrossCheck, PassThroughPolicy, ThorUtxoPolicy};
 use xindex_signer::remote::{AnyHsmBackend, RemoteHsmBackend};
 use xindex_signer::{aggregate_signatures, SoftwareSigner};
@@ -56,6 +58,21 @@ enum SignerMode {
 enum CrossCheckMode {
     PassThrough,
     ThorBtc,
+}
+
+fn dev_settlement_context(source_chain_id: u64, evidence_hash: B256) -> SettlementContext {
+    let observed_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |duration| duration.as_secs());
+    settlement_context(
+        evidence_hash,
+        observed_at,
+        observed_at.saturating_add(120),
+        alloy_primitives::U256::from(source_chain_id),
+        1,
+        evidence_hash,
+        0,
+    )
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -381,7 +398,8 @@ async fn run(args: Args) -> Result<()> {
         // Single-slot Phase 2.A path: sign and post the one slot.
         let slot_idx: usize = 0;
         let slot_index_u256 = alloy_primitives::U256::from(slot_idx);
-        let attestation_payload = attestation(intent_id, slot_index_u256, expected_amount);
+        let context = dev_settlement_context(chain_id, eth_tx_hash);
+        let attestation_payload = attestation(intent_id, slot_index_u256, expected_amount, context);
         // aggregate_signatures calls the (reqwest::blocking) signers — run it
         // on a blocking thread, off the async worker.
         let sigs = {
@@ -416,7 +434,13 @@ async fn run(args: Args) -> Result<()> {
             "posting attest()"
         );
         let pending = match oracle
-            .attest(intent_id, slot_index_u256, expected_amount, sig_bytes)
+            .attest(
+                intent_id,
+                slot_index_u256,
+                expected_amount,
+                settlement_context_to_contract(context),
+                sig_bytes,
+            )
             .send()
             .await
         {

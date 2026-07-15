@@ -1,5 +1,12 @@
 # CTD-1 signet rehearsal — the closure gate
 
+> **Historical custody baseline.** This document records the former 3-of-5
+> native-custody closure design. The current Gate-4 procedure is
+> [`gate4-bitgo-rehearsal.md`](./gate4-bitgo-rehearsal.md), using BitGo
+> self-custody native Bitcoin 2-of-3 multisig while retaining the separate
+> 3-of-5 observation/certification quorum. This document alone cannot close
+> current Gate 4 and its Set-A ceremony must not be executed as a fallback.
+
 > **Purpose.** CTD-1 (fleet-wide Critical: coordinator-trusted destination)
 > is code-complete: Slices A–E + the Slice C production tail are built and
 > tested. It stays **Critical-Open** until THIS rehearsal passes with
@@ -21,7 +28,7 @@ Per operator, on infrastructure the OTHER operators do not control:
 | Signer daemon | `xindex-signer-daemon` | Set-A custody key + Set-B certification key, HSM-backed (never in process memory) |
 | Observer | `xindex-observe-redeem` | none (asks its own daemon to sign) |
 | Ethereum RPC | own WS + HTTP endpoint | — |
-| THORChain sources | **≥2 distinct** THORNode REST endpoints (refinement 1 — a shared source collapses 5 observers into 1) | — |
+| THORChain sources | **≥3 distinct** THORNode REST endpoints (refinement 1 — a shared source collapses 5 observers into 1) | — |
 
 Shared (untrusted — can fail rounds, can never steer them):
 coordinator host running `xindex-redeem` / `xindex-attest` /
@@ -59,7 +66,7 @@ drill, a mock Asgard inbound (the drill notes say which is acceptable).
 - [ ] `LARGE_SPEND_THRESHOLD` ≈2% of custody; `LARGE_SPEND_DELAY_SECS=1800`.
 - [ ] `CANCEL_RECOVERY_DEST` = the ops/treasury Safe (DL-CTD-C-1) — the
       SAME address on all 5.
-- [ ] `THORNODE_URLS`: ≥2 per operator, and the 5 operators' source sets
+- [ ] `THORNODE_URLS`: ≥3 per operator, and the 5 operators' source sets
       are not all identical.
 
 ## 3. Drills

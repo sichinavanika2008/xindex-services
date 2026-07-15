@@ -168,6 +168,7 @@ pub fn pick_fee_estimate<S: std::hash::BuildHasher>(
 /// UTXO discovery uses the canonical Esplora pattern: walk the address's
 /// transaction history, identify the vouts paying our `script_pubkey`,
 /// then query `get_output_status` to filter unspent outputs.
+#[derive(Clone)]
 pub struct EsploraClient {
     /// Configured chain network. Used to validate addresses passed to
     /// `get_address_utxos` belong to the intended network.

@@ -5,7 +5,7 @@
 //! (using the SAME builders the executor signs with), recomputes its signing
 //! hash, and asserts it equals the payload the enclave is being asked to sign
 //! (`prepare_key`). A coordinator that writes both the store key and the
-//! Turnkey payload therefore cannot pair an honest bound context with a
+//! provider signing request therefore cannot pair an honest bound context with a
 //! signature over a different message (TK-01). The same pass range-checks the
 //! declared fee against the per-chain cap (TK-02). Any reconstruction failure,
 //! payload mismatch, or fee breach is a fail-closed REJECT.

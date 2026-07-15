@@ -401,7 +401,7 @@ mod tests {
     use xindex_shared::eip712::{
         attestation, attestation_oracle_domain, redemption_attestation,
         redemption_attestation_signing_hash, refund_attestation, refund_attestation_signing_hash,
-        streamed_settlement, streamed_settlement_signing_hash,
+        settlement_context, streamed_settlement, streamed_settlement_signing_hash,
     };
 
     /// Anvil's first deterministic private key (account 0).
@@ -413,6 +413,18 @@ mod tests {
         0xf3, 0x9f, 0xd6, 0xe5, 0x1a, 0xad, 0x88, 0xf6, 0xf4, 0xce, 0x6a, 0xb8, 0x82, 0x72, 0x79,
         0xcf, 0xff, 0xb9, 0x22, 0x66,
     ]);
+
+    fn test_context() -> xindex_shared::eip712::SettlementContext {
+        settlement_context(
+            B256::repeat_byte(0x88),
+            1_800_000_000,
+            1_800_000_300,
+            U256::from(31_337u64),
+            20_000_000,
+            B256::repeat_byte(0x99),
+            0,
+        )
+    }
 
     #[test]
     #[expect(
@@ -441,6 +453,7 @@ mod tests {
             B256::repeat_byte(0xcd),
             U256::from(0u8),
             U256::from(1_000_000u32),
+            test_context(),
         );
         let digest = attestation_signing_hash(&a, &domain);
 
@@ -475,6 +488,7 @@ mod tests {
             B256::repeat_byte(0xcd),
             U256::from(0u8),
             U256::from(1_000_000u32),
+            test_context(),
         );
 
         let sig_bytes = sign_attestation(&s, &domain, &a).expect("sign_attestation");
@@ -506,6 +520,7 @@ mod tests {
             B256::repeat_byte(0xcd),
             U256::from(0u8),
             U256::from(1_000_000u32),
+            test_context(),
         );
 
         let backends: Vec<&SoftwareSigner> = vec![&s0, &s1];
@@ -537,6 +552,7 @@ mod tests {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(1_000_000u32),
+            test_context(),
         );
 
         let sig_bytes = sign_redemption_attestation(&s, &domain, &a).expect("sign");
@@ -562,6 +578,7 @@ mod tests {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(99_999u32),
+            test_context(),
         );
 
         let sig_bytes = sign_refund_attestation(&s, &domain, &a).expect("sign");
@@ -577,6 +594,7 @@ mod tests {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(99_999u32),
+            test_context(),
         );
         let r_sig = sign_redemption_attestation(&s, &domain, &r).expect("sign");
         let r_parsed = PrimitiveSignature::try_from(r_sig.as_slice()).expect("65-byte");
@@ -607,6 +625,7 @@ mod tests {
             B256::repeat_byte(0xa1),
             U256::from(60_000_000u32),
             U256::from(30_000_000u32),
+            test_context(),
         );
 
         let sig_bytes = sign_streamed_settlement(&s, &domain, &a).expect("sign");
@@ -622,6 +641,7 @@ mod tests {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(60_000_000u32),
+            test_context(),
         );
         let r_sig = sign_redemption_attestation(&s, &domain, &r).expect("sign");
         let r_parsed = PrimitiveSignature::try_from(r_sig.as_slice()).expect("65-byte");
@@ -655,6 +675,7 @@ mod tests {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(7u32),
+            test_context(),
         );
         let red_d = redemption_attestation_signing_hash(&red, &domain);
         let red_sigs = aggregate_redemption_signatures(&backends, &domain, &red).expect("agg red");
@@ -673,6 +694,7 @@ mod tests {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(8u32),
+            test_context(),
         );
         let refu_d = refund_attestation_signing_hash(&refu, &domain);
         let refu_sigs = aggregate_refund_signatures(&backends, &domain, &refu).expect("agg ref");

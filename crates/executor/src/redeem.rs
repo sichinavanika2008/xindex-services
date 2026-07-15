@@ -319,8 +319,8 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
         })
     }
 
-    /// End-to-end: select UTXO → build PSBT (Asgard out, `OP_RETURN` memo,
-    /// change) → sign with K keys → finalize → broadcast. Returns the
+    /// End-to-end: select UTXO → build PSBT (Asgard out, change,
+    /// `OP_RETURN` memo) → sign with K keys → finalize → broadcast. Returns the
     /// broadcast txid.
     ///
     /// `asgard` is the `THORChain` BTC inbound vault, resolved live by the
@@ -390,7 +390,7 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
     /// The shared custody-spend core, used by BOTH the redeem path
     /// (RIC-certified) and the mint-cancel swap-back
     /// ([`crate::cancel_swap_back`], ACC-certified): select UTXO → build
-    /// PSBT (Asgard out, `OP_RETURN` memo, change-to-self) → collect K
+    /// PSBT (Asgard out, change-to-self, `OP_RETURN` memo) → collect K
     /// partial signatures → finalize → broadcast.
     ///
     /// **`vin[0]` invariant:** the sole input is a multisig UTXO, so
@@ -468,7 +468,7 @@ impl<C: UtxoChainClient> InProcessExecutor<C> {
             Amount::ZERO
         };
 
-        // Outputs: [Asgard vault, OP_RETURN(memo), change→multisig].
+        // Outputs: [Asgard vault, change→multisig, OP_RETURN(memo)].
         // Single input ⇒ vin[0] is the multisig UTXO (refund-to-sender).
         let mut psbt = build_spending_psbt(
             std::slice::from_ref(&multisig_utxo),
@@ -773,14 +773,15 @@ mod tests {
         assert_eq!(tx.input.len(), 1);
         assert_eq!(tx.input[0].previous_output.txid, utxo_txid);
 
-        // Outputs: [Asgard, OP_RETURN(memo), change→multisig].
+        // Outputs: [Asgard, change→multisig, OP_RETURN(memo)].
         assert_eq!(tx.output.len(), 3);
         assert_eq!(tx.output[0].value, Amount::from_sat(50_000_000));
         assert_eq!(tx.output[0].script_pubkey, asgard().script_pubkey());
-        assert!(tx.output[1].script_pubkey.is_op_return());
-        assert_eq!(tx.output[1].value, Amount::ZERO);
+        assert_eq!(tx.output[1].script_pubkey, multisig_addr.script_pubkey());
+        assert!(tx.output[2].script_pubkey.is_op_return());
+        assert_eq!(tx.output[2].value, Amount::ZERO);
         // OP_RETURN carries the exact contract memo.
-        let op_return_bytes: Vec<u8> = tx.output[1]
+        let op_return_bytes: Vec<u8> = tx.output[2]
             .script_pubkey
             .as_bytes()
             .iter()
@@ -788,6 +789,5 @@ mod tests {
             .skip(2) // OP_RETURN + pushlen
             .collect();
         assert_eq!(op_return_bytes, memo.as_bytes());
-        assert_eq!(tx.output[2].script_pubkey, multisig_addr.script_pubkey());
     }
 }

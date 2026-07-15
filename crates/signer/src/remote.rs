@@ -15,6 +15,10 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use alloy_sol_types::Eip712Domain;
+use xindex_ops::network::{blocking_client_builder, read_bounded_blocking, HttpClientPolicy};
+use xindex_ops::tls::{
+    exact_pinned_blocking_client_builder, load_cert_chain, load_private_key, pinned_cert_store,
+};
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::eip712::{
     AcquireCancelCertificate, AsyncLegDeliveryAttestation, AsyncLegRefundAttestation,
@@ -29,6 +33,7 @@ use xindex_shared::signer_wire::{
 use crate::{HsmBackend, RicSigner, SignerError, SoftwareSigner};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
+const MAX_SIGNER_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// HTTP client implementing [`HsmBackend`] against one signer daemon.
 /// Cheap to clone (the `reqwest::blocking::Client` is internally
@@ -38,7 +43,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 5;
 pub struct RemoteHsmBackend {
     base_url: String,
     eth_address: Address,
-    inner: reqwest::blocking::Client,
+    inner: Result<reqwest::blocking::Client, String>,
 }
 
 impl std::fmt::Debug for RemoteHsmBackend {
@@ -71,10 +76,17 @@ impl RemoteHsmBackend {
         eth_address: Address,
         timeout: Duration,
     ) -> Self {
-        let inner = reqwest::blocking::Client::builder()
-            .timeout(timeout)
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        let inner = blocking_client_builder(HttpClientPolicy {
+            connect_timeout: timeout.min(Duration::from_secs(1)),
+            request_timeout: timeout,
+            max_response_bytes: MAX_SIGNER_RESPONSE_BYTES,
+        })
+        .and_then(|builder| {
+            builder
+                .build()
+                .map_err(|_| xindex_ops::network::NetworkError::ClientBuild)
+        })
+        .map_err(|error| error.to_string());
         Self {
             base_url: base_url.into(),
             eth_address,
@@ -83,19 +95,19 @@ impl RemoteHsmBackend {
     }
 
     /// Construct a production client that presents a coordinator/observer
-    /// certificate, trusts only the supplied daemon certificate roots, and
+    /// certificate, accepts only the supplied exact daemon leaf bundle, and
     /// refuses plaintext HTTP. The TLS private key authenticates transport;
     /// it is not an attestation or custody signing key.
     ///
     /// # Errors
-    /// Invalid HTTPS URL, malformed PEM identity/root bundle, or client build
+    /// Invalid HTTPS URL, malformed PEM identity/peer bundle, or client build
     /// failure. No permissive fallback is used.
     pub fn with_mtls_pem(
         base_url: impl Into<String>,
         eth_address: Address,
         client_cert_pem: &[u8],
         client_key_pem: &[u8],
-        daemon_root_pem: &[u8],
+        daemon_peer_bundle_pem: &[u8],
         timeout: Duration,
     ) -> Result<Self, SignerError> {
         let base_url = base_url.into();
@@ -106,32 +118,28 @@ impl RemoteHsmBackend {
                 "production daemon URL must use https".to_string(),
             ));
         }
-        let mut identity_pem = Vec::with_capacity(client_cert_pem.len() + client_key_pem.len() + 1);
-        identity_pem.extend_from_slice(client_cert_pem);
-        identity_pem.push(b'\n');
-        identity_pem.extend_from_slice(client_key_pem);
-        let identity = reqwest::Identity::from_pem(&identity_pem)
-            .map_err(|_| SignerError::Backend("daemon mTLS identity PEM is invalid".to_string()))?;
-        let roots = reqwest::Certificate::from_pem_bundle(daemon_root_pem)
-            .map_err(|_| SignerError::Backend("daemon root PEM is invalid".to_string()))?;
-        if roots.is_empty() {
-            return Err(SignerError::Backend("daemon root PEM is empty".to_string()));
-        }
-        let mut builder = reqwest::blocking::Client::builder()
-            .timeout(timeout)
-            .https_only(true)
-            .tls_built_in_root_certs(false)
-            .identity(identity);
-        for root in roots {
-            builder = builder.add_root_certificate(root);
-        }
+        let pins = pinned_cert_store(&[daemon_peer_bundle_pem.to_vec()])
+            .map_err(|error| SignerError::Backend(format!("daemon exact pin: {error}")))?;
+        let builder = exact_pinned_blocking_client_builder(
+            HttpClientPolicy {
+                connect_timeout: timeout.min(Duration::from_secs(1)),
+                request_timeout: timeout,
+                max_response_bytes: MAX_SIGNER_RESPONSE_BYTES,
+            },
+            load_cert_chain(client_cert_pem)
+                .map_err(|error| SignerError::Backend(format!("daemon client cert: {error}")))?,
+            load_private_key(client_key_pem)
+                .map_err(|error| SignerError::Backend(format!("daemon client key: {error}")))?,
+            pins,
+        )
+        .map_err(|error| SignerError::Backend(format!("daemon mTLS: {error}")))?;
         let inner = builder
             .build()
             .map_err(|_| SignerError::Backend("build daemon mTLS client".to_string()))?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             eth_address,
-            inner,
+            inner: Ok(inner),
         })
     }
 
@@ -141,7 +149,11 @@ impl RemoteHsmBackend {
         body: &T,
     ) -> Result<[u8; 65], SignerError> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self.inner.post(&url).json(body).send().map_err(|e| {
+        let inner = self
+            .inner
+            .as_ref()
+            .map_err(|_| SignerError::Backend("daemon HTTP client unavailable".to_string()))?;
+        let resp = inner.post(&url).json(body).send().map_err(|e| {
             SignerError::Backend(format!("daemon transport: {}", transport_class(&e)))
         })?;
         let status = resp.status();
@@ -151,8 +163,9 @@ impl RemoteHsmBackend {
                 status.as_u16()
             )));
         }
-        let parsed: Eip712SignResponse = resp
-            .json()
+        let response_body = read_bounded_blocking(resp, MAX_SIGNER_RESPONSE_BYTES)
+            .map_err(|_| SignerError::Backend("daemon response body".to_string()))?;
+        let parsed: Eip712SignResponse = serde_json::from_slice(&response_body)
             .map_err(|_| SignerError::Backend("daemon response json malformed".to_string()))?;
         // Pin: coordinator MUST verify the daemon signed with the
         // configured public key. A mis-pointed daemon returning the
@@ -344,6 +357,15 @@ impl HsmBackend for RemoteHsmBackend {
             intent_id: format!("{:#x}", attestation.intentId),
             slot_index: attestation.slotIndex.to_string(),
             attested_amount: attestation.attestedAmount.to_string(),
+            evidence_hash: format!("{:#x}", attestation.evidenceHash),
+            observed_at: attestation.observedAt,
+            valid_until: attestation.validUntil,
+            source_chain_id: u64::try_from(attestation.sourceChainId).map_err(|_| {
+                SignerError::Backend("settlement sourceChainId exceeds u64".to_string())
+            })?,
+            source_block_number: attestation.sourceBlockNumber,
+            source_block_hash: format!("{:#x}", attestation.sourceBlockHash),
+            observation_epoch: attestation.observationEpoch,
         };
         self.post_sign("/api/v1/sign/eip712-attestation", &req)
     }
@@ -358,6 +380,15 @@ impl HsmBackend for RemoteHsmBackend {
             leg_index: attestation.legIndex.to_string(),
             asset_id: format!("{:#x}", attestation.assetId),
             delivered_amount: attestation.deliveredAmount.to_string(),
+            evidence_hash: format!("{:#x}", attestation.evidenceHash),
+            observed_at: attestation.observedAt,
+            valid_until: attestation.validUntil,
+            source_chain_id: u64::try_from(attestation.sourceChainId).map_err(|_| {
+                SignerError::Backend("settlement sourceChainId exceeds u64".to_string())
+            })?,
+            source_block_number: attestation.sourceBlockNumber,
+            source_block_hash: format!("{:#x}", attestation.sourceBlockHash),
+            observation_epoch: attestation.observationEpoch,
         };
         self.post_sign("/api/v1/sign/eip712-redemption-delivery", &req)
     }
@@ -372,6 +403,15 @@ impl HsmBackend for RemoteHsmBackend {
             leg_index: attestation.legIndex.to_string(),
             asset_id: format!("{:#x}", attestation.assetId),
             refunded_amount: attestation.refundedAmount.to_string(),
+            evidence_hash: format!("{:#x}", attestation.evidenceHash),
+            observed_at: attestation.observedAt,
+            valid_until: attestation.validUntil,
+            source_chain_id: u64::try_from(attestation.sourceChainId).map_err(|_| {
+                SignerError::Backend("settlement sourceChainId exceeds u64".to_string())
+            })?,
+            source_block_number: attestation.sourceBlockNumber,
+            source_block_hash: format!("{:#x}", attestation.sourceBlockHash),
+            observation_epoch: attestation.observationEpoch,
         };
         self.post_sign("/api/v1/sign/eip712-refund", &req)
     }
@@ -387,6 +427,15 @@ impl HsmBackend for RemoteHsmBackend {
             asset_id: format!("{:#x}", attestation.assetId),
             delivered_usdt: attestation.deliveredUsdt.to_string(),
             refunded_native: attestation.refundedNative.to_string(),
+            evidence_hash: format!("{:#x}", attestation.evidenceHash),
+            observed_at: attestation.observedAt,
+            valid_until: attestation.validUntil,
+            source_chain_id: u64::try_from(attestation.sourceChainId).map_err(|_| {
+                SignerError::Backend("settlement sourceChainId exceeds u64".to_string())
+            })?,
+            source_block_number: attestation.sourceBlockNumber,
+            source_block_hash: format!("{:#x}", attestation.sourceBlockHash),
+            observation_epoch: attestation.observationEpoch,
         };
         self.post_sign("/api/v1/sign/eip712-streamed-settlement", &req)
     }
@@ -472,6 +521,7 @@ mod tests {
     use alloy_primitives::U256;
     use xindex_shared::eip712::{
         attestation, attestation_oracle_domain, redemption_attestation, refund_attestation,
+        settlement_context,
     };
 
     fn signer_addr() -> Address {
@@ -480,6 +530,18 @@ mod tests {
 
     fn domain() -> Eip712Domain {
         attestation_oracle_domain(31337, Address::repeat_byte(0xab))
+    }
+
+    fn test_context() -> xindex_shared::eip712::SettlementContext {
+        settlement_context(
+            B256::repeat_byte(0x88),
+            1_800_000_000,
+            1_800_000_300,
+            U256::from(31_337u64),
+            20_000_000,
+            B256::repeat_byte(0x99),
+            0,
+        )
     }
 
     /// 65-byte deterministic test signature (NOT a real ECDSA sig —
@@ -499,6 +561,7 @@ mod tests {
             B256::repeat_byte(0x11),
             U256::from(0u8),
             U256::from(1_000_000u32),
+            test_context(),
         );
 
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -545,7 +608,7 @@ mod tests {
             .mount(&server)
             .await;
         let url = server.uri();
-        let a = attestation(B256::ZERO, U256::ZERO, U256::ZERO);
+        let a = attestation(B256::ZERO, U256::ZERO, U256::ZERO, test_context());
         let err = tokio::task::spawn_blocking(move || {
             RemoteHsmBackend::new(url, signer_addr()).sign_attestation_msg(&domain(), &a)
         })
@@ -573,6 +636,7 @@ mod tests {
             U256::ZERO,
             B256::repeat_byte(0xa1),
             U256::from(1u8),
+            test_context(),
         );
         let err = tokio::task::spawn_blocking(move || {
             RemoteHsmBackend::new(url, signer_addr()).sign_redemption_attestation_msg(&domain(), &r)
@@ -608,7 +672,7 @@ mod tests {
             .mount(&server)
             .await;
         let url = server.uri();
-        let r = refund_attestation(red, U256::ZERO, asset, amt);
+        let r = refund_attestation(red, U256::ZERO, asset, amt, test_context());
         let sig = tokio::task::spawn_blocking(move || {
             RemoteHsmBackend::new(url, signer_addr()).sign_refund_attestation_msg(&domain(), &r)
         })
@@ -640,7 +704,8 @@ mod tests {
         let ric = xindex_shared::eip712::redemption_intent_certificate(
             B256::repeat_byte(0xab),
             U256::from(1u8),
-            B256::repeat_byte(0xa1),
+            ChainId::Btc.asset_id_hash(),
+            ChainId::Btc.native_chain_id_hash(),
             U256::from(100_000_000u64),
             8,
             B256::repeat_byte(0xcd),

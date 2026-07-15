@@ -15,7 +15,7 @@ workspace = true
 # not just tests). The workspace base enables no alloy-primitives features,
 # so the recovery API must be turned on here explicitly — it was previously
 # available to `intent` only via the daemon's transitive feature unification.
-alloy-primitives = { workspace = true, features = ["k256"] }
+alloy-primitives = { workspace = true, features = ["k256", "serde"] }
 alloy-sol-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true

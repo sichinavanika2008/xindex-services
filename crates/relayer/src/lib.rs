@@ -14,6 +14,7 @@
 
 pub mod hint_builder;
 pub mod price_collector;
+pub mod redemption_finalizer;
 pub mod redemption_store;
 pub mod registry_collector;
 pub mod registry_hints;
@@ -26,6 +27,10 @@ pub use hint_builder::{
 };
 pub use price_collector::{
     IngestOutcome, PriceCollectError, PriceCollector, PricePayload, ReadyPrice,
+};
+pub use redemption_finalizer::{
+    FinalizationJob, FinalizationJobState, FinalizerStats, RedemptionFinalizerError,
+    SqliteRedemptionFinalizerStore, StuckRedemption,
 };
 pub use redemption_store::{
     InMemoryRedemptionTracker, RedemptionTrackerError, RedemptionTrackerStore,

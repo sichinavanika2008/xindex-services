@@ -64,6 +64,7 @@ struct CertifiedPlaintext {
     memo_hash: String,
     final_destination_hash: String,
     vault_resolved_at: u64,
+    asgard_address: String,
 }
 
 impl CertifiedPlaintext {
@@ -79,8 +80,19 @@ impl CertifiedPlaintext {
             memo_hash: resp.memo_hash.clone(),
             final_destination_hash: resp.final_destination_hash.clone(),
             vault_resolved_at: resp.vault_resolved_at,
+            asgard_address: resp.asgard_address.clone(),
         }
     }
+}
+
+/// Quorum proof paired with the byte-identical raw target supplied by that
+/// same distinct-signer quorum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembledIntentProof {
+    /// Signed certificate proof.
+    pub proof: IntentProof,
+    /// Exact raw Asgard address agreed by the proof's signer group.
+    pub asgard_address: String,
 }
 
 /// Assemble a quorum [`IntentProof`] from observer certifications.
@@ -104,6 +116,17 @@ pub fn assemble_intent_proof(
     responses: &[ObserverCertifyResponse],
     quorum: usize,
 ) -> Result<IntentProof, RelayAssemblyError> {
+    assemble_intent_proof_with_target(responses, quorum).map(|assembled| assembled.proof)
+}
+
+/// Assemble a proof and its exact raw target from one byte-identical quorum.
+///
+/// # Errors
+/// Returns the same fail-closed errors as [`assemble_intent_proof`].
+pub fn assemble_intent_proof_with_target(
+    responses: &[ObserverCertifyResponse],
+    quorum: usize,
+) -> Result<AssembledIntentProof, RelayAssemblyError> {
     if quorum == 0 {
         return Err(RelayAssemblyError::ZeroQuorum);
     }
@@ -130,7 +153,10 @@ pub fn assemble_intent_proof(
     for (plaintext, members) in &groups {
         best_distinct = best_distinct.max(members.len());
         if members.len() >= quorum {
-            return Ok(build_proof(plaintext, members));
+            return Ok(AssembledIntentProof {
+                proof: build_proof(plaintext, members),
+                asgard_address: plaintext.asgard_address.clone(),
+            });
         }
     }
     Err(RelayAssemblyError::QuorumNotReached {
@@ -178,6 +204,7 @@ struct CertifiedCancelPlaintext {
     memo_hash: String,
     final_destination_hash: String,
     vault_resolved_at: u64,
+    asgard_address: String,
 }
 
 impl CertifiedCancelPlaintext {
@@ -194,8 +221,18 @@ impl CertifiedCancelPlaintext {
             memo_hash: resp.memo_hash.clone(),
             final_destination_hash: resp.final_destination_hash.clone(),
             vault_resolved_at: resp.vault_resolved_at,
+            asgard_address: resp.asgard_address.clone(),
         }
     }
+}
+
+/// Acquire-cancel quorum proof paired with its byte-identical raw target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembledAcquireCancelProof {
+    /// Signed certificate proof.
+    pub proof: AcquireCancelProof,
+    /// Exact raw Asgard address agreed by the proof's signer group.
+    pub asgard_address: String,
 }
 
 /// Assemble a quorum [`AcquireCancelProof`] from observer ACC
@@ -213,6 +250,17 @@ pub fn assemble_acquire_cancel_proof(
     responses: &[ObserverCertifyAccResponse],
     quorum: usize,
 ) -> Result<AcquireCancelProof, RelayAssemblyError> {
+    assemble_acquire_cancel_proof_with_target(responses, quorum).map(|assembled| assembled.proof)
+}
+
+/// Assemble an acquire-cancel proof and exact raw target from one quorum.
+///
+/// # Errors
+/// Returns the same fail-closed errors as [`assemble_acquire_cancel_proof`].
+pub fn assemble_acquire_cancel_proof_with_target(
+    responses: &[ObserverCertifyAccResponse],
+    quorum: usize,
+) -> Result<AssembledAcquireCancelProof, RelayAssemblyError> {
     if quorum == 0 {
         return Err(RelayAssemblyError::ZeroQuorum);
     }
@@ -236,7 +284,10 @@ pub fn assemble_acquire_cancel_proof(
     for (plaintext, members) in &groups {
         best_distinct = best_distinct.max(members.len());
         if members.len() >= quorum {
-            return Ok(build_cancel_proof(plaintext, members));
+            return Ok(AssembledAcquireCancelProof {
+                proof: build_cancel_proof(plaintext, members),
+                asgard_address: plaintext.asgard_address.clone(),
+            });
         }
     }
     Err(RelayAssemblyError::QuorumNotReached {
@@ -289,6 +340,17 @@ mod tests {
         }
     }
 
+    fn resp_with_raw(
+        signer: u8,
+        sig: u8,
+        asgard_hash: &str,
+        asgard_address: &str,
+    ) -> ObserverCertifyResponse {
+        let mut response = resp(signer, sig, asgard_hash);
+        response.asgard_address = asgard_address.to_string();
+        response
+    }
+
     const GOOD: &str = "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
     const POISON: &str = "0x6666666666666666666666666666666666666666666666666666666666666666";
 
@@ -311,6 +373,27 @@ mod tests {
         let responses = vec![resp(1, 0xa1, GOOD), resp(2, 0xa2, GOOD)];
         let proof = assemble_intent_proof(&responses, 2).expect("must assemble");
         assert_eq!(proof.signatures.len(), 2);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn same_signed_hash_with_conflicting_raw_targets_never_reaches_quorum_in_any_order() {
+        let honest = resp_with_raw(1, 0xa1, GOOD, "bc1qcanonical");
+        let malicious = resp_with_raw(2, 0xa2, GOOD, "BC1QNONCANONICAL");
+        for responses in [
+            vec![honest.clone(), malicious.clone()],
+            vec![malicious, honest],
+        ] {
+            let error = assemble_intent_proof(&responses, 2).expect_err("raw split must reject");
+            assert_eq!(
+                error,
+                RelayAssemblyError::QuorumNotReached {
+                    quorum: 2,
+                    best_distinct: 1,
+                    groups: 2,
+                }
+            );
+        }
     }
 
     #[test]
@@ -425,6 +508,17 @@ mod tests {
         }
     }
 
+    fn acc_resp_with_raw(
+        signer: u8,
+        sig: u8,
+        asgard_hash: &str,
+        asgard_address: &str,
+    ) -> ObserverCertifyAccResponse {
+        let mut response = acc_resp(signer, sig, asgard_hash);
+        response.asgard_address = asgard_address.to_string();
+        response
+    }
+
     /// CTD-1 Slice C tail: the ACC assembler applies the same grouping /
     /// dedup / quorum discipline as the RIC assembler.
     #[test]
@@ -437,6 +531,25 @@ mod tests {
         assert_eq!(proof.intent_id, format!("0x{}", "1d".repeat(32)));
         assert_eq!(proof.slot_index, "1");
         assert_eq!(proof.immediate_target_hash, GOOD);
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "test code")]
+    fn acc_same_signed_hash_with_conflicting_raw_targets_rejects() {
+        let responses = vec![
+            acc_resp_with_raw(1, 0xa1, GOOD, "bc1qcanonical"),
+            acc_resp_with_raw(2, 0xa2, GOOD, "bc1qother"),
+        ];
+        let error =
+            assemble_acquire_cancel_proof(&responses, 2).expect_err("raw split must reject");
+        assert_eq!(
+            error,
+            RelayAssemblyError::QuorumNotReached {
+                quorum: 2,
+                best_distinct: 1,
+                groups: 2,
+            }
+        );
     }
 
     /// A poisoned-target minority lands in its own ACC plaintext group

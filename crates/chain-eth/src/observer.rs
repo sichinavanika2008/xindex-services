@@ -24,6 +24,8 @@
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use bitcoin::Network;
+use std::time::Duration;
+use xindex_ops::network::{async_client, read_bounded_async, BlockingWorkPool, HttpClientPolicy};
 use xindex_shared::chain_registry::{ChainId, CustodyFamily};
 use xindex_shared::eip712::{
     acquire_cancel_certificate, attestation_oracle_domain, redemption_intent_certificate,
@@ -283,26 +285,35 @@ impl std::fmt::Debug for HttpHaltSource {
 
 impl HttpHaltSource {
     /// Halt source over `url` (HTTP JSON-RPC) for the guard contract.
-    #[must_use]
-    pub fn new(url: String, guard: Address) -> Self {
-        Self {
+    ///
+    /// # Errors
+    /// Static bounded-client construction failure.
+    pub fn new(url: String, guard: Address) -> Result<Self, String> {
+        Self::build(url, guard, "latest")
+    }
+
+    fn build(url: String, guard: Address, block_tag: &'static str) -> Result<Self, String> {
+        let client = async_client(HttpClientPolicy {
+            connect_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(10),
+            max_response_bytes: MAX_HALT_BODY,
+        })
+        .map_err(|error| format!("halt HTTP client: {error}"))?;
+        Ok(Self {
             url,
             guard,
-            block_tag: "latest",
-            client: reqwest::Client::new(),
-        }
+            block_tag,
+            client,
+        })
     }
 
     /// Production form: evaluate the guard at the execution client's
     /// consensus-finalized tag, matching finalized event ingestion.
-    #[must_use]
-    pub fn finalized(url: String, guard: Address) -> Self {
-        Self {
-            url,
-            guard,
-            block_tag: "finalized",
-            client: reqwest::Client::new(),
-        }
+    ///
+    /// # Errors
+    /// Static bounded-client construction failure.
+    pub fn finalized(url: String, guard: Address) -> Result<Self, String> {
+        Self::build(url, guard, "finalized")
     }
 }
 
@@ -332,22 +343,9 @@ impl HaltSource for HttpHaltSource {
         if !status.is_success() {
             return Err(format!("halt eth_call http {}", status.as_u16()));
         }
-        if resp
-            .content_length()
-            .is_some_and(|length| length > MAX_HALT_BODY as u64)
-        {
-            return Err("halt eth_call response exceeds 64 KiB".to_string());
-        }
-        let mut bytes = Vec::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
-            let chunk =
-                chunk.map_err(|e| format!("halt eth_call body: {}", transport_class(&e)))?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_HALT_BODY {
-                return Err("halt eth_call response exceeds 64 KiB".to_string());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = read_bounded_async(resp, MAX_HALT_BODY)
+            .await
+            .map_err(|error| format!("halt eth_call body: {error}"))?;
         let v: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|_| "halt eth_call body is malformed json".to_string())?;
         let result = v
@@ -543,6 +541,7 @@ pub struct Observer<L, S, G, A = xindex_chain_thor::AsgardAgreement> {
     cancels: InMemoryCancelSource,
     signer: std::sync::Arc<S>,
     halt: G,
+    blocking_work: BlockingWorkPool,
 }
 
 impl<L, S, G, A> Observer<L, S, G, A>
@@ -565,6 +564,7 @@ where
             cancels: InMemoryCancelSource::new(),
             signer: std::sync::Arc::new(signer),
             halt,
+            blocking_work: BlockingWorkPool::default(),
         }
     }
 
@@ -655,6 +655,7 @@ where
             redemption_id,
             U256::from(leg_index),
             self.config.chain.asset_id_hash(),
+            self.config.chain.native_chain_id_hash(),
             facts.amount,
             self.config.chain.decimals(),
             immediate_target_hash,
@@ -669,9 +670,11 @@ where
         // works on both multi-thread and current-thread (test) runtimes.
         let chain = self.config.chain;
         let signer = std::sync::Arc::clone(&self.signer);
-        let sig = tokio::task::spawn_blocking(move || signer.sign_ric(chain, &ric, &domain))
+        let sig = self
+            .blocking_work
+            .run(move || signer.sign_ric(chain, &ric, &domain))
             .await
-            .map_err(|e| SignerError::Backend(format!("sign_ric task: {e}")))??;
+            .map_err(|error| SignerError::Backend(format!("sign_ric worker: {error}")))??;
 
         Ok(ObserverCertifyResponse {
             chain_id: self.config.chain,
@@ -775,6 +778,7 @@ where
             observed.facts.intent_id,
             U256::from(observed.facts.slot_index),
             self.config.chain.asset_id_hash(),
+            self.config.chain.native_chain_id_hash(),
             amount,
             self.config.chain.decimals(),
             immediate_target_hash,
@@ -786,9 +790,11 @@ where
         // See certify_ric: run the reqwest::blocking signer off the async worker.
         let chain = self.config.chain;
         let signer = std::sync::Arc::clone(&self.signer);
-        let sig = tokio::task::spawn_blocking(move || signer.sign_acc(chain, &acc, &domain))
+        let sig = self
+            .blocking_work
+            .run(move || signer.sign_acc(chain, &acc, &domain))
             .await
-            .map_err(|e| SignerError::Backend(format!("sign_acc task: {e}")))??;
+            .map_err(|error| SignerError::Backend(format!("sign_acc worker: {error}")))??;
 
         Ok(ObserverCertifyAccResponse {
             chain_id: self.config.chain,
@@ -1023,12 +1029,12 @@ mod tests {
     }
 
     #[expect(clippy::expect_used, reason = "test code")]
-    fn agreement(servers: &[&MockServer]) -> AsgardAgreement {
+    fn agreement(servers: [&MockServer; 3]) -> AsgardAgreement {
         let clients = servers
-            .iter()
+            .into_iter()
             .map(|s| ThorClient::with_base_url(s.uri()).expect("client"))
             .collect();
-        AsgardAgreement::new(clients).expect("two sources")
+        AsgardAgreement::new(clients).expect("three sources")
     }
 
     fn recovery() -> Address {
@@ -1078,17 +1084,18 @@ mod tests {
         }
     }
 
-    /// Happy path: two agreeing sources, valid leg facts → a certificate
+    /// Happy path: three agreeing sources, valid leg facts → a certificate
     /// whose signature recovers to the observer's Set-B address over the
     /// independently-rebuilt RIC digest. This is the end-to-end teeth.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
-    async fn certifies_with_two_agreeing_sources() {
+    async fn certifies_with_three_agreeing_sources() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1118,6 +1125,7 @@ mod tests {
             redemptionId: B256::repeat_byte(0xab),
             legIndex: U256::ZERO,
             assetId: ChainId::Btc.asset_id_hash(),
+            nativeChainId: ChainId::Btc.native_chain_id_hash(),
             amount: U256::from(50_000_000u64),
             amountDecimals: 8,
             immediateTargetHash: expect_target,
@@ -1135,16 +1143,17 @@ mod tests {
         assert_eq!(recovered, signer().signer_address());
     }
 
-    /// Refinement 1: a disagreement between the operator's two sources
-    /// is a hard refusal — the observer never certifies on a split.
+    /// Refinement 1: a disagreement among the operator's three sources is a
+    /// hard refusal — the observer never certifies on a split.
     #[tokio::test]
     #[expect(clippy::expect_used, reason = "test code")]
     async fn source_disagreement_refuses_to_certify() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1165,9 +1174,10 @@ mod tests {
     async fn halted_source_refuses_to_certify() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, true).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1187,9 +1197,10 @@ mod tests {
     async fn missing_event_is_not_found() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1209,9 +1220,10 @@ mod tests {
     async fn wrong_chain_refused() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1233,11 +1245,12 @@ mod tests {
     async fn solana_always_refused() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let mut cfg = config();
         cfg.chain = ChainId::Sol;
         let observer = Observer::new(
             cfg,
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1259,9 +1272,10 @@ mod tests {
     async fn stale_stamp_refused() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1283,11 +1297,12 @@ mod tests {
     async fn zero_amount_event_invalid() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let mut f = facts();
         f.amount = U256::ZERO;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(f),
                 observed_at: NOW,
@@ -1308,9 +1323,10 @@ mod tests {
     async fn halted_guard_refuses_certification() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1332,9 +1348,10 @@ mod tests {
     async fn halt_source_failure_fails_closed() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1357,12 +1374,13 @@ mod tests {
     async fn large_leg_waits_out_fraud_window() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let mut cfg = config();
         cfg.large_spend_threshold = Some(U256::from(10_000_000u64));
         let observed_at = NOW - 100;
         let observer = Observer::new(
             cfg,
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at,
@@ -1391,11 +1409,12 @@ mod tests {
     async fn large_leg_certifies_after_fraud_window() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let mut cfg = config();
         cfg.large_spend_threshold = Some(U256::from(10_000_000u64));
         let observer = Observer::new(
             cfg,
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW - 1_801,
@@ -1419,11 +1438,12 @@ mod tests {
     async fn small_leg_skips_fraud_window() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let mut cfg = config();
         cfg.large_spend_threshold = Some(U256::from(50_000_000u64));
         let observer = Observer::new(
             cfg,
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: Some(facts()),
                 observed_at: NOW,
@@ -1489,9 +1509,10 @@ mod tests {
     async fn acc_certifies_and_signature_recovers() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1523,6 +1544,7 @@ mod tests {
             intentId: INTENT_ID,
             slotIndex: U256::from(1u64),
             assetId: ChainId::Btc.asset_id_hash(),
+            nativeChainId: ChainId::Btc.native_chain_id_hash(),
             amount: U256::from(50_000_000u64),
             amountDecimals: 8,
             immediateTargetHash: expect_target,
@@ -1545,9 +1567,10 @@ mod tests {
     async fn acc_unseen_cancel_is_not_found() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1570,9 +1593,10 @@ mod tests {
     async fn acc_memo_steered_destination_rejected() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1609,9 +1633,10 @@ mod tests {
     async fn rust001_affiliate_skim_memo_rejected() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1671,9 +1696,10 @@ mod tests {
     async fn acc_memo_wrong_asset_rejected() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1697,11 +1723,12 @@ mod tests {
     async fn acc_disabled_without_recovery_dest() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let mut cfg = config();
         cfg.cancel_recovery_dest = None;
         let observer = Observer::new(
             cfg,
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1722,9 +1749,10 @@ mod tests {
     async fn acc_zero_amount_rejected() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1750,11 +1778,12 @@ mod tests {
     async fn acc_large_swap_back_waits_out_fraud_window() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let mut cfg = config();
         cfg.large_spend_threshold = Some(U256::from(10_000_000u64));
         let observer = Observer::new(
             cfg,
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,
@@ -1792,9 +1821,10 @@ mod tests {
     async fn acc_halted_guard_refuses() {
         let a = btc_source(ASGARD_BTC, false).await;
         let b = btc_source(ASGARD_BTC, false).await;
+        let c = btc_source(ASGARD_BTC, false).await;
         let observer = Observer::new(
             config(),
-            agreement(&[&a, &b]),
+            agreement([&a, &b, &c]),
             FakeLegs {
                 facts: None,
                 observed_at: NOW,

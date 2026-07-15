@@ -6,10 +6,11 @@
 //! emits a deterministic signature vector only when one byte-identical payload
 //! reaches quorum.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use alloy_primitives::{Address, PrimitiveSignature, B256, U256};
 use alloy_sol_types::Eip712Domain;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use xindex_shared::eip712::{
     inbound_state, inbound_state_signing_hash, quote_authorization,
@@ -18,7 +19,7 @@ use xindex_shared::eip712::{
 use xindex_shared::registry_wire::{SignedInboundStateMessage, SignedQuoteAuthorizationMessage};
 
 /// Exact inbound plaintext accepted by `attestInbound`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InboundPayload {
     pub vault: Address,
     pub router: Address,
@@ -30,7 +31,7 @@ pub struct InboundPayload {
 }
 
 /// Exact quote plaintext consumed by `consumeQuoteAuthorization`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QuotePayload {
     pub adapter: Address,
     pub index_token: Address,
@@ -47,18 +48,45 @@ pub struct QuotePayload {
 }
 
 /// Quorum-ready inbound report.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyInbound {
     pub payload: InboundPayload,
+    #[serde(with = "signature_vec_serde")]
     pub signatures: Vec<[u8; 65]>,
 }
 
 /// Quorum-ready quote authorization. This is returned to the acquiring caller;
 /// it is consumed atomically inside the adapter call rather than posted alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyQuote {
     pub payload: QuotePayload,
+    #[serde(with = "signature_vec_serde")]
     pub signatures: Vec<[u8; 65]>,
+}
+
+mod signature_vec_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(signatures: &[[u8; 65]], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        signatures
+            .iter()
+            .map(|signature| format!("0x{}", alloy_primitives::hex::encode(signature)))
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<[u8; 65]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|raw| super::parse_signature(&raw).map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 /// Result of collecting a valid signature.
@@ -96,6 +124,42 @@ pub enum RegistryCollectError {
     SignerNotAllowed(Address),
     #[error("signer {signer} equivocated for {identity}")]
     Equivocation { signer: Address, identity: String },
+    #[error("invalid collector limits: {0}")]
+    InvalidLimits(&'static str),
+    #[error("{family} collector capacity exceeded for {scope}")]
+    CapacityExceeded {
+        family: &'static str,
+        scope: &'static str,
+    },
+}
+
+/// Hard steady-state limits for incomplete registry rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryCollectorLimits {
+    pub max_active_inbound_payloads: usize,
+    pub max_active_quote_payloads: usize,
+    pub max_rounds_per_signer: usize,
+}
+
+impl Default for RegistryCollectorLimits {
+    fn default() -> Self {
+        Self {
+            max_active_inbound_payloads: 64,
+            max_active_quote_payloads: 256,
+            max_rounds_per_signer: 32,
+        }
+    }
+}
+
+/// Observable active-state counts used by tests and process metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryCollectorStats {
+    pub inbound_payloads: usize,
+    pub inbound_rounds: usize,
+    pub inbound_queued: usize,
+    pub quote_payloads: usize,
+    pub quote_rounds: usize,
+    pub quote_queued: usize,
 }
 
 /// Both registry report-family collectors sharing the exact same on-chain
@@ -105,12 +169,17 @@ pub struct RegistryCollector {
     domain: Eip712Domain,
     allowed_signers: HashSet<Address>,
     threshold: usize,
+    limits: RegistryCollectorLimits,
     inbound_votes: HashMap<InboundPayload, HashMap<Address, [u8; 65]>>,
     inbound_rounds: HashMap<(u64, Address), InboundPayload>,
     inbound_queued: HashSet<InboundPayload>,
+    inbound_expiry: BTreeMap<u64, HashSet<InboundPayload>>,
+    inbound_round_count: HashMap<Address, usize>,
     quote_votes: HashMap<QuotePayload, HashMap<Address, [u8; 65]>>,
     quote_rounds: HashMap<(Address, u64, Address), QuotePayload>,
     quote_queued: HashSet<QuotePayload>,
+    quote_expiry: BTreeMap<u64, HashSet<QuotePayload>>,
+    quote_round_count: HashMap<Address, usize>,
 }
 
 impl RegistryCollector {
@@ -124,6 +193,25 @@ impl RegistryCollector {
         domain: Eip712Domain,
         allowed_signers: impl IntoIterator<Item = Address>,
         threshold: usize,
+    ) -> Result<Self, RegistryCollectError> {
+        Self::with_limits(
+            domain,
+            allowed_signers,
+            threshold,
+            RegistryCollectorLimits::default(),
+        )
+    }
+
+    /// Construct with explicit active-round limits. Intended for focused
+    /// tests and reviewed production profiles.
+    ///
+    /// # Errors
+    /// The same roster errors as [`Self::new`], plus zero limits.
+    pub fn with_limits(
+        domain: Eip712Domain,
+        allowed_signers: impl IntoIterator<Item = Address>,
+        threshold: usize,
+        limits: RegistryCollectorLimits,
     ) -> Result<Self, RegistryCollectError> {
         let allowed_signers: HashSet<Address> = allowed_signers.into_iter().collect();
         if threshold == 0 || threshold > allowed_signers.len() {
@@ -139,17 +227,43 @@ impl RegistryCollector {
                 majority,
             });
         }
+        if limits.max_active_inbound_payloads == 0
+            || limits.max_active_quote_payloads == 0
+            || limits.max_rounds_per_signer == 0
+        {
+            return Err(RegistryCollectError::InvalidLimits(
+                "all active-round limits must be non-zero",
+            ));
+        }
         Ok(Self {
             domain,
             allowed_signers,
             threshold,
+            limits,
             inbound_votes: HashMap::new(),
             inbound_rounds: HashMap::new(),
             inbound_queued: HashSet::new(),
+            inbound_expiry: BTreeMap::new(),
+            inbound_round_count: HashMap::new(),
             quote_votes: HashMap::new(),
             quote_rounds: HashMap::new(),
             quote_queued: HashSet::new(),
+            quote_expiry: BTreeMap::new(),
+            quote_round_count: HashMap::new(),
         })
+    }
+
+    /// Current bounded state counts.
+    #[must_use]
+    pub fn stats(&self) -> RegistryCollectorStats {
+        RegistryCollectorStats {
+            inbound_payloads: self.inbound_votes.len(),
+            inbound_rounds: self.inbound_rounds.len(),
+            inbound_queued: self.inbound_queued.len(),
+            quote_payloads: self.quote_votes.len(),
+            quote_rounds: self.quote_rounds.len(),
+            quote_queued: self.quote_queued.len(),
+        }
     }
 
     /// Recover-verify and collect one inbound signature.
@@ -162,6 +276,7 @@ impl RegistryCollector {
         message: &SignedInboundStateMessage,
         now: u64,
     ) -> Result<CollectOutcome<ReadyInbound>, RegistryCollectError> {
+        self.retire_expired_rounds(now);
         let payload = parse_inbound(message)?;
         if payload.observed_at == 0
             || payload.observed_at > now
@@ -182,7 +297,8 @@ impl RegistryCollector {
             payload.source_hash,
         );
         let digest = inbound_state_signing_hash(&typed, &self.domain);
-        let signer = self.recover(&message.signer_address, &message.signature, digest)?;
+        let (signer, signature) =
+            self.recover(&message.signer_address, &message.signature, digest)?;
         let round = (payload.sequence, signer);
         if let Some(previous) = self.inbound_rounds.get(&round) {
             if previous != &payload {
@@ -192,18 +308,46 @@ impl RegistryCollector {
                 });
             }
         } else {
+            if self
+                .inbound_round_count
+                .get(&signer)
+                .copied()
+                .unwrap_or_default()
+                >= self.limits.max_rounds_per_signer
+            {
+                return Err(RegistryCollectError::CapacityExceeded {
+                    family: "inbound",
+                    scope: "signer",
+                });
+            }
+            if !self.inbound_votes.contains_key(&payload)
+                && self.inbound_votes.len() >= self.limits.max_active_inbound_payloads
+            {
+                return Err(RegistryCollectError::CapacityExceeded {
+                    family: "inbound",
+                    scope: "global",
+                });
+            }
             self.inbound_rounds.insert(round, payload);
+            *self.inbound_round_count.entry(signer).or_default() += 1;
         }
-        let signature = parse_signature(&message.signature)?;
+        if !self.inbound_votes.contains_key(&payload) {
+            self.inbound_expiry
+                .entry(payload.valid_until)
+                .or_default()
+                .insert(payload);
+        }
         let votes = self.inbound_votes.entry(payload).or_default();
-        if votes.insert(signer, signature).is_some() {
-            return Ok(CollectOutcome::Duplicate { count: votes.len() });
-        }
-        if votes.len() >= self.threshold && self.inbound_queued.insert(payload) {
+        let duplicate = votes.insert(signer, signature).is_some();
+        if votes.len() >= self.threshold {
+            self.inbound_queued.insert(payload);
             return Ok(CollectOutcome::Ready(ReadyInbound {
                 payload,
                 signatures: ordered_signatures(votes),
             }));
+        }
+        if duplicate {
+            return Ok(CollectOutcome::Duplicate { count: votes.len() });
         }
         Ok(CollectOutcome::Accepted { count: votes.len() })
     }
@@ -218,6 +362,7 @@ impl RegistryCollector {
         message: &SignedQuoteAuthorizationMessage,
         now: u64,
     ) -> Result<CollectOutcome<ReadyQuote>, RegistryCollectError> {
+        self.retire_expired_rounds(now);
         let payload = parse_quote(message)?;
         if payload.dispatch_deadline <= now {
             return Err(RegistryCollectError::ExpiredQuote);
@@ -237,7 +382,8 @@ impl RegistryCollector {
             payload.quote_hash,
         );
         let digest = quote_authorization_signing_hash(&typed, &self.domain);
-        let signer = self.recover(&message.signer_address, &message.signature, digest)?;
+        let (signer, signature) =
+            self.recover(&message.signer_address, &message.signature, digest)?;
         let round = (payload.originator, payload.quote_nonce, signer);
         if let Some(previous) = self.quote_rounds.get(&round) {
             if previous != &payload {
@@ -250,18 +396,46 @@ impl RegistryCollector {
                 });
             }
         } else {
+            if self
+                .quote_round_count
+                .get(&signer)
+                .copied()
+                .unwrap_or_default()
+                >= self.limits.max_rounds_per_signer
+            {
+                return Err(RegistryCollectError::CapacityExceeded {
+                    family: "quote",
+                    scope: "signer",
+                });
+            }
+            if !self.quote_votes.contains_key(&payload)
+                && self.quote_votes.len() >= self.limits.max_active_quote_payloads
+            {
+                return Err(RegistryCollectError::CapacityExceeded {
+                    family: "quote",
+                    scope: "global",
+                });
+            }
             self.quote_rounds.insert(round, payload);
+            *self.quote_round_count.entry(signer).or_default() += 1;
         }
-        let signature = parse_signature(&message.signature)?;
+        if !self.quote_votes.contains_key(&payload) {
+            self.quote_expiry
+                .entry(payload.dispatch_deadline)
+                .or_default()
+                .insert(payload);
+        }
         let votes = self.quote_votes.entry(payload).or_default();
-        if votes.insert(signer, signature).is_some() {
-            return Ok(CollectOutcome::Duplicate { count: votes.len() });
-        }
-        if votes.len() >= self.threshold && self.quote_queued.insert(payload) {
+        let duplicate = votes.insert(signer, signature).is_some();
+        if votes.len() >= self.threshold {
+            self.quote_queued.insert(payload);
             return Ok(CollectOutcome::Ready(ReadyQuote {
                 payload,
                 signatures: ordered_signatures(votes),
             }));
+        }
+        if duplicate {
+            return Ok(CollectOutcome::Duplicate { count: votes.len() });
         }
         Ok(CollectOutcome::Accepted { count: votes.len() })
     }
@@ -271,7 +445,7 @@ impl RegistryCollector {
         claimed_raw: &str,
         signature_raw: &str,
         digest: B256,
-    ) -> Result<Address, RegistryCollectError> {
+    ) -> Result<(Address, [u8; 65]), RegistryCollectError> {
         let claimed = parse_address("signerAddress", claimed_raw)?;
         let signature = parse_signature(signature_raw)?;
         let parsed = PrimitiveSignature::try_from(signature.as_slice())
@@ -290,7 +464,71 @@ impl RegistryCollector {
         if !self.allowed_signers.contains(&recovered) {
             return Err(RegistryCollectError::SignerNotAllowed(recovered));
         }
-        Ok(recovered)
+        Ok((recovered, signature))
+    }
+
+    fn retire_expired_rounds(&mut self, now: u64) {
+        let inbound_expiries: Vec<_> = self
+            .inbound_expiry
+            .range(..=now)
+            .map(|(expiry, _)| *expiry)
+            .collect();
+        for expiry in inbound_expiries {
+            let Some(payloads) = self.inbound_expiry.remove(&expiry) else {
+                continue;
+            };
+            for payload in payloads {
+                let signers: Vec<_> = self
+                    .inbound_rounds
+                    .iter()
+                    .filter_map(|((_, signer), candidate)| {
+                        (candidate == &payload).then_some(*signer)
+                    })
+                    .collect();
+                for signer in signers {
+                    self.inbound_rounds.remove(&(payload.sequence, signer));
+                    decrement_count(&mut self.inbound_round_count, signer);
+                }
+                self.inbound_votes.remove(&payload);
+                self.inbound_queued.remove(&payload);
+            }
+        }
+
+        let quote_expiries: Vec<_> = self
+            .quote_expiry
+            .range(..=now)
+            .map(|(expiry, _)| *expiry)
+            .collect();
+        for expiry in quote_expiries {
+            let Some(payloads) = self.quote_expiry.remove(&expiry) else {
+                continue;
+            };
+            for payload in payloads {
+                let signers: Vec<_> = self
+                    .quote_rounds
+                    .iter()
+                    .filter_map(|((_, _, signer), candidate)| {
+                        (candidate == &payload).then_some(*signer)
+                    })
+                    .collect();
+                for signer in signers {
+                    self.quote_rounds
+                        .remove(&(payload.originator, payload.quote_nonce, signer));
+                    decrement_count(&mut self.quote_round_count, signer);
+                }
+                self.quote_votes.remove(&payload);
+                self.quote_queued.remove(&payload);
+            }
+        }
+    }
+}
+
+fn decrement_count(counts: &mut HashMap<Address, usize>, signer: Address) {
+    if let Some(count) = counts.get_mut(&signer) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&signer);
+        }
     }
 }
 
@@ -436,8 +674,93 @@ fn ordered_signatures(votes: &HashMap<Address, [u8; 65]>) -> Vec<[u8; 65]> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test fixtures")]
+
     use super::*;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::{Signer, SignerSync};
     use xindex_shared::eip712::thorchain_registry_domain;
+
+    fn signer(seed: u8) -> PrivateKeySigner {
+        format!("0x{}", format!("{seed:02x}").repeat(32))
+            .parse()
+            .expect("test signer")
+    }
+
+    fn domain() -> Eip712Domain {
+        thorchain_registry_domain(1, Address::repeat_byte(0xcc))
+    }
+
+    fn signed_inbound(
+        signer: &PrivateKeySigner,
+        sequence: u64,
+        observed_at: u64,
+        valid_until: u64,
+    ) -> SignedInboundStateMessage {
+        let source_hash = B256::from(U256::from(sequence));
+        let typed = inbound_state(
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+            0,
+            observed_at,
+            valid_until,
+            sequence,
+            source_hash,
+        );
+        let digest = inbound_state_signing_hash(&typed, &domain());
+        let signature = signer.sign_hash_sync(&digest).expect("sign").as_bytes();
+        SignedInboundStateMessage {
+            vault: format!("{:#x}", Address::repeat_byte(2)),
+            router: format!("{:#x}", Address::repeat_byte(3)),
+            pause_flags: 0,
+            observed_at,
+            valid_until,
+            sequence,
+            source_hash: format!("{source_hash:#x}"),
+            signer_address: format!("{:#x}", signer.address()),
+            signature: format!("0x{}", alloy_primitives::hex::encode(signature)),
+        }
+    }
+
+    fn signed_quote(
+        signer: &PrivateKeySigner,
+        quote_nonce: u64,
+        dispatch_deadline: u64,
+    ) -> SignedQuoteAuthorizationMessage {
+        let quote_hash = B256::from(U256::from(quote_nonce));
+        let typed = quote_authorization(
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+            Address::repeat_byte(4),
+            Address::repeat_byte(5),
+            Address::repeat_byte(6),
+            U256::from(7u8),
+            B256::repeat_byte(8),
+            B256::repeat_byte(9),
+            B256::repeat_byte(10),
+            dispatch_deadline,
+            quote_nonce,
+            quote_hash,
+        );
+        let digest = quote_authorization_signing_hash(&typed, &domain());
+        let signature = signer.sign_hash_sync(&digest).expect("sign").as_bytes();
+        SignedQuoteAuthorizationMessage {
+            adapter: format!("{:#x}", Address::repeat_byte(2)),
+            index_token: format!("{:#x}", Address::repeat_byte(3)),
+            originator: format!("{:#x}", Address::repeat_byte(4)),
+            funding_token: format!("{:#x}", Address::repeat_byte(5)),
+            target_token: format!("{:#x}", Address::repeat_byte(6)),
+            amount_in: "7".to_string(),
+            custody_hash: format!("{:#x}", B256::repeat_byte(8)),
+            inbound_state_hash: format!("{:#x}", B256::repeat_byte(9)),
+            memo_hash: format!("{:#x}", B256::repeat_byte(10)),
+            dispatch_deadline,
+            quote_nonce,
+            quote_hash: format!("{quote_hash:#x}"),
+            signer_address: format!("{:#x}", signer.address()),
+            signature: format!("0x{}", alloy_primitives::hex::encode(signature)),
+        }
+    }
 
     #[test]
     fn collector_requires_strict_majority() {
@@ -473,5 +796,176 @@ mod tests {
             signature: format!("0x{}", "00".repeat(65)),
         };
         assert!(parse_inbound(&message).is_err());
+    }
+
+    #[test]
+    fn expired_generations_release_in_memory_round_identities() {
+        let signer = Address::repeat_byte(1);
+        let domain = thorchain_registry_domain(1, Address::repeat_byte(0xcc));
+        let mut collector = RegistryCollector::new(domain, [signer], 1).expect("collector");
+        let inbound = InboundPayload {
+            vault: Address::repeat_byte(2),
+            router: Address::repeat_byte(3),
+            pause_flags: 0,
+            observed_at: 10,
+            valid_until: 20,
+            sequence: 7,
+            source_hash: B256::repeat_byte(4),
+        };
+        let quote = QuotePayload {
+            adapter: Address::repeat_byte(5),
+            index_token: Address::repeat_byte(6),
+            originator: Address::repeat_byte(7),
+            funding_token: Address::repeat_byte(8),
+            target_token: Address::repeat_byte(9),
+            amount_in: U256::from(10u8),
+            custody_hash: B256::repeat_byte(11),
+            inbound_state_hash: B256::repeat_byte(12),
+            memo_hash: B256::repeat_byte(13),
+            dispatch_deadline: 20,
+            quote_nonce: 1,
+            quote_hash: B256::repeat_byte(14),
+        };
+        collector.inbound_rounds.insert((7, signer), inbound);
+        collector.inbound_votes.insert(inbound, HashMap::new());
+        collector.inbound_queued.insert(inbound);
+        collector
+            .inbound_expiry
+            .entry(20)
+            .or_default()
+            .insert(inbound);
+        collector.inbound_round_count.insert(signer, 1);
+        collector
+            .quote_rounds
+            .insert((quote.originator, 1, signer), quote);
+        collector.quote_votes.insert(quote, HashMap::new());
+        collector.quote_queued.insert(quote);
+        collector.quote_expiry.entry(20).or_default().insert(quote);
+        collector.quote_round_count.insert(signer, 1);
+
+        collector.retire_expired_rounds(20);
+
+        assert!(collector.inbound_rounds.is_empty());
+        assert!(collector.inbound_votes.is_empty());
+        assert!(collector.inbound_queued.is_empty());
+        assert!(collector.inbound_expiry.is_empty());
+        assert!(collector.inbound_round_count.is_empty());
+        assert!(collector.quote_rounds.is_empty());
+        assert!(collector.quote_votes.is_empty());
+        assert!(collector.quote_queued.is_empty());
+        assert!(collector.quote_expiry.is_empty());
+        assert!(collector.quote_round_count.is_empty());
+    }
+
+    #[test]
+    fn ten_thousand_one_vote_rounds_stay_bounded_and_honest_quorum_progresses() {
+        let signers = [signer(1), signer(2), signer(3), signer(4), signer(5)];
+        let limits = RegistryCollectorLimits {
+            max_active_inbound_payloads: 4,
+            max_active_quote_payloads: 4,
+            max_rounds_per_signer: 2,
+        };
+        let mut collector = RegistryCollector::with_limits(
+            domain(),
+            signers.iter().map(Signer::address),
+            3,
+            limits,
+        )
+        .expect("collector");
+
+        for sequence in 1..=10_000 {
+            let result =
+                collector.ingest_inbound(&signed_inbound(&signers[0], sequence, 100, 700), 100);
+            if sequence <= 2 {
+                assert!(matches!(result, Ok(CollectOutcome::Accepted { count: 1 })));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(RegistryCollectError::CapacityExceeded {
+                        family: "inbound",
+                        scope: "signer"
+                    })
+                ));
+            }
+        }
+        let bounded = collector.stats();
+        assert_eq!(bounded.inbound_payloads, 2);
+        assert_eq!(bounded.inbound_rounds, 2);
+
+        let honest = signed_inbound(&signers[1], 20_000, 100, 700);
+        assert!(matches!(
+            collector.ingest_inbound(&honest, 100),
+            Ok(CollectOutcome::Accepted { count: 1 })
+        ));
+        let honest = signed_inbound(&signers[2], 20_000, 100, 700);
+        assert!(matches!(
+            collector.ingest_inbound(&honest, 100),
+            Ok(CollectOutcome::Accepted { count: 2 })
+        ));
+        let honest = signed_inbound(&signers[3], 20_000, 100, 700);
+        assert!(matches!(
+            collector.ingest_inbound(&honest, 100),
+            Ok(CollectOutcome::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn quote_rounds_are_bounded_and_expiry_immediately_releases_capacity() {
+        let signer = signer(1);
+        let limits = RegistryCollectorLimits {
+            max_active_inbound_payloads: 1,
+            max_active_quote_payloads: 2,
+            max_rounds_per_signer: 2,
+        };
+        let mut collector = RegistryCollector::with_limits(domain(), [signer.address()], 1, limits)
+            .expect("collector");
+        assert!(matches!(
+            collector.ingest_quote(&signed_quote(&signer, 1, 110), 100),
+            Ok(CollectOutcome::Ready(_))
+        ));
+        assert!(matches!(
+            collector.ingest_quote(&signed_quote(&signer, 2, 120), 100),
+            Ok(CollectOutcome::Ready(_))
+        ));
+        assert!(matches!(
+            collector.ingest_quote(&signed_quote(&signer, 3, 130), 100),
+            Err(RegistryCollectError::CapacityExceeded {
+                family: "quote",
+                scope: "signer"
+            })
+        ));
+
+        // Exact expiry retires nonce 1 through the expiry index before quota
+        // evaluation, so a fresh round can progress without a full-map leak.
+        assert!(matches!(
+            collector.ingest_quote(&signed_quote(&signer, 3, 130), 110),
+            Ok(CollectOutcome::Ready(_))
+        ));
+        let stats = collector.stats();
+        assert_eq!(stats.quote_payloads, 2);
+        assert_eq!(stats.quote_rounds, 2);
+    }
+
+    #[test]
+    fn ready_quorum_is_repeatable_until_durable_enqueue_succeeds() {
+        let signers = [signer(1), signer(2), signer(3)];
+        let mut collector =
+            RegistryCollector::new(domain(), signers.iter().map(Signer::address), 3)
+                .expect("collector");
+        for signer in &signers[..2] {
+            assert!(matches!(
+                collector.ingest_inbound(&signed_inbound(signer, 1, 100, 200), 100),
+                Ok(CollectOutcome::Accepted { .. })
+            ));
+        }
+        let third = signed_inbound(&signers[2], 1, 100, 200);
+        assert!(matches!(
+            collector.ingest_inbound(&third, 100),
+            Ok(CollectOutcome::Ready(_))
+        ));
+        assert!(matches!(
+            collector.ingest_inbound(&third, 100),
+            Ok(CollectOutcome::Ready(_))
+        ));
     }
 }

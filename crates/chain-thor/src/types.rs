@@ -4,9 +4,10 @@
 //! `serde(default)` lets us tolerate missing or new optional fields
 //! without breaking on every upstream schema change.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Missing upstream safety fields are ambiguous, never affirmative evidence
 /// that trading is available. Default every halt flag to `true` so a schema
@@ -52,6 +53,127 @@ pub struct InboundAddress {
     pub gas_rate_units: Option<String>,
 }
 
+/// One chain/address row in `GET /thorchain/vaults/asgard`.
+///
+/// This endpoint is queried with an explicit historical `height` for
+/// settlement identity checks. Current `/inbound_addresses` rows remain the
+/// source for live halt and routing policy only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultAddress {
+    pub chain: String,
+    pub address: String,
+}
+
+/// Safety-relevant subset of an Asgard vault returned by
+/// `GET /thorchain/vaults/asgard?height=N`.
+///
+/// The load-bearing fields intentionally have no serde defaults. A provider
+/// that omits identity, type, status, or addresses cannot produce settlement
+/// evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AsgardVault {
+    pub pub_key: String,
+    #[serde(rename = "type")]
+    pub vault_type: String,
+    pub status: String,
+    pub status_since: i64,
+    pub addresses: Vec<VaultAddress>,
+    #[serde(default)]
+    pub block_height: Option<i64>,
+}
+
+/// Exact source-height set of active or retiring Asgard addresses for one
+/// native chain. It is immutable evidence for historical sender/destination
+/// identity; it deliberately carries no live halt flags.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalAsgardMembership {
+    pub height: u64,
+    pub chain: String,
+    pub addresses: Vec<String>,
+}
+
+/// Fail-closed errors while deriving historical Asgard membership.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AsgardMembershipError {
+    #[error("THOR transaction is missing finalised_height")]
+    MissingFinalisedHeight,
+    #[error("invalid THOR finalised_height {0}")]
+    InvalidFinalisedHeight(i64),
+    #[error("historical Asgard chain is empty")]
+    EmptyChain,
+    #[error("eligible vault {pub_key} has unexpected type {vault_type}")]
+    UnexpectedVaultType { pub_key: String, vault_type: String },
+    #[error("eligible vault {pub_key} has an empty {chain} address")]
+    EmptyEligibleAddress { pub_key: String, chain: String },
+    #[error("no active or retiring Asgard address for {chain} at height {height}")]
+    NoEligibleAddress { height: u64, chain: String },
+}
+
+impl HistoricalAsgardMembership {
+    /// Derive the canonical, sorted, de-duplicated active/retiring address set
+    /// from the response obtained at exactly `height`.
+    ///
+    /// # Errors
+    /// Rejects zero/negative heights, empty chain names, malformed eligible
+    /// vaults, or a snapshot with no eligible address for the requested chain.
+    pub fn from_vaults(
+        height: u64,
+        chain: &str,
+        vaults: &[AsgardVault],
+    ) -> Result<Self, AsgardMembershipError> {
+        if height == 0 {
+            return Err(AsgardMembershipError::InvalidFinalisedHeight(0));
+        }
+        if chain.is_empty() {
+            return Err(AsgardMembershipError::EmptyChain);
+        }
+        let mut addresses = BTreeSet::new();
+        for vault in vaults
+            .iter()
+            .filter(|vault| matches!(vault.status.as_str(), "ActiveVault" | "RetiringVault"))
+        {
+            if vault.vault_type != "AsgardVault" {
+                return Err(AsgardMembershipError::UnexpectedVaultType {
+                    pub_key: vault.pub_key.clone(),
+                    vault_type: vault.vault_type.clone(),
+                });
+            }
+            for address in vault
+                .addresses
+                .iter()
+                .filter(|address| address.chain == chain)
+            {
+                if address.address.is_empty() {
+                    return Err(AsgardMembershipError::EmptyEligibleAddress {
+                        pub_key: vault.pub_key.clone(),
+                        chain: chain.to_string(),
+                    });
+                }
+                addresses.insert(address.address.clone());
+            }
+        }
+        if addresses.is_empty() {
+            return Err(AsgardMembershipError::NoEligibleAddress {
+                height,
+                chain: chain.to_string(),
+            });
+        }
+        Ok(Self {
+            height,
+            chain: chain.to_string(),
+            addresses: addresses.into_iter().collect(),
+        })
+    }
+
+    /// Whether this exact historical snapshot contains `address`.
+    #[must_use]
+    pub fn contains(&self, address: &str) -> bool {
+        self.addresses
+            .binary_search_by(|candidate| candidate.as_str().cmp(address))
+            .is_ok()
+    }
+}
+
 /// Subset of `GET /thorchain/tx/{hash}` we read for inbound observation.
 ///
 /// Returned when `THORChain`'s Bifrost validators have voted on a deposit
@@ -67,6 +189,23 @@ pub struct TxResponse {
     pub actions: Vec<TxOutAction>,
     #[serde(default)]
     pub finalised_height: Option<i64>,
+}
+
+impl TxResponse {
+    /// Exact `THORChain` height at which historical Asgard membership must be
+    /// queried for this finalized settlement.
+    ///
+    /// # Errors
+    /// Missing, zero, and negative heights are ambiguous and fail closed.
+    pub fn historical_asgard_height(&self) -> Result<u64, AsgardMembershipError> {
+        let height = self
+            .finalised_height
+            .ok_or(AsgardMembershipError::MissingFinalisedHeight)?;
+        u64::try_from(height)
+            .ok()
+            .filter(|height| *height > 0)
+            .ok_or(AsgardMembershipError::InvalidFinalisedHeight(height))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -412,5 +551,97 @@ mod tests {
         assert!(!entry.global_trading_paused);
         assert!(!entry.chain_trading_paused);
         assert!(!entry.chain_lp_actions_paused);
+    }
+
+    #[test]
+    fn historical_membership_uses_only_active_and_retiring_vaults() {
+        let vaults: Vec<AsgardVault> = serde_json::from_value(serde_json::json!([
+            {
+                "pub_key": "thorpub1active",
+                "type": "AsgardVault",
+                "status": "ActiveVault",
+                "status_since": 90,
+                "addresses": [
+                    { "chain": "BTC", "address": "bc1qactive" },
+                    { "chain": "ETH", "address": "0xactive" }
+                ]
+            },
+            {
+                "pub_key": "thorpub1retiring",
+                "type": "AsgardVault",
+                "status": "RetiringVault",
+                "status_since": 95,
+                "addresses": [{ "chain": "BTC", "address": "bc1qretiring" }]
+            },
+            {
+                "pub_key": "thorpub1inactive",
+                "type": "AsgardVault",
+                "status": "InactiveVault",
+                "status_since": 99,
+                "addresses": [{ "chain": "BTC", "address": "bc1qineligible" }]
+            }
+        ]))
+        .expect("vault fixture");
+
+        let membership = HistoricalAsgardMembership::from_vaults(100, "BTC", &vaults)
+            .expect("historical membership");
+        assert_eq!(membership.height, 100);
+        assert_eq!(membership.chain, "BTC");
+        assert_eq!(
+            membership.addresses,
+            vec!["bc1qactive".to_string(), "bc1qretiring".to_string()]
+        );
+        assert!(membership.contains("bc1qactive"));
+        assert!(membership.contains("bc1qretiring"));
+        assert!(!membership.contains("bc1qineligible"));
+    }
+
+    #[test]
+    fn historical_membership_fails_closed_on_missing_height_or_addresses() {
+        let status: TxResponse = serde_json::from_value(serde_json::json!({
+            "observed_tx": {
+                "tx": {
+                    "id": "ABC", "chain": "BTC", "from_address": "from",
+                    "to_address": "to", "coins": [], "memo": ""
+                },
+                "status": "done"
+            },
+            "actions": []
+        }))
+        .expect("status fixture");
+        assert!(matches!(
+            status.historical_asgard_height(),
+            Err(AsgardMembershipError::MissingFinalisedHeight)
+        ));
+
+        let status_zero: TxResponse = serde_json::from_value(serde_json::json!({
+            "observed_tx": {
+                "tx": {
+                    "id": "ABC", "chain": "BTC", "from_address": "from",
+                    "to_address": "to", "coins": [], "memo": ""
+                },
+                "status": "done"
+            },
+            "actions": [],
+            "finalised_height": 0
+        }))
+        .expect("zero-height status fixture");
+        assert!(matches!(
+            status_zero.historical_asgard_height(),
+            Err(AsgardMembershipError::InvalidFinalisedHeight(0))
+        ));
+
+        let vaults: Vec<AsgardVault> = serde_json::from_value(serde_json::json!([{
+            "pub_key": "thorpub1inactive",
+            "type": "AsgardVault",
+            "status": "InactiveVault",
+            "status_since": 99,
+            "addresses": [{ "chain": "BTC", "address": "bc1qineligible" }]
+        }]))
+        .expect("inactive fixture");
+        assert!(matches!(
+            HistoricalAsgardMembership::from_vaults(100, "BTC", &vaults),
+            Err(AsgardMembershipError::NoEligibleAddress { .. })
+        ));
     }
 }

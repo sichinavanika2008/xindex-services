@@ -16,7 +16,9 @@ command -v promtool >/dev/null 2>&1 \
 
 ./scripts/check-abi.sh --solidity-root ..
 ./scripts/check-production-profile.sh
+./scripts/check-msrv.sh
 promtool check rules ops/prometheus/gate3-alerts.yml
+promtool test rules ops/prometheus/gate3-alerts.test.yml
 
 RUSTUP_TOOLCHAIN=1.95.0-aarch64-apple-darwin \
     cargo run --offline --locked -p xindex-ops \
@@ -28,4 +30,4 @@ for evidence_dir in "$@"; do
         --bin xindex-evidence-check -- "$evidence_dir"
 done
 
-echo "Gate-3 static, topology, alert-rule, and evidence checks: OK"
+echo "Gate-3 compiled behavior, MSRV, static, topology, alert-rule, and evidence checks: OK"

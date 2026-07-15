@@ -6,8 +6,22 @@ verdict and reasoning. No silent suppressions.
 
 > **Historical-record note (2026-07-10):** legacy AI-tool names and out-of-tree
 > paths in older entries are provenance only, not active instructions. Use
-> `AGENTS.md`, current source, tests, and the current Turnkey runbook for
-> present work.
+> `AGENTS.md`, current source, tests, and the current BitGo qualification
+> runbook for present work. Turnkey and Cobo references below describe removed
+> historical code.
+
+## Custody provider transition (2026-07-14)
+
+BitGo is the selected future BTC custody provider using native Bitcoin
+self-custody on-chain 2-of-3 multisig (user, offline backup and BitGo keys),
+not MPC. The active Cobo gate/crate/runbooks and the earlier Turnkey surfaces
+are removed and production-profile guards reject reintroduction. This does not
+close custody readiness: no live BitGo account, wallet, key, Testnet4 signature
+or transaction evidence exists; provider transport/orchestration, recovery,
+controlled THORChain devnet rehearsal and independent review remain open. A
+key-free request/policy adapter core now exists, but provider transport,
+durable orchestration and live response handling remain unimplemented and
+unapproved.
 
 Audit log: 2026-05-09 (two-pass internal audit covering ~5,000 LOC).
 
@@ -509,6 +523,10 @@ Full report: `~/.claude/projects/-Users-imac-Movies-Xindex/audit-rust-report.md`
 - **KNOWN CONSEQUENCE (Slice C blocker):** the PSBT gate is unconditional, so the **mint-cancel BTC swap-back** (`AcquireCancelled`) path CANNOT be signed until the Acquire-Cancel sibling certificate lands (Slice C: psbt gate accepts RIC XOR AC-cert). Deliberate fail-closed ordering — a no-RIC carve-out would re-open CTD-1.
 
 **Slice B BUILT (2026-06-11) — per-operator observer + RA-6 + diverse ≥2-source Asgard ("the teeth"):**
+> **2026-07-14 supersession:** `AsgardAgreement` now requires three configured
+> and three responding sources. Every historical “≥2-source” statement in
+> this record is superseded by the live ≥3-source policy and current runbooks.
+
 - **≥2-source Asgard agreement gate** (`chain-thor/src/agreement.rs`, `AsgardAgreement`): resolves the inbound from each operator's OWN distinct THORChain sources concurrently and requires UNANIMITY among the ≥2 responders on `(address, router)` + OR'd halt flags (refinement 1 — the k-of-n floor is illusory on a single shared source). A disagreement is a hard refusal, NEVER majority-voted away; a single poisoned/MITM'd endpoint cannot drive a sign. 8 tests (agree / disagree / 2-of-3-no-override / sub-minimum / halt / chain-absent / gas-rate-differs-OK).
 - **Per-operator observer** (`chain-eth/src/observer.rs`, `Observer` + `xindex-observe-redeem` binary): each operator independently reads `RedeemDispatched` leg facts from its OWN Ethereum RPC, resolves Asgard via its own agreement gate, rebuilds the canonical RIC, and asks its OWN Set-B daemon to sign it (`POST /api/v1/certify-ric`). `immediate_target_hash` is derived family-exactly to match the daemon bind (UTXO `keccak(scriptPubKey)`, EVM `keccak(20-byte addr)`, account-string `keccak(utf8)`). Solana always refused (RA-2). 9 + binary tests incl. an end-to-end recover-the-signature-over-the-rebuilt-digest assertion and source-disagreement / halt / stale-stamp / wrong-chain refusals.
 - **Thin relay collection** (`shared/src/ric_relay.rs` `assemble_intent_proof` + `executor/src/ric_collector.rs` `RicCollector`): fans certify out to the operators, groups responses by certified plaintext, dedups by signer, and assembles the k-of-n `IntentProof` for the plaintext ≥ quorum observers agree on — a poisoned minority lands in its own group and never reaches quorum; tolerates `n - quorum` failures. The relay is UNTRUSTED (no crypto; the custody daemon re-verifies statelessly). `xindex-redeem` collects the RIC before dispatch, pays to the observers' AGREED Asgard (not its own resolution), and attaches the proof — replacing the Slice-A `None`. 14 tests (relay 9 + collector 5).
@@ -880,8 +898,8 @@ The parent-repository audit initially assessed clean `main@365d9b4` and found
 4 Critical, 5 High and 2 Medium production-readiness findings. Local `main` was
 then fast-forwarded, from already-present objects and without fetch/push, to
 `1de7114`; published commit `f22b71a` contains the first remediation pass and
-the current uncommitted feature-branch candidate contains the code-completion
-pass below.
+the current local feature-branch checkpoint contains the code-completion pass
+below.
 
 Closed at the reviewed launch-code boundary:
 
@@ -948,6 +966,294 @@ signer/HSM was used. One deterministic in-process unit-signing fixture ran once
 because an initial test-name filter was too broad; all subsequent execution was
 fully qualified and key-free. The authoritative report is
 `../memory/GATE-3-SIGNER-SERVICE-AUDIT.md`.
+
+## BTC-ORDER-01 — Critical, pre-deployment — THORChain VOUT order (2026-07-14)
+
+Found during the key-free BitGo compatibility preflight. The shared Bitcoin
+builder emitted `[Asgard payout, OP_RETURN memo, custody change]`. The signer
+policy required the correct payout, memo and custody-only change set but did
+not bind their positions. Current THORChain rules require Asgard at VOUT0,
+change back to VIN0 in the next output (normally VOUT1), and the OP_RETURN memo
+after it (normally VOUT2); the rules warn that randomized or incorrect VOUT
+ordering is very likely to lose funds.
+
+**Disposition: fixed in the local custody checkpoint.** The provider-
+neutral builder now emits `[payout, change?, memo?]`. The shared certificate
+binder accepts only `[payout, memo]` when there is no change or
+`[payout, non-zero VIN0 change, memo]` when change exists. The transitional
+signer daemon delegates to that binder, and the redeem/swap-back assertions and
+fixtures use the same order. Eight key-free binder tests cover correct shapes,
+the former order, displaced payout, duplicate/second/zero change, duplicate
+memo and wrong memo; one public-script-only builder regression pins the emitted
+order. The BitGo development gate now has ten key-free
+input/layout/signature/mutation checks, and the shared adapter has twelve
+key-free request/policy regressions. Changed signer/custody/executor test
+targets compile locked/offline.
+
+No wallet, custody key, signature, broadcast, testnet transaction, or mainnet
+transaction was used. This closes the code defect only. Every future provider
+must still produce a captured unsigned transaction proving it preserves the
+exact order before any signer or broadcast path is enabled.
+
+## BITGO-GATE-01 — High, pre-deployment — synthetic signature evidence (2026-07-14)
+
+Found while continuing the selected BitGo qualification. The first offline
+gate version compared the unsigned transaction skeleton but treated any
+non-empty half-signed/final witness as signature evidence. A synthetic byte
+string could therefore pass `user_signature_preservation`; the final check did
+not prove that the two signatures belonged to the captured user and BitGo
+roles. The same schema did not bind exact role public keys/witness script and
+did not pin `changeAddressType=p2wsh`, `isReplaceableByFee=false`, or the input
+sequence. Severity is High because this could create false custody-qualification
+evidence, but BitGo is disabled and no live transaction path consumed the
+report.
+
+**Disposition: fixed in the local BitGo checkpoint.** Evidence schema
+v2 captures the exact compressed user/backup/BitGo keys, external chain code
+20, exact 2-of-3 witness script, native-P2WSH change type and non-RBF build
+intent. The shared `xindex-bitgo-adapter` generates the typed build/send
+payloads and validates exact input/output/fee policy. Both the adapter and gate
+recompute BIP-143 sighashes, require low-S `SIGHASH_ALL`, verify the user role
+before submission, require exact user + BitGo roles in descriptor order after
+finalization, and reject synthetic witnesses. Ten gate tests and twelve adapter
+tests pass locked/offline; a static public signature from BitGo's manual guide
+exercises verification without creating or using a private key.
+
+This closes the local false-evidence defect only. No HTTP transport, token,
+approval or broadcast method was added. Live Testnet4 capture, provider
+response/rebuild handling, durable orchestration, recovery and independent
+custody review remain mandatory.
+
+## External audit M-05 — systemic network resource bounds (2026-07-15)
+
+**Medium — fixed in the local remediation worktree.** The immutable 2026-07
+external report found missing connect/total deadlines, unbounded peer JSON
+decoding, unlimited pre-authenticated TLS tasks and request-triggered blocking
+work without an admission bound. Slow or oversized peers could exhaust
+sockets, tasks, Tokio blocking threads or memory before quorum/signing work
+progressed.
+
+The fix centralizes bounded async/blocking reqwest builders, streaming response
+caps and a bounded Alloy JSON-RPC transport in `xindex-ops::network`. A
+fail-fast `BlockingWorkPool` retains its permit inside the OS-thread closure,
+including after waiter timeout/cancellation. The affected Ethereum/halt,
+ERC-20, RIC/ACC, registry, settlement, price and remote-signer paths use the
+shared deadlines/caps, and the settlement observer gates synchronous evidence,
+snapshot-policy and HSM work.
+
+`xindex-ops::tls` now owns the production HTTP/1.1 mTLS listener with bounded
+pre-auth/request concurrency, handshake/header/request/connection deadlines,
+header/body caps and deterministic 503 overload behavior. Signer-daemon and
+coordinator/observer services reuse it rather than spawning divergent
+unlimited listener tasks.
+
+TDD evidence: the first compile failed because the shared policy did not exist;
+a valid padded 300 KiB RIC response initially decoded; and the first silent
+post-handshake regression exposed Hyper auto-protocol detection outside the
+header timer. Final locked/offline results are 7/7 network tests, 6/6 TLS tests
+and 1/1 real oversized-RIC regression. Strict all-target/all-feature Clippy
+with `-D warnings` passes for all seven affected crates.
+
+This closes availability/resource finding M-05. Exact peer authentication is
+the separate M-06 disposition below.
+
+## External audit M-06 — exact peer mTLS pinning (2026-07-15)
+
+**Medium — fixed in the local remediation worktree.** The immutable 2026-07
+external report found that the helpers loaded every configured PEM certificate
+as a trust root. Supplying a root/intermediate bundle therefore admitted any
+sibling leaf issued by that authority even though the surrounding API and
+operational language described one pinned peer.
+
+`xindex-ops::tls::PinnedCertStore` now interprets each configured entry as one
+leaf-first peer bundle: the first certificate's DER SHA-256 fingerprint is the
+allowed identity and only the last certificate is installed as the explicit
+trust anchor. The peer presents its intermediates. Shared client/server
+verifier wrappers run rustls `WebPkiServerVerifier` or
+`WebPkiClientVerifier` first, including chain, validity, purpose, signature and
+hostname checks, and compare the exact end-entity pin only after that succeeds.
+A CA-only entry pins the CA certificate itself rather than all issued leaves;
+an intended renewal overlap requires separately configured old/new bundles.
+
+All production inbound mTLS configurations and outbound async/blocking reqwest
+clients now use the shared exact verifier. Role-specific application messages
+continue to verify the configured EVM signer address or BTC public key. Legacy
+serialized/CLI names containing `ca_pem` are retained for compatibility, but
+comments and active runbooks specify leaf-first peer bundles and explicitly
+state that generic CA allowlisting fails closed.
+
+TDD first reproduced the bug by accepting sibling client leaf B after
+configuring leaf A under their common root. Final locked/offline evidence is
+12/12 signer-daemon TLS regressions covering client/server siblings, CA-only
+input, an intermediate chain, explicit two-pin rotation, expired/future leaves,
+hostname validation, self-signed peers, malformed/empty input and key mismatch.
+The 7/7 ops TLS tests include a loopback reqwest request proving the production
+builder preserves the exact verifier. Strict all-target/all-feature Clippy with
+`-D warnings` passes across all seven affected crates.
+
+This closes the code-level trust defect only. Peer certificates, roots,
+private keys, rotation records, operator mapping and ceremonies remain
+deployment-owned inputs; none was provisioned or exercised here. The system is
+not production-approved.
+
+## External audit M-09 — contradictory active custody documentation (2026-07-15)
+
+**Medium — fixed locally across both repositories.** Active entry points had
+simultaneously described BTC custody as a native 3-of-5 wallet, a Turnkey
+single-key/approver path, and the selected BitGo model. That could cause an
+operator or reviewer to deploy a removed trust model or confuse the 3-of-5
+observation threshold with custody authorization.
+
+`memory/BITGO-CUSTODY.md` is now the canonical decision. Root/nested READMEs,
+both agent instruction entry points, and the active GitHub blockchain
+instruction state the same selected future model: disabled BitGo native P2WSH
+2-of-3 with user, independently held offline-backup, and BitGo roles.
+Observation, RIC, and settlement certification remain a distinct 3-of-5
+quorum. Turnkey and Cobo are prohibited as primary or fallback providers.
+
+The old `AUDIT-HANDOFF.md` is prominently marked historical/superseded and its
+Turnkey/3-of-5 material remains provenance only. The mixed production config
+runbook marks the retained remote-HSM custody fields historical/disabled while
+preserving non-custody registry, observation, certification, and price
+guidance.
+
+TDD evidence: the new parent `scripts/check-custody-docs.sh` first failed on the
+stale root README, then passed after reconciliation. Parent CI runs it. This
+nested repository's production-profile guard independently requires the same
+three architecture/separation/prohibition statements and the historical
+runbook marker; it passes. Shell syntax, formatting, and both repositories'
+whitespace checks pass.
+
+This is documentation/process closure, not custody readiness. BitGo transport,
+accounts, wallets, keys, authorizations, Testnet4/controlled-THORChain evidence,
+recovery, ceremonies, and independent review remain absent.
+
+## External audit L-04 — literal-text production safety gate (2026-07-15)
+
+**Low — fixed in the local remediation worktree.** The production-profile gate
+previously treated literal source and documentation strings as its primary
+evidence. Those scans could remain green if a compiled entry point bypassed its
+startup validator or performed secret, network, or listener work first.
+
+`scripts/check-production-profile-behavior.sh` now builds and runs exactly one
+table-driven unsafe-configuration test in each of the eight production entry
+points. Mutations cover prohibited key backends, wrong networks, collapsed
+topology/thresholds, missing durability, unsafe endpoints, missing exact-peer
+pins, aliased/public listeners, and invalid timing/retry bounds. Deliberately
+unreadable dummy secret paths prove policy validation wins before secret I/O;
+the tests do not parse keys, construct production clients, or bind listeners.
+The script rejects any test failure or passing-marker count other than 8.
+
+The full production-profile wrapper runs this compiled gate first and labels
+its retained provider-removal and source/documentation checks supplemental
+lints. CI, the Just target, README, assurance notes, release wrapper, and the
+Gate-3 release runbook describe the same authority split.
+
+TDD first failed at 0/8 compiled markers. Final locked/offline evidence passes
+8/8 and the full wrapper passes. Strict all-target/all-feature Clippy with
+`-D warnings` passes for signer-daemon, executor, chain-eth, and relayer; shell
+syntax, Rust formatting, and the Git whitespace check pass. No key, provider,
+listener, network, deployment, or external transaction was used. Operational
+release gates and production approval remain open.
+
+## External audit L-05 — noncanonical BTC OP_RETURN binding (2026-07-15)
+
+**Low — fixed in the local remediation worktree.** The provider-neutral BTC
+binder previously concatenated all pushed bytes after `OP_RETURN` and ignored
+non-push instructions. Scripts containing an inserted `OP_NOP`, split pushes,
+trailing instructions, or non-minimal PUSHDATA widths could bind to the same
+certified memo. The offline BitGo gate separately compared a generated script,
+so rehearsal and shared adapter decisions were inconsistent.
+
+`xindex-custody-core::btc_bind` now exposes the single canonical parser and
+builder used by the certificate binder, BitGo adapter, and BitGo development
+gate. Accepted scripts contain exactly `OP_RETURN` and one non-empty minimal
+push consuming the entire script. Minimality includes direct/PUSHDATA1/2/4
+boundaries and `OP_PUSHNUM_NEG1` / `OP_PUSHNUM_1..16` for their one-byte
+payloads. Empty, malformed, split, intervening, trailing, and wider encodings
+fail closed.
+
+TDD first demonstrated acceptance of `OP_RETURN OP_NOP <memo-push>`. Final
+key-free suites pass 59/59 custody-core, 14/14 adapter, and 12/12 development
+gate tests. Boundary regressions cover 1/75/76/255/256/65,535/65,536 bytes and
+every wider-than-needed PUSHDATA class. Strict all-target/all-feature Clippy
+passes for the three affected packages; signer-daemon and custody-node targets
+compile without executing signing tests. The 8/8 compiled production-profile
+gate remains green. No key, provider, wallet, network, broadcast, or external
+transaction was used.
+
+## External audit L-06 — certificate-volume window fallback (2026-07-15)
+
+**Low — fixed in the local remediation worktree.** `CertVolumePolicy` accepted
+every non-zero `u64` duration, while request-time database arithmetic used
+`i64::try_from(window_secs).unwrap_or(86_400)`. An unrepresentable operator
+value silently became a one-day bucket rather than failing startup.
+
+`CertVolumePolicy::try_new` now losslessly converts the on-disk value once and
+stores a private signed duration. The supported operational range is
+1..=2,678,400 seconds (31 days), with the production profile remaining 24
+hours. Runtime and SQLite use the exact stored value with no narrowing or
+fallback. The binary rejects invalid windows before inspecting durable paths,
+TLS keys, HSM material, databases, or listeners.
+
+TDD first failed because maximum plus one returned `Ok(())`. Boundary tests
+now pin zero, exact maximum, maximum plus one, `i64::MAX`, `u64::MAX`, cap
+validation, and exact signed storage. The compiled production-entrypoint test
+also rejects representable-over-maximum and unrepresentable values before its
+dummy secret paths. Strict all-target/all-feature Clippy passes and the full
+8/8 production-profile gate remains green. No key, HSM, listener, database,
+deployment, or external transaction was used.
+
+## External audit L-07 — false Rust MSRV declaration (2026-07-15)
+
+**Low — fixed in the local remediation worktree.** `Cargo.toml` claimed Rust
+1.85 while `rust-toolchain.toml` and CI pinned 1.95.0; the locked dependency
+metadata already reaches Rust 1.90. Consumers therefore received a false
+compatibility promise.
+
+The manifest and toolchain now both declare exact Rust 1.95.0, the lowest
+installed compiler reproduced against this complete snapshot (the other local
+toolchain is 1.97.0). The project deliberately does not infer whole-workspace
+compatibility from the lower dependency-only floor. `scripts/check-msrv.sh`
+requires manifest/toolchain/active-rustc equality and then runs
+`cargo check --workspace --all-features --locked`. A dedicated CI job and the
+Just/Gate-3 release gates execute it.
+
+TDD first failed with the exact `1.85 != 1.95.0` mismatch. It now passes on
+rustc/cargo 1.95.0 with the complete locked all-feature workspace check.
+Shell syntax, formatting, and whitespace validation pass. No compiler or
+dependency was downloaded and Cargo.lock did not change.
+
+## External audit L-08 — floating assurance executables (2026-07-15)
+
+**Low — fixed in process in the local remediation worktree.** The assurance
+and supply-chain jobs installed the newest available `cargo-careful`,
+`cargo-mutants`, `cargo-deny`, and `cargo-audit`; the careful job also used an
+undated nightly channel. Identical service commits could therefore acquire
+different mutation, UB, license, or advisory behavior without review.
+
+The services workflows now consume the parent protocol repository's single
+`config/assurance-tools.json` manifest. The canonical policy pins Rust 1.95.0,
+nightly-2026-07-15, `cargo-careful` 0.4.10, `cargo-mutants` 27.1.0,
+`cargo-deny` 0.20.2, and `cargo-audit` 0.22.2. Each Cargo install uses
+`--locked --version '=X.Y.Z'`, and every job checks the executable's reported
+version before use.
+
+The separate-repository boundary is fail-closed: workflows sparse-checkout
+only the parent manifest and verifier, verify both reviewed SHA-256 values,
+then load the pins. A changed parent file blocks services CI until these
+content hashes are explicitly updated. The parent verifier also scans this
+repository's workflow/bootstrap documentation for `@latest`, undated
+stable/nightly, and unversioned Python/Cargo/Go installs.
+
+The pre-fix gate enumerated all four floating Cargo tools and both undated
+nightly sites; the post-fix combined-repository gate and four verifier tests
+pass, YAML parsing and Git whitespace checks pass, and locally installed
+`cargo-deny` 0.20.2/`cargo-audit` 0.22.2 report exact matches. Dated nightly,
+`cargo-careful`, and `cargo-mutants` were not downloaded locally; their fresh
+bootstrap/version checks remain CI work. No workflow dispatch, dependency
+download, push, key, HSM, provider, deployment, or external transaction was
+used.
 
 ## When this file gets updated
 

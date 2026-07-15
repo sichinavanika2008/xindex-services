@@ -5,7 +5,8 @@
 //! call) and its authorizing k-of-n RIC, verify the certificate (one-shot
 //! consume) and bind the tx to it; APPROVE only if both pass, else a
 //! fail-closed [`Decision::Reject`]. Mirrors [`crate::btc::decide_redeem_spend`]
-//! for the plain single-sig EVM custody key (no Gnosis Safe under Cobo MPC).
+//! for a possible plain single-signature EVM custody key. No EVM custody
+//! provider is currently selected or production-wired.
 
 use alloy_primitives::{Address, U256};
 

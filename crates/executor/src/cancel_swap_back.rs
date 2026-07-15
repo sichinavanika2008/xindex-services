@@ -53,7 +53,7 @@ pub struct SwapBackTask {
 
 impl<C: UtxoChainClient> InProcessExecutor<C> {
     /// Execute one swap-back end-to-end: select UTXO → build PSBT
-    /// (Asgard out, `OP_RETURN` memo, change-to-self) → collect K
+    /// (Asgard out, change-to-self, `OP_RETURN` memo) → collect K
     /// cosigner partials (each daemon re-verifies the ACC) → finalize →
     /// broadcast. Returns the broadcast txid.
     ///
@@ -252,8 +252,8 @@ mod tests {
     }
 
     /// End-to-end (local keys): the swap-back builds the same exact-set
-    /// spend shape as the redeem path — `[Asgard payout, OP_RETURN(memo),
-    /// change→multisig]` with `vin[0]` the multisig UTXO.
+    /// spend shape as the redeem path — `[Asgard payout, change→multisig,
+    /// OP_RETURN(memo)]` with `vin[0]` the multisig UTXO.
     #[test]
     #[expect(clippy::expect_used, reason = "test code")]
     fn swap_back_builds_asgard_deposit_with_memo_and_change() {
@@ -276,10 +276,11 @@ mod tests {
         assert_eq!(tx.output.len(), 3);
         assert_eq!(tx.output[0].value, Amount::from_sat(50_000_000));
         assert_eq!(tx.output[0].script_pubkey, asgard().script_pubkey());
-        assert!(tx.output[1].script_pubkey.is_op_return());
-        assert_eq!(tx.output[1].value, Amount::ZERO);
+        assert_eq!(tx.output[1].script_pubkey, multisig_addr.script_pubkey());
+        assert!(tx.output[2].script_pubkey.is_op_return());
+        assert_eq!(tx.output[2].value, Amount::ZERO);
         // OP_RETURN carries the exact certified memo bytes.
-        let op_return_bytes: Vec<u8> = tx.output[1]
+        let op_return_bytes: Vec<u8> = tx.output[2]
             .script_pubkey
             .as_bytes()
             .iter()
@@ -287,7 +288,6 @@ mod tests {
             .skip(2)
             .collect();
         assert_eq!(op_return_bytes, memo.as_bytes());
-        assert_eq!(tx.output[2].script_pubkey, multisig_addr.script_pubkey());
     }
 
     /// The cosigner path hands every daemon the ACC arm (never a RIC,

@@ -1,0 +1,23 @@
+[Unit]
+Description=Xindex finalized-journal terminal redemption worker
+After=network-online.target xindex-finalized-observer.service
+Wants=network-online.target
+Requires=xindex-finalized-observer.service
+
+[Service]
+Type=simple
+User=xindex
+Group=xindex
+EnvironmentFile=/etc/xindex/finalize-redeem.env
+ExecStart=/usr/local/bin/xindex-finalize-redeem
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/xindex
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

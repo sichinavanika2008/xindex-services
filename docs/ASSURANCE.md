@@ -5,11 +5,27 @@ The fast gate (`fmt` / `clippy -D warnings` / `test` / `deny` / `audit`) runs on
 Deeper, slower assurance runs in the **Assurance** workflow
 (`.github/workflows/assurance.yml`, scheduled weekly + manual `workflow_dispatch`)
 on GitHub runners rather than a local box that thrashes on full-workspace builds.
+Both repositories consume the one reviewed `config/assurance-tools.json`
+manifest in the Solidity repository. The services workflows fetch only that
+manifest and its verifier, require their reviewed SHA-256 values, install exact
+top-level versions, and verify reported versions before use.
+
+## Declared MSRV
+
+Rust 1.95.0 is the exact workspace `rust-version` and toolchain pin. It is the
+lowest compiler installed and reproduced against this complete locked snapshot;
+dependency metadata bottoms out at 1.90 but does not prove the workspace source
+builds there. `scripts/check-msrv.sh` requires the manifest, toolchain file and
+active `rustc` to match exactly, then runs
+`cargo check --workspace --all-features --locked`. The dedicated CI `msrv` job
+runs that gate on every push and pull request.
 
 ## Gate-3 release evidence
 
-The compile/static gate is necessary but does not prove the production trust
-topology or evidence-retention controls. A release custodian must also run:
+The compiled/static gate is necessary but does not prove the production trust
+topology or evidence-retention controls. Its production-profile component runs
+eight key-free startup-policy mutation matrices; source-string checks are
+supplemental lint, not the behavioral proof. A release custodian must also run:
 
 ```bash
 ./scripts/check-gate3-release.sh \
@@ -19,10 +35,11 @@ topology or evidence-retention controls. A release custodian must also run:
   /var/lib/xindex/evidence/settlement-observer
 ```
 
-The wrapper reruns ABI and production-profile checks, validates the checked-in
-Prometheus rules with `promtool`, rejects a collapsed or placeholder operator
-topology, and verifies every evidence file plus its inventory root. It requires
-real owner-only release artifacts and therefore is not replaced by CI fixtures.
+The wrapper reruns ABI, production-profile, and declared-MSRV checks, validates
+the checked-in Prometheus rules with `promtool`, rejects a collapsed or
+placeholder operator topology, and verifies every evidence file plus its
+inventory root. It requires real owner-only release artifacts and therefore is
+not replaced by CI fixtures.
 Alert routing, WORM export/reconciliation and incident-drill evidence remain
 operator-controlled requirements described in
 [`gate3-operations.md`](runbooks/gate3-operations.md).
@@ -32,8 +49,8 @@ operator-controlled requirements described in
 Runs the suite under a `std` built with debug assertions and extra UB checks.
 
 ```bash
-cargo install cargo-careful --locked
-cargo +nightly careful test --workspace
+cargo install --locked --version '=0.4.10' cargo-careful
+cargo +nightly-2026-07-15 careful test --workspace
 ```
 
 CI: `assurance.yml` → `careful` job.
@@ -43,7 +60,7 @@ CI: `assurance.yml` → `careful` job.
 Mutates the source and re-runs the tests; surviving mutants reveal weak tests.
 
 ```bash
-cargo install cargo-mutants --locked
+cargo install --locked --version '=27.1.0' cargo-mutants
 cargo mutants --baseline=skip -p xindex-shared -p xindex-signer-daemon
 ```
 
@@ -77,7 +94,8 @@ comparisons that consume the clock stay tested via injectable `now`).
 - `server`: `hash_leg_payload` (layout-bound), `check_ric_sign_recency`
   future-skew + max-age boundaries (refactored to an injectable-`now` inner so
   the `>` is deterministically testable), `consume_cert_volume_gate` window-bucket
-  arithmetic (extracted to `window_start_for`), `acc_error_code`.
+  arithmetic (extracted to `window_start_for`), fail-closed certificate-window
+  conversion and 31-day maximum boundaries, `acc_error_code`.
 - `cosmos_tx`: `bind_send_to_cert` native-denom mismatch (CTD bind cannot be a
   no-op). `intent`: `IntentPolicy::validate` quorum == whitelist boundary.
   `solana_tx`: `solana_kind_str`, forbidden-destination (`system_program`) arm.

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::providers::{Provider, ProviderBuilder, ReqwestProvider};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::types::BlockTransactionsKind;
 use alloy::sol;
 use alloy::transports::Transport;
@@ -28,36 +28,39 @@ use axum::routing::post;
 use axum::{Json, Router};
 use clap::Parser;
 use futures_util::future::join_all;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder as HyperBuilder;
-use hyper_util::service::TowerToHyperService;
 use prometheus::Registry;
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig};
+use rustls::ServerConfig;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{mpsc, Notify};
-use tokio_rustls::TlsAcceptor;
+use tokio::sync::Notify;
 use xindex_chain_eth::bindings::{IndexFactory, ThorchainAdapter, ThorchainVaultRegistry};
-use xindex_chain_eth::rpc::is_transient_rpc_error;
 use xindex_chain_thor::{
     derive_inbound, evaluate_quote, evm_raw_to_thor, validate_common_quote,
     ExternalPriceObservation, InboundCandidate, InboundPolicy, QuoteCandidate, QuoteDecision,
     QuoteEvidence, QuotePolicy, RawResponse, RawSourcePoll, SwapQuoteRequest, SwapQuoteResponse,
     ThorClient, ThorConsensusClient, ThorSourceClient, TipCheckpoint,
 };
+use xindex_ops::network::{async_client, read_bounded_async, BoundedAlloyHttp, HttpClientPolicy};
+use xindex_ops::tls::{
+    exact_pinned_async_client_builder, load_cert_chain, load_private_key, pinned_cert_store,
+    serve_mtls, server_config,
+};
 use xindex_ops::{serve_metrics, Metrics};
 use xindex_relayer::registry_collector::{
     inbound_payload_from_message, quote_payload_from_message, CollectOutcome, InboundPayload,
-    QuotePayload, ReadyInbound, ReadyQuote, RegistryCollector,
+    QuotePayload, ReadyInbound, ReadyQuote, RegistryCollectError, RegistryCollector,
+    RegistryCollectorLimits,
 };
 use xindex_relayer::registry_hints::{encode_acquire_hints, quote_payload_from_candidate};
 use xindex_shared::eip712::thorchain_registry_domain;
-use xindex_shared::evidence::EvidenceStore;
-use xindex_shared::registry_state::{SqliteRegistryState, TipAdvance};
+use xindex_shared::evidence::{EvidenceRetentionPolicy, EvidenceStore};
+use xindex_shared::posting_outbox::{
+    NewPostingJob, PostingEnqueueOutcome, PostingJob, PostingJobState, SqlitePostingOutbox,
+};
+use xindex_shared::registry_state::{
+    inbound_signature_identity, quote_signature_identity, SqliteRegistryState, TipAdvance,
+};
 use xindex_shared::registry_wire::{SignedInboundStateMessage, SignedQuoteAuthorizationMessage};
 use xindex_signer_daemon::price_venue::{
     BinanceVenue, CoinbaseVenue, KrakenVenue, PriceVenue, SourcedValue, VenueError,
@@ -65,6 +68,16 @@ use xindex_signer_daemon::price_venue::{
 
 const PRODUCTION_REGISTRY_SIGNER_COUNT: usize = 5;
 const PRODUCTION_REGISTRY_THRESHOLD: usize = 3;
+// Combined with `RegistryCollectorLimits::default`, this caps active quote
+// candidate memory at 64 MiB globally and 8 MiB per first-voting signer even
+// when every accepted envelope is at the wire limit.
+const MAX_REGISTRY_SUBMISSION_BYTES: usize = 256 * 1024;
+const COLLECTOR_EVIDENCE_RETENTION: EvidenceRetentionPolicy = EvidenceRetentionPolicy {
+    max_records: 512,
+    max_total_bytes: 64 * 1024 * 1024,
+};
+
+type BoundedProvider = RootProvider<BoundedAlloyHttp>;
 
 #[derive(Debug)]
 struct PriceFleet {
@@ -123,6 +136,7 @@ struct Config {
     threshold: usize,
     signer_timeout_secs: u64,
     signer_client_identity_pem: PathBuf,
+    /// Legacy-named leaf-first exact signer peer bundles.
     signer_server_ca_pems: Vec<PathBuf>,
     server_cert_pem: PathBuf,
     server_key_pem: PathBuf,
@@ -200,11 +214,25 @@ struct QuoteSignatureSubmission {
     signed: SignedQuoteAuthorizationMessage,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableInboundQuorum {
+    ready: ReadyInbound,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DurableQuoteQuorum {
+    candidate: QuoteCandidate,
+    ready: ReadyQuote,
+}
+
 struct AppState {
     chain_id: u64,
     registry_address: Address,
-    provider: Arc<ReqwestProvider>,
+    provider: Arc<BoundedProvider>,
     durable_state: SqliteRegistryState,
+    posting_outbox: SqlitePostingOutbox,
     evidence: EvidenceStore,
     operator_id: String,
     inbound_policy: InboundPolicy,
@@ -218,7 +246,7 @@ struct AppState {
     signer_client: reqwest::Client,
     signer_urls: Vec<String>,
     collector: Arc<Mutex<RegistryCollector>>,
-    inbound_ready_tx: mpsc::Sender<ReadyInbound>,
+    inbound_notify: Notify,
     quote_candidates: Mutex<HashMap<QuotePayload, QuoteCandidate>>,
     ready_quotes: Mutex<HashMap<QuotePayload, ReadyQuote>>,
     quote_notify: Notify,
@@ -263,6 +291,8 @@ struct QuoteChainState {
 enum ApiError {
     Refused(&'static str),
     Dependency(&'static str),
+    Overloaded(&'static str),
+    Oversized(&'static str),
     Timeout,
 }
 
@@ -279,6 +309,16 @@ impl IntoResponse for ApiError {
                 "dependency_unavailable",
                 component,
             ),
+            Self::Overloaded(component) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "capacity_exceeded",
+                component,
+            ),
+            Self::Oversized(component) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                component,
+            ),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "quorum_timeout", "signers"),
         };
         tracing::warn!(
@@ -287,6 +327,43 @@ impl IntoResponse for ApiError {
             "registry coordinator request failed"
         );
         (status, Json(json!({"error": code}))).into_response()
+    }
+}
+
+fn record_collector_result(state: &AppState, kind: &str, result: &str) {
+    state
+        .metrics
+        .registry_collector_messages
+        .with_label_values(&[kind, result])
+        .inc();
+}
+
+fn enforce_submission_size<T: Serialize>(
+    state: &AppState,
+    kind: &'static str,
+    submission: &T,
+) -> Result<(), ApiError> {
+    let size = serde_json::to_vec(submission)
+        .map_err(|_| ApiError::Dependency("submission_size"))?
+        .len();
+    if size > MAX_REGISTRY_SUBMISSION_BYTES {
+        record_collector_result(state, kind, "oversized");
+        return Err(ApiError::Oversized("registry_submission"));
+    }
+    Ok(())
+}
+
+fn map_collector_error(
+    state: &AppState,
+    kind: &'static str,
+    error: &RegistryCollectError,
+) -> ApiError {
+    if matches!(error, RegistryCollectError::CapacityExceeded { .. }) {
+        record_collector_result(state, kind, "capacity");
+        ApiError::Overloaded("registry_collector")
+    } else {
+        record_collector_result(state, kind, "refused");
+        ApiError::Refused("registry_signature")
     }
 }
 
@@ -348,7 +425,7 @@ struct QuoteProducerEvidence<'a> {
 #[tokio::main]
 async fn main() -> Result<()> {
     xindex_ops::init_tracing();
-    run(Args::parse()).await
+    Box::pin(run(Args::parse())).await
 }
 
 #[expect(
@@ -363,14 +440,8 @@ async fn run(args: Args) -> Result<()> {
     validate_config(&config)?;
     let registry_address = parse_nonzero_address("registry_contract", &config.registry_contract)?;
     let poster_address = parse_nonzero_address("poster_address", &config.poster_address)?;
-    let read_provider = Arc::new(
-        ProviderBuilder::new().on_http(
-            config
-                .ethereum_rpc_url
-                .parse()
-                .context("Ethereum RPC URL")?,
-        ),
-    );
+    let read_provider =
+        Arc::new(ProviderBuilder::new().on_client(bounded_rpc_client(&config.ethereum_rpc_url)?));
     let actual_chain_id = read_provider
         .get_chain_id()
         .await
@@ -385,12 +456,30 @@ async fn run(args: Args) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     verify_roster(&read_provider, registry_address, &roster, config.threshold).await?;
     let domain = thorchain_registry_domain(config.chain_id, registry_address);
-    let collector = RegistryCollector::new(domain, roster, config.threshold)
-        .context("construct registry collector")?;
+    let collector_limits = RegistryCollectorLimits::default();
+    let collector =
+        RegistryCollector::with_limits(domain, roster, config.threshold, collector_limits)
+            .context("construct registry collector")?;
     let durable_state = SqliteRegistryState::connect(&config.database_url)
         .await
         .context("open durable registry state")?;
+    let posting_outbox = SqlitePostingOutbox::connect(&config.database_url)
+        .await
+        .context("open durable registry posting outbox")?;
     let evidence = EvidenceStore::open(&config.evidence_dir).context("open evidence store")?;
+    for namespace in ["collector-inbound", "collector-quote"] {
+        let report = evidence
+            .enforce_retention(namespace, COLLECTOR_EVIDENCE_RETENTION)
+            .with_context(|| format!("enforce {namespace} evidence retention"))?;
+        if report.pruned_records > 0 {
+            tracing::warn!(
+                namespace,
+                pruned_records = report.pruned_records,
+                pruned_bytes = report.pruned_bytes,
+                "enforced bounded local collector-evidence retention at startup"
+            );
+        }
+    }
     let sources = config
         .sources
         .iter()
@@ -421,11 +510,12 @@ async fn run(args: Args) -> Result<()> {
         .iter()
         .map(|asset| (asset.asset.clone(), asset.clone()))
         .collect();
-    let public_http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.signer_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build public-data client")?;
+    let public_http = async_client(HttpClientPolicy {
+        connect_timeout: Duration::from_secs(config.signer_timeout_secs.min(3)),
+        request_timeout: Duration::from_secs(config.signer_timeout_secs),
+        max_response_bytes: 2 * 1024 * 1024,
+    })
+    .context("build public-data client")?;
     let prices = PriceFleet {
         binance: BinanceVenue::new(public_http.clone(), config.binance_base.clone()),
         coinbase: CoinbaseVenue::new(public_http.clone(), config.coinbase_base.clone()),
@@ -452,12 +542,28 @@ async fn run(args: Args) -> Result<()> {
     }
     let metrics_address = config.metrics_address;
 
-    let (inbound_ready_tx, inbound_ready_rx) = mpsc::channel(64);
+    let now = now_unix()?;
+    let mut quote_candidates = HashMap::new();
+    let mut ready_quotes = HashMap::new();
+    for job in posting_outbox
+        .load_active_bounded(
+            "registry_quote",
+            now,
+            collector_limits.max_active_quote_payloads,
+        )
+        .await
+        .context("reload durable quote quorums")?
+    {
+        let durable = decode_quote_job(&job).context("decode durable quote quorum")?;
+        quote_candidates.insert(durable.ready.payload, durable.candidate);
+        ready_quotes.insert(durable.ready.payload, durable.ready);
+    }
     let state = Arc::new(AppState {
         chain_id: config.chain_id,
         registry_address,
         provider: read_provider,
         durable_state,
+        posting_outbox,
         evidence,
         operator_id: config.operator_id,
         inbound_policy: config.inbound_policy,
@@ -471,9 +577,9 @@ async fn run(args: Args) -> Result<()> {
         signer_client,
         signer_urls,
         collector: Arc::new(Mutex::new(collector)),
-        inbound_ready_tx,
-        quote_candidates: Mutex::new(HashMap::new()),
-        ready_quotes: Mutex::new(HashMap::new()),
+        inbound_notify: Notify::new(),
+        quote_candidates: Mutex::new(quote_candidates),
+        ready_quotes: Mutex::new(ready_quotes),
         quote_notify: Notify::new(),
         quote_build_lock: tokio::sync::Mutex::new(()),
         metrics,
@@ -482,10 +588,10 @@ async fn run(args: Args) -> Result<()> {
     let poster_provider = Arc::new(
         ProviderBuilder::new()
             .with_recommended_fillers()
-            .on_http(config.ethereum_rpc_url.parse().context("poster RPC URL")?),
+            .on_client(bounded_rpc_client(&config.ethereum_rpc_url)?),
     );
     let poster = inbound_poster(
-        inbound_ready_rx,
+        state.clone(),
         poster_provider,
         registry_address,
         poster_address,
@@ -507,7 +613,7 @@ async fn run(args: Args) -> Result<()> {
             post(collect_quote_submission),
         )
         .route("/api/v1/registry/quote", post(build_quote))
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REGISTRY_SUBMISSION_BYTES))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.listen_address)
         .await
@@ -542,6 +648,7 @@ async fn ingest_inbound_submission(
     submission: InboundSignatureSubmission,
     now: u64,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    enforce_submission_size(state, "inbound", &submission)?;
     let expected = inbound_payload_from_candidate(&submission.candidate)
         .map_err(|_| ApiError::Refused("inbound_candidate"))?;
     let signed = inbound_payload_from_message(&submission.signed)
@@ -549,35 +656,80 @@ async fn ingest_inbound_submission(
     if expected != signed {
         return Err(ApiError::Refused("inbound_envelope_mismatch"));
     }
-    state
-        .evidence
-        .persist_hashed(
-            &format!("collector-inbound-{}", expected.sequence),
-            &submission,
-        )
-        .map_err(|_| ApiError::Dependency("evidence_store"))?;
-    let outcome = state
-        .collector
-        .lock()
-        .map_err(|_| ApiError::Dependency("collector_lock"))?
-        .ingest_inbound(&submission.signed, now)
-        .map_err(|_| ApiError::Refused("inbound_signature"))?;
+    let outcome = {
+        let mut collector = state
+            .collector
+            .lock()
+            .map_err(|_| ApiError::Dependency("collector_lock"))?;
+        match collector.ingest_inbound(&submission.signed, now) {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(map_collector_error(state, "inbound", &error)),
+        }
+    };
     match outcome {
-        CollectOutcome::Accepted { count } => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"status": "accepted", "signatures": count})),
-        )),
-        CollectOutcome::Duplicate { count } => Ok((
-            StatusCode::OK,
-            Json(json!({"status": "duplicate", "signatures": count})),
-        )),
+        CollectOutcome::Accepted { count } => {
+            record_collector_result(state, "inbound", "accepted");
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({"status": "accepted", "signatures": count})),
+            ))
+        }
+        CollectOutcome::Duplicate { count } => {
+            record_collector_result(state, "inbound", "duplicate");
+            Ok((
+                StatusCode::OK,
+                Json(json!({"status": "duplicate", "signatures": count})),
+            ))
+        }
         CollectOutcome::Ready(ready) => {
             let count = ready.signatures.len();
-            state
-                .inbound_ready_tx
-                .send(ready)
+            let durable = DurableInboundQuorum { ready };
+            let body =
+                serde_json::to_vec(&durable).map_err(|_| ApiError::Dependency("outbox_encode"))?;
+            let payload_hash = alloy_primitives::keccak256(&body);
+            let identity = inbound_signature_identity(durable.ready.payload.sequence);
+            let enqueue = state
+                .posting_outbox
+                .enqueue(NewPostingJob {
+                    kind: "registry_inbound",
+                    identity: &identity,
+                    generation: durable.ready.payload.valid_until,
+                    payload_hash,
+                    payload: &body,
+                    expires_at: durable.ready.payload.valid_until,
+                    now,
+                })
                 .await
-                .map_err(|_| ApiError::Dependency("poster_worker"))?;
+                .map_err(|_| ApiError::Dependency("posting_outbox"))?;
+            match enqueue {
+                PostingEnqueueOutcome::Queued
+                | PostingEnqueueOutcome::Idempotent {
+                    state: PostingJobState::Queued | PostingJobState::Posting,
+                } => state.inbound_notify.notify_one(),
+                PostingEnqueueOutcome::Idempotent {
+                    state: PostingJobState::Posted,
+                } => {}
+                PostingEnqueueOutcome::Idempotent {
+                    state: PostingJobState::Expired | PostingJobState::Superseded,
+                }
+                | PostingEnqueueOutcome::Conflict { .. } => {
+                    return Err(ApiError::Refused("inbound_generation_conflict"));
+                }
+            }
+            if state
+                .evidence
+                .persist_hashed_retained(
+                    "collector-inbound",
+                    &format!("collector-inbound-{}", durable.ready.payload.sequence),
+                    &durable,
+                    COLLECTOR_EVIDENCE_RETENTION,
+                )
+                .is_err()
+            {
+                record_collector_result(state, "inbound", "evidence_error");
+                return Err(ApiError::Dependency("evidence_store"));
+            }
+            record_collector_result(state, "inbound", "quorum");
             Ok((
                 StatusCode::ACCEPTED,
                 Json(json!({"status": "quorum", "signatures": count})),
@@ -591,14 +743,19 @@ async fn collect_quote_submission(
     Json(submission): Json<QuoteSignatureSubmission>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let now = now_unix().map_err(|_| ApiError::Dependency("clock"))?;
-    ingest_quote_submission(&state, &submission, now)
+    ingest_quote_submission(&state, &submission, now).await
 }
 
-fn ingest_quote_submission(
+#[expect(
+    clippy::too_many_lines,
+    reason = "verified candidate admission, bounded collection, durable enqueue, retained evidence, and cache publication form one fail-closed transaction"
+)]
+async fn ingest_quote_submission(
     state: &Arc<AppState>,
     submission: &QuoteSignatureSubmission,
     now: u64,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    enforce_submission_size(state, "quote", submission)?;
     let expected = quote_payload_from_candidate(&submission.candidate)
         .map_err(|_| ApiError::Refused("quote_candidate"))?;
     let signed = quote_payload_from_message(&submission.signed)
@@ -606,49 +763,113 @@ fn ingest_quote_submission(
     if expected != signed {
         return Err(ApiError::Refused("quote_envelope_mismatch"));
     }
-    state
-        .evidence
-        .persist_hashed(
-            &format!("collector-quote-{}", expected.quote_nonce),
-            &submission,
-        )
-        .map_err(|_| ApiError::Dependency("evidence_store"))?;
-    {
+    cleanup_quotes(state, now)?;
+    let outcome = {
+        // Hold the candidate lock across collector mutation so concurrent
+        // envelopes cannot install conflicting unsigned/raw candidate bytes
+        // for the same signed payload.
         let mut candidates = state
             .quote_candidates
             .lock()
             .map_err(|_| ApiError::Dependency("candidate_lock"))?;
-        if let Some(existing) = candidates.get(&expected) {
-            if existing != &submission.candidate {
-                return Err(ApiError::Refused("quote_candidate_conflict"));
-            }
-        } else {
-            candidates.insert(expected, submission.candidate.clone());
+        if candidates
+            .get(&expected)
+            .is_some_and(|existing| existing != &submission.candidate)
+        {
+            return Err(ApiError::Refused("quote_candidate_conflict"));
         }
-    }
-    let outcome = state
-        .collector
-        .lock()
-        .map_err(|_| ApiError::Dependency("collector_lock"))?
-        .ingest_quote(&submission.signed, now)
-        .map_err(|_| ApiError::Refused("quote_signature"))?;
+        let outcome = {
+            let mut collector = state
+                .collector
+                .lock()
+                .map_err(|_| ApiError::Dependency("collector_lock"))?;
+            match collector.ingest_quote(&submission.signed, now) {
+                Ok(outcome) => outcome,
+                Err(error) => return Err(map_collector_error(state, "quote", &error)),
+            }
+        };
+        candidates
+            .entry(expected)
+            .or_insert_with(|| submission.candidate.clone());
+        outcome
+    };
     match outcome {
-        CollectOutcome::Accepted { count } => Ok((
-            StatusCode::ACCEPTED,
-            Json(json!({"status": "accepted", "signatures": count})),
-        )),
-        CollectOutcome::Duplicate { count } => Ok((
-            StatusCode::OK,
-            Json(json!({"status": "duplicate", "signatures": count})),
-        )),
+        CollectOutcome::Accepted { count } => {
+            record_collector_result(state, "quote", "accepted");
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(json!({"status": "accepted", "signatures": count})),
+            ))
+        }
+        CollectOutcome::Duplicate { count } => {
+            record_collector_result(state, "quote", "duplicate");
+            Ok((
+                StatusCode::OK,
+                Json(json!({"status": "duplicate", "signatures": count})),
+            ))
+        }
         CollectOutcome::Ready(ready) => {
             let count = ready.signatures.len();
+            let durable = DurableQuoteQuorum {
+                candidate: submission.candidate.clone(),
+                ready,
+            };
+            let body =
+                serde_json::to_vec(&durable).map_err(|_| ApiError::Dependency("outbox_encode"))?;
+            let payload_hash = alloy_primitives::keccak256(&body);
+            let identity = quote_signature_identity(
+                durable.ready.payload.originator,
+                durable.ready.payload.quote_nonce,
+            );
+            let enqueue = state
+                .posting_outbox
+                .enqueue(NewPostingJob {
+                    kind: "registry_quote",
+                    identity: &identity,
+                    generation: durable.ready.payload.dispatch_deadline,
+                    payload_hash,
+                    payload: &body,
+                    expires_at: durable.ready.payload.dispatch_deadline,
+                    now,
+                })
+                .await
+                .map_err(|_| ApiError::Dependency("posting_outbox"))?;
+            match enqueue {
+                PostingEnqueueOutcome::Queued
+                | PostingEnqueueOutcome::Idempotent {
+                    state:
+                        PostingJobState::Queued | PostingJobState::Posting | PostingJobState::Posted,
+                } => {}
+                PostingEnqueueOutcome::Idempotent {
+                    state: PostingJobState::Expired | PostingJobState::Superseded,
+                }
+                | PostingEnqueueOutcome::Conflict { .. } => {
+                    return Err(ApiError::Refused("quote_generation_conflict"));
+                }
+            }
+            if state
+                .evidence
+                .persist_hashed_retained(
+                    "collector-quote",
+                    &format!(
+                        "collector-quote-{}-{}",
+                        durable.ready.payload.originator, durable.ready.payload.quote_nonce
+                    ),
+                    &durable,
+                    COLLECTOR_EVIDENCE_RETENTION,
+                )
+                .is_err()
+            {
+                record_collector_result(state, "quote", "evidence_error");
+                return Err(ApiError::Dependency("evidence_store"));
+            }
             state
                 .ready_quotes
                 .lock()
                 .map_err(|_| ApiError::Dependency("ready_quote_lock"))?
-                .insert(ready.payload, ready);
+                .insert(durable.ready.payload, durable.ready);
             state.quote_notify.notify_waiters();
+            record_collector_result(state, "quote", "quorum");
             Ok((
                 StatusCode::ACCEPTED,
                 Json(json!({"status": "quorum", "signatures": count})),
@@ -695,6 +916,19 @@ async fn build_quote(
     .map_err(|_| ApiError::Dependency("finalized_quote_reads"))?;
     if target_token != chain.target_token || chain.router == Address::ZERO {
         return Err(ApiError::Refused("target_or_router"));
+    }
+    if let Some((candidate, ready)) = reusable_quote(
+        &state,
+        adapter,
+        index_token,
+        originator,
+        funding_token,
+        target_token,
+        amount_in,
+        &chain,
+        now,
+    )? {
+        return render_quote_response(&candidate, &ready);
     }
     let amount_thor = evm_raw_to_thor(amount_in, chain.funding_decimals)
         .map_err(|_| ApiError::Refused("amount_scaling"))?;
@@ -804,16 +1038,7 @@ async fn build_quote(
         .insert(payload, candidate.clone());
     distribute_quote_candidate(&state, &candidate, now).await;
     let ready = wait_for_quote(&state, &payload).await?;
-    let hints = encode_acquire_hints(&candidate, &ready)
-        .map_err(|_| ApiError::Refused("canonical_hints"))?;
-    Ok(Json(QuoteHintsResponse {
-        hints: format!("0x{}", alloy_primitives::hex::encode(hints)),
-        min_out_native: candidate.decision.min_out_1e8.clone(),
-        dispatch_deadline: candidate.decision.dispatch_deadline,
-        quote_nonce: payload.quote_nonce,
-        quote_hash: format!("{:#x}", candidate.decision.quote_hash),
-        memo: candidate.decision.memo,
-    }))
+    render_quote_response(&candidate, &ready)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -952,7 +1177,7 @@ async fn distribute_inbound_candidate(
         if !response.status().is_success() {
             continue;
         }
-        if let Ok(signed) = response.json::<SignedInboundStateMessage>().await {
+        if let Some(signed) = decode_signer_response::<SignedInboundStateMessage>(response).await {
             let submission = InboundSignatureSubmission {
                 candidate: candidate.clone(),
                 signed,
@@ -976,14 +1201,23 @@ async fn distribute_quote_candidate(state: &Arc<AppState>, candidate: &QuoteCand
         if !response.status().is_success() {
             continue;
         }
-        if let Ok(signed) = response.json::<SignedQuoteAuthorizationMessage>().await {
+        if let Some(signed) =
+            decode_signer_response::<SignedQuoteAuthorizationMessage>(response).await
+        {
             let submission = QuoteSignatureSubmission {
                 candidate: candidate.clone(),
                 signed,
             };
-            let _ = ingest_quote_submission(state, &submission, now);
+            let _ = ingest_quote_submission(state, &submission, now).await;
         }
     }
+}
+
+async fn decode_signer_response<T: DeserializeOwned>(response: reqwest::Response) -> Option<T> {
+    let body = read_bounded_async(response, MAX_REGISTRY_SUBMISSION_BYTES)
+        .await
+        .ok()?;
+    serde_json::from_slice(&body).ok()
 }
 
 async fn wait_for_quote(
@@ -997,7 +1231,8 @@ async fn wait_for_quote(
             .ready_quotes
             .lock()
             .map_err(|_| ApiError::Dependency("ready_quote_lock"))?
-            .remove(payload)
+            .get(payload)
+            .cloned()
         {
             return Ok(ready);
         }
@@ -1005,6 +1240,76 @@ async fn wait_for_quote(
             .await
             .map_err(|_| ApiError::Timeout)?;
     }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reuse must bind every value-moving quote request field to one durable quorum"
+)]
+fn reusable_quote(
+    state: &Arc<AppState>,
+    adapter: Address,
+    index_token: Address,
+    originator: Address,
+    funding_token: Address,
+    target_token: Address,
+    amount_in: U256,
+    chain: &QuoteChainState,
+    now: u64,
+) -> Result<Option<(QuoteCandidate, ReadyQuote)>, ApiError> {
+    let expected_nonce = chain
+        .quote_nonce
+        .checked_add(1)
+        .ok_or(ApiError::Refused("quote_nonce_exhausted"))?;
+    let ready = state
+        .ready_quotes
+        .lock()
+        .map_err(|_| ApiError::Dependency("ready_quote_lock"))?
+        .values()
+        .find(|ready| {
+            let payload = ready.payload;
+            payload.adapter == adapter
+                && payload.index_token == index_token
+                && payload.originator == originator
+                && payload.funding_token == funding_token
+                && payload.target_token == target_token
+                && payload.amount_in == amount_in
+                && payload.custody_hash == chain.custody_hash
+                && payload.inbound_state_hash == chain.inbound_hash
+                && payload.quote_nonce == expected_nonce
+                && payload.dispatch_deadline > now
+        })
+        .cloned();
+    let Some(ready) = ready else {
+        return Ok(None);
+    };
+    let candidate = state
+        .quote_candidates
+        .lock()
+        .map_err(|_| ApiError::Dependency("candidate_lock"))?
+        .get(&ready.payload)
+        .filter(|candidate| {
+            candidate.current_state_valid_until == chain.valid_until
+                && candidate.finalized_onchain_nonce == chain.quote_nonce
+        })
+        .cloned();
+    Ok(candidate.map(|candidate| (candidate, ready)))
+}
+
+fn render_quote_response(
+    candidate: &QuoteCandidate,
+    ready: &ReadyQuote,
+) -> Result<Json<QuoteHintsResponse>, ApiError> {
+    let hints =
+        encode_acquire_hints(candidate, ready).map_err(|_| ApiError::Refused("canonical_hints"))?;
+    Ok(Json(QuoteHintsResponse {
+        hints: format!("0x{}", alloy_primitives::hex::encode(hints)),
+        min_out_native: candidate.decision.min_out_1e8.clone(),
+        dispatch_deadline: candidate.decision.dispatch_deadline,
+        quote_nonce: ready.payload.quote_nonce,
+        quote_hash: format!("{:#x}", candidate.decision.quote_hash),
+        memo: candidate.decision.memo.clone(),
+    }))
 }
 
 fn cleanup_quotes(state: &Arc<AppState>, now: u64) -> Result<(), ApiError> {
@@ -1053,14 +1358,15 @@ fn select_strictest_quote<'a>(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "one isolated worker owns the poster provider and its explicit retry policy"
+    clippy::too_many_lines,
+    reason = "one isolated registry state machine owns idempotence, posting and durable retry policy"
 )]
 async fn inbound_poster<P, T>(
-    mut ready_rx: mpsc::Receiver<ReadyInbound>,
+    state: Arc<AppState>,
     provider: Arc<P>,
     registry_address: Address,
     poster_address: Address,
-    attempts: u32,
+    backoff_attempt_cap: u32,
     retry_base_ms: u64,
     retry_max_ms: u64,
     metrics: Metrics,
@@ -1069,62 +1375,183 @@ async fn inbound_poster<P, T>(
     T: Transport + Clone + 'static,
 {
     let registry = ThorchainVaultRegistry::new(registry_address, provider);
-    while let Some(ready) = ready_rx.recv().await {
-        let payload = ready.payload;
-        for attempt in 1..=attempts {
-            match registry.inboundState().call().await {
-                Ok(current) if current._0.sequence >= payload.sequence => {
-                    if inbound_matches_state(payload, &current._0) {
-                        metrics
-                            .registry_last_success_timestamp_seconds
-                            .with_label_values(&["inbound_post"])
-                            .set(u64_to_i64(now_unix().map_or(0, |value| value)));
-                    }
-                    break;
+    let Ok(started_at) = now_unix() else {
+        return;
+    };
+    if state
+        .posting_outbox
+        .recover_inflight("registry_inbound", started_at)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        let Ok(now) = now_unix() else {
+            return;
+        };
+        let job = match state
+            .posting_outbox
+            .claim_next("registry_inbound", now)
+            .await
+        {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                tokio::select! {
+                    () = state.inbound_notify.notified() => {}
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
-                Ok(_) => {}
-                Err(error) if is_transient_rpc_error(&error) && attempt < attempts => {
-                    tokio::time::sleep(retry_delay(attempt, retry_base_ms, retry_max_ms)).await;
-                    continue;
-                }
-                Err(_) => break,
+                continue;
             }
-            let signatures = ready.signatures.iter().copied().map(Bytes::from).collect();
-            let sent = registry
-                .attestInbound(
-                    payload.vault,
-                    payload.router,
-                    payload.pause_flags,
-                    payload.observed_at,
-                    payload.valid_until,
-                    payload.sequence,
-                    payload.source_hash,
-                    signatures,
-                )
-                .from(poster_address)
-                .send()
-                .await;
-            match sent {
-                Ok(transaction) => match transaction.get_receipt().await {
-                    Ok(receipt) if receipt.status() => {
-                        metrics
-                            .registry_last_success_timestamp_seconds
-                            .with_label_values(&["inbound_post"])
-                            .set(u64_to_i64(now_unix().map_or(0, |value| value)));
-                        break;
-                    }
-                    Err(_) if attempt < attempts => {
-                        tokio::time::sleep(retry_delay(attempt, retry_base_ms, retry_max_ms)).await;
-                    }
-                    Ok(_) | Err(_) => break,
-                },
-                Err(error) if is_transient_rpc_error(&error) && attempt < attempts => {
-                    tokio::time::sleep(retry_delay(attempt, retry_base_ms, retry_max_ms)).await;
+            Err(_) => return,
+        };
+        let Ok(durable) = decode_inbound_job(&job) else {
+            return;
+        };
+        let ready = durable.ready;
+        let payload = ready.payload;
+        if now >= payload.valid_until {
+            if state
+                .posting_outbox
+                .finish(&job, PostingJobState::Expired, now)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+
+        match registry.inboundState().call().await {
+            Ok(current) if current._0.sequence >= payload.sequence => {
+                let terminal = if current._0.sequence == payload.sequence
+                    && inbound_matches_state(payload, &current._0)
+                {
+                    metrics
+                        .registry_last_success_timestamp_seconds
+                        .with_label_values(&["inbound_post"])
+                        .set(u64_to_i64(now));
+                    PostingJobState::Posted
+                } else {
+                    PostingJobState::Superseded
+                };
+                if state
+                    .posting_outbox
+                    .finish(&job, terminal, now)
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-                Err(_) => break,
+                continue;
+            }
+            Ok(current) if current._0.sequence.saturating_add(1) == payload.sequence => {}
+            Ok(_) => {
+                if retry_inbound_job(
+                    &state.posting_outbox,
+                    &job,
+                    "sequence_gap",
+                    now,
+                    backoff_attempt_cap,
+                    retry_base_ms,
+                    retry_max_ms,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            Err(_) => {
+                if retry_inbound_job(
+                    &state.posting_outbox,
+                    &job,
+                    "provider_unavailable",
+                    now,
+                    backoff_attempt_cap,
+                    retry_base_ms,
+                    retry_max_ms,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                continue;
             }
         }
+
+        let signatures = ready.signatures.iter().copied().map(Bytes::from).collect();
+        let posted = match registry
+            .attestInbound(
+                payload.vault,
+                payload.router,
+                payload.pause_flags,
+                payload.observed_at,
+                payload.valid_until,
+                payload.sequence,
+                payload.source_hash,
+                signatures,
+            )
+            .from(poster_address)
+            .send()
+            .await
+        {
+            Ok(transaction) => transaction
+                .get_receipt()
+                .await
+                .is_ok_and(|receipt| receipt.status()),
+            Err(_) => false,
+        };
+        if posted {
+            metrics
+                .registry_last_success_timestamp_seconds
+                .with_label_values(&["inbound_post"])
+                .set(u64_to_i64(now));
+            if state
+                .posting_outbox
+                .finish(&job, PostingJobState::Posted, now)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        } else if retry_inbound_job(
+            &state.posting_outbox,
+            &job,
+            "post_unconfirmed",
+            now,
+            backoff_attempt_cap,
+            retry_base_ms,
+            retry_max_ms,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
     }
+}
+
+async fn retry_inbound_job(
+    outbox: &SqlitePostingOutbox,
+    job: &PostingJob,
+    error: &str,
+    now: u64,
+    backoff_attempt_cap: u32,
+    retry_base_ms: u64,
+    retry_max_ms: u64,
+) -> Result<()> {
+    let attempt = u32::try_from(job.attempts.min(u64::from(backoff_attempt_cap)))
+        .unwrap_or(backoff_attempt_cap)
+        .max(1);
+    let delay = retry_delay(attempt, retry_base_ms, retry_max_ms);
+    let next_attempt_at = now.saturating_add(delay.as_secs().max(1));
+    outbox
+        .retry(job, next_attempt_at, error, now)
+        .await
+        .context("durably requeue inbound post")
 }
 
 fn inbound_matches_state(
@@ -1140,6 +1567,47 @@ fn inbound_matches_state(
         && state.sourceHash == payload.source_hash
 }
 
+fn decode_inbound_job(job: &PostingJob) -> Result<DurableInboundQuorum> {
+    if job.kind != "registry_inbound"
+        || alloy_primitives::keccak256(&job.payload) != job.payload_hash
+    {
+        anyhow::bail!("registry inbound outbox identity/hash mismatch");
+    }
+    let durable: DurableInboundQuorum =
+        serde_json::from_slice(&job.payload).context("decode inbound quorum payload")?;
+    let expected_identity = inbound_signature_identity(durable.ready.payload.sequence);
+    if job.identity != expected_identity
+        || job.generation != durable.ready.payload.valid_until
+        || job.expires_at != durable.ready.payload.valid_until
+    {
+        anyhow::bail!("registry inbound outbox generation mismatch");
+    }
+    Ok(durable)
+}
+
+fn decode_quote_job(job: &PostingJob) -> Result<DurableQuoteQuorum> {
+    if job.kind != "registry_quote" || alloy_primitives::keccak256(&job.payload) != job.payload_hash
+    {
+        anyhow::bail!("registry quote outbox identity/hash mismatch");
+    }
+    let durable: DurableQuoteQuorum =
+        serde_json::from_slice(&job.payload).context("decode quote quorum payload")?;
+    let expected_identity = quote_signature_identity(
+        durable.ready.payload.originator,
+        durable.ready.payload.quote_nonce,
+    );
+    let candidate_payload = quote_payload_from_candidate(&durable.candidate)
+        .context("decode durable quote candidate")?;
+    if job.identity != expected_identity
+        || job.generation != durable.ready.payload.dispatch_deadline
+        || job.expires_at != durable.ready.payload.dispatch_deadline
+        || candidate_payload != durable.ready.payload
+    {
+        anyhow::bail!("registry quote outbox generation mismatch");
+    }
+    Ok(durable)
+}
+
 fn inbound_payload_from_candidate(candidate: &InboundCandidate) -> Result<InboundPayload> {
     Ok(InboundPayload {
         vault: Address::from_str(&candidate.derived.vault).context("candidate vault")?,
@@ -1153,7 +1621,7 @@ fn inbound_payload_from_candidate(candidate: &InboundCandidate) -> Result<Inboun
 }
 
 async fn verify_roster(
-    provider: &Arc<ReqwestProvider>,
+    provider: &Arc<BoundedProvider>,
     registry_address: Address,
     signers: &[Address],
     threshold: usize,
@@ -1187,7 +1655,7 @@ async fn verify_roster(
     Ok(())
 }
 
-async fn finalized_block(provider: &ReqwestProvider) -> Result<FinalizedBlock> {
+async fn finalized_block(provider: &BoundedProvider) -> Result<FinalizedBlock> {
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Finalized, BlockTransactionsKind::Hashes)
         .await?
@@ -1200,7 +1668,7 @@ async fn finalized_block(provider: &ReqwestProvider) -> Result<FinalizedBlock> {
 }
 
 async fn quote_chain_state(
-    provider: &Arc<ReqwestProvider>,
+    provider: &Arc<BoundedProvider>,
     registry_address: Address,
     adapter_address: Address,
     funding_token: Address,
@@ -1371,10 +1839,6 @@ fn validate_config(config: &Config) -> Result<()> {
         anyhow::bail!("invalid production setting; registry topology must be exactly 3-of-5");
     }
     validate_public_id(&config.operator_id)?;
-    validate_database_url(&config.database_url)?;
-    validate_owner_only_directory(&config.evidence_dir)?;
-    validate_secret_file(&config.signer_client_identity_pem)?;
-    validate_secret_file(&config.server_key_pem)?;
     if !config.metrics_address.ip().is_loopback() {
         anyhow::bail!("metrics address must bind loopback");
     }
@@ -1446,8 +1910,13 @@ fn validate_config(config: &Config) -> Result<()> {
         }
     }
     if config.signer_server_ca_pems.is_empty() || config.pinned_client_cert_pems.is_empty() {
-        anyhow::bail!("mTLS trust roots must not be empty");
+        anyhow::bail!("mTLS exact-peer allowlists must not be empty");
     }
+    // Pure production policy precedes all durable/secret path inspection.
+    validate_database_url(&config.database_url)?;
+    validate_owner_only_directory(&config.evidence_dir)?;
+    validate_secret_file(&config.signer_client_identity_pem)?;
+    validate_secret_file(&config.server_key_pem)?;
     Ok(())
 }
 
@@ -1540,63 +2009,47 @@ fn parse_nonzero_address(label: &str, raw: &str) -> Result<Address> {
 }
 
 fn signer_client(config: &Config) -> Result<reqwest::Client> {
-    let identity = reqwest::Identity::from_pem(&fs::read(&config.signer_client_identity_pem)?)?;
-    let mut builder = reqwest::Client::builder()
-        .identity(identity)
-        .timeout(Duration::from_secs(config.signer_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_built_in_root_certs(false);
-    for path in &config.signer_server_ca_pems {
-        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&fs::read(path)?)?);
-    }
+    let identity = fs::read(&config.signer_client_identity_pem)?;
+    let peers = config
+        .signer_server_ca_pems
+        .iter()
+        .map(fs::read)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let builder = exact_pinned_async_client_builder(
+        HttpClientPolicy {
+            connect_timeout: Duration::from_secs(config.signer_timeout_secs.min(3)),
+            request_timeout: Duration::from_secs(config.signer_timeout_secs),
+            max_response_bytes: MAX_REGISTRY_SUBMISSION_BYTES,
+        },
+        load_cert_chain(&identity)?,
+        load_private_key(&identity)?,
+        pinned_cert_store(&peers)?,
+    )?;
     Ok(builder.build()?)
 }
 
-fn provider() -> Arc<CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+fn bounded_rpc_client(raw_url: &str) -> Result<alloy::rpc::client::RpcClient<BoundedAlloyHttp>> {
+    let transport = BoundedAlloyHttp::new(
+        raw_url,
+        HttpClientPolicy {
+            connect_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(15),
+            max_response_bytes: 16 * 1024 * 1024,
+        },
+    )
+    .context("build bounded Ethereum RPC client")?;
+    Ok(alloy::rpc::client::RpcClient::new(transport, true))
 }
 
 fn load_server_tls(config: &Config) -> Result<ServerConfig> {
-    let chain = CertificateDer::pem_slice_iter(&fs::read(&config.server_cert_pem)?)
+    let chain = load_cert_chain(&fs::read(&config.server_cert_pem)?)?;
+    let key = load_private_key(&fs::read(&config.server_key_pem)?)?;
+    let peer_pems = config
+        .pinned_client_cert_pems
+        .iter()
+        .map(fs::read)
         .collect::<Result<Vec<_>, _>>()?;
-    let key = PrivateKeyDer::from_pem_slice(&fs::read(&config.server_key_pem)?)?;
-    let mut roots = RootCertStore::empty();
-    for path in &config.pinned_client_cert_pems {
-        for cert in CertificateDer::pem_slice_iter(&fs::read(path)?) {
-            roots.add(cert?)?;
-        }
-    }
-    if roots.is_empty() {
-        anyhow::bail!("pinned mTLS client roots are empty");
-    }
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider()).build()?;
-    Ok(ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(chain, key)?)
-}
-
-async fn serve_mtls(
-    listener: tokio::net::TcpListener,
-    config: Arc<ServerConfig>,
-    app: Router,
-) -> std::io::Result<()> {
-    let acceptor = TlsAcceptor::from(config);
-    loop {
-        let (tcp, _) = listener.accept().await?;
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        tokio::spawn(async move {
-            let Ok(stream) = acceptor.accept(tcp).await else {
-                return;
-            };
-            let service = TowerToHyperService::new(app);
-            let _ = HyperBuilder::new(TokioExecutor::new())
-                .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                .await;
-        });
-    }
+    Ok(server_config(chain, key, pinned_cert_store(&peer_pems)?)?)
 }
 
 fn now_unix() -> Result<u64> {
@@ -1615,6 +2068,266 @@ mod tests {
     #![expect(clippy::expect_used, reason = "test fixtures")]
 
     use super::*;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::{Signer, SignerSync};
+
+    fn production_config() -> Config {
+        Config {
+            chain_id: 1,
+            registry_contract: "0x0000000000000000000000000000000000000001".into(),
+            poster_address: "0x0000000000000000000000000000000000000002".into(),
+            ethereum_rpc_url: "https://rpc.example".into(),
+            operator_id: "coordinator-01".into(),
+            database_url: "sqlite:///definitely/not/read/coordinator.db".into(),
+            evidence_dir: "/definitely/not/read/evidence".into(),
+            listen_address: SocketAddr::from(([0, 0, 0, 0], 9444)),
+            metrics_address: SocketAddr::from(([127, 0, 0, 1], 9097)),
+            inbound_interval_secs: 12,
+            report_validity_secs: 60,
+            quote_wait_secs: 5,
+            post_attempts: 3,
+            retry_base_ms: 500,
+            retry_max_ms: 10_000,
+            inbound_policy: InboundPolicy {
+                source_chain: "ETH".into(),
+                enabled_chains: vec!["ETH".into(), "BTC".into()],
+                allowlisted_pools: vec!["BTC.BTC".into()],
+                max_tip_age_secs: 12,
+                max_height_skew: 2,
+            },
+            quote_policy: QuotePolicy {
+                allowlisted_assets: vec!["BTC.BTC".into(), "ETH.USDT".into()],
+                min_price_sources: 3,
+                max_price_age_secs: 30,
+                max_price_deviation_bps: 100,
+                external_floor_bps: 9_900,
+                max_dispatch_ttl_secs: 300,
+                max_stream_blocks: 100,
+                max_total_swap_secs: 600,
+            },
+            sources: (1..=3)
+                .map(|index| SourceConfig {
+                    id: format!("source-{index}"),
+                    thornode_url: format!("https://thornode-{index}.example"),
+                    consensus_url: format!("https://consensus-{index}.example"),
+                })
+                .collect(),
+            routes: vec![RouteConfig {
+                adapter: "0x0000000000000000000000000000000000000003".into(),
+                funding_token: "0x0000000000000000000000000000000000000004".into(),
+                funding_asset: "ETH.USDT".into(),
+            }],
+            asset_prices: vec![
+                AssetPriceConfig {
+                    asset: "BTC.BTC".into(),
+                    binance: "BTCUSDT".into(),
+                    coinbase: "BTC-USD".into(),
+                    kraken: "XBTUSD".into(),
+                },
+                AssetPriceConfig {
+                    asset: "ETH.USDT".into(),
+                    binance: "ETHUSDT".into(),
+                    coinbase: "ETH-USD".into(),
+                    kraken: "ETHUSD".into(),
+                },
+            ],
+            binance_base: "https://binance.example".into(),
+            coinbase_base: "https://coinbase.example".into(),
+            kraken_base: "https://kraken.example".into(),
+            signers: (10u8..=14)
+                .map(|byte| SignerConfig {
+                    address: format!("0x{byte:040x}"),
+                    url: format!("https://signer-{byte}.example"),
+                })
+                .collect(),
+            threshold: 3,
+            signer_timeout_secs: 5,
+            signer_client_identity_pem: "/definitely/not/read/signer.pem".into(),
+            signer_server_ca_pems: vec!["/definitely/not/read/signer-peer.pem".into()],
+            server_cert_pem: "/definitely/not/read/server.crt".into(),
+            server_key_pem: "/definitely/not/read/server.key".into(),
+            pinned_client_cert_pems: vec!["/definitely/not/read/client.crt".into()],
+        }
+    }
+
+    fn assert_policy_rejection(config: &Config) {
+        let error = validate_config(config).expect_err("unsafe production mutation must fail");
+        assert!(
+            !error.to_string().contains("definitely/not/read"),
+            "policy mutation reached secret/path I/O: {error:#}"
+        );
+    }
+
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        let mut zero_chain = production_config();
+        zero_chain.chain_id = 0;
+        assert_policy_rejection(&zero_chain);
+
+        let mut collapsed_signers = production_config();
+        collapsed_signers.signers.truncate(4);
+        assert_policy_rejection(&collapsed_signers);
+
+        let mut minority_threshold = production_config();
+        minority_threshold.threshold = 2;
+        assert_policy_rejection(&minority_threshold);
+
+        let mut two_sources = production_config();
+        two_sources.sources.truncate(2);
+        assert_policy_rejection(&two_sources);
+
+        let mut plaintext_rpc = production_config();
+        plaintext_rpc.ethereum_rpc_url = "http://rpc.example".into();
+        assert_policy_rejection(&plaintext_rpc);
+
+        let mut public_metrics = production_config();
+        public_metrics.metrics_address = SocketAddr::from(([0, 0, 0, 0], 9097));
+        assert_policy_rejection(&public_metrics);
+
+        let mut duplicate_signer = production_config();
+        duplicate_signer.signers[1].address = duplicate_signer.signers[0].address.clone();
+        assert_policy_rejection(&duplicate_signer);
+
+        let mut no_peer_pins = production_config();
+        no_peer_pins.signer_server_ca_pems.clear();
+        assert_policy_rejection(&no_peer_pins);
+    }
+
+    fn signer(seed: u8) -> PrivateKeySigner {
+        format!("0x{}", format!("{seed:02x}").repeat(32))
+            .parse()
+            .expect("test signer")
+    }
+
+    fn inbound_submission(signer: &PrivateKeySigner, sequence: u64) -> InboundSignatureSubmission {
+        let source_hash = B256::from(U256::from(sequence));
+        let candidate = InboundCandidate {
+            derived: xindex_chain_thor::DerivedInbound {
+                vault: format!("{:#x}", Address::repeat_byte(2)),
+                router: format!("{:#x}", Address::repeat_byte(3)),
+                pause_flags: 0,
+                source_hash,
+                bundle: xindex_chain_thor::CanonicalSourceBundle {
+                    schema: "test".to_string(),
+                    source_chain: "ETH".to_string(),
+                    enabled_chains: vec!["ETH".to_string(), "BTC".to_string()],
+                    allowlisted_pools: vec!["BTC.BTC".to_string()],
+                    sources: Vec::new(),
+                },
+            },
+            observed_at: 100,
+            valid_until: 200,
+            sequence,
+        };
+        let typed = xindex_shared::eip712::inbound_state(
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+            0,
+            100,
+            200,
+            sequence,
+            source_hash,
+        );
+        let domain = thorchain_registry_domain(1, Address::repeat_byte(0xcc));
+        let digest = xindex_shared::eip712::inbound_state_signing_hash(&typed, &domain);
+        let signature = signer.sign_hash_sync(&digest).expect("sign").as_bytes();
+        InboundSignatureSubmission {
+            candidate,
+            signed: SignedInboundStateMessage {
+                vault: format!("{:#x}", Address::repeat_byte(2)),
+                router: format!("{:#x}", Address::repeat_byte(3)),
+                pause_flags: 0,
+                observed_at: 100,
+                valid_until: 200,
+                sequence,
+                source_hash: format!("{source_hash:#x}"),
+                signer_address: format!("{:#x}", signer.address()),
+                signature: format!("0x{}", alloy_primitives::hex::encode(signature)),
+            },
+        }
+    }
+
+    async fn ingress_test_state(
+        signers: &[PrivateKeySigner],
+    ) -> (Arc<AppState>, EvidenceStore, PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "xindex-registry-ingress-{}-{}",
+            std::process::id(),
+            signers[0].address()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).expect("evidence dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+        }
+        let evidence = EvidenceStore::open(&directory).expect("evidence");
+        let registry = Registry::new();
+        let metrics = Metrics::new(&registry).expect("metrics");
+        let http = reqwest::Client::new();
+        let provider =
+            Arc::new(ProviderBuilder::new().on_client(
+                bounded_rpc_client("http://127.0.0.1:1").expect("bounded test provider"),
+            ));
+        let collector = RegistryCollector::new(
+            thorchain_registry_domain(1, Address::repeat_byte(0xcc)),
+            signers.iter().map(Signer::address),
+            3,
+        )
+        .expect("collector");
+        let state = Arc::new(AppState {
+            chain_id: 1,
+            registry_address: Address::repeat_byte(0xcc),
+            provider,
+            durable_state: SqliteRegistryState::connect("sqlite::memory:")
+                .await
+                .expect("registry state"),
+            posting_outbox: SqlitePostingOutbox::connect("sqlite::memory:")
+                .await
+                .expect("outbox"),
+            evidence: evidence.clone(),
+            operator_id: "test".to_string(),
+            inbound_policy: InboundPolicy {
+                source_chain: "ETH".to_string(),
+                enabled_chains: vec!["ETH".to_string(), "BTC".to_string()],
+                allowlisted_pools: vec!["BTC.BTC".to_string()],
+                max_tip_age_secs: 12,
+                max_height_skew: 2,
+            },
+            quote_policy: QuotePolicy {
+                allowlisted_assets: vec!["BTC.BTC".to_string()],
+                min_price_sources: 3,
+                max_price_age_secs: 30,
+                max_price_deviation_bps: 100,
+                external_floor_bps: 9_900,
+                max_dispatch_ttl_secs: 300,
+                max_stream_blocks: 100,
+                max_total_swap_secs: 600,
+            },
+            report_validity_secs: 60,
+            quote_wait_secs: 1,
+            sources: Vec::new(),
+            routes: HashMap::new(),
+            asset_prices: HashMap::new(),
+            prices: PriceFleet {
+                binance: BinanceVenue::new(http.clone(), "http://127.0.0.1:1"),
+                coinbase: CoinbaseVenue::new(http.clone(), "http://127.0.0.1:1"),
+                kraken: KrakenVenue::new(http.clone(), "http://127.0.0.1:1"),
+            },
+            signer_client: http,
+            signer_urls: Vec::new(),
+            collector: Arc::new(Mutex::new(collector)),
+            inbound_notify: Notify::new(),
+            quote_candidates: Mutex::new(HashMap::new()),
+            ready_quotes: Mutex::new(HashMap::new()),
+            quote_notify: Notify::new(),
+            quote_build_lock: tokio::sync::Mutex::new(()),
+            metrics,
+        });
+        (state, evidence, directory)
+    }
 
     fn test_quote(
         source: &'static str,
@@ -1713,5 +2426,90 @@ mod tests {
         assert_eq!(selected.0, "c");
         assert_eq!(selected.3.min_out_1e8, "110");
         assert_eq!(selected.3.dispatch_deadline, 80);
+    }
+
+    #[test]
+    fn durable_inbound_quorum_round_trips_exact_generation() {
+        let mut first_signature = [0x11; 65];
+        first_signature[64] = 27;
+        let mut second_signature = [0x22; 65];
+        second_signature[64] = 28;
+        let mut third_signature = [0x33; 65];
+        third_signature[64] = 27;
+        let ready = ReadyInbound {
+            payload: InboundPayload {
+                vault: Address::repeat_byte(1),
+                router: Address::repeat_byte(2),
+                pause_flags: 3,
+                observed_at: 100,
+                valid_until: 160,
+                sequence: 7,
+                source_hash: B256::repeat_byte(4),
+            },
+            signatures: vec![first_signature, second_signature, third_signature],
+        };
+        let body = serde_json::to_vec(&DurableInboundQuorum {
+            ready: ready.clone(),
+        })
+        .expect("encode");
+        let job = PostingJob {
+            kind: "registry_inbound".to_string(),
+            identity: inbound_signature_identity(7).to_vec(),
+            generation: 160,
+            payload_hash: alloy_primitives::keccak256(&body),
+            payload: body,
+            state: PostingJobState::Queued,
+            expires_at: 160,
+            attempts: 0,
+            next_attempt_at: 100,
+            created_at: 100,
+            updated_at: 100,
+        };
+        assert_eq!(decode_inbound_job(&job).expect("decode").ready, ready);
+
+        let mut wrong_generation = job;
+        wrong_generation.generation = 161;
+        assert!(decode_inbound_job(&wrong_generation).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_and_one_vote_submissions_create_no_evidence_files() {
+        let signers = [signer(1), signer(2), signer(3)];
+        let (state, evidence, directory) = ingress_test_state(&signers).await;
+
+        let mut invalid = inbound_submission(&signers[0], 1);
+        invalid.signed.signature = format!("0x{}", "00".repeat(65));
+        assert!(ingest_inbound_submission(&state, invalid, 100)
+            .await
+            .is_err());
+        assert_eq!(
+            evidence.verify_records().expect("inventory").record_count,
+            0
+        );
+
+        let accepted = ingest_inbound_submission(&state, inbound_submission(&signers[0], 2), 100)
+            .await
+            .expect("one vote accepted");
+        assert_eq!(accepted.0, StatusCode::ACCEPTED);
+        assert_eq!(
+            evidence.verify_records().expect("inventory").record_count,
+            0
+        );
+
+        let _ = ingest_inbound_submission(&state, inbound_submission(&signers[1], 2), 100)
+            .await
+            .expect("second vote");
+        let quorum = ingest_inbound_submission(&state, inbound_submission(&signers[2], 2), 100)
+            .await
+            .expect("quorum");
+        assert_eq!(quorum.0, StatusCode::ACCEPTED);
+        assert_eq!(
+            evidence.verify_records().expect("inventory").record_count,
+            1
+        );
+
+        drop(state);
+        drop(evidence);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

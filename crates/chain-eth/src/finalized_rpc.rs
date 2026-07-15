@@ -9,10 +9,10 @@
 use std::time::Duration;
 
 use alloy_primitives::{keccak256, Address, Bytes, B256};
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
+use xindex_ops::network::{async_client, read_bounded_async, HttpClientPolicy, NetworkError};
 
 const MAX_RPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -81,10 +81,12 @@ impl FinalizedRpcClient {
                 "RPC URL must use http or https".to_string(),
             ));
         }
-        let client = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|error| FinalizedRpcError::Transport(transport_class(&error)))?;
+        let client = async_client(HttpClientPolicy {
+            connect_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(15),
+            max_response_bytes: MAX_RPC_RESPONSE_BYTES,
+        })
+        .map_err(|_| FinalizedRpcError::Transport("client_build"))?;
         Ok(Self { endpoint, client })
     }
 
@@ -340,16 +342,12 @@ fn decode_log(log: RpcLog) -> Result<FinalizedLog, FinalizedRpcError> {
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, FinalizedRpcError> {
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| FinalizedRpcError::Transport(transport_class(&error)))?;
-        if bytes.len().saturating_add(chunk.len()) > MAX_RPC_RESPONSE_BYTES {
-            return Err(FinalizedRpcError::ResponseTooLarge);
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    read_bounded_async(response, MAX_RPC_RESPONSE_BYTES)
+        .await
+        .map_err(|error| match error {
+            NetworkError::ResponseTooLarge { .. } => FinalizedRpcError::ResponseTooLarge,
+            _ => FinalizedRpcError::Transport("body"),
+        })
 }
 
 fn parse_quantity(value: &str, label: &str) -> Result<u64, FinalizedRpcError> {

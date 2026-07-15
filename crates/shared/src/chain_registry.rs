@@ -80,7 +80,16 @@ pub enum ChainId {
 
 impl fmt::Display for ChainId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ChainId {
+    /// Canonical lowercase wire identifier. This exact spelling is used by
+    /// JSON, replay namespaces, and the RIC/ACC native-chain commitment.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Btc => "btc",
             Self::Ltc => "ltc",
             Self::Bch => "bch",
@@ -96,7 +105,7 @@ impl fmt::Display for ChainId {
             Self::Xrp => "xrp",
             Self::Sol => "sol",
             Self::Tron => "tron",
-        })
+        }
     }
 }
 
@@ -568,6 +577,16 @@ impl ChainId {
         keccak256(self.thor_asset().as_bytes())
     }
 
+    /// Canonical RIC/ACC `nativeChainId` commitment: keccak256 of this
+    /// chain's lowercase wire identifier (for example, `keccak256("btc")`).
+    /// The certificate constructors receive this separately from `assetId`
+    /// so the signed shape cannot be relabeled into another replay or quota
+    /// namespace.
+    #[must_use]
+    pub fn native_chain_id_hash(self) -> B256 {
+        keccak256(self.as_str().as_bytes())
+    }
+
     /// Reverse of [`asset_id_hash`]: lookup the `ChainId` for an
     /// on-chain `legAssetIds[i]` value. Returns `None` if the asset
     /// hash doesn't match any supported chain. Iterates [`ALL_CHAINS`].
@@ -928,6 +947,26 @@ mod tests {
             for (j, b) in hashes.iter().enumerate() {
                 if i != j {
                     assert_ne!(a, b, "asset_id_hash collision: idx {i} vs {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_chain_id_hash_matches_canonical_wire_id_and_is_unique() {
+        let hashes: Vec<B256> = ALL_CHAINS
+            .iter()
+            .copied()
+            .map(ChainId::native_chain_id_hash)
+            .collect();
+        for (index, chain) in ALL_CHAINS.iter().copied().enumerate() {
+            assert_eq!(hashes[index], keccak256(chain.as_str().as_bytes()));
+            assert_eq!(chain.to_string(), chain.as_str());
+        }
+        for (i, a) in hashes.iter().enumerate() {
+            for (j, b) in hashes.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "native chain-id collision: idx {i} vs {j}");
                 }
             }
         }

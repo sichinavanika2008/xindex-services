@@ -169,6 +169,44 @@ def daemon_sign(path: str, body: dict) -> list[str]:
     return sigs[:3]
 
 
+def settlement_context(lg: dict) -> tuple[dict, str]:
+    """Build one deterministic, signed source context for an observed log."""
+    source_chain_id = int(strip_annot(cast("chain-id")))
+    source_block_number = int(lg["blockNumber"], 16)
+    source_block_hash = lg["blockHash"]
+    observed_at = int(
+        strip_annot(cast("block", str(source_block_number), "--field", "timestamp"))
+    )
+    valid_until = observed_at + 300
+    observation_epoch = int(
+        strip_annot(
+            cast(
+                "call",
+                ORACLE,
+                "observationEpoch(uint256)(uint64)",
+                str(source_chain_id),
+            )
+        )
+    )
+    evidence_hash = keccak(
+        f'{source_block_hash}:{lg["transactionHash"]}:{lg["logIndex"]}'
+    )
+    body = {
+        "evidence_hash": evidence_hash,
+        "observed_at": observed_at,
+        "valid_until": valid_until,
+        "source_chain_id": source_chain_id,
+        "source_block_number": source_block_number,
+        "source_block_hash": source_block_hash,
+        "observation_epoch": observation_epoch,
+    }
+    encoded = (
+        f"({evidence_hash},{observed_at},{valid_until},{source_chain_id},"
+        f"{source_block_number},{source_block_hash},{observation_epoch})"
+    )
+    return body, encoded
+
+
 def handle_mint(lg: dict) -> None:
     intent_id = lg["topics"][1]
     fields = abi_decode("address,uint256,uint64,bytes32[],uint256[]", lg["data"])
@@ -177,15 +215,29 @@ def handle_mint(lg: dict) -> None:
     expected = parse_array(fields[4])
     n = len(expected)
     per_slot = amount_in // n if n else 0
+    context_body, context_tuple = settlement_context(lg)
     log(f"MintIntentCreated {intent_id} — {n} async slot(s), amountIn={amount_in}")
     for slot in range(n):
         amount = attest_amount(expected[slot], per_slot)
         try:
             sigs = daemon_sign(
                 "/api/v1/sign/eip712-attestation",
-                {"intent_id": intent_id, "slot_index": str(slot), "attested_amount": amount},
+                {
+                    "intent_id": intent_id,
+                    "slot_index": str(slot),
+                    "attested_amount": amount,
+                    **context_body,
+                },
             )
-            cast_send(ORACLE, "attest(bytes32,uint256,uint256,bytes[])", intent_id, str(slot), amount, "[" + ",".join(sigs) + "]")
+            cast_send(
+                ORACLE,
+                "attest(bytes32,uint256,uint256,(bytes32,uint64,uint64,uint256,uint64,bytes32,uint64),bytes[])",
+                intent_id,
+                str(slot),
+                amount,
+                context_tuple,
+                "[" + ",".join(sigs) + "]",
+            )
             log(f"  attested slot {slot} amount={amount}")
         except RuntimeError as exc:
             # Already-attested (restart re-scan) or transient — skip this slot.
@@ -211,6 +263,7 @@ def handle_redeem(lg: dict) -> None:
     # burning fraction f returns ~f * the original deposit.
     at = ("--block", str(int(lg["blockNumber"], 16) - 1))
     supply = int(strip_annot(cast("call", index_token, "totalSupply()(uint256)", *at)))
+    context_body, context_tuple = settlement_context(lg)
     log(f"RedemptionIntentCreated {redemption_id} — {n} leg(s) for {index_token}")
     for leg in range(n):
         bal = int(strip_annot(cast("call", index_token, "asyncSlotBalance(uint256)(uint256)", str(leg), *at)))
@@ -222,12 +275,23 @@ def handle_redeem(lg: dict) -> None:
             # 2. collect + post the per-leg delivery attestation.
             sigs = daemon_sign(
                 "/api/v1/sign/eip712-redemption-delivery",
-                {"redemption_id": redemption_id, "leg_index": str(leg), "asset_id": asset_id, "delivered_amount": amount},
+                {
+                    "redemption_id": redemption_id,
+                    "leg_index": str(leg),
+                    "asset_id": asset_id,
+                    "delivered_amount": amount,
+                    **context_body,
+                },
             )
             cast_send(
                 ORACLE,
-                "attestRedemption(bytes32,uint256,bytes32,uint256,bytes[])",
-                redemption_id, str(leg), asset_id, amount, "[" + ",".join(sigs) + "]",
+                "attestRedemption(bytes32,uint256,bytes32,uint256,(bytes32,uint64,uint64,uint256,uint64,bytes32,uint64),bytes[])",
+                redemption_id,
+                str(leg),
+                asset_id,
+                amount,
+                context_tuple,
+                "[" + ",".join(sigs) + "]",
             )
             log(f"  delivered+attested leg {leg} asset={asset_id} usdt={amount}")
         except RuntimeError as exc:

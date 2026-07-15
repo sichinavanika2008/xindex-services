@@ -28,7 +28,7 @@ use tracing::{error, info, warn};
 use xindex_chain_eth::bindings::PriceAttestationOracle;
 use xindex_chain_eth::rpc::is_transient_rpc_error;
 use xindex_ops::tls::{
-    load_cert_chain, load_private_key, pinned_root_store, serve_mtls, server_config,
+    load_cert_chain, load_private_key, pinned_cert_store, serve_mtls, server_config,
 };
 use xindex_ops::{serve_metrics, Metrics};
 use xindex_relayer::{IngestOutcome, PriceCollector, ReadyPrice};
@@ -112,6 +112,13 @@ struct AppState {
     collector: Arc<Mutex<PriceCollector>>,
     ready_tx: mpsc::Sender<ReadyPrice>,
     metrics: Metrics,
+}
+
+struct ValidatedStartup {
+    oracle_address: Address,
+    poster_address: Address,
+    signers: Vec<Address>,
+    listen: SocketAddr,
 }
 
 fn now_unix() -> Option<u64> {
@@ -266,38 +273,9 @@ fn validate_secret_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_server_tls(args: &Args) -> Result<rustls::ServerConfig> {
-    validate_secret_file(&args.server_key_pem)?;
-    if args.pinned_client_cert_pems.is_empty() {
-        anyhow::bail!("at least one pinned price-signer client certificate is required");
-    }
-    let server_chain = load_cert_chain(&fs::read(&args.server_cert_pem)?)?;
-    let server_key = load_private_key(&fs::read(&args.server_key_pem)?)?;
-    let roots = args
-        .pinned_client_cert_pems
-        .iter()
-        .map(fs::read)
-        .collect::<std::io::Result<Vec<_>>>()?;
-    server_config(server_chain, server_key, pinned_root_store(&roots)?).map_err(Into::into)
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-    run(Args::parse()).await
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "startup validation and the single sequential nonce-safe poster worker are clearer together"
-)]
-async fn run(args: Args) -> Result<()> {
+/// Pure production preflight. This runs before TLS key reads, RPC creation,
+/// listener binds, or any other external operation.
+fn validate_startup(args: &Args) -> Result<ValidatedStartup> {
     if args.max_age_secs == 0
         || args.post_attempts == 0
         || args.retry_base_ms == 0
@@ -310,6 +288,9 @@ async fn run(args: Args) -> Result<()> {
     }
     if !args.metrics_address.ip().is_loopback() || args.metrics_address.port() == 0 {
         anyhow::bail!("METRICS_ADDRESS must be a non-zero loopback listener");
+    }
+    if args.pinned_client_cert_pems.is_empty() {
+        anyhow::bail!("at least one pinned price-signer client certificate is required");
     }
     validate_rpc_url(&args.rpc_url)?;
     let oracle_address = Address::from_str(&args.oracle_address).context("PRICE_ORACLE_ADDR")?;
@@ -331,6 +312,51 @@ async fn run(args: Args) -> Result<()> {
     if listen == args.metrics_address {
         anyhow::bail!("collector and metrics listeners must be distinct");
     }
+    Ok(ValidatedStartup {
+        oracle_address,
+        poster_address,
+        signers,
+        listen,
+    })
+}
+
+fn build_server_tls(args: &Args) -> Result<rustls::ServerConfig> {
+    validate_secret_file(&args.server_key_pem)?;
+    if args.pinned_client_cert_pems.is_empty() {
+        anyhow::bail!("at least one pinned price-signer client certificate is required");
+    }
+    let server_chain = load_cert_chain(&fs::read(&args.server_cert_pem)?)?;
+    let server_key = load_private_key(&fs::read(&args.server_key_pem)?)?;
+    let peer_bundles = args
+        .pinned_client_cert_pems
+        .iter()
+        .map(fs::read)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    server_config(server_chain, server_key, pinned_cert_store(&peer_bundles)?).map_err(Into::into)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    run(Args::parse()).await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "startup validation and the single sequential nonce-safe poster worker are clearer together"
+)]
+async fn run(args: Args) -> Result<()> {
+    let validated = validate_startup(&args)?;
+    let oracle_address = validated.oracle_address;
+    let poster_address = validated.poster_address;
+    let signers = validated.signers;
+    let listen = validated.listen;
     let tls = Arc::new(build_server_tls(&args)?);
     let rpc_url = args.rpc_url.parse().context("ETH_RPC_URL")?;
     let provider = Arc::new(
@@ -557,6 +583,74 @@ async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn production_args() -> Args {
+        Args {
+            rpc_url: "https://rpc.example".into(),
+            oracle_address: "0x0000000000000000000000000000000000000001".into(),
+            poster_address: "0x0000000000000000000000000000000000000002".into(),
+            signer_addresses: (10u8..=20)
+                .map(|byte| format!("0x{byte:040x}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            threshold: 7,
+            expected_chain_id: 1,
+            max_age_secs: 300,
+            listen_address: "127.0.0.1:9191".into(),
+            metrics_address: SocketAddr::from(([127, 0, 0, 1], 9192)),
+            server_cert_pem: "/definitely/not/read/server.crt".into(),
+            server_key_pem: "/definitely/not/read/server.key".into(),
+            pinned_client_cert_pems: vec!["/definitely/not/read/peer.crt".into()],
+            post_attempts: 6,
+            retry_base_ms: 500,
+            retry_max_ms: 10_000,
+        }
+    }
+
+    /// L-04: every mutation is rejected by the pure startup validator while
+    /// all TLS paths are intentionally unreadable. No key, RPC, or listener is
+    /// touched by this test.
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        assert!(validate_startup(&production_args()).is_ok());
+
+        let mut collapsed = production_args();
+        collapsed.threshold = 6;
+        assert!(validate_startup(&collapsed).is_err());
+
+        let mut short_roster = production_args();
+        short_roster.signer_addresses = short_roster
+            .signer_addresses
+            .split(',')
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(validate_startup(&short_roster).is_err());
+
+        let mut plaintext_rpc = production_args();
+        plaintext_rpc.rpc_url = "http://rpc.example".into();
+        assert!(validate_startup(&plaintext_rpc).is_err());
+
+        let mut no_peer_pin = production_args();
+        no_peer_pin.pinned_client_cert_pems.clear();
+        assert!(validate_startup(&no_peer_pin).is_err());
+
+        let mut public_metrics = production_args();
+        public_metrics.metrics_address = SocketAddr::from(([0, 0, 0, 0], 9192));
+        assert!(validate_startup(&public_metrics).is_err());
+
+        let mut same_listener = production_args();
+        same_listener.metrics_address = SocketAddr::from(([127, 0, 0, 1], 9191));
+        assert!(validate_startup(&same_listener).is_err());
+
+        let mut zero_chain = production_args();
+        zero_chain.expected_chain_id = 0;
+        assert!(validate_startup(&zero_chain).is_err());
+
+        let mut zero_retry = production_args();
+        zero_retry.post_attempts = 0;
+        assert!(validate_startup(&zero_retry).is_err());
+    }
 
     #[test]
     fn retry_delay_is_exponential_and_capped() {

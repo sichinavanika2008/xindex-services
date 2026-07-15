@@ -1,0 +1,472 @@
+{
+  "schema_version": 1,
+  "gate": "XINDEX_GATE_4",
+  "environment": "sepolia+thorchain-devnet+btc-testnet4",
+  "protocol_commit": "REPLACE_WITH_40_HEX_PROTOCOL_COMMIT",
+  "services_commit": "REPLACE_WITH_40_HEX_SERVICES_COMMIT",
+  "started_at_utc": "REPLACE_WITH_START_UTC",
+  "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+  "reviewers": [
+    "REPLACE_REVIEWER_1",
+    "REPLACE_REVIEWER_2"
+  ],
+  "authorization": {
+    "path": "/absolute/private/gate4/authorization.txt",
+    "sha256": "REPLACE_WITH_AUTHORIZATION_SHA256"
+  },
+  "bitgo_qualification": {
+    "report_sha256": "REPLACE_WITH_BITGO_LIVE_REPORT_SHA256",
+    "evidence": {
+      "path": "/absolute/private/gate4/bitgo-gate-evidence.json",
+      "sha256": "REPLACE_WITH_BITGO_EVIDENCE_SHA256"
+    }
+  },
+  "topology": {
+    "observation_certification": {
+      "threshold": 3,
+      "participants": 5,
+      "members": [
+        {
+          "operator_id": "REPLACE_OBSERVER_1",
+          "admin_domain": "REPLACE_OBSERVER_1_ADMIN",
+          "infrastructure_domain": "REPLACE_OBSERVER_1_INFRA",
+          "rpc_failure_domain": "REPLACE_OBSERVER_1_RPC_DOMAIN",
+          "certification_pubkey_sha256": "REPLACE_OBSERVER_1_CERT_KEY_SHA256",
+          "thornode_origins": [
+            "https://replace-observer-1-thornode-a.invalid/",
+            "https://replace-observer-1-thornode-b.invalid/"
+          ]
+        },
+        {
+          "operator_id": "REPLACE_OBSERVER_2",
+          "admin_domain": "REPLACE_OBSERVER_2_ADMIN",
+          "infrastructure_domain": "REPLACE_OBSERVER_2_INFRA",
+          "rpc_failure_domain": "REPLACE_OBSERVER_2_RPC_DOMAIN",
+          "certification_pubkey_sha256": "REPLACE_OBSERVER_2_CERT_KEY_SHA256",
+          "thornode_origins": [
+            "https://replace-observer-2-thornode-a.invalid/",
+            "https://replace-observer-2-thornode-b.invalid/"
+          ]
+        },
+        {
+          "operator_id": "REPLACE_OBSERVER_3",
+          "admin_domain": "REPLACE_OBSERVER_3_ADMIN",
+          "infrastructure_domain": "REPLACE_OBSERVER_3_INFRA",
+          "rpc_failure_domain": "REPLACE_OBSERVER_3_RPC_DOMAIN",
+          "certification_pubkey_sha256": "REPLACE_OBSERVER_3_CERT_KEY_SHA256",
+          "thornode_origins": [
+            "https://replace-observer-3-thornode-a.invalid/",
+            "https://replace-observer-3-thornode-b.invalid/"
+          ]
+        },
+        {
+          "operator_id": "REPLACE_OBSERVER_4",
+          "admin_domain": "REPLACE_OBSERVER_4_ADMIN",
+          "infrastructure_domain": "REPLACE_OBSERVER_4_INFRA",
+          "rpc_failure_domain": "REPLACE_OBSERVER_4_RPC_DOMAIN",
+          "certification_pubkey_sha256": "REPLACE_OBSERVER_4_CERT_KEY_SHA256",
+          "thornode_origins": [
+            "https://replace-observer-4-thornode-a.invalid/",
+            "https://replace-observer-4-thornode-b.invalid/"
+          ]
+        },
+        {
+          "operator_id": "REPLACE_OBSERVER_5",
+          "admin_domain": "REPLACE_OBSERVER_5_ADMIN",
+          "infrastructure_domain": "REPLACE_OBSERVER_5_INFRA",
+          "rpc_failure_domain": "REPLACE_OBSERVER_5_RPC_DOMAIN",
+          "certification_pubkey_sha256": "REPLACE_OBSERVER_5_CERT_KEY_SHA256",
+          "thornode_origins": [
+            "https://replace-observer-5-thornode-a.invalid/",
+            "https://replace-observer-5-thornode-b.invalid/"
+          ]
+        }
+      ]
+    },
+    "custody": {
+      "threshold": 2,
+      "participants": 3,
+      "provider": "bitgo",
+      "network": "bitcoin-testnet4",
+      "address_type": "p2wsh",
+      "wallet_id": "REPLACE_WITH_BITGO_TEST_WALLET_ID",
+      "wallet_keyset_sha256": "REPLACE_WITH_PUBLIC_KEYSET_SHA256",
+      "members": [
+        {
+          "holder_type": "user",
+          "signer_role": "normal",
+          "key_id_sha256": "REPLACE_WITH_USER_PUBLIC_KEY_ID_SHA256",
+          "operator_id": "REPLACE_CUSTODY_USER_OPERATOR",
+          "admin_domain": "REPLACE_CUSTODY_USER_ADMIN",
+          "failure_domain": "REPLACE_CUSTODY_USER_FAILURE_DOMAIN"
+        },
+        {
+          "holder_type": "backup",
+          "signer_role": "recovery",
+          "key_id_sha256": "REPLACE_WITH_BACKUP_PUBLIC_KEY_ID_SHA256",
+          "operator_id": "REPLACE_CUSTODY_BACKUP_OPERATOR",
+          "admin_domain": "REPLACE_CUSTODY_BACKUP_ADMIN",
+          "failure_domain": "REPLACE_CUSTODY_BACKUP_FAILURE_DOMAIN"
+        },
+        {
+          "holder_type": "bitgo",
+          "signer_role": "normal",
+          "key_id_sha256": "REPLACE_WITH_BITGO_PUBLIC_KEY_ID_SHA256",
+          "operator_id": "bitgo",
+          "admin_domain": "bitgo",
+          "failure_domain": "bitgo-managed"
+        }
+      ]
+    }
+  },
+  "drills": [
+    {
+      "id": "G4-MINT-HAPPY",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Complete Sepolia mint lifecycle is independently observed and finalized.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "transaction", "environment": "sepolia", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-MINT-HAPPY/transcript.log", "sha256": "REPLACE_WITH_SHA256_A"}, {"path": "/absolute/private/gate4/G4-MINT-HAPPY/operator.log", "sha256": "REPLACE_WITH_SHA256_B"}]
+    },
+    {
+      "id": "G4-REDEEM-HAPPY",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3", "REPLACE_CUSTODY_USER_OPERATOR", "bitgo"],
+      "expected": "BitGo on-chain 2-of-3 redemption completes through Bitcoin Testnet4, the controlled THORChain devnet and settlement attestation.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 600000,
+      "custody_signature_created": true,
+      "custody_broadcast_created": true,
+      "external_evidence": [{"kind": "transaction", "environment": "bitcoin-testnet4", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-REDEEM-HAPPY/transcript.log", "sha256": "REPLACE_WITH_SHA256_C"}, {"path": "/absolute/private/gate4/G4-REDEEM-HAPPY/operator.log", "sha256": "REPLACE_WITH_SHA256_D"}]
+    },
+    {
+      "id": "G4-RECOVERY-CONTROLLED",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Controlled recovery or make-whole flow completes within reviewed caps.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 900000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "ceremony_record", "environment": "gate4-testnet", "id": "REPLACE_WITH_RECORD_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-RECOVERY-CONTROLLED/transcript.log", "sha256": "REPLACE_WITH_SHA256_E"}, {"path": "/absolute/private/gate4/G4-RECOVERY-CONTROLLED/operator.log", "sha256": "REPLACE_WITH_SHA256_F"}]
+    },
+    {
+      "id": "G4-ORACLE-DIVERGENCE",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Divergent price evidence fails closed and raises the expected alert.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "operator_log", "environment": "sepolia", "id": "REPLACE_WITH_LOG_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-ORACLE-DIVERGENCE/transcript.log", "sha256": "REPLACE_WITH_SHA256_G"}, {"path": "/absolute/private/gate4/G4-ORACLE-DIVERGENCE/operator.log", "sha256": "REPLACE_WITH_SHA256_H"}]
+    },
+    {
+      "id": "G4-ORACLE-STALE",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Stale, future and non-positive oracle data fail closed before consumption.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "operator_log", "environment": "sepolia", "id": "REPLACE_WITH_LOG_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-ORACLE-STALE/transcript.log", "sha256": "REPLACE_WITH_SHA256_I"}, {"path": "/absolute/private/gate4/G4-ORACLE-STALE/operator.log", "sha256": "REPLACE_WITH_SHA256_J"}]
+    },
+    {
+      "id": "G4-SEQUENCER-OUTAGE",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Sequencer outage and recovery grace block affected reads and settlement.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "operator_log", "environment": "sepolia", "id": "REPLACE_WITH_LOG_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-SEQUENCER-OUTAGE/transcript.log", "sha256": "REPLACE_WITH_SHA256_K"}, {"path": "/absolute/private/gate4/G4-SEQUENCER-OUTAGE/operator.log", "sha256": "REPLACE_WITH_SHA256_L"}]
+    },
+    {
+      "id": "G4-SIGNER-LOSS",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3", "REPLACE_OBSERVER_4", "REPLACE_OBSERVER_5"],
+      "expected": "Three-of-five succeeds with two unavailable and fails with three unavailable.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "operator_log", "environment": "gate4-testnet", "id": "REPLACE_WITH_LOG_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-SIGNER-LOSS/transcript.log", "sha256": "REPLACE_WITH_SHA256_M"}, {"path": "/absolute/private/gate4/G4-SIGNER-LOSS/operator.log", "sha256": "REPLACE_WITH_SHA256_N"}]
+    },
+    {
+      "id": "G4-SIGNER-COMPROMISE",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Wrong signer, key or source cannot create an accepted report or signature.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "operator_log", "environment": "gate4-testnet", "id": "REPLACE_WITH_LOG_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-SIGNER-COMPROMISE/transcript.log", "sha256": "REPLACE_WITH_SHA256_O"}, {"path": "/absolute/private/gate4/G4-SIGNER-COMPROMISE/operator.log", "sha256": "REPLACE_WITH_SHA256_P"}]
+    },
+    {
+      "id": "G4-THOR-HALT",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "THORChain halt blocks new flow with no custody signature or broadcast.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "operator_log", "environment": "thorchain-devnet", "id": "REPLACE_WITH_LOG_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-THOR-HALT/transcript.log", "sha256": "REPLACE_WITH_SHA256_Q"}, {"path": "/absolute/private/gate4/G4-THOR-HALT/operator.log", "sha256": "REPLACE_WITH_SHA256_R"}]
+    },
+    {
+      "id": "G4-VAULT-ROTATION",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Stale vault is rejected and a freshly attested vault is accepted.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 600000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "block", "environment": "thorchain-devnet", "id": "REPLACE_WITH_BLOCK_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-VAULT-ROTATION/transcript.log", "sha256": "REPLACE_WITH_SHA256_S"}, {"path": "/absolute/private/gate4/G4-VAULT-ROTATION/operator.log", "sha256": "REPLACE_WITH_SHA256_T"}]
+    },
+    {
+      "id": "G4-ROUTER-ROTATION",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Wrong Router is rejected and reviewed Router rotation succeeds.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 600000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "transaction", "environment": "sepolia", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-ROUTER-ROTATION/transcript.log", "sha256": "REPLACE_WITH_SHA256_U"}, {"path": "/absolute/private/gate4/G4-ROUTER-ROTATION/operator.log", "sha256": "REPLACE_WITH_SHA256_V"}]
+    },
+    {
+      "id": "G4-STREAM-PARTIAL",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3", "REPLACE_CUSTODY_USER_OPERATOR", "bitgo"],
+      "expected": "Partial streamed delivery and refund settle exact amounts once.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 900000,
+      "custody_signature_created": true,
+      "custody_broadcast_created": true,
+      "external_evidence": [{"kind": "transaction", "environment": "bitcoin-testnet4", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-STREAM-PARTIAL/transcript.log", "sha256": "REPLACE_WITH_SHA256_W"}, {"path": "/absolute/private/gate4/G4-STREAM-PARTIAL/operator.log", "sha256": "REPLACE_WITH_SHA256_X"}]
+    },
+    {
+      "id": "G4-REFUND-FULL",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Full refund restores exact accounting with no over-mint or replay.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 900000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "transaction", "environment": "sepolia", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-REFUND-FULL/transcript.log", "sha256": "REPLACE_WITH_SHA256_Y"}, {"path": "/absolute/private/gate4/G4-REFUND-FULL/operator.log", "sha256": "REPLACE_WITH_SHA256_Z"}]
+    },
+    {
+      "id": "G4-DELAYED-INCLUSION",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Delayed or reorged inclusion preserves nonce, reservation and retry safety.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 600000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "block", "environment": "sepolia", "id": "REPLACE_WITH_BLOCK_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-DELAYED-INCLUSION/transcript.log", "sha256": "REPLACE_WITH_SHA256_27"}, {"path": "/absolute/private/gate4/G4-DELAYED-INCLUSION/operator.log", "sha256": "REPLACE_WITH_SHA256_28"}]
+    },
+    {
+      "id": "G4-EMERGENCY-PAUSE",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Pause blocks new risk and controlled unpause restores only reviewed flow.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "transaction", "environment": "sepolia", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-EMERGENCY-PAUSE/transcript.log", "sha256": "REPLACE_WITH_SHA256_29"}, {"path": "/absolute/private/gate4/G4-EMERGENCY-PAUSE/operator.log", "sha256": "REPLACE_WITH_SHA256_30"}]
+    },
+    {
+      "id": "G4-CHALLENGE-INVALIDATION",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Challenge and invalidation remove pending data without replay regression.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "transaction", "environment": "sepolia", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-CHALLENGE-INVALIDATION/transcript.log", "sha256": "REPLACE_WITH_SHA256_31"}, {"path": "/absolute/private/gate4/G4-CHALLENGE-INVALIDATION/operator.log", "sha256": "REPLACE_WITH_SHA256_32"}]
+    },
+    {
+      "id": "G4-BITGO-BACKUP-RECOVERY",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_CUSTODY_USER_OPERATOR", "REPLACE_CUSTODY_BACKUP_OPERATOR"],
+      "expected": "The offline backup plus user key recover the same P2WSH wallet and complete a capped Testnet4 transfer without BitGo.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 600000,
+      "custody_signature_created": true,
+      "custody_broadcast_created": true,
+      "external_evidence": [{"kind": "ceremony_record", "environment": "bitgo-recovery", "id": "REPLACE_WITH_RECOVERY_RECORD_ID", "verified": false}, {"kind": "transaction", "environment": "bitcoin-testnet4", "id": "REPLACE_WITH_TX_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-BITGO-BACKUP-RECOVERY/transcript.log", "sha256": "REPLACE_WITH_SHA256_33"}, {"path": "/absolute/private/gate4/G4-BITGO-BACKUP-RECOVERY/operator.log", "sha256": "REPLACE_WITH_SHA256_34"}]
+    },
+    {
+      "id": "G4-BITGO-APPROVAL-OUTAGE",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_CUSTODY_USER_OPERATOR", "bitgo"],
+      "expected": "BitGo approval, policy or service unavailability creates no second signature or broadcast.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "provider_request", "environment": "bitgo-test", "id": "REPLACE_WITH_REQUEST_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-BITGO-APPROVAL-OUTAGE/transcript.log", "sha256": "REPLACE_WITH_SHA256_35"}, {"path": "/absolute/private/gate4/G4-BITGO-APPROVAL-OUTAGE/operator.log", "sha256": "REPLACE_WITH_SHA256_36"}]
+    },
+    {
+      "id": "G4-BITGO-TAMPER-REJECT",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_CUSTODY_USER_OPERATOR", "bitgo"],
+      "expected": "Input, output order, payout, memo, change and fee mutations are rejected before the user or BitGo signature.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "provider_request", "environment": "bitgo-test", "id": "REPLACE_WITH_REQUEST_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-BITGO-TAMPER-REJECT/transcript.log", "sha256": "REPLACE_WITH_SHA256_37"}, {"path": "/absolute/private/gate4/G4-BITGO-TAMPER-REJECT/operator.log", "sha256": "REPLACE_WITH_SHA256_38"}]
+    },
+    {
+      "id": "G4-CTD-FORGED-DESTINATION",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3", "REPLACE_CUSTODY_USER_OPERATOR"],
+      "expected": "Honest RIC combined with attacker destination is rejected before signing.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "provider_request", "environment": "bitgo-test", "id": "REPLACE_WITH_REQUEST_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-CTD-FORGED-DESTINATION/transcript.log", "sha256": "REPLACE_WITH_SHA256_39"}, {"path": "/absolute/private/gate4/G4-CTD-FORGED-DESTINATION/operator.log", "sha256": "REPLACE_WITH_SHA256_40"}]
+    },
+    {
+      "id": "G4-REPLAY-EQUIVOCATION",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3", "REPLACE_CUSTODY_USER_OPERATOR"],
+      "expected": "Re-drive and conflicting certificate are rejected with no new signature.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "provider_request", "environment": "bitgo-test", "id": "REPLACE_WITH_REQUEST_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-REPLAY-EQUIVOCATION/transcript.log", "sha256": "REPLACE_WITH_SHA256_41"}, {"path": "/absolute/private/gate4/G4-REPLAY-EQUIVOCATION/operator.log", "sha256": "REPLACE_WITH_SHA256_42"}]
+    },
+    {
+      "id": "G4-VOLUME-CAP",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Service and on-chain volume caps reject the over-cap operation.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [{"kind": "operator_log", "environment": "sepolia", "id": "REPLACE_WITH_LOG_ID", "verified": false}],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-VOLUME-CAP/transcript.log", "sha256": "REPLACE_WITH_SHA256_43"}, {"path": "/absolute/private/gate4/G4-VOLUME-CAP/operator.log", "sha256": "REPLACE_WITH_SHA256_44"}]
+    },
+    {
+      "id": "G4-ALERT-WORM",
+      "status": "REPLACE_WITH_PASS",
+      "started_at_utc": "REPLACE_WITH_START_UTC",
+      "completed_at_utc": "REPLACE_WITH_COMPLETION_UTC",
+      "operators": ["REPLACE_OBSERVER_1", "REPLACE_OBSERVER_2", "REPLACE_OBSERVER_3"],
+      "expected": "Injected incident pages an operator and creates independent WORM evidence.",
+      "observed": "REPLACE_WITH_OBSERVED_RESULT",
+      "response_time_ms": 0,
+      "response_time_budget_ms": 300000,
+      "custody_signature_created": false,
+      "custody_broadcast_created": false,
+      "external_evidence": [
+        {"kind": "alert", "environment": "gate4-testnet", "id": "REPLACE_WITH_ALERT_ID", "verified": false},
+        {"kind": "worm_record", "environment": "gate4-testnet", "id": "REPLACE_WITH_WORM_ID", "verified": false}
+      ],
+      "artifacts": [{"path": "/absolute/private/gate4/G4-ALERT-WORM/transcript.log", "sha256": "REPLACE_WITH_SHA256_45"}, {"path": "/absolute/private/gate4/G4-ALERT-WORM/operator.log", "sha256": "REPLACE_WITH_SHA256_46"}]
+    }
+  ]
+}

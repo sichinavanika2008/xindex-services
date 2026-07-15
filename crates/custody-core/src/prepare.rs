@@ -1,12 +1,10 @@
-//! Bind-prepare side-channel (Cobo `request_id` ↔ our unsigned spend + cert).
+//! Bind-prepare side-channel (provider correlation id ↔ unsigned spend + cert).
 //!
-//! Because the Cobo TSS-Node callback request carries only the signing
-//! request (the provider's policy engine cannot see destination/amount/memo),
-//! the executor stores the unsigned spend + its k-of-n certificate here BEFORE
-//! submitting the transfer to Cobo, keyed by a correlation id it echoes
-//! through as the Cobo `request_id`. The callback retrieves the prepared
-//! context by that id and binds the spend; a missing context is a fail-closed
-//! REJECT.
+//! A custody-provider request may omit independently certified transaction
+//! context. The executor therefore stores the unsigned spend + its k-of-n
+//! certificate here before submitting a provider request, keyed by a stable
+//! correlation id. An approval adapter retrieves and binds that context; a
+//! missing context is a fail-closed rejection.
 //!
 //! [`PreparedSpend`] is the per-family payload: the BTC PSBT, an EVM
 //! `depositWithExpiry` call, or an account-model send. Two stores implement
@@ -45,7 +43,7 @@ pub enum PrepareError {
 pub struct BindContext {
     /// Custody chain of the spend.
     pub chain: ChainId,
-    /// The unsigned PSBT the executor will submit to Cobo.
+    /// The unsigned PSBT the executor will submit to the custody boundary.
     pub psbt: Psbt,
     /// The k-of-n RIC authorizing a redeem spend (XOR [`Self::acc`]).
     pub ric: Option<IntentProof>,
@@ -198,7 +196,7 @@ pub struct AccountPrepared {
 }
 
 /// The unsigned spend + certificate stored at prepare time, dispatched on by
-/// the callback once Cobo asks to sign under the correlated `request_id`.
+/// a custody adapter under the correlated `request_id`.
 #[derive(Debug, Clone)]
 pub enum PreparedSpend {
     /// A BTC redeem / swap-back PSBT. Boxed — a PSBT is far larger than the
@@ -211,7 +209,7 @@ pub enum PreparedSpend {
 }
 
 /// Prepare-store API. The executor `put`s the unsigned spend + cert keyed by
-/// the Cobo `request_id` before submitting to Cobo; the callback `get`s it to
+/// a provider correlation id before submission; the approval path `get`s it to
 /// bind the spend. AFIT + `Send`, static dispatch — same shape as
 /// [`xindex_custody_core::replay::ReplayStore`].
 pub trait PrepareStore: Send + Sync {
@@ -219,7 +217,7 @@ pub trait PrepareStore: Send + Sync {
     ///
     /// # Errors
     /// [`PrepareError`] on a store or serialization failure — the executor
-    /// MUST NOT submit to Cobo if this fails (the callback would then have no
+    /// MUST NOT submit to a provider if this fails (the approver would have no
     /// context and fail-close).
     fn put(
         &self,

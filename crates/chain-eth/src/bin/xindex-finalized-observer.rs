@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{ProviderBuilder, RootProvider};
 use alloy_primitives::{Address, B256, U256};
 use alloy_sol_types::SolEvent;
 use anyhow::{Context, Result};
@@ -42,8 +42,9 @@ use xindex_chain_thor::{
     derive_inbound, CanonicalSourceBundle, InboundAddress, InboundPolicy, RawSourcePoll,
     SourceSnapshot, ThorClient, ThorConsensusClient, ThorSourceClient, TipCheckpoint,
 };
+use xindex_ops::network::{BoundedAlloyHttp, HttpClientPolicy};
 use xindex_ops::tls::{
-    load_cert_chain, load_private_key, pinned_root_store, serve_mtls, server_config,
+    load_cert_chain, load_private_key, pinned_cert_store, serve_mtls, server_config,
 };
 use xindex_ops::{serve_metrics, Metrics};
 use xindex_shared::chain_registry::ChainId;
@@ -133,6 +134,7 @@ struct SignerConfig {
     address: String,
     client_cert_pem: PathBuf,
     client_key_pem: PathBuf,
+    /// Legacy-named leaf-first exact signer peer bundle.
     server_ca_pem: PathBuf,
     timeout_secs: u64,
 }
@@ -304,6 +306,9 @@ struct AppState {
     rpc: FinalizedRpcClient,
     evidence: EvidenceStore,
     operator_id: String,
+    oracle_address: Address,
+    expected_chain_id: u64,
+    ethereum_rpc_url: String,
     ready: Arc<AtomicBool>,
     last_sync_at: Arc<AtomicU64>,
     max_sync_age_secs: u64,
@@ -513,6 +518,9 @@ async fn build_runtime(config: &Config) -> Result<Runtime> {
         rpc: rpc.clone(),
         evidence: evidence.clone(),
         operator_id: config.operator_id.clone(),
+        oracle_address: launch.oracle,
+        expected_chain_id: config.expected_chain_id,
+        ethereum_rpc_url: config.ethereum_rpc_url.clone(),
         ready: Arc::clone(&ready),
         last_sync_at: Arc::clone(&last_sync_at),
         max_sync_age_secs: (config.poll_interval_millis / 1_000)
@@ -588,7 +596,8 @@ fn build_observer(
         poll_lock: Arc::new(tokio::sync::Mutex::new(())),
         metrics: metrics.clone(),
     };
-    let halt = HttpHaltSource::finalized(config.ethereum_rpc_url.clone(), launch.guard);
+    let halt = HttpHaltSource::finalized(config.ethereum_rpc_url.clone(), launch.guard)
+        .map_err(anyhow::Error::msg)?;
     Ok(Arc::new(Observer::new(
         ObserverConfig {
             chain: config.chain,
@@ -638,6 +647,8 @@ async fn build_settlement_observer(
     BtcSettlementObserver::new(
         BtcSettlementConfig {
             operator_id: config.operator_id.clone(),
+            source_chain_id: config.expected_chain_id,
+            signature_validity_secs: config.stamp_window_secs,
             asset_id: launch.mint_asset_id,
             target_token: launch.target_token,
             btc_custody_address: launch.btc_custody_address.clone(),
@@ -662,11 +673,7 @@ async fn build_settlement_observer(
 }
 
 async fn verify_attestation_roster(config: &Config, launch: &LaunchValues) -> Result<()> {
-    let rpc_url = config
-        .ethereum_rpc_url
-        .parse()
-        .context("parse Ethereum RPC URL")?;
-    let provider = Arc::new(ProviderBuilder::new().on_http(rpc_url));
+    let provider = Arc::new(bounded_provider(&config.ethereum_rpc_url)?);
     let oracle = AttestationOracle::new(launch.oracle, provider);
     let onchain_threshold: usize = oracle
         .threshold()
@@ -825,6 +832,12 @@ async fn process_block(
         ThorchainAdapter::RedeemDispatched::SIGNATURE_HASH,
         ThorchainAdapter::AcquireCancelled::SIGNATURE_HASH,
         IntentQueue::MintIntentCreated::SIGNATURE_HASH,
+        IntentQueue::RedemptionIntentCreated::SIGNATURE_HASH,
+        IntentQueue::LegAttested::SIGNATURE_HASH,
+        IntentQueue::LegRefunded::SIGNATURE_HASH,
+        IntentQueue::LegStreamedSettled::SIGNATURE_HASH,
+        IntentQueue::RedemptionIntentFinalized::SIGNATURE_HASH,
+        IntentQueue::RedemptionStuckCancelled::SIGNATURE_HASH,
     ];
     let logs = state
         .rpc
@@ -853,7 +866,7 @@ async fn process_block(
         .evidence
         .persist_hashed(&format!("evm-finalized-{number}"), &evidence)
         .context("persist finalized block evidence")?;
-    let (mints, legs, cancels) = decode_protocol_logs(
+    let (mints, legs, cancels, redemptions) = decode_protocol_logs(
         state.adapter,
         state.intent_queue,
         state.redemption_leg_index,
@@ -874,6 +887,7 @@ async fn process_block(
             &mints,
             &legs,
             &cancels,
+            &redemptions,
         )
         .await?;
     for event in &cancels {
@@ -894,6 +908,11 @@ async fn process_block(
         .observer_events
         .with_label_values(&["redemption_dispatch", "observed"])
         .inc_by(u64::try_from(legs.len()).unwrap_or(u64::MAX));
+    state
+        .metrics
+        .observer_events
+        .with_label_values(&["redemption_terminal", "observed"])
+        .inc_by(u64::try_from(redemptions.len()).unwrap_or(u64::MAX));
     Ok(())
 }
 
@@ -1146,6 +1165,27 @@ async fn ensure_canonical_ready(state: &AppState) -> Result<(), (StatusCode, Jso
             "observer checkpoint is no longer the finalized head",
         ));
     }
+    let local_epoch = state
+        .store
+        .observation_epoch()
+        .await
+        .map_err(|_| service_unavailable("local observation epoch read failed"))?;
+    let provider = Arc::new(
+        bounded_provider(&state.ethereum_rpc_url)
+            .map_err(|_| service_unavailable("Ethereum RPC client is unavailable"))?,
+    );
+    let onchain_epoch = AttestationOracle::new(state.oracle_address, provider)
+        .observationEpoch(U256::from(state.expected_chain_id))
+        .call()
+        .await
+        .map_err(|_| service_unavailable("on-chain observation epoch read failed"))?
+        .epoch;
+    if local_epoch != onchain_epoch {
+        state.ready.store(false, Ordering::Release);
+        return Err(service_unavailable(
+            "local rollback epoch is not reconciled on AttestationOracle",
+        ));
+    }
     Ok(())
 }
 
@@ -1155,6 +1195,20 @@ fn readiness(state: &AppState) -> bool {
     }
     let last = state.last_sync_at.load(Ordering::Acquire);
     now_unix().is_ok_and(|now| last != 0 && now.saturating_sub(last) <= state.max_sync_age_secs)
+}
+
+fn bounded_provider(raw_url: &str) -> Result<RootProvider<BoundedAlloyHttp>> {
+    let transport = BoundedAlloyHttp::new(
+        raw_url,
+        HttpClientPolicy {
+            connect_timeout: Duration::from_secs(3),
+            request_timeout: Duration::from_secs(15),
+            max_response_bytes: 16 * 1024 * 1024,
+        },
+    )
+    .context("build bounded Ethereum RPC client")?;
+    let client = alloy::rpc::client::RpcClient::new(transport, true);
+    Ok(ProviderBuilder::new().on_client(client))
 }
 
 fn render_observer_error(error: &ObserverError) -> (StatusCode, Json<ErrorBody>) {
@@ -1198,7 +1252,7 @@ fn render_settlement_error(error: &SettlementObserverError) -> (StatusCode, Json
         | SettlementObserverError::Bitcoin(_)
         | SettlementObserverError::Ethereum(_)
         | SettlementObserverError::Signer(_)
-        | SettlementObserverError::Worker => StatusCode::SERVICE_UNAVAILABLE,
+        | SettlementObserverError::Worker(_) => StatusCode::SERVICE_UNAVAILABLE,
     };
     (
         status,
@@ -1229,11 +1283,11 @@ async fn build_remote_signer(
 ) -> Result<RemoteHsmBackend> {
     let cert = fs::read(&config.client_cert_pem).context("read signer client certificate")?;
     let key = fs::read(&config.client_key_pem).context("read signer client TLS key")?;
-    let roots = fs::read(&config.server_ca_pem).context("read signer server CA")?;
+    let peer_bundle = fs::read(&config.server_ca_pem).context("read signer exact peer bundle")?;
     let url = config.url.clone();
     let timeout = Duration::from_secs(config.timeout_secs);
     tokio::task::spawn_blocking(move || {
-        RemoteHsmBackend::with_mtls_pem(url, signer_address, &cert, &key, &roots, timeout)
+        RemoteHsmBackend::with_mtls_pem(url, signer_address, &cert, &key, &peer_bundle, timeout)
     })
     .await
     .context("build remote signer task")?
@@ -1267,16 +1321,16 @@ fn raw_source_evidence(poll: &RawSourcePoll) -> RawSourceEvidence<'_> {
 fn load_server_tls(config: &Config) -> Result<rustls::ServerConfig> {
     let server_cert = fs::read(&config.server_cert_pem).context("read server certificate")?;
     let server_key = fs::read(&config.server_key_pem).context("read server TLS key")?;
-    let client_roots = config
+    let client_peers = config
         .coordinator_client_cert_pems
         .iter()
         .map(fs::read)
         .collect::<std::io::Result<Vec<_>>>()
-        .context("read coordinator client roots")?;
+        .context("read coordinator exact client peer bundles")?;
     server_config(
         load_cert_chain(&server_cert)?,
         load_private_key(&server_key)?,
-        pinned_root_store(&client_roots)?,
+        pinned_cert_store(&client_peers)?,
     )
     .context("build observer mTLS server")
 }
@@ -1330,10 +1384,6 @@ fn validate_config(config: &Config) -> Result<()> {
     {
         anyhow::bail!("observer, THOR state, and settlement databases must be separate files");
     }
-    validate_database_url(&config.observer_database_url)?;
-    validate_database_url(&config.thor_state_database_url)?;
-    validate_database_url(&config.settlement_database_url)?;
-    validate_owner_only_directory(&config.evidence_dir)?;
     if !config.metrics_address.ip().is_loopback() {
         anyhow::bail!("metrics_address must bind loopback");
     }
@@ -1360,18 +1410,6 @@ fn validate_config(config: &Config) -> Result<()> {
             anyhow::bail!("THOR source identities and origins must be distinct");
         }
     }
-    validate_secret_file(&config.server_key_pem)?;
-    validate_secret_file(&config.signer.client_key_pem)?;
-    for path in [
-        &config.server_cert_pem,
-        &config.signer.client_cert_pem,
-        &config.signer.server_ca_pem,
-    ] {
-        validate_regular_file(path)?;
-    }
-    for path in &config.coordinator_client_cert_pems {
-        validate_regular_file(path)?;
-    }
     let adapter = parse_nonzero_address("thorchain_adapter", &config.thorchain_adapter)?;
     let intent_queue = parse_nonzero_address("intent_queue", &config.intent_queue)?;
     parse_nonzero_address("attestation_oracle", &config.attestation_oracle)?;
@@ -1392,6 +1430,24 @@ fn validate_config(config: &Config) -> Result<()> {
         .context("parse btc_custody_address")?
         .require_network(parse_btc_network(&config.btc_network)?)
         .context("btc_custody_address network mismatch")?;
+    // Durable and secret path inspection is deliberately last so malformed
+    // production policy cannot trigger a key read before being rejected.
+    validate_database_url(&config.observer_database_url)?;
+    validate_database_url(&config.thor_state_database_url)?;
+    validate_database_url(&config.settlement_database_url)?;
+    validate_owner_only_directory(&config.evidence_dir)?;
+    validate_secret_file(&config.server_key_pem)?;
+    validate_secret_file(&config.signer.client_key_pem)?;
+    for path in [
+        &config.server_cert_pem,
+        &config.signer.client_cert_pem,
+        &config.signer.server_ca_pem,
+    ] {
+        validate_regular_file(path)?;
+    }
+    for path in &config.coordinator_client_cert_pems {
+        validate_regular_file(path)?;
+    }
     Ok(())
 }
 
@@ -1526,7 +1582,120 @@ fn u64_to_i64(value: u64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test fixtures")]
+
     use super::*;
+
+    fn production_config() -> Config {
+        Config {
+            operator_id: "observer-01".into(),
+            expected_chain_id: 1,
+            ethereum_rpc_url: "https://rpc.example".into(),
+            thorchain_adapter: "0x0000000000000000000000000000000000000001".into(),
+            intent_queue: "0x0000000000000000000000000000000000000002".into(),
+            attestation_oracle: "0x0000000000000000000000000000000000000003".into(),
+            custody_guard: "0x0000000000000000000000000000000000000004".into(),
+            chain: ChainId::Btc,
+            btc_network: "bitcoin".into(),
+            redemption_leg_index: 0,
+            mint_asset_id: format!("{:#x}", B256::repeat_byte(0x11)),
+            target_token: "0x0000000000000000000000000000000000000005".into(),
+            btc_custody_address: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT".into(),
+            btc_esplora_url: "https://esplora.example".into(),
+            btc_min_confirmations: 6,
+            btc_tolerance_sats: 1_000,
+            usdt_token: "0x0000000000000000000000000000000000000006".into(),
+            ethereum_lookback_blocks: 10_000,
+            usdt_tolerance_1e6: 1_000,
+            settlement_database_url: "sqlite:///definitely/not/read/settlement.db".into(),
+            expected_attestation_signer_count: 5,
+            expected_attestation_threshold: 3,
+            start_block: 1,
+            poll_interval_millis: 2_000,
+            observer_database_url: "sqlite:///definitely/not/read/observer.db".into(),
+            thor_state_database_url: "sqlite:///definitely/not/read/thor.db".into(),
+            evidence_dir: "/definitely/not/read/evidence".into(),
+            listen_address: SocketAddr::from(([0, 0, 0, 0], 9445)),
+            metrics_address: SocketAddr::from(([127, 0, 0, 1], 9098)),
+            stamp_window_secs: 60,
+            large_spend_threshold: "100000000".into(),
+            large_spend_delay_secs: 1_800,
+            cancel_recovery_destination: "0x0000000000000000000000000000000000000007".into(),
+            swap_back_asset: "ETH.USDT".into(),
+            inbound_policy: InboundPolicy {
+                source_chain: "ETH".into(),
+                enabled_chains: vec!["ETH".into(), "BTC".into()],
+                allowlisted_pools: vec!["BTC.BTC".into()],
+                max_tip_age_secs: 12,
+                max_height_skew: 2,
+            },
+            sources: (1..=3)
+                .map(|index| SourceConfig {
+                    id: format!("source-{index}"),
+                    thornode_url: format!("https://thornode-{index}.example"),
+                    consensus_url: format!("https://consensus-{index}.example"),
+                })
+                .collect(),
+            signer: SignerConfig {
+                url: "https://signer.example".into(),
+                address: "0x0000000000000000000000000000000000000008".into(),
+                client_cert_pem: "/definitely/not/read/signer.crt".into(),
+                client_key_pem: "/definitely/not/read/signer.key".into(),
+                server_ca_pem: "/definitely/not/read/signer-peer.pem".into(),
+                timeout_secs: 5,
+            },
+            server_cert_pem: "/definitely/not/read/server.crt".into(),
+            server_key_pem: "/definitely/not/read/server.key".into(),
+            coordinator_client_cert_pems: vec!["/definitely/not/read/coordinator.crt".into()],
+        }
+    }
+
+    fn assert_policy_rejection(config: &Config) {
+        let error = validate_config(config).expect_err("unsafe production mutation must fail");
+        assert!(
+            !error.to_string().contains("definitely/not/read"),
+            "policy mutation reached secret/path I/O: {error:#}"
+        );
+    }
+
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        let mut zero_chain = production_config();
+        zero_chain.expected_chain_id = 0;
+        assert_policy_rejection(&zero_chain);
+
+        let mut non_btc = production_config();
+        non_btc.chain = ChainId::Ltc;
+        assert_policy_rejection(&non_btc);
+
+        let mut collapsed_attesters = production_config();
+        collapsed_attesters.expected_attestation_signer_count = 3;
+        assert_policy_rejection(&collapsed_attesters);
+
+        let mut two_sources = production_config();
+        two_sources.sources.truncate(2);
+        assert_policy_rejection(&two_sources);
+
+        let mut shared_database = production_config();
+        shared_database.thor_state_database_url = shared_database.observer_database_url.clone();
+        assert_policy_rejection(&shared_database);
+
+        let mut plaintext_rpc = production_config();
+        plaintext_rpc.ethereum_rpc_url = "http://rpc.example".into();
+        assert_policy_rejection(&plaintext_rpc);
+
+        let mut public_metrics = production_config();
+        public_metrics.metrics_address = SocketAddr::from(([0, 0, 0, 0], 9098));
+        assert_policy_rejection(&public_metrics);
+
+        let mut no_peer_pin = production_config();
+        no_peer_pin.coordinator_client_cert_pems.clear();
+        assert_policy_rejection(&no_peer_pin);
+
+        let mut testnet = production_config();
+        testnet.btc_network = "signet".into();
+        assert_policy_rejection(&testnet);
+    }
 
     #[test]
     fn endpoint_policy_rejects_credentials_and_plaintext_public_hosts() {

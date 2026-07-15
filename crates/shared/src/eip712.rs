@@ -1,13 +1,5 @@
 //! EIP-712 typed-data definitions mirroring `AttestationOracle.sol`.
 //!
-//! The on-chain `ATTESTATION_TYPEHASH` constant at
-//! `Xindex/src/AttestationOracle.sol:32-33` is:
-//!
-//! ```solidity
-//! bytes32 public constant ATTESTATION_TYPEHASH =
-//!     keccak256("Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)");
-//! ```
-//!
 //! Phase 3.0: the two redemption-side typehashes were generalized to
 //! per-leg shape (one redemption may span N async legs). Each leg's
 //! delivery and refund attestations are signed under a SEPARATE
@@ -22,6 +14,43 @@
 
 use alloy_primitives::{keccak256, Address, B256, U256};
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
+use serde::{Deserialize, Serialize};
+
+/// Signed source/freshness envelope shared by every settlement report.
+/// These fields are flattened into each EIP-712 struct (rather than nested)
+/// so Solidity and Rust have one unambiguous root type string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SettlementContext {
+    pub evidence_hash: B256,
+    pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: U256,
+    pub source_block_number: u64,
+    pub source_block_hash: B256,
+    pub observation_epoch: u64,
+}
+
+/// Construct the common signed settlement source/freshness envelope.
+#[must_use]
+pub const fn settlement_context(
+    evidence_hash: B256,
+    observed_at: u64,
+    valid_until: u64,
+    source_chain_id: U256,
+    source_block_number: u64,
+    source_block_hash: B256,
+    observation_epoch: u64,
+) -> SettlementContext {
+    SettlementContext {
+        evidence_hash,
+        observed_at,
+        valid_until,
+        source_chain_id,
+        source_block_number,
+        source_block_hash,
+        observation_epoch,
+    }
+}
 
 sol! {
     /// Attestation payload signed by each k-of-n signer. The on-chain
@@ -32,13 +61,19 @@ sol! {
         bytes32 intentId;
         uint256 slotIndex;
         uint256 attestedAmount;
+        bytes32 evidenceHash;
+        uint64 observedAt;
+        uint64 validUntil;
+        uint256 sourceChainId;
+        uint64 sourceBlockNumber;
+        bytes32 sourceBlockHash;
+        uint64 observationEpoch;
     }
 }
 
 /// Verbatim type string used to derive the on-chain typehash. MUST match
 /// `AttestationOracle.sol:32-33` byte-for-byte. Trailing-newline-free.
-pub const ATTESTATION_TYPE_STRING: &[u8] =
-    b"Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)";
+pub const ATTESTATION_TYPE_STRING: &[u8] = b"Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount,bytes32 evidenceHash,uint64 observedAt,uint64 validUntil,uint256 sourceChainId,uint64 sourceBlockNumber,bytes32 sourceBlockHash,uint64 observationEpoch)";
 
 /// `keccak256(ATTESTATION_TYPE_STRING)` — equals
 /// `AttestationOracle.ATTESTATION_TYPEHASH` on-chain.
@@ -50,11 +85,23 @@ pub fn attestation_typehash() -> B256 {
 /// Construct an `Attestation` from raw fields. Convenience for tests +
 /// future signer code.
 #[must_use]
-pub fn attestation(intent_id: B256, slot_index: U256, attested_amount: U256) -> Attestation {
+pub fn attestation(
+    intent_id: B256,
+    slot_index: U256,
+    attested_amount: U256,
+    context: SettlementContext,
+) -> Attestation {
     Attestation {
         intentId: intent_id,
         slotIndex: slot_index,
         attestedAmount: attested_amount,
+        evidenceHash: context.evidence_hash,
+        observedAt: context.observed_at,
+        validUntil: context.valid_until,
+        sourceChainId: context.source_chain_id,
+        sourceBlockNumber: context.source_block_number,
+        sourceBlockHash: context.source_block_hash,
+        observationEpoch: context.observation_epoch,
     }
 }
 
@@ -97,12 +144,18 @@ sol! {
         uint256 legIndex;
         bytes32 assetId;
         uint256 deliveredAmount;
+        bytes32 evidenceHash;
+        uint64 observedAt;
+        uint64 validUntil;
+        uint256 sourceChainId;
+        uint64 sourceBlockNumber;
+        bytes32 sourceBlockHash;
+        uint64 observationEpoch;
     }
 }
 
 /// Verbatim type string. MUST match `AttestationOracle.sol:39-42`.
-pub const ASYNC_LEG_DELIVERY_TYPE_STRING: &[u8] =
-    b"AsyncLegDeliveryAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredAmount)";
+pub const ASYNC_LEG_DELIVERY_TYPE_STRING: &[u8] = b"AsyncLegDeliveryAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredAmount,bytes32 evidenceHash,uint64 observedAt,uint64 validUntil,uint256 sourceChainId,uint64 sourceBlockNumber,bytes32 sourceBlockHash,uint64 observationEpoch)";
 
 /// `keccak256(ASYNC_LEG_DELIVERY_TYPE_STRING)` — equals
 /// `AttestationOracle.ASYNC_LEG_DELIVERY_TYPEHASH` on-chain.
@@ -118,12 +171,20 @@ pub fn redemption_attestation(
     leg_index: U256,
     asset_id: B256,
     delivered_amount: U256,
+    context: SettlementContext,
 ) -> AsyncLegDeliveryAttestation {
     AsyncLegDeliveryAttestation {
         redemptionId: redemption_id,
         legIndex: leg_index,
         assetId: asset_id,
         deliveredAmount: delivered_amount,
+        evidenceHash: context.evidence_hash,
+        observedAt: context.observed_at,
+        validUntil: context.valid_until,
+        sourceChainId: context.source_chain_id,
+        sourceBlockNumber: context.source_block_number,
+        sourceBlockHash: context.source_block_hash,
+        observationEpoch: context.observation_epoch,
     }
 }
 
@@ -157,12 +218,18 @@ sol! {
         uint256 legIndex;
         bytes32 assetId;
         uint256 refundedAmount;
+        bytes32 evidenceHash;
+        uint64 observedAt;
+        uint64 validUntil;
+        uint256 sourceChainId;
+        uint64 sourceBlockNumber;
+        bytes32 sourceBlockHash;
+        uint64 observationEpoch;
     }
 }
 
 /// Verbatim type string. MUST match `AttestationOracle.sol:47-50`.
-pub const ASYNC_LEG_REFUND_TYPE_STRING: &[u8] =
-    b"AsyncLegRefundAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 refundedAmount)";
+pub const ASYNC_LEG_REFUND_TYPE_STRING: &[u8] = b"AsyncLegRefundAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 refundedAmount,bytes32 evidenceHash,uint64 observedAt,uint64 validUntil,uint256 sourceChainId,uint64 sourceBlockNumber,bytes32 sourceBlockHash,uint64 observationEpoch)";
 
 /// `keccak256(ASYNC_LEG_REFUND_TYPE_STRING)` — equals
 /// `AttestationOracle.ASYNC_LEG_REFUND_TYPEHASH` on-chain.
@@ -178,12 +245,20 @@ pub fn refund_attestation(
     leg_index: U256,
     asset_id: B256,
     refunded_amount: U256,
+    context: SettlementContext,
 ) -> AsyncLegRefundAttestation {
     AsyncLegRefundAttestation {
         redemptionId: redemption_id,
         legIndex: leg_index,
         assetId: asset_id,
         refundedAmount: refunded_amount,
+        evidenceHash: context.evidence_hash,
+        observedAt: context.observed_at,
+        validUntil: context.valid_until,
+        sourceChainId: context.source_chain_id,
+        sourceBlockNumber: context.source_block_number,
+        sourceBlockHash: context.source_block_hash,
+        observationEpoch: context.observation_epoch,
     }
 }
 
@@ -213,12 +288,19 @@ sol! {
         bytes32 assetId;
         uint256 deliveredUsdt;
         uint256 refundedNative;
+        bytes32 evidenceHash;
+        uint64 observedAt;
+        uint64 validUntil;
+        uint256 sourceChainId;
+        uint64 sourceBlockNumber;
+        bytes32 sourceBlockHash;
+        uint64 observationEpoch;
     }
 }
 
 /// Verbatim type string. MUST match `AttestationOracle.sol`'s
 /// `ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH` source string.
-pub const ASYNC_LEG_STREAMED_SETTLEMENT_TYPE_STRING: &[u8] = b"AsyncLegStreamedSettlement(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredUsdt,uint256 refundedNative)";
+pub const ASYNC_LEG_STREAMED_SETTLEMENT_TYPE_STRING: &[u8] = b"AsyncLegStreamedSettlement(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredUsdt,uint256 refundedNative,bytes32 evidenceHash,uint64 observedAt,uint64 validUntil,uint256 sourceChainId,uint64 sourceBlockNumber,bytes32 sourceBlockHash,uint64 observationEpoch)";
 
 /// `keccak256(ASYNC_LEG_STREAMED_SETTLEMENT_TYPE_STRING)` — equals
 /// `AttestationOracle.ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH` on-chain.
@@ -235,6 +317,7 @@ pub fn streamed_settlement(
     asset_id: B256,
     delivered_usdt: U256,
     refunded_native: U256,
+    context: SettlementContext,
 ) -> AsyncLegStreamedSettlement {
     AsyncLegStreamedSettlement {
         redemptionId: redemption_id,
@@ -242,6 +325,13 @@ pub fn streamed_settlement(
         assetId: asset_id,
         deliveredUsdt: delivered_usdt,
         refundedNative: refunded_native,
+        evidenceHash: context.evidence_hash,
+        observedAt: context.observed_at,
+        validUntil: context.valid_until,
+        sourceChainId: context.source_chain_id,
+        sourceBlockNumber: context.source_block_number,
+        sourceBlockHash: context.source_block_hash,
+        observationEpoch: context.observation_epoch,
     }
 }
 
@@ -283,6 +373,7 @@ sol! {
         bytes32 redemptionId;
         uint256 legIndex;
         bytes32 assetId;
+        bytes32 nativeChainId;
         uint256 amount;
         uint8 amountDecimals;
         bytes32 immediateTargetHash;
@@ -294,7 +385,7 @@ sol! {
 
 /// Verbatim RIC type string. Off-chain only — pinned for cross-operator
 /// consistency (every operator's Rust MUST compute the identical digest).
-pub const RIC_TYPE_STRING: &[u8] = b"RedemptionIntentCertificate(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 amount,uint8 amountDecimals,bytes32 immediateTargetHash,bytes32 memoHash,bytes32 finalDestinationHash,uint64 vaultResolvedAt)";
+pub const RIC_TYPE_STRING: &[u8] = b"RedemptionIntentCertificate(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,bytes32 nativeChainId,uint256 amount,uint8 amountDecimals,bytes32 immediateTargetHash,bytes32 memoHash,bytes32 finalDestinationHash,uint64 vaultResolvedAt)";
 
 /// `keccak256(RIC_TYPE_STRING)`.
 #[must_use]
@@ -306,12 +397,13 @@ pub fn ric_typehash() -> B256 {
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the RIC binds 9 distinct certified fields; a wrapper struct param would just re-wrap them"
+    reason = "the RIC binds 10 distinct certified fields; a wrapper struct param would just re-wrap them"
 )]
 pub fn redemption_intent_certificate(
     redemption_id: B256,
     leg_index: U256,
     asset_id: B256,
+    native_chain_id: B256,
     amount: U256,
     amount_decimals: u8,
     immediate_target_hash: B256,
@@ -323,6 +415,7 @@ pub fn redemption_intent_certificate(
         redemptionId: redemption_id,
         legIndex: leg_index,
         assetId: asset_id,
+        nativeChainId: native_chain_id,
         amount,
         amountDecimals: amount_decimals,
         immediateTargetHash: immediate_target_hash,
@@ -361,6 +454,7 @@ sol! {
         bytes32 intentId;
         uint256 slotIndex;
         bytes32 assetId;
+        bytes32 nativeChainId;
         uint256 amount;
         uint8 amountDecimals;
         bytes32 immediateTargetHash;
@@ -373,7 +467,7 @@ sol! {
 /// Verbatim ACC type string. Off-chain only — pinned for cross-operator
 /// consistency (every operator's daemon MUST compute the identical
 /// digest). Sibling of [`RIC_TYPE_STRING`].
-pub const ACQUIRE_CANCEL_TYPE_STRING: &[u8] = b"AcquireCancelCertificate(bytes32 cancelId,bytes32 intentId,uint256 slotIndex,bytes32 assetId,uint256 amount,uint8 amountDecimals,bytes32 immediateTargetHash,bytes32 memoHash,bytes32 finalDestinationHash,uint64 vaultResolvedAt)";
+pub const ACQUIRE_CANCEL_TYPE_STRING: &[u8] = b"AcquireCancelCertificate(bytes32 cancelId,bytes32 intentId,uint256 slotIndex,bytes32 assetId,bytes32 nativeChainId,uint256 amount,uint8 amountDecimals,bytes32 immediateTargetHash,bytes32 memoHash,bytes32 finalDestinationHash,uint64 vaultResolvedAt)";
 
 /// `keccak256(ACQUIRE_CANCEL_TYPE_STRING)`.
 #[must_use]
@@ -385,13 +479,14 @@ pub fn acquire_cancel_typehash() -> B256 {
 #[must_use]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the ACC binds 10 distinct certified fields; a wrapper struct param would just re-wrap them"
+    reason = "the ACC binds 11 distinct certified fields; a wrapper struct param would just re-wrap them"
 )]
 pub fn acquire_cancel_certificate(
     cancel_id: B256,
     intent_id: B256,
     slot_index: U256,
     asset_id: B256,
+    native_chain_id: B256,
     amount: U256,
     amount_decimals: u8,
     immediate_target_hash: B256,
@@ -404,6 +499,7 @@ pub fn acquire_cancel_certificate(
         intentId: intent_id,
         slotIndex: slot_index,
         assetId: asset_id,
+        nativeChainId: native_chain_id,
         amount,
         amountDecimals: amount_decimals,
         immediateTargetHash: immediate_target_hash,
@@ -649,6 +745,18 @@ mod tests {
     use alloy_primitives::b256;
     use alloy_sol_types::SolValue;
 
+    fn golden_settlement_context() -> SettlementContext {
+        settlement_context(
+            B256::repeat_byte(0x88),
+            1_800_000_000,
+            1_800_000_300,
+            U256::from(1u64),
+            20_000_000,
+            B256::repeat_byte(0x99),
+            7,
+        )
+    }
+
     /// The `sol!` macro auto-derives a typehash from the struct definition.
     /// This test asserts byte-equality against the manually-pinned typehash
     /// constant. If a future macro upgrade ever changes how the typehash is
@@ -668,13 +776,8 @@ mod tests {
     /// MUST exactly match `AttestationOracle.ATTESTATION_TYPEHASH` on-chain.
     #[test]
     fn typehash_matches_solidity_source() {
-        // Pinned: keccak256("Attestation(bytes32 intentId,uint256 slotIndex,uint256 attestedAmount)")
-        // Source of truth: `Xindex/src/AttestationOracle.sol:32-33`.
-        let pinned = B256::new([
-            0x9f, 0x3c, 0x39, 0x69, 0x59, 0x8b, 0x74, 0x63, 0x09, 0xf5, 0x6d, 0x8b, 0x47, 0x8f,
-            0x26, 0x76, 0x90, 0x2e, 0xf8, 0x2d, 0xd9, 0x71, 0x21, 0xdb, 0xd8, 0x0c, 0x45, 0x78,
-            0xa3, 0x1a, 0x46, 0x2a,
-        ]);
+        // Pinned from the full source/freshness-bound type string above.
+        let pinned = b256!("0x38a3beebbb549601401f995718f0907d2d6f3a1f675928405ce340ced511005f");
         assert_eq!(
             attestation_typehash(),
             pinned,
@@ -693,6 +796,7 @@ mod tests {
             B256::repeat_byte(0xab),
             U256::from(1u8),
             U256::from(1_000_000u32),
+            golden_settlement_context(),
         );
         let encoded = a.abi_encode();
         let decoded = Attestation::abi_decode(&encoded, true).expect("round-trip decode");
@@ -702,15 +806,10 @@ mod tests {
     }
 
     /// Pinned from
-    /// `cast keccak "AsyncLegDeliveryAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredAmount)"`.
-    /// Source of truth: `Xindex/src/AttestationOracle.sol:39-42`.
+    /// `cast keccak` of [`ASYNC_LEG_DELIVERY_TYPE_STRING`].
     #[test]
     fn redemption_typehash_matches_solidity_source() {
-        let pinned = B256::new([
-            0xb9, 0x16, 0x6b, 0x72, 0x86, 0x3f, 0x84, 0x0d, 0x15, 0x97, 0x6d, 0xac, 0x19, 0x65,
-            0xd0, 0xf3, 0x28, 0x42, 0xfa, 0xbb, 0x80, 0x08, 0xff, 0xb2, 0x6f, 0x64, 0x8d, 0xdd,
-            0xef, 0x59, 0x26, 0xce,
-        ]);
+        let pinned = b256!("0xfc42da1bda871b2b19087408ea6d5062841f1cd398eff721ad13fcb345fd4848");
         assert_eq!(
             redemption_attestation_typehash(),
             pinned,
@@ -724,15 +823,10 @@ mod tests {
     }
 
     /// Pinned from
-    /// `cast keccak "AsyncLegRefundAttestation(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 refundedAmount)"`.
-    /// Source of truth: `Xindex/src/AttestationOracle.sol:47-50`.
+    /// `cast keccak` of [`ASYNC_LEG_REFUND_TYPE_STRING`].
     #[test]
     fn refund_typehash_matches_solidity_source() {
-        let pinned = B256::new([
-            0x3b, 0xa6, 0x6f, 0x74, 0x26, 0x5d, 0x64, 0x09, 0x85, 0x23, 0x9e, 0x60, 0xe2, 0x2f,
-            0xd8, 0x92, 0xca, 0x9b, 0x9d, 0x88, 0xbc, 0xdb, 0x19, 0x1e, 0x59, 0x47, 0x97, 0x38,
-            0xe0, 0x9c, 0x41, 0xc6,
-        ]);
+        let pinned = b256!("0x06c4120e08cf70ee7c5c4a9c787c07889c8c964d92b2c0da3356dddb97374d72");
         assert_eq!(
             refund_attestation_typehash(),
             pinned,
@@ -746,16 +840,10 @@ mod tests {
     }
 
     /// Pinned from
-    /// `cast keccak "AsyncLegStreamedSettlement(bytes32 redemptionId,uint256 legIndex,bytes32 assetId,uint256 deliveredUsdt,uint256 refundedNative)"`.
-    /// Source of truth: `Xindex/src/AttestationOracle.sol`'s
-    /// `ASYNC_LEG_STREAMED_SETTLEMENT_TYPEHASH`.
+    /// `cast keccak` of [`ASYNC_LEG_STREAMED_SETTLEMENT_TYPE_STRING`].
     #[test]
     fn streamed_settlement_typehash_matches_solidity_source() {
-        let pinned = B256::new([
-            0x8b, 0x30, 0x71, 0x2f, 0x33, 0xfa, 0xc5, 0xba, 0x21, 0x2a, 0x51, 0xbc, 0xcc, 0x8a,
-            0xc1, 0x0c, 0xba, 0x09, 0xac, 0xa9, 0x31, 0x33, 0xef, 0x28, 0x42, 0xf0, 0x04, 0x15,
-            0x1d, 0x50, 0xf4, 0x33,
-        ]);
+        let pinned = b256!("0x20da49cd3741d480bd896044dfa27d536ad6c0a963a771c721159142abb2233a");
         assert_eq!(
             streamed_settlement_typehash(),
             pinned,
@@ -774,11 +862,12 @@ mod tests {
     /// digest. Recompute with `cast keccak "<RIC_TYPE_STRING>"`.
     #[test]
     fn ric_typehash_pinned_and_macro_consistent() {
-        let pinned = B256::new([
-            0x66, 0x3a, 0xa6, 0x05, 0x67, 0x7f, 0xa5, 0x9b, 0x65, 0x89, 0x17, 0x88, 0x2d, 0xed,
-            0x96, 0x78, 0x00, 0x75, 0x71, 0x14, 0xb6, 0x05, 0x25, 0xe2, 0xf2, 0x48, 0x7d, 0xb2,
-            0xf4, 0x49, 0xf9, 0x37,
-        ]);
+        assert!(
+            std::str::from_utf8(RIC_TYPE_STRING)
+                .is_ok_and(|type_string| type_string.contains("bytes32 nativeChainId")),
+            "RIC v2 must bind the canonical native-chain identifier"
+        );
+        let pinned = b256!("0xd5294c4329b536e1f60dc30b921745a04e46e8a3aec40367b7217c7708b91c01");
         assert_eq!(
             ric_typehash(),
             pinned,
@@ -797,11 +886,12 @@ mod tests {
     /// `cast keccak "<ACQUIRE_CANCEL_TYPE_STRING>"`.
     #[test]
     fn acquire_cancel_typehash_pinned_and_macro_consistent() {
-        let pinned = B256::new([
-            0x0e, 0x06, 0x33, 0x49, 0x7f, 0xa5, 0x7c, 0x06, 0x9b, 0xb7, 0xec, 0x8d, 0x0b, 0x1e,
-            0xf3, 0xe0, 0xa4, 0x8d, 0x96, 0xce, 0x4e, 0x85, 0x28, 0x6e, 0x7d, 0x57, 0x96, 0xef,
-            0x16, 0xe2, 0x2a, 0xc1,
-        ]);
+        assert!(
+            std::str::from_utf8(ACQUIRE_CANCEL_TYPE_STRING)
+                .is_ok_and(|type_string| type_string.contains("bytes32 nativeChainId")),
+            "ACC v2 must bind the canonical native-chain identifier"
+        );
+        let pinned = b256!("0x385923248ee4be4fcacef0eb1fc80894adab9ac5521414b08c733f3d7064cfd1");
         assert_eq!(
             acquire_cancel_typehash(),
             pinned,
@@ -945,10 +1035,11 @@ mod tests {
             B256::repeat_byte(0x11),
             U256::from(7u64),
             U256::from(1_000_000u64),
+            golden_settlement_context(),
         );
         assert_eq!(
             attestation_signing_hash(&a, &golden_domain()),
-            b256!("0x725ef8cb8e8b8366cdb15d2a7fca128d0629bd9e5fb0342f4a3627887d739224"),
+            b256!("0xf79590b94efea153c3523972889e57e0ce0e5e44788358365173d21039d12c53"),
             "mint attestation digest drifted"
         );
     }
@@ -960,10 +1051,11 @@ mod tests {
             U256::from(3u64),
             B256::repeat_byte(0x33),
             U256::from(2_000_000u64),
+            golden_settlement_context(),
         );
         assert_eq!(
             redemption_attestation_signing_hash(&d, &golden_domain()),
-            b256!("0xf8e1a0228e8f5c19120e5cb8b2c464c9bddd3c4e81063dc3abfd24fd17106d0e"),
+            b256!("0xde8c0c3987180857488cebbb3f111103c5876da261cd3256b74e65ec3c42ac21"),
             "delivery attestation digest drifted"
         );
     }
@@ -975,10 +1067,11 @@ mod tests {
             U256::from(1u64),
             B256::repeat_byte(0x55),
             U256::from(900_000u64),
+            golden_settlement_context(),
         );
         assert_eq!(
             refund_attestation_signing_hash(&r, &golden_domain()),
-            b256!("0xdaf4c0b462ce75f3c20aff96ff82669b5f65d17f13df74c5b731b12c1cd84e1a"),
+            b256!("0xf5b6eea80d89fa26a802ba7eb84ebcb47f9959a7bce4a01e007204ee00025815"),
             "refund attestation digest drifted"
         );
     }
@@ -991,12 +1084,45 @@ mod tests {
             B256::repeat_byte(0x77),
             U256::from(500_000u64),
             U256::from(400_000u64),
+            golden_settlement_context(),
         );
         assert_eq!(
             streamed_settlement_signing_hash(&s, &golden_domain()),
-            b256!("0x03bc753298d69d144eda71e92bc8ebf4de4285d11ce2cc764250e96e9640c374"),
+            b256!("0x049017a11b4efbac6a058cc06173ed6eaf43f60607660c708c4fc9c2753839ce"),
             "streamed-settlement digest drifted"
         );
+    }
+
+    #[test]
+    fn settlement_digest_binds_every_source_context_field() {
+        let base = golden_settlement_context();
+        let digest = |context| {
+            attestation_signing_hash(
+                &attestation(
+                    B256::repeat_byte(0x11),
+                    U256::from(7u64),
+                    U256::from(1_000_000u64),
+                    context,
+                ),
+                &golden_domain(),
+            )
+        };
+        let expected = digest(base);
+        let mut variants = [base; 7];
+        variants[0].evidence_hash = B256::repeat_byte(0x89);
+        variants[1].observed_at += 1;
+        variants[2].valid_until += 1;
+        variants[3].source_chain_id += U256::from(1u8);
+        variants[4].source_block_number += 1;
+        variants[5].source_block_hash = B256::repeat_byte(0x9a);
+        variants[6].observation_epoch += 1;
+        for changed in variants {
+            assert_ne!(
+                digest(changed),
+                expected,
+                "unsigned settlement context field"
+            );
+        }
     }
 
     #[test]
@@ -1064,6 +1190,7 @@ mod tests {
             B256::repeat_byte(0x88),
             U256::from(4u64),
             B256::repeat_byte(0x99),
+            B256::repeat_byte(0x98),
             U256::from(3_000_000u64),
             8,
             B256::repeat_byte(0xAA),
@@ -1073,7 +1200,7 @@ mod tests {
         );
         assert_eq!(
             ric_signing_hash(&ric, &golden_domain()),
-            b256!("0x734783e8fc35297112da10de93706d7ed917d4a33d9f9e6777f67c92a969ea8c"),
+            b256!("0x4ef0bfb67128773bdb18e87440a6a56dbc9b5a5253f4d1de05e26107612bc9e5"),
             "RIC digest drifted — cross-operator divergence"
         );
     }
@@ -1085,6 +1212,7 @@ mod tests {
             B256::repeat_byte(0xEE),
             U256::from(5u64),
             B256::repeat_byte(0x12),
+            B256::repeat_byte(0x13),
             U256::from(4_000_000u64),
             6,
             B256::repeat_byte(0x34),
@@ -1094,7 +1222,7 @@ mod tests {
         );
         assert_eq!(
             acquire_cancel_signing_hash(&acc, &golden_domain()),
-            b256!("0xa4369421bfee1e94bbe986096702c53e97c2835ced0376b462491ca62e907368"),
+            b256!("0x0242970a7a5bcc28ae612fdf09cf4be64886e30a9475136eb0ae2155db2a2c0a"),
             "ACC digest drifted — cross-operator divergence"
         );
     }

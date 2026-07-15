@@ -3,8 +3,8 @@
     reason = "mock server: prints its THORNODE_URLS line for the operator"
 )]
 //! Mock `THORNode` for the one-box rehearsal: serves a fixed BTC
-//! `inbound_addresses` Asgard entry on TWO loopback ports (the observer's
-//! `AsgardAgreement` requires ≥2 distinct sources that AGREE — a single
+//! `inbound_addresses` Asgard entry on THREE loopback ports (the observer's
+//! `AsgardAgreement` requires ≥3 distinct sources that AGREE — a single
 //! shared source collapses 5 observers into 1). DEV / TESTNET ONLY: it
 //! returns whatever Asgard address you pass, with all halt flags false, so
 //! the observer resolves it and certifies.
@@ -16,7 +16,7 @@
 //!
 //! ```text
 //! cargo run -p xindex-signer-daemon --example mock_thornode -- \
-//!     <btc_asgard_address> [port0=26659] [port1=26660]
+//!     <btc_asgard_address> [port0=26659] [port1=26660] [port2=26661]
 //! ```
 
 use std::future::IntoFuture;
@@ -41,12 +41,15 @@ fn app(asgard: Value) -> Router {
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let asgard_addr = args.next().ok_or_else(|| {
-        anyhow::anyhow!("usage: mock_thornode <btc_asgard_address> [port0=26659] [port1=26660]")
+        anyhow::anyhow!(
+            "usage: mock_thornode <btc_asgard_address> [port0=26659] [port1=26660] [port2=26661]"
+        )
     })?;
     let port0: u16 = args.next().map_or(Ok(26659), |s| s.parse())?;
     let port1: u16 = args.next().map_or(Ok(26660), |s| s.parse())?;
+    let port2: u16 = args.next().map_or(Ok(26661), |s| s.parse())?;
 
-    // ≥2 sources must agree on `address` + report no halt flags, or the
+    // ≥3 sources must agree on `address` + report no halt flags, or the
     // observer's AsgardAgreement refuses to certify.
     let body = json!([{
         "chain": "BTC",
@@ -60,14 +63,19 @@ async fn main() -> Result<()> {
 
     let l0 = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port0))).await?;
     let l1 = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port1))).await?;
+    let l2 = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port2))).await?;
     println!("mock THORNode — BTC Asgard inbound = {asgard_addr}");
-    println!("THORNODE_URLS=http://127.0.0.1:{port0},http://127.0.0.1:{port1}");
+    println!(
+        "THORNODE_URLS=http://127.0.0.1:{port0},http://127.0.0.1:{port1},http://127.0.0.1:{port2}"
+    );
 
-    let (r0, r1) = tokio::join!(
+    let (r0, r1, r2) = tokio::join!(
         axum::serve(l0, app(body.clone())).into_future(),
-        axum::serve(l1, app(body)).into_future(),
+        axum::serve(l1, app(body.clone())).into_future(),
+        axum::serve(l2, app(body)).into_future(),
     );
     r0?;
     r1?;
+    r2?;
     Ok(())
 }

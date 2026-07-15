@@ -1,0 +1,34 @@
+rule_files:
+  - gate3-alerts.yml
+
+evaluation_interval: 30s
+
+tests:
+  - name: terminal-worker-missing-series-pages
+    interval: 30s
+    input_series:
+      - series: 'up{job="xindex-finalized-observer",instance="local"}'
+        values: '1+0x8'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: XindexTerminalRedemptionWorkerMissing
+        exp_alerts:
+          - exp_labels:
+              job: xindex-finalize-redeem
+              severity: critical
+              gate: "3"
+            exp_annotations:
+              summary: Terminal redemption worker or its required stuck series is missing
+              runbook: docs/runbooks/gate3-operations.md#service-or-monitoring-loss
+
+  - name: terminal-worker-present-zero-stuck-is-healthy
+    interval: 30s
+    input_series:
+      - series: 'up{job="xindex-finalize-redeem",instance="local"}'
+        values: '1+0x8'
+      - series: 'xindex_redeem_relayer_stuck{job="xindex-finalize-redeem",instance="local"}'
+        values: '0+0x8'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: XindexTerminalRedemptionWorkerMissing
+        exp_alerts: []

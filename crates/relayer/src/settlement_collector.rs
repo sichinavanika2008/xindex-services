@@ -9,11 +9,12 @@ use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, PrimitiveSignature, B256, U256};
 use alloy_sol_types::Eip712Domain;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use xindex_shared::eip712::{
     attestation, attestation_signing_hash, redemption_attestation,
     redemption_attestation_signing_hash, refund_attestation, refund_attestation_signing_hash,
-    streamed_settlement, streamed_settlement_signing_hash,
+    settlement_context, streamed_settlement, streamed_settlement_signing_hash, SettlementContext,
 };
 use xindex_shared::settlement_wire::{
     SignedDeliverySettlement, SignedMintSettlement, SignedRefundSettlement,
@@ -21,13 +22,14 @@ use xindex_shared::settlement_wire::{
 };
 
 /// One exact on-chain attestation payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SettlementPayload {
     /// Mint slot delivery.
     Mint {
         intent_id: B256,
         slot_index: U256,
         attested_amount: U256,
+        context: SettlementContext,
     },
     /// Redemption delivery-only outcome.
     Delivery {
@@ -35,6 +37,7 @@ pub enum SettlementPayload {
         leg_index: U256,
         asset_id: B256,
         delivered_amount: U256,
+        context: SettlementContext,
     },
     /// Redemption refund-only outcome.
     Refund {
@@ -42,6 +45,7 @@ pub enum SettlementPayload {
         leg_index: U256,
         asset_id: B256,
         refunded_amount: U256,
+        context: SettlementContext,
     },
     /// Fully-finalized combined streamed outcome.
     Streamed {
@@ -50,22 +54,49 @@ pub enum SettlementPayload {
         asset_id: B256,
         delivered_usdt: U256,
         refunded_native: U256,
+        context: SettlementContext,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SettlementRound {
-    Mint(B256, U256),
-    Redemption(B256, U256),
+    Mint(B256, U256, u64),
+    Redemption(B256, U256, u64),
 }
 
 /// Exact payload with deterministic, recovered-signer-ordered signatures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadySettlement {
     /// Complete signed plaintext.
     pub payload: SettlementPayload,
     /// Threshold signatures ordered by recovered address.
+    #[serde(with = "signature_vec_serde")]
     pub signatures: Vec<[u8; 65]>,
+}
+
+mod signature_vec_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(signatures: &[[u8; 65]], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        signatures
+            .iter()
+            .map(|signature| format!("0x{}", alloy_primitives::hex::encode(signature)))
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<[u8; 65]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer)?
+            .into_iter()
+            .map(|raw| super::parse_signature(&raw).map_err(serde::de::Error::custom))
+            .collect()
+    }
 }
 
 /// Result of accepting one observer response.
@@ -76,7 +107,7 @@ pub enum SettlementIngestOutcome {
     /// Exact signer/payload retry.
     Duplicate { count: usize },
     /// This vote completed an exact quorum.
-    Ready(ReadySettlement),
+    Ready(Box<ReadySettlement>),
 }
 
 /// Fail-closed observer-response validation errors.
@@ -109,6 +140,12 @@ pub enum SettlementCollectError {
     /// Future observation stamp.
     #[error("future observer response: observed {observed_at}, now {now}")]
     Future { observed_at: u64, now: u64 },
+    /// Signed report lifetime has reached its strict deadline.
+    #[error("expired observer response: valid until {valid_until}, now {now}")]
+    Expired { valid_until: u64, now: u64 },
+    /// Signed source chain is not the configured finalized journal chain.
+    #[error("wrong settlement source chain: expected {expected}, got {actual}")]
+    WrongSourceChain { expected: u64, actual: u64 },
     /// Malformed, high-S, or unrecoverable signature.
     #[error("invalid signature: {0}")]
     InvalidSignature(String),
@@ -134,6 +171,7 @@ pub struct SettlementCollector {
     allowed_signers: HashSet<Address>,
     threshold: usize,
     max_response_age_secs: u64,
+    expected_source_chain_id: u64,
     votes: HashMap<SettlementPayload, HashMap<Address, [u8; 65]>>,
     signer_rounds: HashMap<(SettlementRound, Address), SettlementPayload>,
 }
@@ -148,6 +186,7 @@ impl SettlementCollector {
         allowed_signers: impl IntoIterator<Item = Address>,
         threshold: usize,
         max_response_age_secs: u64,
+        expected_source_chain_id: u64,
     ) -> Result<Self, SettlementCollectError> {
         let allowed_signers: HashSet<_> = allowed_signers.into_iter().collect();
         if threshold == 0 || threshold > allowed_signers.len() {
@@ -159,11 +198,18 @@ impl SettlementCollector {
         if max_response_age_secs == 0 {
             return Err(SettlementCollectError::InvalidResponseAge);
         }
+        if expected_source_chain_id == 0 {
+            return Err(SettlementCollectError::WrongSourceChain {
+                expected: 1,
+                actual: 0,
+            });
+        }
         Ok(Self {
             domain,
             allowed_signers,
             threshold,
             max_response_age_secs,
+            expected_source_chain_id,
             votes: HashMap::new(),
             signer_rounds: HashMap::new(),
         })
@@ -181,7 +227,17 @@ impl SettlementCollector {
         expected_slot_index: U256,
         now: u64,
     ) -> Result<SettlementIngestOutcome, SettlementCollectError> {
-        self.validate_metadata(&message.evidence_hash, message.observed_at, now)?;
+        self.retire_expired_rounds(now);
+        let context = self.validate_context(
+            &message.evidence_hash,
+            message.observed_at,
+            message.valid_until,
+            message.source_chain_id,
+            message.source_block_number,
+            &message.source_block_hash,
+            message.observation_epoch,
+            now,
+        )?;
         let intent_id = parse_b256("intentId", &message.intent_id)?;
         let slot_index = parse_u256("slotIndex", &message.slot_index)?;
         let attested_amount = parse_u256("attestedAmount", &message.attested_amount)?;
@@ -195,14 +251,15 @@ impl SettlementCollector {
             intent_id,
             slot_index,
             attested_amount,
+            context,
         };
         let digest = attestation_signing_hash(
-            &attestation(intent_id, slot_index, attested_amount),
+            &attestation(intent_id, slot_index, attested_amount, context),
             &self.domain,
         );
         self.ingest_verified(
-            payload,
-            SettlementRound::Mint(intent_id, slot_index),
+            &payload,
+            SettlementRound::Mint(intent_id, slot_index, context.observation_epoch),
             &message.signer_address,
             &message.signature,
             digest,
@@ -221,7 +278,17 @@ impl SettlementCollector {
         expected_asset_id: B256,
         now: u64,
     ) -> Result<SettlementIngestOutcome, SettlementCollectError> {
-        self.validate_metadata(&message.evidence_hash, message.observed_at, now)?;
+        self.retire_expired_rounds(now);
+        let context = self.validate_context(
+            &message.evidence_hash,
+            message.observed_at,
+            message.valid_until,
+            message.source_chain_id,
+            message.source_block_number,
+            &message.source_block_hash,
+            message.observation_epoch,
+            now,
+        )?;
         let redemption_id = parse_b256("redemptionId", &message.redemption_id)?;
         let leg_index = parse_u256("legIndex", &message.leg_index)?;
         let asset_id = parse_b256("assetId", &message.asset_id)?;
@@ -242,14 +309,21 @@ impl SettlementCollector {
             leg_index,
             asset_id,
             delivered_amount,
+            context,
         };
         let digest = redemption_attestation_signing_hash(
-            &redemption_attestation(redemption_id, leg_index, asset_id, delivered_amount),
+            &redemption_attestation(
+                redemption_id,
+                leg_index,
+                asset_id,
+                delivered_amount,
+                context,
+            ),
             &self.domain,
         );
         self.ingest_verified(
-            payload,
-            SettlementRound::Redemption(redemption_id, leg_index),
+            &payload,
+            SettlementRound::Redemption(redemption_id, leg_index, context.observation_epoch),
             &message.signer_address,
             &message.signature,
             digest,
@@ -268,7 +342,17 @@ impl SettlementCollector {
         expected_asset_id: B256,
         now: u64,
     ) -> Result<SettlementIngestOutcome, SettlementCollectError> {
-        self.validate_metadata(&message.evidence_hash, message.observed_at, now)?;
+        self.retire_expired_rounds(now);
+        let context = self.validate_context(
+            &message.evidence_hash,
+            message.observed_at,
+            message.valid_until,
+            message.source_chain_id,
+            message.source_block_number,
+            &message.source_block_hash,
+            message.observation_epoch,
+            now,
+        )?;
         let redemption_id = parse_b256("redemptionId", &message.redemption_id)?;
         let leg_index = parse_u256("legIndex", &message.leg_index)?;
         let asset_id = parse_b256("assetId", &message.asset_id)?;
@@ -289,14 +373,15 @@ impl SettlementCollector {
             leg_index,
             asset_id,
             refunded_amount,
+            context,
         };
         let digest = refund_attestation_signing_hash(
-            &refund_attestation(redemption_id, leg_index, asset_id, refunded_amount),
+            &refund_attestation(redemption_id, leg_index, asset_id, refunded_amount, context),
             &self.domain,
         );
         self.ingest_verified(
-            payload,
-            SettlementRound::Redemption(redemption_id, leg_index),
+            &payload,
+            SettlementRound::Redemption(redemption_id, leg_index, context.observation_epoch),
             &message.signer_address,
             &message.signature,
             digest,
@@ -315,7 +400,17 @@ impl SettlementCollector {
         expected_asset_id: B256,
         now: u64,
     ) -> Result<SettlementIngestOutcome, SettlementCollectError> {
-        self.validate_metadata(&message.evidence_hash, message.observed_at, now)?;
+        self.retire_expired_rounds(now);
+        let context = self.validate_context(
+            &message.evidence_hash,
+            message.observed_at,
+            message.valid_until,
+            message.source_chain_id,
+            message.source_block_number,
+            &message.source_block_hash,
+            message.observation_epoch,
+            now,
+        )?;
         let redemption_id = parse_b256("redemptionId", &message.redemption_id)?;
         let leg_index = parse_u256("legIndex", &message.leg_index)?;
         let asset_id = parse_b256("assetId", &message.asset_id)?;
@@ -338,6 +433,7 @@ impl SettlementCollector {
             asset_id,
             delivered_usdt,
             refunded_native,
+            context,
         };
         let digest = streamed_settlement_signing_hash(
             &streamed_settlement(
@@ -346,42 +442,82 @@ impl SettlementCollector {
                 asset_id,
                 delivered_usdt,
                 refunded_native,
+                context,
             ),
             &self.domain,
         );
         self.ingest_verified(
-            payload,
-            SettlementRound::Redemption(redemption_id, leg_index),
+            &payload,
+            SettlementRound::Redemption(redemption_id, leg_index, context.observation_epoch),
             &message.signer_address,
             &message.signature,
             digest,
         )
     }
 
-    fn validate_metadata(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "all flattened signed context fields are validated together"
+    )]
+    fn validate_context(
         &self,
         evidence_hash: &str,
         observed_at: u64,
+        valid_until: u64,
+        source_chain_id: u64,
+        source_block_number: u64,
+        source_block_hash: &str,
+        observation_epoch: u64,
         now: u64,
-    ) -> Result<(), SettlementCollectError> {
-        if parse_b256("evidenceHash", evidence_hash)? == B256::ZERO {
+    ) -> Result<SettlementContext, SettlementCollectError> {
+        let evidence_hash = parse_b256("evidenceHash", evidence_hash)?;
+        let source_block_hash = parse_b256("sourceBlockHash", source_block_hash)?;
+        if evidence_hash == B256::ZERO
+            || source_block_hash == B256::ZERO
+            || source_block_number == 0
+        {
             return Err(SettlementCollectError::InvalidField {
-                field: "evidenceHash",
+                field: "settlementContext",
                 reason: "zero".to_string(),
+            });
+        }
+        if source_chain_id != self.expected_source_chain_id {
+            return Err(SettlementCollectError::WrongSourceChain {
+                expected: self.expected_source_chain_id,
+                actual: source_chain_id,
             });
         }
         if observed_at > now {
             return Err(SettlementCollectError::Future { observed_at, now });
         }
+        if now >= valid_until {
+            return Err(SettlementCollectError::Expired { valid_until, now });
+        }
+        if valid_until <= observed_at
+            || valid_until.saturating_sub(observed_at) > self.max_response_age_secs
+        {
+            return Err(SettlementCollectError::InvalidField {
+                field: "validUntil",
+                reason: "outside configured signed lifetime".to_string(),
+            });
+        }
         if now.saturating_sub(observed_at) > self.max_response_age_secs {
             return Err(SettlementCollectError::Stale { observed_at, now });
         }
-        Ok(())
+        Ok(settlement_context(
+            evidence_hash,
+            observed_at,
+            valid_until,
+            U256::from(source_chain_id),
+            source_block_number,
+            source_block_hash,
+            observation_epoch,
+        ))
     }
 
     fn ingest_verified(
         &mut self,
-        payload: SettlementPayload,
+        payload: &SettlementPayload,
         round: SettlementRound,
         claimed_raw: &str,
         signature_raw: &str,
@@ -406,35 +542,55 @@ impl SettlementCollector {
             return Err(SettlementCollectError::SignerNotAllowed(recovered));
         }
         if let Some(previous) = self.signer_rounds.get(&(round, recovered)) {
-            if previous != &payload {
+            if previous != payload {
                 return Err(SettlementCollectError::Equivocation { signer: recovered });
             }
         } else {
-            self.signer_rounds.insert((round, recovered), payload);
+            self.signer_rounds.insert((round, recovered), *payload);
         }
-        let votes = self.votes.entry(payload).or_default();
+        let votes = self.votes.entry(*payload).or_default();
         if votes.contains_key(&recovered) {
             if votes.len() >= self.threshold {
-                return Ok(SettlementIngestOutcome::Ready(ready(payload, votes)));
+                return Ok(SettlementIngestOutcome::Ready(Box::new(ready(
+                    payload, votes,
+                ))));
             }
             return Ok(SettlementIngestOutcome::Duplicate { count: votes.len() });
         }
         votes.insert(recovered, signature);
         if votes.len() >= self.threshold {
-            return Ok(SettlementIngestOutcome::Ready(ready(payload, votes)));
+            return Ok(SettlementIngestOutcome::Ready(Box::new(ready(
+                payload, votes,
+            ))));
         }
         Ok(SettlementIngestOutcome::Accepted { count: votes.len() })
     }
+
+    fn retire_expired_rounds(&mut self, now: u64) {
+        self.votes
+            .retain(|payload, _| settlement_valid_until(payload) > now);
+        self.signer_rounds
+            .retain(|_, payload| settlement_valid_until(payload) > now);
+    }
 }
 
-fn ready(payload: SettlementPayload, votes: &HashMap<Address, [u8; 65]>) -> ReadySettlement {
+fn settlement_valid_until(payload: &SettlementPayload) -> u64 {
+    match payload {
+        SettlementPayload::Mint { context, .. }
+        | SettlementPayload::Delivery { context, .. }
+        | SettlementPayload::Refund { context, .. }
+        | SettlementPayload::Streamed { context, .. } => context.valid_until,
+    }
+}
+
+fn ready(payload: &SettlementPayload, votes: &HashMap<Address, [u8; 65]>) -> ReadySettlement {
     let mut ordered: Vec<_> = votes
         .iter()
         .map(|(address, signature)| (*address, *signature))
         .collect();
     ordered.sort_by(|(left, _), (right, _)| left.as_slice().cmp(right.as_slice()));
     ReadySettlement {
-        payload,
+        payload: *payload,
         signatures: ordered
             .into_iter()
             .map(|(_, signature)| signature)
@@ -510,10 +666,74 @@ mod tests {
         attestation_oracle_domain(31_337, Address::repeat_byte(0xcc))
     }
 
+    fn test_context() -> SettlementContext {
+        settlement_context(
+            B256::repeat_byte(0xee),
+            1_000,
+            1_060,
+            U256::from(31_337u64),
+            20_000_000,
+            B256::repeat_byte(0xdd),
+            0,
+        )
+    }
+
+    #[test]
+    fn settlement_context_is_rejected_before_signature_recovery() {
+        let collector =
+            SettlementCollector::new(domain(), [Address::repeat_byte(1)], 1, 60, 31_337)
+                .expect("collector");
+        let evidence = format!("{:#x}", B256::repeat_byte(0xee));
+        let source_hash = format!("{:#x}", B256::repeat_byte(0xdd));
+
+        assert_eq!(
+            collector.validate_context(
+                &evidence,
+                1_000,
+                1_060,
+                31_337,
+                20_000_000,
+                &source_hash,
+                0,
+                1_060,
+            ),
+            Err(SettlementCollectError::Expired {
+                valid_until: 1_060,
+                now: 1_060,
+            })
+        );
+        assert!(matches!(
+            collector.validate_context(
+                &evidence,
+                1_061,
+                1_100,
+                31_337,
+                20_000_000,
+                &source_hash,
+                0,
+                1_060,
+            ),
+            Err(SettlementCollectError::Future { .. })
+        ));
+        assert!(matches!(
+            collector.validate_context(
+                &evidence,
+                1_000,
+                1_060,
+                1,
+                20_000_000,
+                &source_hash,
+                0,
+                1_010,
+            ),
+            Err(SettlementCollectError::WrongSourceChain { .. })
+        ));
+    }
+
     fn mint_message(signer: &PrivateKeySigner, amount: u64) -> SignedMintSettlement {
         let intent = B256::repeat_byte(0x11);
         let digest = attestation_signing_hash(
-            &attestation(intent, U256::ZERO, U256::from(amount)),
+            &attestation(intent, U256::ZERO, U256::from(amount), test_context()),
             &domain(),
         );
         let signature = signer.sign_hash_sync(&digest).expect("sign").as_bytes();
@@ -525,6 +745,11 @@ mod tests {
             signature: format!("0x{}", alloy_primitives::hex::encode(signature)),
             evidence_hash: format!("{:#x}", B256::repeat_byte(0xee)),
             observed_at: 1_000,
+            valid_until: 1_060,
+            source_chain_id: 31_337,
+            source_block_number: 20_000_000,
+            source_block_hash: format!("{:#x}", B256::repeat_byte(0xdd)),
+            observation_epoch: 0,
         }
     }
 
@@ -532,7 +757,7 @@ mod tests {
     fn exact_mint_quorum_and_equivocation_guard() {
         let signers = [signer(3), signer(1), signer(2)];
         let mut collector =
-            SettlementCollector::new(domain(), signers.iter().map(Signer::address), 2, 60)
+            SettlementCollector::new(domain(), signers.iter().map(Signer::address), 2, 60, 31_337)
                 .expect("collector");
         let intent = B256::repeat_byte(0x11);
         assert!(matches!(
@@ -564,5 +789,56 @@ mod tests {
             )
             .expect_err("equivocation");
         assert!(matches!(error, SettlementCollectError::Equivocation { .. }));
+    }
+
+    #[test]
+    fn expired_generation_releases_in_memory_round_identity_at_equality() {
+        let allowed = Address::repeat_byte(0x41);
+        let mut collector =
+            SettlementCollector::new(domain(), [allowed], 1, 120, 31_337).expect("collector");
+        let expired = SettlementPayload::Mint {
+            intent_id: B256::repeat_byte(0x21),
+            slot_index: U256::ZERO,
+            attested_amount: U256::from(1u64),
+            context: test_context(),
+        };
+        let mut live_context = test_context();
+        live_context.valid_until = 1_120;
+        let live = SettlementPayload::Mint {
+            intent_id: B256::repeat_byte(0x22),
+            slot_index: U256::ZERO,
+            attested_amount: U256::from(2u64),
+            context: live_context,
+        };
+        collector
+            .votes
+            .insert(expired, HashMap::from([(allowed, [0x1b; 65])]));
+        collector
+            .votes
+            .insert(live, HashMap::from([(allowed, [0x1c; 65])]));
+        collector.signer_rounds.insert(
+            (
+                SettlementRound::Mint(B256::repeat_byte(0x21), U256::ZERO, 0),
+                allowed,
+            ),
+            expired,
+        );
+        collector.signer_rounds.insert(
+            (
+                SettlementRound::Mint(B256::repeat_byte(0x22), U256::ZERO, 0),
+                allowed,
+            ),
+            live,
+        );
+
+        collector.retire_expired_rounds(1_060);
+
+        assert_eq!(collector.votes.len(), 1);
+        assert!(collector.votes.contains_key(&live));
+        assert_eq!(collector.signer_rounds.len(), 1);
+        assert!(collector
+            .signer_rounds
+            .values()
+            .all(|payload| *payload == live));
     }
 }

@@ -31,6 +31,7 @@
 //! and the `==`-binding of request fields to certified values lives in
 //! each handler, where the family-specific spend shape is known.
 
+use crate::chain_registry::ChainId;
 use crate::eip712::{
     acquire_cancel_certificate, acquire_cancel_signing_hash, attestation_oracle_domain,
     redemption_intent_certificate, ric_signing_hash,
@@ -179,10 +180,12 @@ pub fn validate_intent_proof(
         .validate()
         .map_err(|e| IntentError::ProofInvalid(format!("daemon intent policy invalid: {e}")))?;
     let intent = parse_proof_fields(proof)?;
+    let native_chain = certificate_native_chain(intent.asset_id, intent.amount_decimals)?;
     let ric = redemption_intent_certificate(
         intent.redemption_id,
         U256::from(intent.leg_index),
         intent.asset_id,
+        native_chain.native_chain_id_hash(),
         intent.amount,
         intent.amount_decimals,
         intent.immediate_target_hash,
@@ -249,11 +252,13 @@ pub fn validate_acquire_cancel_proof(
         .validate()
         .map_err(|e| IntentError::ProofInvalid(format!("daemon intent policy invalid: {e}")))?;
     let cancel = parse_cancel_fields(proof)?;
+    let native_chain = certificate_native_chain(cancel.asset_id, cancel.amount_decimals)?;
     let acc = acquire_cancel_certificate(
         cancel.cancel_id,
         cancel.intent_id,
         U256::from(cancel.slot_index),
         cancel.asset_id,
+        native_chain.native_chain_id_hash(),
         cancel.amount,
         cancel.amount_decimals,
         cancel.immediate_target_hash,
@@ -307,6 +312,24 @@ fn parse_proof_fields(proof: &IntentProof) -> Result<VerifiedIntent, IntentError
         vault_resolved_at: proof.vault_resolved_at,
         signers: Vec::new(),
     })
+}
+
+/// Derive the signed native-chain commitment from the canonical asset
+/// registry. A proof cannot supply or relabel this value: unknown assets and
+/// decimal mismatches are rejected before signature recovery.
+fn certificate_native_chain(asset_id: B256, amount_decimals: u8) -> Result<ChainId, IntentError> {
+    let chain = ChainId::from_asset_id(asset_id).ok_or_else(|| {
+        IntentError::ProofInvalid(
+            "asset_id is absent from the canonical chain registry".to_string(),
+        )
+    })?;
+    if amount_decimals != chain.decimals() {
+        return Err(IntentError::ProofInvalid(format!(
+            "amount_decimals {amount_decimals} does not match canonical {chain} decimals {}",
+            chain.decimals()
+        )));
+    }
+    Ok(chain)
 }
 
 /// Strict signature-set verification: every entry must be a valid
@@ -414,6 +437,8 @@ fn parse_u32(dec_str: &str, field: &str) -> Result<u32, IntentError> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test code")]
+
     use super::*;
     use alloy_primitives::keccak256;
     use k256::ecdsa::SigningKey;
@@ -483,7 +508,7 @@ mod tests {
         IntentProof {
             redemption_id: format!("0x{}", "ab".repeat(32)),
             leg_index: "1".to_string(),
-            asset_id: format!("0x{}", "a1".repeat(32)),
+            asset_id: format!("{:#x}", ChainId::Btc.asset_id_hash()),
             amount: "100000000".to_string(),
             amount_decimals: 8,
             immediate_target_hash: format!("0x{}", "cd".repeat(32)),
@@ -505,10 +530,14 @@ mod tests {
     /// would no longer verify against the production digest).
     #[expect(clippy::expect_used, reason = "test code")]
     fn digest_for(proof: &IntentProof, chain_id: u64, contract: Address) -> B256 {
+        let asset_id = b256_of(&proof.asset_id);
+        let native_chain_id =
+            ChainId::from_asset_id(asset_id).map_or(B256::ZERO, ChainId::native_chain_id_hash);
         let ric = redemption_intent_certificate(
             b256_of(&proof.redemption_id),
             U256::from_str_radix(&proof.leg_index, 10).expect("leg"),
-            b256_of(&proof.asset_id),
+            asset_id,
+            native_chain_id,
             U256::from_str_radix(&proof.amount, 10).expect("amount"),
             proof.amount_decimals,
             b256_of(&proof.immediate_target_hash),
@@ -588,6 +617,29 @@ mod tests {
     fn empty_signature_set_rejected() {
         let proof = signed_proof(|_| {}, &[]);
         assert_rejected(&proof, error_codes::INTENT_PROOF_INVALID, "sub-quorum");
+    }
+
+    #[test]
+    fn ric_unknown_asset_and_wrong_decimals_fail_before_signature_recovery() {
+        let key_free_policy = IntentPolicy {
+            signer_whitelist: vec![Address::repeat_byte(0x11)],
+            intent_quorum: 1,
+            ric_max_age_secs: MAX_AGE,
+        };
+        for mutate in [
+            |proof: &mut IntentProof| {
+                proof.asset_id = format!("{:#x}", B256::repeat_byte(0xff));
+            },
+            |proof: &mut IntentProof| {
+                proof.amount_decimals = 7;
+            },
+        ] {
+            let mut proof = sample_proof();
+            mutate(&mut proof);
+            let error = validate_intent_proof(&proof, CHAIN_ID, oracle(), &key_free_policy, NOW)
+                .expect_err("non-canonical certificate asset metadata must fail");
+            assert_eq!(error.error_code(), error_codes::INTENT_PROOF_INVALID);
+        }
     }
 
     #[test]
@@ -776,7 +828,7 @@ mod tests {
             cancel_id: format!("0x{}", "11".repeat(32)),
             intent_id: format!("0x{}", "22".repeat(32)),
             slot_index: "0".to_string(),
-            asset_id: format!("0x{}", "a1".repeat(32)),
+            asset_id: format!("{:#x}", ChainId::Btc.asset_id_hash()),
             amount: "50000000".to_string(),
             amount_decimals: 8,
             immediate_target_hash: format!("0x{}", "cd".repeat(32)),
@@ -790,11 +842,15 @@ mod tests {
     /// Independent ACC digest recompute from the proof's literal fields.
     #[expect(clippy::expect_used, reason = "test code")]
     fn acc_digest_for(proof: &AcquireCancelProof, chain_id: u64, contract: Address) -> B256 {
+        let asset_id = b256_of(&proof.asset_id);
+        let native_chain_id =
+            ChainId::from_asset_id(asset_id).map_or(B256::ZERO, ChainId::native_chain_id_hash);
         let acc = acquire_cancel_certificate(
             b256_of(&proof.cancel_id),
             b256_of(&proof.intent_id),
             U256::from_str_radix(&proof.slot_index, 10).expect("slot"),
-            b256_of(&proof.asset_id),
+            asset_id,
+            native_chain_id,
             U256::from_str_radix(&proof.amount, 10).expect("amount"),
             proof.amount_decimals,
             b256_of(&proof.immediate_target_hash),
@@ -817,6 +873,30 @@ mod tests {
             .map(|s| sign_digest(&key_identity(*s).0, digest))
             .collect();
         proof
+    }
+
+    #[test]
+    fn acc_unknown_asset_and_wrong_decimals_fail_before_signature_recovery() {
+        let key_free_policy = IntentPolicy {
+            signer_whitelist: vec![Address::repeat_byte(0x11)],
+            intent_quorum: 1,
+            ric_max_age_secs: MAX_AGE,
+        };
+        for mutate in [
+            |proof: &mut AcquireCancelProof| {
+                proof.asset_id = format!("{:#x}", B256::repeat_byte(0xff));
+            },
+            |proof: &mut AcquireCancelProof| {
+                proof.amount_decimals = 7;
+            },
+        ] {
+            let mut proof = sample_acc_proof();
+            mutate(&mut proof);
+            let error =
+                validate_acquire_cancel_proof(&proof, CHAIN_ID, oracle(), &key_free_policy, NOW)
+                    .expect_err("non-canonical certificate asset metadata must fail");
+            assert_eq!(error.error_code(), error_codes::INTENT_PROOF_INVALID);
+        }
     }
 
     /// The ACC validator mirrors the RIC validator: 3-of-5 over the ACC

@@ -225,13 +225,19 @@ impl<H: HsmDigestSigner> RegistrySigner<'_, H> {
         let digest = inbound_state_signing_hash(&report, self.domain);
         let signature = match self
             .state
-            .reserve_inbound_signature(report.sequence, digest, context.now)
+            .reserve_inbound_signature(report.sequence, report.validUntil, digest, context.now)
             .await?
         {
             SignatureReservation::Reserved => {
                 let signature = self.sign_and_verify(digest).await?;
                 self.state
-                    .complete_inbound_signature(report.sequence, digest, signature, context.now)
+                    .complete_inbound_signature(
+                        report.sequence,
+                        report.validUntil,
+                        digest,
+                        signature,
+                        context.now,
+                    )
                     .await?;
                 signature
             }
@@ -306,7 +312,13 @@ impl<H: HsmDigestSigner> RegistrySigner<'_, H> {
         }
         let signature = match self
             .state
-            .reserve_quote_signature(quote.originator, quote.quoteNonce, digest, context.now)
+            .reserve_quote_signature(
+                quote.originator,
+                quote.quoteNonce,
+                quote.dispatchDeadline,
+                digest,
+                context.now,
+            )
             .await?
         {
             SignatureReservation::Reserved => {
@@ -315,6 +327,7 @@ impl<H: HsmDigestSigner> RegistrySigner<'_, H> {
                     .complete_quote_signature(
                         quote.originator,
                         quote.quoteNonce,
+                        quote.dispatchDeadline,
                         digest,
                         signature,
                         context.now,

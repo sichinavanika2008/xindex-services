@@ -199,7 +199,8 @@ struct Args {
     #[arg(long, env = "COSIGNER_CLIENT_KEY_PEM")]
     cosigner_client_key_pem: Option<PathBuf>,
 
-    /// Pinned signer-daemon CA/certificate bundle; system roots are disabled.
+    /// Leaf-first exact signer-daemon peer bundle. The legacy CLI/environment
+    /// name says CA, but a CA-only file does not authorize its issued leaves.
     #[arg(long, env = "COSIGNER_SERVER_CA_PEM")]
     cosigner_server_ca_pem: Option<PathBuf>,
 
@@ -228,7 +229,8 @@ struct Args {
     #[arg(long, env = "OBSERVER_CLIENT_KEY_PEM")]
     observer_client_key_pem: Option<PathBuf>,
 
-    /// Pinned observer CA/certificate bundle; system roots are disabled.
+    /// Leaf-first exact observer peer bundle. The legacy CLI/environment name
+    /// says CA, but a CA-only file does not authorize its issued leaves.
     #[arg(long, env = "OBSERVER_SERVER_CA_PEM")]
     observer_server_ca_pem: Option<PathBuf>,
 
@@ -730,7 +732,7 @@ fn build_executor(
                     fs::read(
                         args.cosigner_server_ca_pem
                             .as_deref()
-                            .context("cosigner server CA required")?,
+                            .context("cosigner exact server peer bundle required")?,
                     )?,
                 ))
             };
@@ -791,7 +793,7 @@ fn build_ric_collector(args: &Args) -> Result<Option<RicCollector>> {
             &fs::read(
                 args.observer_server_ca_pem
                     .as_deref()
-                    .context("observer server CA required")?,
+                    .context("observer exact server peer bundle required")?,
             )?,
             Duration::from_secs(20),
         )
@@ -1435,7 +1437,136 @@ where
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test fixtures")]
+
     use super::*;
+
+    fn production_args() -> Args {
+        Args {
+            dev: false,
+            rpc_url: "wss://execution.example".into(),
+            thorchain_adapter: "0x0000000000000000000000000000000000000001".into(),
+            btc_target_token: Some("0x0000000000000000000000000000000000000002".into()),
+            eth_finalized_rpc_url: Some("https://finalized.example".into()),
+            expected_eth_chain_id: Some(1),
+            finalized_observer_database_url: Some("sqlite:///var/lib/xindex/finalized.db".into()),
+            finalized_observer_id: Some("observer-01".into()),
+            finalized_poll_millis: 2_000,
+            thornode_url: "https://thornode.example".into(),
+            redemption_database_url: Some("sqlite:///var/lib/xindex/redemptions.db".into()),
+            esplora_url: "https://esplora.example".into(),
+            btc_network: "bitcoin".into(),
+            chain: "btc".into(),
+            multisig_pubkeys: "p1,p2,p3,p4,p5".into(),
+            multisig_threshold: 3,
+            signer_mode: SignerMode::Remote,
+            multisig_secret_keys: None,
+            cosigner_daemon_urls: Some(
+                "https://c1.example,https://c2.example,https://c3.example,https://c4.example,https://c5.example"
+                    .into(),
+            ),
+            cosigner_pubkeys: Some("p1,p2,p3,p4,p5".into()),
+            cosigner_client_cert_pem: Some("/definitely/not/read/cosigner.crt".into()),
+            cosigner_client_key_pem: Some("/definitely/not/read/cosigner.key".into()),
+            cosigner_server_ca_pem: Some("/definitely/not/read/cosigner-peer.pem".into()),
+            observer_urls: Some(
+                "https://o1.example,https://o2.example,https://o3.example,https://o4.example,https://o5.example"
+                    .into(),
+            ),
+            intent_quorum: Some(3),
+            observer_client_cert_pem: Some("/definitely/not/read/observer.crt".into()),
+            observer_client_key_pem: Some("/definitely/not/read/observer.key".into()),
+            observer_server_ca_pem: Some("/definitely/not/read/observer-peer.pem".into()),
+            fee_sats: 5_000,
+            fee_target_blocks: 3,
+            fee_cap_sats: 100_000,
+            from_block: 0,
+            broadcast_database_url: Some("sqlite:///var/lib/xindex/broadcast.db".into()),
+            rebroadcast_stuck_timeout_secs: 3_600,
+            rebroadcast_min_confirmations: 6,
+            rebroadcast_final_depth: 100,
+            metrics_address: SocketAddr::from(([127, 0, 0, 1], 9094)),
+        }
+    }
+
+    fn assert_policy_rejection(args: &Args, expected: &str) {
+        let error = args
+            .assert_production_safe()
+            .expect_err("unsafe production mutation must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error:#}"
+        );
+        assert!(
+            !error.to_string().contains("definitely/not/read"),
+            "policy mutation reached secret-file I/O: {error:#}"
+        );
+    }
+
+    /// L-04: compiled mutation matrix over the production-only custody
+    /// preflight. Dummy secret paths and key text must remain untouched.
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        let mut software = production_args();
+        software.signer_mode = SignerMode::Software;
+        assert_policy_rejection(&software, "requires remote HSM cosigners");
+
+        let mut raw_key = production_args();
+        raw_key.multisig_secret_keys = Some("never-read-secret".into());
+        assert_policy_rejection(&raw_key, "prohibits raw secret keys");
+
+        let mut non_mainnet = production_args();
+        non_mainnet.btc_network = "signet".into();
+        assert_policy_rejection(&non_mainnet, "Bitcoin mainnet only");
+
+        let mut collapsed_custody = production_args();
+        collapsed_custody.multisig_pubkeys = "p1,p2,p3".into();
+        assert_policy_rejection(
+            &collapsed_custody,
+            "custody topology must be exactly 3-of-5",
+        );
+
+        let mut public_metrics = production_args();
+        public_metrics.metrics_address = SocketAddr::from(([0, 0, 0, 0], 9094));
+        assert_policy_rejection(&public_metrics, "metrics listener");
+
+        let mut ephemeral = production_args();
+        ephemeral.broadcast_database_url = None;
+        assert_policy_rejection(&ephemeral, "durable broadcast and redemption SQLite stores");
+
+        let mut no_finalized_journal = production_args();
+        no_finalized_journal.finalized_observer_database_url = None;
+        assert_policy_rejection(&no_finalized_journal, "finalized-observer journal source");
+
+        let mut plaintext_finalized_rpc = production_args();
+        plaintext_finalized_rpc.eth_finalized_rpc_url = Some("http://rpc.example".into());
+        assert_policy_rejection(&plaintext_finalized_rpc, "must use HTTPS");
+
+        let mut collapsed_observers = production_args();
+        collapsed_observers.observer_urls = Some("https://o1.example,https://o2.example".into());
+        assert_policy_rejection(
+            &collapsed_observers,
+            "observer topology must be exactly 3-of-5",
+        );
+
+        let mut collapsed_cosigners = production_args();
+        collapsed_cosigners.cosigner_daemon_urls = Some("https://c1.example".into());
+        assert_policy_rejection(
+            &collapsed_cosigners,
+            "remote-cosigner topology must be exactly 3-of-5",
+        );
+
+        let mut missing_tls = production_args();
+        missing_tls.observer_client_key_pem = None;
+        assert_policy_rejection(&missing_tls, "pinned mTLS material");
+
+        let mut duplicate_origin = production_args();
+        duplicate_origin.cosigner_daemon_urls = Some(
+            "https://c1.example,https://c1.example,https://c3.example,https://c4.example,https://c5.example"
+                .into(),
+        );
+        assert_policy_rejection(&duplicate_origin, "origins must be distinct");
+    }
 
     #[test]
     fn parse_network_accepts_canonical_aliases() {

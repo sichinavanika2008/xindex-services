@@ -24,24 +24,27 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
 use futures_util::future::join_all;
-use futures_util::StreamExt;
 use prometheus::Registry;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
-use xindex_chain_eth::bindings::{AttestationOracle, IntentQueue};
-use xindex_chain_eth::rpc::is_transient_rpc_error;
+use xindex_chain_eth::bindings::{settlement_context_to_contract, AttestationOracle, IntentQueue};
+use xindex_ops::network::{read_bounded_async, HttpClientPolicy};
 use xindex_ops::tls::{
-    load_cert_chain, load_private_key, pinned_root_store, serve_mtls, server_config,
+    exact_pinned_async_client_builder, load_cert_chain, load_private_key, pinned_cert_store,
+    serve_mtls, server_config,
 };
 use xindex_ops::{serve_metrics, Metrics};
 use xindex_relayer::{
     ReadySettlement, SettlementCollector, SettlementIngestOutcome, SettlementPayload,
 };
-use xindex_shared::eip712::attestation_oracle_domain;
+use xindex_shared::eip712::{attestation_oracle_domain, SettlementContext};
 use xindex_shared::evidence::EvidenceStore;
+use xindex_shared::posting_outbox::{
+    NewPostingJob, PostingEnqueueOutcome, PostingJob, PostingJobState, SqlitePostingOutbox,
+};
 use xindex_shared::settlement_wire::{
     MintSettlementRequest, RedemptionSettlementRequest, SignedDeliverySettlement,
     SignedMintSettlement, SignedRefundSettlement, SignedStreamedSettlement,
@@ -72,6 +75,7 @@ struct Config {
     asset_id: String,
     redemption_leg_index: u32,
     poster_address: String,
+    database_url: String,
     observers: Vec<ObserverConfig>,
     threshold: usize,
     max_response_age_secs: u64,
@@ -83,6 +87,7 @@ struct Config {
     listen_address: SocketAddr,
     metrics_address: SocketAddr,
     observer_client_identity_pem: PathBuf,
+    /// Legacy-named leaf-first exact observer peer bundles.
     observer_server_ca_pems: Vec<PathBuf>,
     server_cert_pem: PathBuf,
     server_key_pem: PathBuf,
@@ -115,7 +120,8 @@ struct AppState {
     observer_client: reqwest::Client,
     observers: Arc<Vec<ObserverEndpoint>>,
     collector: Arc<Mutex<SettlementCollector>>,
-    ready_tx: mpsc::Sender<ReadySettlement>,
+    posting_outbox: SqlitePostingOutbox,
+    poster_notify: Arc<Notify>,
     evidence: EvidenceStore,
     metrics: Metrics,
 }
@@ -212,27 +218,19 @@ async fn run(config: Config) -> Result<()> {
     let registry = Registry::new();
     let metrics = Metrics::new(&registry).context("register metrics")?;
     let evidence = EvidenceStore::open(&config.evidence_dir).context("open evidence store")?;
+    let posting_outbox = SqlitePostingOutbox::connect(&config.database_url)
+        .await
+        .context("open durable settlement posting outbox")?;
     let observer_client = build_observer_client(&config)?;
     let collector = SettlementCollector::new(
         attestation_oracle_domain(config.chain_id, oracle_address),
         observers.iter().map(|observer| observer.signer_address),
         config.threshold,
         config.max_response_age_secs,
+        config.chain_id,
     )
     .context("build exact settlement collector")?;
-    let (ready_tx, ready_rx) = mpsc::channel::<ReadySettlement>(256);
-    let worker = tokio::spawn(poster_worker(
-        ready_rx,
-        Arc::clone(&provider),
-        oracle_address,
-        queue_address,
-        asset_id,
-        poster_address,
-        config.post_attempts,
-        config.retry_base_ms,
-        config.retry_max_ms,
-        metrics.clone(),
-    ));
+    let poster_notify = Arc::new(Notify::new());
     let state = AppState {
         oracle_address,
         queue_address,
@@ -243,10 +241,18 @@ async fn run(config: Config) -> Result<()> {
         observer_client,
         observers: Arc::new(observers),
         collector: Arc::new(Mutex::new(collector)),
-        ready_tx,
+        posting_outbox,
+        poster_notify,
         evidence,
         metrics,
     };
+    let worker = tokio::spawn(poster_worker(
+        state.clone(),
+        poster_address,
+        config.post_attempts,
+        config.retry_base_ms,
+        config.retry_max_ms,
+    ));
     let app = Router::new()
         .route("/api/v1/settlement/mint", post(trigger_mint))
         .route("/api/v1/settlement/delivery", post(trigger_delivery))
@@ -614,21 +620,9 @@ where
     if !status.is_success() {
         anyhow::bail!("observer refused with HTTP {status}");
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_OBSERVER_BODY_BYTES as u64)
-    {
-        anyhow::bail!("observer response exceeds body limit");
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("observer response body")?;
-        if body.len().saturating_add(chunk.len()) > MAX_OBSERVER_BODY_BYTES {
-            anyhow::bail!("observer response exceeds body limit");
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let body = read_bounded_async(response, MAX_OBSERVER_BODY_BYTES)
+        .await
+        .context("bounded observer response body")?;
     serde_json::from_slice(&body).context("decode observer response")
 }
 
@@ -720,7 +714,7 @@ fn record_outcome(
                 .with_label_values(&[kind, "observed"])
                 .inc();
             if ready.is_none() {
-                *ready = Some(candidate);
+                *ready = Some(*candidate);
             }
         }
     }
@@ -739,6 +733,16 @@ async fn finish_collection(
         });
     };
     let count = ready.signatures.len();
+    let context = payload_context(&ready.payload);
+    let onchain_epoch = AttestationOracle::new(state.oracle_address, Arc::clone(&state.provider))
+        .observationEpoch(context.source_chain_id)
+        .call()
+        .await
+        .map_err(|_| ApiError::Dependency("attestation_observation_epoch"))?
+        .epoch;
+    if context.observation_epoch != onchain_epoch {
+        return Err(ApiError::Refused("observation_epoch_mismatch"));
+    }
     state
         .evidence
         .persist_hashed(
@@ -749,11 +753,37 @@ async fn finish_collection(
             error!(%error, "settlement quorum evidence persistence failed");
             ApiError::Dependency("evidence_store")
         })?;
-    state
-        .ready_tx
-        .send(ready)
+    let body = serde_json::to_vec(&ready).map_err(|_| ApiError::Dependency("outbox_encode"))?;
+    let payload_hash = alloy_primitives::keccak256(&body);
+    let identity = settlement_identity(&ready.payload);
+    let enqueue = state
+        .posting_outbox
+        .enqueue(NewPostingJob {
+            kind: "settlement",
+            identity: &identity,
+            generation: context.valid_until,
+            payload_hash,
+            payload: &body,
+            expires_at: context.valid_until,
+            now: now_unix_wire()?,
+        })
         .await
-        .map_err(|_| ApiError::Dependency("poster_worker"))?;
+        .map_err(|_| ApiError::Dependency("posting_outbox"))?;
+    match enqueue {
+        PostingEnqueueOutcome::Queued
+        | PostingEnqueueOutcome::Idempotent {
+            state: PostingJobState::Queued | PostingJobState::Posting,
+        } => state.poster_notify.notify_one(),
+        PostingEnqueueOutcome::Idempotent {
+            state: PostingJobState::Posted,
+        } => {}
+        PostingEnqueueOutcome::Idempotent {
+            state: PostingJobState::Expired | PostingJobState::Superseded,
+        }
+        | PostingEnqueueOutcome::Conflict { .. } => {
+            return Err(ApiError::Refused("settlement_generation_conflict"));
+        }
+    }
     Ok((
         StatusCode::ACCEPTED,
         Json(CollectorResponse {
@@ -763,41 +793,56 @@ async fn finish_collection(
     ))
 }
 
+fn payload_context(payload: &SettlementPayload) -> SettlementContext {
+    match *payload {
+        SettlementPayload::Mint { context, .. }
+        | SettlementPayload::Delivery { context, .. }
+        | SettlementPayload::Refund { context, .. }
+        | SettlementPayload::Streamed { context, .. } => context,
+    }
+}
+
 fn ready_evidence(ready: &ReadySettlement) -> Value {
     let payload = match ready.payload {
         SettlementPayload::Mint {
             intent_id,
             slot_index,
             attested_amount,
+            context,
         } => json!({
             "kind": "mint",
             "intentId": format!("{intent_id:#x}"),
             "slotIndex": slot_index.to_string(),
             "attestedAmount": attested_amount.to_string(),
+            "context": settlement_context_evidence(context),
         }),
         SettlementPayload::Delivery {
             redemption_id,
             leg_index,
             asset_id,
             delivered_amount,
+            context,
         } => json!({
             "kind": "delivery",
             "redemptionId": format!("{redemption_id:#x}"),
             "legIndex": leg_index.to_string(),
             "assetId": format!("{asset_id:#x}"),
             "deliveredAmount": delivered_amount.to_string(),
+            "context": settlement_context_evidence(context),
         }),
         SettlementPayload::Refund {
             redemption_id,
             leg_index,
             asset_id,
             refunded_amount,
+            context,
         } => json!({
             "kind": "refund",
             "redemptionId": format!("{redemption_id:#x}"),
             "legIndex": leg_index.to_string(),
             "assetId": format!("{asset_id:#x}"),
             "refundedAmount": refunded_amount.to_string(),
+            "context": settlement_context_evidence(context),
         }),
         SettlementPayload::Streamed {
             redemption_id,
@@ -805,6 +850,7 @@ fn ready_evidence(ready: &ReadySettlement) -> Value {
             asset_id,
             delivered_usdt,
             refunded_native,
+            context,
         } => json!({
             "kind": "streamed",
             "redemptionId": format!("{redemption_id:#x}"),
@@ -812,6 +858,7 @@ fn ready_evidence(ready: &ReadySettlement) -> Value {
             "assetId": format!("{asset_id:#x}"),
             "deliveredUsdt": delivered_usdt.to_string(),
             "refundedNative": refunded_native.to_string(),
+            "context": settlement_context_evidence(context),
         }),
     };
     json!({
@@ -822,6 +869,18 @@ fn ready_evidence(ready: &ReadySettlement) -> Value {
             .iter()
             .map(|signature| format!("0x{}", alloy_primitives::hex::encode(signature)))
             .collect::<Vec<_>>(),
+    })
+}
+
+fn settlement_context_evidence(context: SettlementContext) -> Value {
+    json!({
+        "evidenceHash": format!("{:#x}", context.evidence_hash),
+        "observedAt": context.observed_at,
+        "validUntil": context.valid_until,
+        "sourceChainId": context.source_chain_id.to_string(),
+        "sourceBlockNumber": context.source_block_number,
+        "sourceBlockHash": format!("{:#x}", context.source_block_hash),
+        "observationEpoch": context.observation_epoch,
     })
 }
 
@@ -849,176 +908,265 @@ fn observer_signer_mismatch(state: &AppState, kind: &'static str, observer: &Obs
 }
 
 #[expect(
-    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the isolated poster worker explicitly owns every on-chain identity, retry bound, idempotence check, and exact ABI call"
 )]
 async fn poster_worker(
-    mut ready_rx: mpsc::Receiver<ReadySettlement>,
-    provider: Arc<ReqwestProvider>,
-    oracle_address: Address,
-    queue_address: Address,
-    asset_id: B256,
+    state: AppState,
     poster_address: Address,
-    attempts: u32,
+    backoff_attempt_cap: u32,
     retry_base_ms: u64,
     retry_max_ms: u64,
-    metrics: Metrics,
 ) {
-    let oracle = AttestationOracle::new(oracle_address, Arc::clone(&provider));
-    let queue = IntentQueue::new(queue_address, provider);
-    while let Some(ready) = ready_rx.recv().await {
-        let kind = payload_kind(ready.payload);
-        for attempt in 1..=attempts {
-            match settlement_state(&queue, oracle_address, asset_id, ready.payload).await {
-                Ok(SettlementState::Exact) => {
-                    metrics
-                        .observer_events
-                        .with_label_values(&[kind, "duplicate"])
-                        .inc();
-                    info!(kind, "settlement already matches on-chain state");
-                    break;
+    let oracle = AttestationOracle::new(state.oracle_address, Arc::clone(&state.provider));
+    let queue = IntentQueue::new(state.queue_address, Arc::clone(&state.provider));
+    let Ok(started_at) = now_unix_wire() else {
+        return;
+    };
+    if state
+        .posting_outbox
+        .recover_inflight("settlement", started_at)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        let Ok(now) = now_unix_wire() else {
+            return;
+        };
+        let job = match state.posting_outbox.claim_next("settlement", now).await {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                tokio::select! {
+                    () = state.poster_notify.notified() => {}
+                    () = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
-                Ok(SettlementState::Conflict(reason)) => {
-                    metrics
-                        .observer_events
-                        .with_label_values(&[kind, "refused"])
-                        .inc();
-                    error!(kind, reason, "settlement conflicts with on-chain state");
-                    break;
-                }
-                Ok(SettlementState::Unresolved) => {}
-                Err(error) if is_transient_rpc_error(&error) && attempt < attempts => {
-                    warn!(kind, attempt, %error, "settlement state read failed; retrying");
-                    tokio::time::sleep(retry_delay(attempt, retry_base_ms, retry_max_ms)).await;
-                    continue;
-                }
-                Err(error) => {
-                    metrics
-                        .observer_events
-                        .with_label_values(&[kind, "error"])
-                        .inc();
-                    error!(kind, %error, "settlement state read failed permanently");
-                    break;
-                }
+                continue;
             }
-            let signatures: Vec<Bytes> =
-                ready.signatures.iter().copied().map(Bytes::from).collect();
-            let sent = match ready.payload {
-                SettlementPayload::Mint {
-                    intent_id,
-                    slot_index,
-                    attested_amount,
-                } => {
-                    oracle
-                        .attest(intent_id, slot_index, attested_amount, signatures)
-                        .from(poster_address)
-                        .send()
-                        .await
+            Err(_) => return,
+        };
+        let Ok(ready) = decode_settlement_job(&job) else {
+            return;
+        };
+        let kind = payload_kind(&ready.payload);
+        if now >= payload_context(&ready.payload).valid_until {
+            if state
+                .posting_outbox
+                .finish(&job, PostingJobState::Expired, now)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        match settlement_state(&queue, state.oracle_address, state.asset_id, &ready.payload).await {
+            Ok(SettlementState::Exact) => {
+                state
+                    .metrics
+                    .observer_events
+                    .with_label_values(&[kind, "duplicate"])
+                    .inc();
+                info!(kind, "settlement already matches on-chain state");
+                if state
+                    .posting_outbox
+                    .finish(&job, PostingJobState::Posted, now)
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-                SettlementPayload::Delivery {
-                    redemption_id,
-                    leg_index,
-                    asset_id,
-                    delivered_amount,
-                } => {
-                    oracle
-                        .attestRedemption(
-                            redemption_id,
-                            leg_index,
-                            asset_id,
-                            delivered_amount,
-                            signatures,
-                        )
-                        .from(poster_address)
-                        .send()
-                        .await
+                continue;
+            }
+            Ok(SettlementState::Conflict(reason)) => {
+                state
+                    .metrics
+                    .observer_events
+                    .with_label_values(&[kind, "refused"])
+                    .inc();
+                error!(kind, reason, "settlement conflicts with on-chain state");
+                if state
+                    .posting_outbox
+                    .finish(&job, PostingJobState::Superseded, now)
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
-                SettlementPayload::Refund {
-                    redemption_id,
-                    leg_index,
-                    asset_id,
-                    refunded_amount,
-                } => {
-                    oracle
-                        .attestRefund(
-                            redemption_id,
-                            leg_index,
-                            asset_id,
-                            refunded_amount,
-                            signatures,
-                        )
-                        .from(poster_address)
-                        .send()
-                        .await
+                continue;
+            }
+            Ok(SettlementState::Unresolved) => {}
+            Err(error) => {
+                warn!(kind, %error, "settlement state read failed; retrying durably");
+                if retry_settlement_job(
+                    &state.posting_outbox,
+                    &job,
+                    "state_read_unavailable",
+                    now,
+                    backoff_attempt_cap,
+                    retry_base_ms,
+                    retry_max_ms,
+                )
+                .await
+                .is_err()
+                {
+                    return;
                 }
-                SettlementPayload::Streamed {
-                    redemption_id,
-                    leg_index,
-                    asset_id,
-                    delivered_usdt,
-                    refunded_native,
-                } => {
-                    oracle
-                        .attestStreamedSettlement(
-                            redemption_id,
-                            leg_index,
-                            asset_id,
-                            delivered_usdt,
-                            refunded_native,
-                            signatures,
-                        )
-                        .from(poster_address)
-                        .send()
-                        .await
-                }
-            };
-            match sent {
-                Ok(transaction) => match transaction.get_receipt().await {
-                    Ok(receipt) if receipt.status() => {
-                        metrics
-                            .observer_events
-                            .with_label_values(&[kind, "posted"])
-                            .inc();
-                        info!(kind, tx_hash = %receipt.transaction_hash, "settlement attestation confirmed");
-                        break;
-                    }
-                    Ok(receipt) => {
-                        metrics
-                            .observer_events
-                            .with_label_values(&[kind, "refused"])
-                            .inc();
-                        error!(kind, tx_hash = %receipt.transaction_hash, "settlement transaction reverted");
-                        break;
-                    }
-                    Err(error) if attempt < attempts => {
-                        warn!(kind, attempt, %error, "settlement receipt unavailable; retrying idempotently");
-                        tokio::time::sleep(retry_delay(attempt, retry_base_ms, retry_max_ms)).await;
-                    }
-                    Err(error) => {
-                        metrics
-                            .observer_events
-                            .with_label_values(&[kind, "error"])
-                            .inc();
-                        error!(kind, %error, "settlement receipt attempts exhausted");
-                        break;
-                    }
-                },
-                Err(error) if is_transient_rpc_error(&error) && attempt < attempts => {
-                    warn!(kind, attempt, %error, "settlement submission failed; retrying");
-                    tokio::time::sleep(retry_delay(attempt, retry_base_ms, retry_max_ms)).await;
-                }
-                Err(error) => {
-                    metrics
-                        .observer_events
-                        .with_label_values(&[kind, "refused"])
-                        .inc();
-                    error!(kind, %error, "settlement submission failed permanently");
-                    break;
-                }
+                continue;
             }
         }
+        let signatures: Vec<Bytes> = ready.signatures.iter().copied().map(Bytes::from).collect();
+        let sent = match ready.payload {
+            SettlementPayload::Mint {
+                intent_id,
+                slot_index,
+                attested_amount,
+                context,
+            } => {
+                oracle
+                    .attest(
+                        intent_id,
+                        slot_index,
+                        attested_amount,
+                        settlement_context_to_contract(context),
+                        signatures,
+                    )
+                    .from(poster_address)
+                    .send()
+                    .await
+            }
+            SettlementPayload::Delivery {
+                redemption_id,
+                leg_index,
+                asset_id,
+                delivered_amount,
+                context,
+            } => {
+                oracle
+                    .attestRedemption(
+                        redemption_id,
+                        leg_index,
+                        asset_id,
+                        delivered_amount,
+                        settlement_context_to_contract(context),
+                        signatures,
+                    )
+                    .from(poster_address)
+                    .send()
+                    .await
+            }
+            SettlementPayload::Refund {
+                redemption_id,
+                leg_index,
+                asset_id,
+                refunded_amount,
+                context,
+            } => {
+                oracle
+                    .attestRefund(
+                        redemption_id,
+                        leg_index,
+                        asset_id,
+                        refunded_amount,
+                        settlement_context_to_contract(context),
+                        signatures,
+                    )
+                    .from(poster_address)
+                    .send()
+                    .await
+            }
+            SettlementPayload::Streamed {
+                redemption_id,
+                leg_index,
+                asset_id,
+                delivered_usdt,
+                refunded_native,
+                context,
+            } => {
+                oracle
+                    .attestStreamedSettlement(
+                        redemption_id,
+                        leg_index,
+                        asset_id,
+                        delivered_usdt,
+                        refunded_native,
+                        settlement_context_to_contract(context),
+                        signatures,
+                    )
+                    .from(poster_address)
+                    .send()
+                    .await
+            }
+        };
+        let posted = match sent {
+            Ok(transaction) => match transaction.get_receipt().await {
+                Ok(receipt) if receipt.status() => {
+                    info!(kind, tx_hash = %receipt.transaction_hash, "settlement attestation confirmed");
+                    true
+                }
+                Ok(receipt) => {
+                    warn!(kind, tx_hash = %receipt.transaction_hash, "settlement transaction reverted; retaining responsibility");
+                    false
+                }
+                Err(error) => {
+                    warn!(kind, %error, "settlement receipt unavailable; retaining responsibility");
+                    false
+                }
+            },
+            Err(error) => {
+                warn!(kind, %error, "settlement submission failed; retaining responsibility");
+                false
+            }
+        };
+        if posted {
+            state
+                .metrics
+                .observer_events
+                .with_label_values(&[kind, "posted"])
+                .inc();
+            if state
+                .posting_outbox
+                .finish(&job, PostingJobState::Posted, now)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        } else if retry_settlement_job(
+            &state.posting_outbox,
+            &job,
+            "post_unconfirmed",
+            now,
+            backoff_attempt_cap,
+            retry_base_ms,
+            retry_max_ms,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
     }
+}
+
+async fn retry_settlement_job(
+    outbox: &SqlitePostingOutbox,
+    job: &PostingJob,
+    error: &str,
+    now: u64,
+    backoff_attempt_cap: u32,
+    retry_base_ms: u64,
+    retry_max_ms: u64,
+) -> Result<()> {
+    let attempt = u32::try_from(job.attempts.min(u64::from(backoff_attempt_cap)))
+        .unwrap_or(backoff_attempt_cap)
+        .max(1);
+    let delay = retry_delay(attempt, retry_base_ms, retry_max_ms);
+    outbox
+        .retry(job, now.saturating_add(delay.as_secs().max(1)), error, now)
+        .await
+        .context("durably requeue settlement post")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1036,17 +1184,18 @@ async fn settlement_state<P, T>(
     queue: &IntentQueue::IntentQueueInstance<T, P>,
     oracle_address: Address,
     expected_asset_id: B256,
-    payload: SettlementPayload,
+    payload: &SettlementPayload,
 ) -> Result<SettlementState>
 where
     P: Provider<T>,
     T: alloy::transports::Transport + Clone,
 {
-    match payload {
+    match *payload {
         SettlementPayload::Mint {
             intent_id,
             slot_index,
             attested_amount,
+            ..
         } => {
             let intent = queue.getIntent(intent_id).call().await?._0;
             if intent.oracle != oracle_address {
@@ -1075,6 +1224,7 @@ where
             leg_index,
             asset_id,
             delivered_amount,
+            ..
         } => {
             let redemption = queue.getRedemption(redemption_id).call().await?._0;
             let Ok(index) = usize::try_from(leg_index) else {
@@ -1103,6 +1253,7 @@ where
             leg_index,
             asset_id,
             refunded_amount,
+            ..
         } => {
             let redemption = queue.getRedemption(redemption_id).call().await?._0;
             let Ok(index) = usize::try_from(leg_index) else {
@@ -1132,6 +1283,7 @@ where
             asset_id,
             delivered_usdt,
             refunded_native,
+            ..
         } => {
             let redemption = queue.getRedemption(redemption_id).call().await?._0;
             let Ok(index) = usize::try_from(leg_index) else {
@@ -1196,13 +1348,59 @@ fn redemption_state(
     }
 }
 
-fn payload_kind(payload: SettlementPayload) -> &'static str {
+fn payload_kind(payload: &SettlementPayload) -> &'static str {
     match payload {
         SettlementPayload::Mint { .. } => "mint",
         SettlementPayload::Delivery { .. } => "delivery",
         SettlementPayload::Refund { .. } => "refund",
         SettlementPayload::Streamed { .. } => "streamed",
     }
+}
+
+fn settlement_identity(payload: &SettlementPayload) -> Vec<u8> {
+    let (prefix, id, index) = match *payload {
+        SettlementPayload::Mint {
+            intent_id,
+            slot_index,
+            ..
+        } => (1u8, intent_id, slot_index),
+        SettlementPayload::Delivery {
+            redemption_id,
+            leg_index,
+            ..
+        }
+        | SettlementPayload::Refund {
+            redemption_id,
+            leg_index,
+            ..
+        }
+        | SettlementPayload::Streamed {
+            redemption_id,
+            leg_index,
+            ..
+        } => (2u8, redemption_id, leg_index),
+    };
+    let mut identity = Vec::with_capacity(65);
+    identity.push(prefix);
+    identity.extend_from_slice(id.as_slice());
+    identity.extend_from_slice(&index.to_be_bytes::<32>());
+    identity
+}
+
+fn decode_settlement_job(job: &PostingJob) -> Result<ReadySettlement> {
+    if job.kind != "settlement" || alloy_primitives::keccak256(&job.payload) != job.payload_hash {
+        anyhow::bail!("settlement outbox identity/hash mismatch");
+    }
+    let ready: ReadySettlement =
+        serde_json::from_slice(&job.payload).context("decode settlement quorum payload")?;
+    let context = payload_context(&ready.payload);
+    if job.identity != settlement_identity(&ready.payload)
+        || job.generation != context.valid_until
+        || job.expires_at != context.valid_until
+    {
+        anyhow::bail!("settlement outbox generation mismatch");
+    }
+    Ok(ready)
 }
 
 async fn verify_roster(
@@ -1285,11 +1483,8 @@ fn validate_config(config: &Config) -> Result<()> {
         anyhow::bail!("metrics address must bind loopback");
     }
     endpoint_origin("ethereum_rpc_url", &config.ethereum_rpc_url, true)?;
-    validate_owner_only_directory(&config.evidence_dir)?;
-    validate_secret_file(&config.observer_client_identity_pem)?;
-    validate_secret_file(&config.server_key_pem)?;
     if config.observer_server_ca_pems.is_empty() || config.pinned_client_cert_pems.is_empty() {
-        anyhow::bail!("pinned mTLS trust roots must not be empty");
+        anyhow::bail!("pinned mTLS exact-peer allowlists must not be empty");
     }
     let mut operators = HashSet::new();
     let mut signers = HashSet::new();
@@ -1314,6 +1509,11 @@ fn validate_config(config: &Config) -> Result<()> {
             anyhow::bail!("observer base_url must not contain a path");
         }
     }
+    // Pure production policy precedes all durable/secret path inspection.
+    validate_database_url(&config.database_url)?;
+    validate_owner_only_directory(&config.evidence_dir)?;
+    validate_secret_file(&config.observer_client_identity_pem)?;
+    validate_secret_file(&config.server_key_pem)?;
     Ok(())
 }
 
@@ -1334,32 +1534,35 @@ fn parse_observers(configured: &[ObserverConfig]) -> Result<Vec<ObserverEndpoint
 }
 
 fn build_observer_client(config: &Config) -> Result<reqwest::Client> {
-    let identity = reqwest::Identity::from_pem(&fs::read(&config.observer_client_identity_pem)?)
-        .context("parse observer client identity")?;
-    let mut builder = reqwest::Client::builder()
-        .identity(identity)
-        .timeout(Duration::from_secs(config.observer_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_built_in_root_certs(false);
-    for path in &config.observer_server_ca_pems {
-        builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(&fs::read(path)?)
-                .with_context(|| format!("parse observer CA {}", path.display()))?,
-        );
-    }
+    let identity = fs::read(&config.observer_client_identity_pem)?;
+    let peers = config
+        .observer_server_ca_pems
+        .iter()
+        .map(fs::read)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let builder = exact_pinned_async_client_builder(
+        HttpClientPolicy {
+            connect_timeout: Duration::from_secs(config.observer_timeout_secs.min(3)),
+            request_timeout: Duration::from_secs(config.observer_timeout_secs),
+            max_response_bytes: MAX_OBSERVER_BODY_BYTES,
+        },
+        load_cert_chain(&identity).context("parse observer client certificate")?,
+        load_private_key(&identity).context("parse observer client key")?,
+        pinned_cert_store(&peers).context("parse exact observer peer pins")?,
+    )?;
     builder.build().context("build pinned observer mTLS client")
 }
 
 fn build_server_tls(config: &Config) -> Result<rustls::ServerConfig> {
     let server_chain = load_cert_chain(&fs::read(&config.server_cert_pem)?)?;
     let server_key = load_private_key(&fs::read(&config.server_key_pem)?)?;
-    let roots = config
+    let peer_bundles = config
         .pinned_client_cert_pems
         .iter()
         .map(fs::read)
         .collect::<std::io::Result<Vec<_>>>()?;
-    let roots = pinned_root_store(&roots)?;
-    server_config(server_chain, server_key, roots).map_err(Into::into)
+    let peer_pins = pinned_cert_store(&peer_bundles)?;
+    server_config(server_chain, server_key, peer_pins).map_err(Into::into)
 }
 
 fn endpoint_origin(label: &str, raw: &str, require_https: bool) -> Result<String> {
@@ -1438,6 +1641,37 @@ fn validate_owner_only_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_database_url(database_url: &str) -> Result<()> {
+    let path = database_url
+        .strip_prefix("sqlite://")
+        .context("database_url must be sqlite:///absolute/path")?
+        .split('?')
+        .next()
+        .context("database_url path absent")?;
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        anyhow::bail!("database_url must resolve to an absolute durable path");
+    }
+    validate_owner_only_directory(path.parent().context("database path has no parent")?)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                anyhow::bail!("existing posting database must be a non-symlink regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
+                    anyhow::bail!("existing posting database must be owner-only and single-link");
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect existing posting database"),
+    }
+    Ok(())
+}
+
 fn validate_secret_file(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("read secret-file metadata for {}", path.display()))?;
@@ -1468,7 +1702,91 @@ fn now_unix_wire() -> Result<u64, ApiError> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test fixtures")]
+
     use super::*;
+
+    fn production_config() -> Config {
+        Config {
+            chain_id: 1,
+            ethereum_rpc_url: "https://rpc.example".into(),
+            attestation_oracle: "0x0000000000000000000000000000000000000001".into(),
+            intent_queue: "0x0000000000000000000000000000000000000002".into(),
+            asset_id: format!("{:#x}", B256::repeat_byte(0x11)),
+            redemption_leg_index: 0,
+            poster_address: "0x0000000000000000000000000000000000000003".into(),
+            database_url: "sqlite:///definitely/not/read/settlement.db".into(),
+            observers: (10u8..=14)
+                .map(|byte| ObserverConfig {
+                    operator_id: format!("observer-{byte}"),
+                    signer_address: format!("0x{byte:040x}"),
+                    base_url: format!("https://observer-{byte}.example"),
+                })
+                .collect(),
+            threshold: 3,
+            max_response_age_secs: 300,
+            observer_timeout_secs: 5,
+            post_attempts: 6,
+            retry_base_ms: 500,
+            retry_max_ms: 10_000,
+            evidence_dir: "/definitely/not/read/evidence".into(),
+            listen_address: SocketAddr::from(([0, 0, 0, 0], 9446)),
+            metrics_address: SocketAddr::from(([127, 0, 0, 1], 9099)),
+            observer_client_identity_pem: "/definitely/not/read/observer.pem".into(),
+            observer_server_ca_pems: vec!["/definitely/not/read/observer-peer.pem".into()],
+            server_cert_pem: "/definitely/not/read/server.crt".into(),
+            server_key_pem: "/definitely/not/read/server.key".into(),
+            pinned_client_cert_pems: vec!["/definitely/not/read/client.crt".into()],
+        }
+    }
+
+    fn assert_policy_rejection(config: &Config) {
+        let error = validate_config(config).expect_err("unsafe production mutation must fail");
+        assert!(
+            !error.to_string().contains("definitely/not/read"),
+            "policy mutation reached secret/path I/O: {error:#}"
+        );
+    }
+
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        let mut zero_chain = production_config();
+        zero_chain.chain_id = 0;
+        assert_policy_rejection(&zero_chain);
+
+        let mut collapsed_observers = production_config();
+        collapsed_observers.observers.truncate(4);
+        assert_policy_rejection(&collapsed_observers);
+
+        let mut minority_threshold = production_config();
+        minority_threshold.threshold = 2;
+        assert_policy_rejection(&minority_threshold);
+
+        let mut stale_responses = production_config();
+        stale_responses.max_response_age_secs = 301;
+        assert_policy_rejection(&stale_responses);
+
+        let mut plaintext_rpc = production_config();
+        plaintext_rpc.ethereum_rpc_url = "http://rpc.example".into();
+        assert_policy_rejection(&plaintext_rpc);
+
+        let mut public_metrics = production_config();
+        public_metrics.metrics_address = SocketAddr::from(([0, 0, 0, 0], 9099));
+        assert_policy_rejection(&public_metrics);
+
+        let mut no_peer_pins = production_config();
+        no_peer_pins.observer_server_ca_pems.clear();
+        assert_policy_rejection(&no_peer_pins);
+
+        let mut duplicate_observer = production_config();
+        duplicate_observer.observers[1].operator_id =
+            duplicate_observer.observers[0].operator_id.clone();
+        assert_policy_rejection(&duplicate_observer);
+
+        let mut observer_path = production_config();
+        observer_path.observers[0].base_url = "https://observer.example/api".into();
+        assert_policy_rejection(&observer_path);
+    }
 
     #[test]
     fn endpoint_policy_rejects_plaintext_credentials_and_query() {
@@ -1491,5 +1809,59 @@ mod tests {
         assert_eq!(retry_delay(1, 500, 10_000), Duration::from_millis(500));
         assert_eq!(retry_delay(2, 500, 10_000), Duration::from_secs(1));
         assert_eq!(retry_delay(9, 500, 10_000), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn durable_settlement_job_round_trips_exact_generation() {
+        let context = xindex_shared::eip712::settlement_context(
+            B256::repeat_byte(0x31),
+            1_000,
+            1_060,
+            U256::from(31_337u64),
+            20_000_000,
+            B256::repeat_byte(0x32),
+            7,
+        );
+        let delivery = SettlementPayload::Delivery {
+            redemption_id: B256::repeat_byte(0x33),
+            leg_index: U256::from(4u64),
+            asset_id: B256::repeat_byte(0x34),
+            delivered_amount: U256::from(50_000u64),
+            context,
+        };
+        let refund = SettlementPayload::Refund {
+            redemption_id: B256::repeat_byte(0x33),
+            leg_index: U256::from(4u64),
+            asset_id: B256::repeat_byte(0x34),
+            refunded_amount: U256::from(25_000u64),
+            context,
+        };
+        assert_eq!(settlement_identity(&delivery), settlement_identity(&refund));
+
+        let mut signature = [0x35; 65];
+        signature[64] = 27;
+        let ready = ReadySettlement {
+            payload: delivery,
+            signatures: vec![signature],
+        };
+        let body = serde_json::to_vec(&ready).expect("encode ready settlement");
+        let job = PostingJob {
+            kind: "settlement".to_string(),
+            identity: settlement_identity(&delivery),
+            generation: context.valid_until,
+            payload_hash: alloy_primitives::keccak256(&body),
+            payload: body,
+            state: PostingJobState::Queued,
+            expires_at: context.valid_until,
+            attempts: 0,
+            next_attempt_at: 1_001,
+            created_at: 1_001,
+            updated_at: 1_001,
+        };
+        assert_eq!(decode_settlement_job(&job).expect("decode"), ready);
+
+        let mut wrong_generation = job;
+        wrong_generation.generation += 1;
+        assert!(decode_settlement_job(&wrong_generation).is_err());
     }
 }

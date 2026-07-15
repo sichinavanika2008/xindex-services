@@ -5,17 +5,9 @@
 //! `execTransaction` flow on the destination chain (via [`EvmRedeemExecutor`]),
 //! and submits the wrapper transaction through an `alloy` `WalletProvider`.
 //!
-//! ## Backends
-//!
-//! Two mutually-exclusive subcommands select the custody backend:
-//!
-//! - `safe` — the Safe v1.4.1 + 3-of-5 cosigner-fleet flow ([`EvmRedeemExecutor`]).
-//! - `turnkey` — the Turnkey single-key flow (`DL-CUSTODY-TURNKEY-1`,
-//!   [`TurnkeyEvmRedeemExecutor`]). The EVM custody key is a single enclave
-//!   EOA; the executor builds the tx + Turnkey signs the hash (gated by the
-//!   approver-watcher) + assembles the raw signed tx, and this binary submits
-//!   it. The unsigned spend is staged in a [`SqlitePrepareStore`] file shared
-//!   with the `xindex-turnkey-approver` process.
+//! The only supported backend is the Safe v1.4.1 + 3-of-5 cosigner-fleet flow
+//! ([`EvmRedeemExecutor`]). Provider-specific single-key custody backends are
+//! intentionally absent.
 //!
 //! ## v1 scope
 //!
@@ -34,22 +26,17 @@
               identifiers in module docs — backticks add noise"
 )]
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy_primitives::{Address, B256, U256};
+use alloy::providers::ProviderBuilder;
+use alloy_primitives::{Address, U256};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use std::sync::Arc;
 use tracing::info;
-use xindex_chain_evm::{AlloyEvmChainClient, EvmChainClient, EvmTxFee};
-use xindex_custody_core::prepare::SqlitePrepareStore;
+use xindex_chain_evm::{AlloyEvmChainClient, EvmTxFee};
 use xindex_executor::evm_redeem::{
     EvmCosigner, EvmRedeemConfig, EvmRedeemExecutor, EvmRedeemTask, SafeLockTable,
 };
-use xindex_executor::turnkey_evm_redeem::{TurnkeyEvmRedeemConfig, TurnkeyEvmRedeemExecutor};
 use xindex_shared::chain_registry::ChainId;
-use xindex_turnkey_client::{TurnkeyClient, TurnkeyStamper, TURNKEY_API_BASE};
 
 /// CLI for a single EVM redeem leg. Production wraps this in a
 /// long-running daemon (V9-era follow-up).
@@ -65,8 +52,6 @@ struct Cli {
 enum Backend {
     /// Safe v1.4.1 + 3-of-5 cosigner-fleet flow.
     Safe(SafeArgs),
-    /// Turnkey single-key flow (DL-CUSTODY-TURNKEY-1).
-    Turnkey(TurnkeyEvmArgs),
 }
 
 /// Arguments for the Safe-backed redeem leg.
@@ -143,106 +128,6 @@ struct SafeArgs {
     amount_wei: String,
 }
 
-/// Arguments for the Turnkey-backed EVM redeem leg. The Turnkey API P-256
-/// private key is read from the `XINDEX_TURNKEY_API_KEY` environment variable
-/// (hex) — never an argv flag.
-#[derive(Debug, ClapArgs)]
-struct TurnkeyEvmArgs {
-    /// Required rehearsal mode. This backend reads a software P-256 Turnkey
-    /// API stamping key, so it is not part of the production profile.
-    #[arg(long, env = "XINDEX_DEV", default_value_t = false)]
-    dev: bool,
-
-    /// Destination EVM chain (eth / bsc / avax / base / pol).
-    #[arg(long)]
-    chain: String,
-
-    /// The Turnkey custody EOA address on `chain` — the `from` of the signed
-    /// tx, whose account nonce this binary fetches.
-    #[arg(long)]
-    custody_address: String,
-
-    /// The Turnkey `signWith` selector (private-key id / wallet-account address)
-    /// for the custody key.
-    #[arg(long)]
-    sign_with: String,
-
-    /// The Turnkey custody sub-organization id.
-    #[arg(long)]
-    organization_id: String,
-
-    /// Current THORChain Asgard vault address on `chain`. Operator refreshes
-    /// from `inbound_addresses` before each run.
-    #[arg(long)]
-    vault: String,
-
-    /// HTTPS RPC URL for `chain` (nonce fetch + raw-tx submit).
-    #[arg(long)]
-    rpc_url: String,
-
-    /// Shared sqlite URL for the bind-prepare store (e.g.
-    /// `sqlite:///var/lib/xindex/prepare.db`). The `xindex-turnkey-approver`
-    /// process reads the same DB to gate the signature.
-    #[arg(long)]
-    db: String,
-
-    /// Turnkey API host. Defaults to the production API; the dev-env is a
-    /// sub-org on the same host.
-    #[arg(long, default_value_t = TURNKEY_API_BASE.to_string())]
-    turnkey_host: String,
-
-    /// Gas budget (units) for the tx.
-    #[arg(long, default_value_t = 300_000)]
-    gas_limit: u64,
-
-    /// EIP-1559 `max_fee_per_gas` (wei).
-    #[arg(long, default_value_t = 0)]
-    max_fee_per_gas: u128,
-
-    /// EIP-1559 `max_priority_fee_per_gas` (wei).
-    #[arg(long, default_value_t = 0)]
-    max_priority_fee_per_gas: u128,
-
-    /// Legacy `gas_price` (wei). Used only on BSC (DL-P3.2-4).
-    #[arg(long, default_value_t = 0)]
-    gas_price: u128,
-
-    /// `depositWithExpiry` expiry, seconds from now.
-    #[arg(long, default_value_t = 7200)]
-    expiry_offset_secs: u64,
-
-    /// Seconds between Turnkey activity-status polls.
-    #[arg(long, default_value_t = 5)]
-    poll_interval_secs: u64,
-
-    /// Max status polls before timing out.
-    #[arg(long, default_value_t = 60)]
-    poll_max_attempts: u32,
-
-    /// Originating dispatch id (32-byte hex). Defaults to zero for a manual
-    /// drive; pass a distinct id per re-drive.
-    #[arg(
-        long,
-        default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
-    )]
-    dispatch_id: String,
-
-    /// Originating redemption id (32-byte hex) for attestation correlation.
-    #[arg(
-        long,
-        default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
-    )]
-    redemption_id: String,
-
-    /// THORChain swap memo carried in `depositWithExpiry`.
-    #[arg(long)]
-    memo: String,
-
-    /// Native amount in wei the custody key is redeeming.
-    #[arg(long)]
-    amount_wei: String,
-}
-
 fn parse_addr(field: &str, hex: &str) -> Result<Address> {
     let stripped = hex.strip_prefix("0x").unwrap_or(hex);
     let bytes =
@@ -257,17 +142,6 @@ fn parse_addr(field: &str, hex: &str) -> Result<Address> {
 fn parse_chain(s: &str) -> Result<ChainId> {
     s.parse::<ChainId>()
         .map_err(|e| anyhow!("--chain {s}: {e}"))
-}
-
-fn parse_b256(field: &str, hex: &str) -> Result<B256> {
-    let stripped = hex.strip_prefix("0x").unwrap_or(hex);
-    let bytes =
-        alloy_primitives::hex::decode(stripped).with_context(|| format!("{field}: bad hex"))?;
-    let arr: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("{field}: expected 32-byte hash"))?;
-    Ok(B256::from(arr))
 }
 
 fn parse_csv_addr(field: &str, csv: &str) -> Result<Vec<Address>> {
@@ -409,7 +283,6 @@ async fn main() -> Result<()> {
 
     match Cli::parse().backend {
         Backend::Safe(args) => run_safe(args).await,
-        Backend::Turnkey(args) => run_turnkey(args).await,
     }
 }
 
@@ -520,102 +393,6 @@ async fn run_safe(args: SafeArgs) -> Result<()> {
         "data: 0x{}",
         alloy_primitives::hex::encode(&outcome.exec_calldata)
     );
-
-    Ok(())
-}
-
-/// Drive a single Turnkey-backed EVM redeem leg: stage the unsigned spend in
-/// the shared prepare store, sign the tx hash via Turnkey (gated by the
-/// approver-watcher), assemble the raw signed tx, and submit it.
-async fn run_turnkey(args: TurnkeyEvmArgs) -> Result<()> {
-    if !args.dev {
-        anyhow::bail!(
-            "refusing production startup: the Turnkey backend reads a software API stamping key; pass --dev only for an authorized rehearsal"
-        );
-    }
-    let chain = parse_chain(&args.chain)?;
-    let custody_address = parse_addr("--custody-address", &args.custody_address)?;
-    let vault = parse_addr("--vault", &args.vault)?;
-    let dispatch_id = parse_b256("--dispatch-id", &args.dispatch_id)?;
-    let redemption_id = parse_b256("--redemption-id", &args.redemption_id)?;
-    let amount_wei =
-        U256::from_str_radix(&args.amount_wei, 10).context("--amount-wei: bad decimal")?;
-
-    // The Turnkey API P-256 key stays out of argv — read it from the env.
-    let api_key = std::env::var("XINDEX_TURNKEY_API_KEY").context(
-        "XINDEX_TURNKEY_API_KEY (hex P-256 private key) must be set for --backend turnkey",
-    )?;
-    let stamper = TurnkeyStamper::from_hex(&api_key).map_err(|e| anyhow!("turnkey key: {e}"))?;
-    let turnkey = Arc::new(
-        TurnkeyClient::new(&args.turnkey_host, &args.organization_id, stamper)
-            .map_err(|e| anyhow!("turnkey client: {e}"))?,
-    );
-
-    // Shared bind-prepare store: the executor `put`s the unsigned spend here;
-    // the approver process `get`s the same DB file to gate the signature.
-    let prepare = Arc::new(
-        SqlitePrepareStore::connect(&args.db)
-            .await
-            .map_err(|e| anyhow!("prepare store {}: {e}", args.db))?,
-    );
-
-    // Provider for the custody EOA nonce + raw-tx submit.
-    let provider = ProviderBuilder::new()
-        .on_http(args.rpc_url.parse().context("--rpc-url")?)
-        .boxed();
-    let evm = AlloyEvmChainClient::new(chain, Arc::new(provider))
-        .map_err(|e| anyhow!("AlloyEvmChainClient::new: {e}"))?;
-    let nonce = evm
-        .provider()
-        .get_transaction_count(custody_address)
-        .await
-        .context("get_transaction_count")?;
-
-    let fee = EvmTxFee {
-        gas_limit: args.gas_limit,
-        max_fee_per_gas: args.max_fee_per_gas,
-        max_priority_fee_per_gas: args.max_priority_fee_per_gas,
-        gas_price: args.gas_price,
-    };
-    let config = TurnkeyEvmRedeemConfig {
-        sign_with: args.sign_with,
-        expiry_offset_secs: args.expiry_offset_secs,
-        poll_interval: Duration::from_secs(args.poll_interval_secs),
-        poll_max_attempts: args.poll_max_attempts,
-    };
-    let executor = TurnkeyEvmRedeemExecutor::new(config, turnkey, prepare);
-
-    let task = EvmRedeemTask {
-        dispatch_id,
-        redemption_id,
-        chain,
-        memo: args.memo,
-        amount_wei,
-        // CTD-1: the RIC is supplied by the observer/relay (Slice B); None
-        // fail-closes at the approver (decide_evm_deposit is RIC-only).
-        intent_proof: None,
-    };
-    info!(
-        ?chain,
-        ?custody_address,
-        nonce,
-        ?amount_wei,
-        "turnkey EVM execute_leg start"
-    );
-    let outcome = executor
-        .execute_leg(&task, vault, nonce, fee)
-        .await
-        .map_err(|e| anyhow!("execute_leg: {e}"))?;
-
-    // Submit the raw signed tx the executor assembled.
-    let tx_hash = evm
-        .submit_raw(outcome.raw_tx)
-        .await
-        .map_err(|e| anyhow!("submit_raw: {e}"))?;
-    info!(activity = %outcome.activity_id, %tx_hash, "turnkey EVM redeem leg broadcast");
-    println!("signing_hash: {:#x}", outcome.signing_hash);
-    println!("activity_id: {}", outcome.activity_id);
-    println!("tx_hash: {tx_hash:#x}");
 
     Ok(())
 }

@@ -259,7 +259,9 @@ fn build_halt_source(args: &Args) -> Result<AnyHaltSource> {
     match (&args.custody_guard, &args.eth_http_url) {
         (Some(guard), Some(url)) => {
             let guard = Address::from_str(guard).context("CUSTODY_GUARD_ADDR invalid")?;
-            Ok(AnyHaltSource::Http(HttpHaltSource::new(url.clone(), guard)))
+            Ok(AnyHaltSource::Http(
+                HttpHaltSource::new(url.clone(), guard).map_err(anyhow::Error::msg)?,
+            ))
         }
         (None, None) => {
             warn!("no CustodyGuard halt gate configured — DEV ONLY");
@@ -542,9 +544,10 @@ mod tests {
     }
 
     #[test]
-    fn build_agreement_requires_two_sources() {
+    fn build_agreement_requires_three_sources() {
         assert!(build_agreement("http://only-one").is_err());
-        assert!(build_agreement("http://a,http://b").is_ok());
+        assert!(build_agreement("http://a,http://b").is_err());
+        assert!(build_agreement("http://a,http://b,http://c").is_ok());
     }
 
     #[test]

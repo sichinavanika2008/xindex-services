@@ -283,7 +283,7 @@ async fn main() -> Result<()> {
     let file: FileConfig = serde_json::from_str(&raw).context("parse config json")?;
     validate_runtime_mode(&file, dev)?;
 
-    let cfg = build_daemon_config(&file)?;
+    let cfg = build_daemon_config(&file, dev)?;
     let utxo = file.utxo.as_ref().map(build_utxo).transpose()?;
     let tls = file.tls.as_ref().map(build_server_config).transpose()?;
     let bind: SocketAddr = file
@@ -332,6 +332,8 @@ fn warn_in_memory() {
 /// replay backend, the transport to the HSM frontend, and the outer mTLS
 /// listener. These checks run before opening the database or binding a socket.
 fn validate_runtime_mode(file: &FileConfig, dev: bool) -> Result<()> {
+    CertVolumePolicy::validate_window_secs(file.cert_volume.window_secs)
+        .map_err(|e| anyhow::anyhow!("cert_volume invalid: {e}"))?;
     let bind = file
         .bind
         .parse::<SocketAddr>()
@@ -477,7 +479,7 @@ fn validate_hsm_url(raw: &str) -> Result<()> {
 
 // ───────────────────────────── builders ─────────────────────────────
 
-fn build_daemon_config(file: &FileConfig) -> Result<DaemonConfig> {
+fn build_daemon_config(file: &FileConfig, dev: bool) -> Result<DaemonConfig> {
     if file.chain_id == 0 {
         bail!("chain_id must be non-zero");
     }
@@ -499,12 +501,7 @@ fn build_daemon_config(file: &FileConfig) -> Result<DaemonConfig> {
     for (name, cap) in &file.cert_volume.caps {
         caps.insert(parse_chain_id(name)?, *cap);
     }
-    let cert_volume = CertVolumePolicy {
-        window_secs: file.cert_volume.window_secs,
-        caps,
-    };
-    cert_volume
-        .validate()
+    let cert_volume = CertVolumePolicy::try_new(file.cert_volume.window_secs, caps, dev)
         .map_err(|e| anyhow::anyhow!("cert_volume invalid: {e}"))?;
 
     Ok(DaemonConfig {
@@ -577,8 +574,8 @@ fn build_server_config(t: &TlsFile) -> Result<rustls::ServerConfig> {
         .iter()
         .map(|p| std::fs::read(p).with_context(|| format!("read {p}")))
         .collect::<Result<Vec<_>>>()?;
-    let roots = tls::pinned_root_store(&pins)?;
-    Ok(tls::server_config(server_chain, server_key, roots)?)
+    let peer_pins = tls::pinned_cert_store(&pins)?;
+    Ok(tls::server_config(server_chain, server_key, peer_pins)?)
 }
 
 // ───────────────────────────── parse helpers ─────────────────────────────
@@ -626,6 +623,104 @@ mod tests {
     #![expect(clippy::expect_used, reason = "test code")]
 
     use super::*;
+    use xindex_signer_daemon::server::MAX_CERT_VOLUME_WINDOW_SECS;
+
+    fn production_file() -> serde_json::Value {
+        serde_json::json!({
+            "chain_id": 1,
+            "verifying_contract": "0x0000000000000000000000000000000000000001",
+            "eth_address": "0x0000000000000000000000000000000000000002",
+            "intent_policy": {
+                "signer_whitelist": ["a", "b", "c", "d", "e"],
+                "intent_quorum": 3,
+                "ric_max_age_secs": 300
+            },
+            "cert_volume": { "window_secs": 86400, "caps": { "btc": 1 } },
+            "hsm": { "kind": "http", "url": "http://127.0.0.1:9000" },
+            "database_url": "sqlite:///definitely/not/read/replay.db",
+            "tls": {
+                "server_cert": "/definitely/not/read/server.crt",
+                "server_key": "/definitely/not/read/server.key",
+                "pinned_client_certs": ["/definitely/not/read/client.crt"]
+            },
+            "bind": "127.0.0.1:8443",
+            "metrics_bind": "127.0.0.1:9090"
+        })
+    }
+
+    fn runtime_rejection(value: serde_json::Value, expected: &str) {
+        let file: FileConfig = serde_json::from_value(value).expect("valid fixture shape");
+        let error = validate_runtime_mode(&file, false).expect_err("mutation must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error:#}"
+        );
+    }
+
+    /// L-04: mutate every outer production-mode control that precedes secret
+    /// parsing and listener startup. The impossible TLS paths are deliberate:
+    /// each mutation must return its policy error before touching them.
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        let mut excessive_window = production_file();
+        excessive_window["cert_volume"]["window_secs"] =
+            serde_json::json!(MAX_CERT_VOLUME_WINDOW_SECS + 1);
+        runtime_rejection(excessive_window, "must be <= 2678400 (31 days)");
+
+        let mut impossible_window = production_file();
+        impossible_window["cert_volume"]["window_secs"] = serde_json::json!(u64::MAX);
+        runtime_rejection(impossible_window, "does not fit signed database duration");
+
+        let mut software = production_file();
+        software["hsm"] = serde_json::json!({
+            "kind": "software",
+            "software": { "eth_secret_key": "unused", "btc_secret_key": "unused" }
+        });
+        runtime_rejection(software, "requires --dev");
+
+        let mut public_hsm = production_file();
+        public_hsm["hsm"]["url"] = serde_json::json!("https://hsm.example");
+        runtime_rejection(public_hsm, "must terminate on loopback");
+
+        let mut public_metrics = production_file();
+        public_metrics["metrics_bind"] = serde_json::json!("0.0.0.0:9090");
+        runtime_rejection(public_metrics, "distinct non-zero loopback");
+
+        let mut collapsed_signers = production_file();
+        collapsed_signers["intent_policy"]["signer_whitelist"] = serde_json::json!(["a", "b", "c"]);
+        runtime_rejection(
+            collapsed_signers,
+            "certification topology must be exactly 3-of-5",
+        );
+
+        let mut minority_quorum = production_file();
+        minority_quorum["intent_policy"]["intent_quorum"] = serde_json::json!(2);
+        runtime_rejection(
+            minority_quorum,
+            "certification topology must be exactly 3-of-5",
+        );
+
+        let mut ephemeral = production_file();
+        ephemeral["database_url"] = serde_json::Value::Null;
+        runtime_rejection(ephemeral, "database_url is required outside --dev");
+
+        let root =
+            std::env::temp_dir().join(format!("xindex-profile-signer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).expect("create secure database parent");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .expect("secure database parent");
+        }
+        let mut plaintext = production_file();
+        plaintext["database_url"] =
+            serde_json::json!(format!("sqlite://{}/replay.db", root.display()));
+        plaintext["tls"] = serde_json::Value::Null;
+        runtime_rejection(plaintext, "mTLS config (`tls`) is required outside --dev");
+        std::fs::remove_dir(root).expect("remove secure database parent");
+    }
 
     #[test]
     fn hsm_url_is_strictly_loopback_and_redacted() {

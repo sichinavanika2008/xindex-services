@@ -1,0 +1,21 @@
+# Inventory template. Each file_sd document is operator-owned and contains the
+# reviewed loopback monitoring-agent target for exactly one service role.
+scrape_configs:
+  - job_name: xindex-signer
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/signer.json] }]
+  - job_name: xindex-price-signer
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/price-signer.json] }]
+  - job_name: xindex-price-collector
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/price-collector.json] }]
+  - job_name: xindex-registry-signer
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/registry-signer.json] }]
+  - job_name: xindex-registry-coordinator
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/registry-coordinator.json] }]
+  - job_name: xindex-finalized-observer
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/finalized-observer.json] }]
+  - job_name: xindex-settlement-collector
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/settlement-collector.json] }]
+  - job_name: xindex-redeem
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/redeem.json] }]
+  - job_name: xindex-finalize-redeem
+    file_sd_configs: [{ files: [/etc/xindex/prometheus/targets/finalize-redeem.json] }]

@@ -38,6 +38,7 @@ use xindex_chain_thor::{
     QuoteEvidence, QuotePolicy, RawSourcePoll, ThorClient, ThorConsensusClient, ThorSourceClient,
     TipCheckpoint,
 };
+use xindex_ops::network::{async_client, HttpClientPolicy};
 use xindex_ops::{serve_metrics, Metrics};
 use xindex_shared::eip712::thorchain_registry_domain;
 use xindex_shared::registry_state::{SqliteRegistryState, TipAdvance};
@@ -50,7 +51,8 @@ use xindex_signer_daemon::registry_sign::{
     InboundValidationContext, QuoteValidationContext, RegistrySigner,
 };
 use xindex_signer_daemon::tls::{
-    load_cert_chain, load_private_key, pinned_root_store, serve_mtls, server_config,
+    exact_pinned_async_client_builder, load_cert_chain, load_private_key, pinned_cert_store,
+    serve_mtls, server_config,
 };
 use xindex_signer_daemon::web3signer::HttpHsmClient;
 
@@ -99,6 +101,7 @@ struct Config {
     server_key_pem: PathBuf,
     coordinator_client_cert_pems: Vec<PathBuf>,
     collector_client_identity_pem: PathBuf,
+    /// Legacy-named leaf-first exact collector peer bundles.
     collector_server_ca_pems: Vec<PathBuf>,
 }
 
@@ -421,11 +424,12 @@ async fn run(args: Args) -> Result<()> {
         .map(|asset| (asset.asset.clone(), asset.clone()))
         .collect();
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.collector_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build public-data HTTP client")?;
+    let http = async_client(HttpClientPolicy {
+        connect_timeout: Duration::from_secs(config.collector_timeout_secs.min(3)),
+        request_timeout: Duration::from_secs(config.collector_timeout_secs),
+        max_response_bytes: 2 * 1024 * 1024,
+    })
+    .context("build public-data HTTP client")?;
     let prices = PriceFleet {
         binance: BinanceVenue::new(http.clone(), config.binance_base.clone()),
         coinbase: CoinbaseVenue::new(http.clone(), config.coinbase_base.clone()),
@@ -1178,7 +1182,6 @@ fn validate_config(config: &Config) -> Result<()> {
         anyhow::bail!("invalid zero/count/lifetime policy setting");
     }
     validate_public_id(&config.operator_id)?;
-    validate_durable_and_secret_paths(config)?;
     ensure_loopback(config.metrics_address.ip(), "metrics_address")?;
     let hsm = endpoint_origin("hsm_url", &config.hsm_url, true, false)?;
     let _rpc = endpoint_origin("ethereum_rpc_url", &config.ethereum_rpc_url, false, true)?;
@@ -1261,8 +1264,11 @@ fn validate_config(config: &Config) -> Result<()> {
     }
     if config.coordinator_client_cert_pems.is_empty() || config.collector_server_ca_pems.is_empty()
     {
-        anyhow::bail!("mTLS trust roots must not be empty");
+        anyhow::bail!("mTLS exact-peer allowlists must not be empty");
     }
+    // Filesystem/secret inspection is deliberately last. Every pure policy
+    // mutation above must fail before the process touches secret-bearing paths.
+    validate_durable_and_secret_paths(config)?;
     Ok(())
 }
 
@@ -1400,7 +1406,7 @@ fn load_server_tls(config: &Config) -> Result<rustls::ServerConfig> {
     server_config(
         load_cert_chain(&server_cert).context("parse server certificate")?,
         load_private_key(&server_key).context("parse server TLS key")?,
-        pinned_root_store(&pinned).context("parse coordinator trust roots")?,
+        pinned_cert_store(&pinned).context("parse exact coordinator peer pins")?,
     )
     .context("build server mTLS config")
 }
@@ -1408,19 +1414,22 @@ fn load_server_tls(config: &Config) -> Result<rustls::ServerConfig> {
 fn collector_client(config: &Config) -> Result<reqwest::Client> {
     let identity_pem = fs::read(&config.collector_client_identity_pem)
         .context("read collector client identity")?;
-    let identity =
-        reqwest::Identity::from_pem(&identity_pem).context("parse collector client identity")?;
-    let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.collector_timeout_secs))
-        .redirect(reqwest::redirect::Policy::none())
-        .tls_built_in_root_certs(false)
-        .identity(identity);
-    for path in &config.collector_server_ca_pems {
-        let pem = fs::read(path).context("read collector server CA")?;
-        builder = builder.add_root_certificate(
-            reqwest::Certificate::from_pem(&pem).context("parse collector server CA")?,
-        );
-    }
+    let peers = config
+        .collector_server_ca_pems
+        .iter()
+        .map(fs::read)
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("read exact collector peer bundles")?;
+    let builder = exact_pinned_async_client_builder(
+        HttpClientPolicy {
+            connect_timeout: Duration::from_secs(config.collector_timeout_secs.min(3)),
+            request_timeout: Duration::from_secs(config.collector_timeout_secs),
+            max_response_bytes: 256 * 1024,
+        },
+        load_cert_chain(&identity_pem).context("parse collector client certificate")?,
+        load_private_key(&identity_pem).context("parse collector client key")?,
+        pinned_cert_store(&peers).context("parse exact collector peer pins")?,
+    )?;
     builder.build().context("build collector mTLS client")
 }
 
@@ -1441,7 +1450,125 @@ fn u64_to_i64(value: u64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::expect_used, reason = "test fixtures")]
+
     use super::*;
+
+    fn production_config() -> Config {
+        Config {
+            chain_id: 1,
+            registry_contract: "0x0000000000000000000000000000000000000001".into(),
+            signer_address: "0x0000000000000000000000000000000000000002".into(),
+            operator_id: "operator-01".into(),
+            ethereum_rpc_url: "https://rpc.example".into(),
+            hsm_url: "http://127.0.0.1:9000".into(),
+            database_url: "sqlite:///definitely/not/read/registry.db".into(),
+            evidence_dir: "/definitely/not/read/evidence".into(),
+            listen_address: SocketAddr::from(([0, 0, 0, 0], 9443)),
+            metrics_address: SocketAddr::from(([127, 0, 0, 1], 9096)),
+            report_validity_secs: 60,
+            inbound_policy: InboundPolicy {
+                source_chain: "ETH".into(),
+                enabled_chains: vec!["ETH".into(), "BTC".into()],
+                allowlisted_pools: vec!["BTC.BTC".into()],
+                max_tip_age_secs: 12,
+                max_height_skew: 2,
+            },
+            quote_policy: QuotePolicy {
+                allowlisted_assets: vec!["BTC.BTC".into(), "ETH.USDT".into()],
+                min_price_sources: 3,
+                max_price_age_secs: 30,
+                max_price_deviation_bps: 100,
+                external_floor_bps: 9_900,
+                max_dispatch_ttl_secs: 300,
+                max_stream_blocks: 100,
+                max_total_swap_secs: 600,
+            },
+            sources: (1..=3)
+                .map(|index| SourceConfig {
+                    id: format!("source-{index}"),
+                    thornode_url: format!("https://thornode-{index}.example"),
+                    consensus_url: format!("https://consensus-{index}.example"),
+                })
+                .collect(),
+            routes: vec![RouteConfig {
+                adapter: "0x0000000000000000000000000000000000000003".into(),
+                funding_token: "0x0000000000000000000000000000000000000004".into(),
+                funding_asset: "ETH.USDT".into(),
+            }],
+            asset_prices: vec![
+                AssetPriceConfig {
+                    asset: "BTC.BTC".into(),
+                    binance: "BTCUSDT".into(),
+                    coinbase: "BTC-USD".into(),
+                    kraken: "XBTUSD".into(),
+                },
+                AssetPriceConfig {
+                    asset: "ETH.USDT".into(),
+                    binance: "ETHUSDT".into(),
+                    coinbase: "ETH-USD".into(),
+                    kraken: "ETHUSD".into(),
+                },
+            ],
+            binance_base: "https://binance.example".into(),
+            coinbase_base: "https://coinbase.example".into(),
+            kraken_base: "https://kraken.example".into(),
+            collectors: vec![
+                "https://collector-1.example".into(),
+                "https://collector-2.example".into(),
+            ],
+            collector_publish_attempts: 3,
+            collector_timeout_secs: 5,
+            server_cert_pem: "/definitely/not/read/server.crt".into(),
+            server_key_pem: "/definitely/not/read/server.key".into(),
+            coordinator_client_cert_pems: vec!["/definitely/not/read/coordinator.crt".into()],
+            collector_client_identity_pem: "/definitely/not/read/collector.pem".into(),
+            collector_server_ca_pems: vec!["/definitely/not/read/collector-peer.pem".into()],
+        }
+    }
+
+    fn assert_policy_rejection(config: &Config) {
+        let error = validate_config(config).expect_err("unsafe production mutation must fail");
+        assert!(
+            !error.to_string().contains("definitely/not/read"),
+            "policy mutation reached secret/path I/O: {error:#}"
+        );
+    }
+
+    #[test]
+    fn production_profile_behavior_rejects_unsafe_mutations() {
+        let mut zero_chain = production_config();
+        zero_chain.chain_id = 0;
+        assert_policy_rejection(&zero_chain);
+
+        let mut two_sources = production_config();
+        two_sources.sources.truncate(2);
+        assert_policy_rejection(&two_sources);
+
+        let mut public_hsm = production_config();
+        public_hsm.hsm_url = "https://hsm.example".into();
+        assert_policy_rejection(&public_hsm);
+
+        let mut plaintext_rpc = production_config();
+        plaintext_rpc.ethereum_rpc_url = "http://rpc.example".into();
+        assert_policy_rejection(&plaintext_rpc);
+
+        let mut public_metrics = production_config();
+        public_metrics.metrics_address = SocketAddr::from(([0, 0, 0, 0], 9096));
+        assert_policy_rejection(&public_metrics);
+
+        let mut duplicate_sources = production_config();
+        duplicate_sources.sources[1].id = duplicate_sources.sources[0].id.clone();
+        assert_policy_rejection(&duplicate_sources);
+
+        let mut duplicate_venues = production_config();
+        duplicate_venues.coinbase_base = duplicate_venues.binance_base.clone();
+        assert_policy_rejection(&duplicate_venues);
+
+        let mut no_peer_pins = production_config();
+        no_peer_pins.coordinator_client_cert_pems.clear();
+        assert_policy_rejection(&no_peer_pins);
+    }
 
     #[test]
     fn endpoint_policy_rejects_credentials_and_public_hsm() {

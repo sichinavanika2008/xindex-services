@@ -1,0 +1,70 @@
+{
+  "schema_version": 2,
+  "provider": "bitgo",
+  "environment": "test",
+  "coin": "tbtc4",
+  "wallet": {
+    "wallet_id": "<CAPTURED_TEST_WALLET_ID>",
+    "wallet_type": "hot",
+    "multisig_type": "onchain",
+    "custody_model": "self-custody",
+    "address_type": "p2wsh",
+    "address_chain_code": 20,
+    "m": 2,
+    "n": 3,
+    "user_pubkey_hex": "<COMPRESSED_USER_PUBLIC_KEY_HEX>",
+    "backup_pubkey_hex": "<COMPRESSED_OFFLINE_BACKUP_PUBLIC_KEY_HEX>",
+    "bitgo_pubkey_hex": "<COMPRESSED_BITGO_PUBLIC_KEY_HEX>"
+  },
+  "build_request": {
+    "tx_format": "psbt",
+    "no_split_change": true,
+    "change_address_type": "p2wsh",
+    "is_replaceable_by_fee": false,
+    "sequence_id": "<UNIQUE_XINDEX_TEST_SEQUENCE_ID>",
+    "change_address": "<EXACT_TESTNET4_VIN0_P2WSH_ADDRESS>",
+    "unspents": [
+      "<TXID>:<VOUT>"
+    ],
+    "recipients": [
+      {
+        "address": "<CONTROLLED_TESTNET4_PAYOUT_ADDRESS>",
+        "amount_sats": 10000
+      },
+      {
+        "address": "scriptPubKey:<FULL_HEX_OP_RETURN_SCRIPT>",
+        "amount_sats": 0
+      }
+    ]
+  },
+  "expected": {
+    "inputs": [
+      {
+        "outpoint": "<TXID>:<VOUT>",
+        "value_sats": 20000,
+        "script_pubkey_hex": "<VIN0_P2WSH_SCRIPTPUBKEY_HEX>",
+        "witness_script_hex": "<EXACT_2_OF_3_USER_BACKUP_BITGO_WITNESS_SCRIPT_HEX>"
+      }
+    ],
+    "payout_script_pubkey_hex": "<PAYOUT_SCRIPTPUBKEY_HEX>",
+    "payout_sats": 10000,
+    "vin0_script_pubkey_hex": "<VIN0_P2WSH_SCRIPTPUBKEY_HEX>",
+    "memo_hex": "<EXACT_THORCHAIN_MEMO_UTF8_HEX>",
+    "max_fee_sats": 2000,
+    "require_change": true
+  },
+  "unsigned_psbt": {
+    "encoding": "base64",
+    "data": "<CAPTURED_UNSIGNED_PSBT_BASE64>"
+  },
+  "user_signed_artifact": null,
+  "final_transaction_hex": null,
+  "live": {
+    "wallet_lookup_corroborated": false,
+    "build_correlation_id": "",
+    "build_response_captured": false,
+    "bitgo_cosign_completed": false,
+    "transfer_id": "",
+    "final_transaction_id": ""
+  }
+}

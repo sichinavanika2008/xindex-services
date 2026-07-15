@@ -3,6 +3,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 use thiserror::Error;
@@ -21,6 +23,10 @@ pub enum EvidenceError {
     Conflict,
     #[error("invalid evidence record: {0}")]
     InvalidRecord(String),
+    #[error("evidence retention quota: {0}")]
+    RetentionQuota(String),
+    #[error("evidence retention lock poisoned")]
+    RetentionLock,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -31,9 +37,35 @@ pub struct EvidenceVerification {
     pub inventory_hash_keccak256: String,
 }
 
+/// Bounded local retention for explicitly ephemeral evidence namespaces.
+/// Canonical/WORM exports remain an operator responsibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceRetentionPolicy {
+    pub max_records: usize,
+    pub max_total_bytes: u64,
+}
+
+/// Result of one retained write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedEvidence {
+    pub path: PathBuf,
+    pub pruned_records: usize,
+    pub pruned_bytes: u64,
+}
+
+/// Inventory after enforcing a retained namespace policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceRetentionReport {
+    pub pruned_records: usize,
+    pub pruned_bytes: u64,
+    pub remaining_records: usize,
+    pub remaining_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct EvidenceStore {
     directory: PathBuf,
+    retention_lock: Arc<Mutex<()>>,
 }
 
 impl EvidenceStore {
@@ -66,6 +98,7 @@ impl EvidenceStore {
         }
         Ok(Self {
             directory: directory.to_path_buf(),
+            retention_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -101,6 +134,82 @@ impl EvidenceStore {
             alloy_primitives::hex::encode(digest.as_slice())
         );
         self.persist_encoded(&record_id, &encoded)
+    }
+
+    /// Persist one content-addressed record in a bounded, explicitly
+    /// ephemeral namespace. Oldest namespace records are removed before the
+    /// new write so both record and byte limits hold after every call.
+    ///
+    /// The `prefix` must start with `<namespace>-`. This prevents one caller
+    /// from pruning an unrelated evidence family. Base [`Self::persist`] and
+    /// [`Self::persist_hashed`] records remain append-only.
+    ///
+    /// # Errors
+    /// Unsafe namespace/prefix, serialization/I/O failure, poisoned process
+    /// lock, an oversized incoming record, or an impossible retention policy.
+    pub fn persist_hashed_retained<T: Serialize>(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        value: &T,
+        policy: EvidenceRetentionPolicy,
+    ) -> Result<RetainedEvidence, EvidenceError> {
+        validate_retention_policy(namespace, prefix, policy)?;
+        let encoded = serde_json::to_vec(value)?;
+        let encoded_len = u64::try_from(encoded.len()).map_err(|_| {
+            EvidenceError::RetentionQuota("encoded record length exceeds u64".to_string())
+        })?;
+        if encoded_len > policy.max_total_bytes || encoded_len > MAX_RECORD_BYTES {
+            return Err(EvidenceError::RetentionQuota(format!(
+                "incoming record {encoded_len} exceeds retained byte limit {}",
+                policy.max_total_bytes
+            )));
+        }
+        let digest = alloy_primitives::keccak256(&encoded);
+        let record_id = format!(
+            "{prefix}-{}",
+            alloy_primitives::hex::encode(digest.as_slice())
+        );
+        let path = self.directory.join(format!("{record_id}.json"));
+        let _guard = self
+            .retention_lock
+            .lock()
+            .map_err(|_| EvidenceError::RetentionLock)?;
+
+        if path.exists() {
+            self.persist_encoded(&record_id, &encoded)?;
+            let report = self.enforce_retention_locked(namespace, policy, Some(&path), 0, 0)?;
+            return Ok(RetainedEvidence {
+                path,
+                pruned_records: report.pruned_records,
+                pruned_bytes: report.pruned_bytes,
+            });
+        }
+        let report = self.enforce_retention_locked(namespace, policy, None, 1, encoded_len)?;
+        self.persist_encoded(&record_id, &encoded)?;
+        Ok(RetainedEvidence {
+            path,
+            pruned_records: report.pruned_records,
+            pruned_bytes: report.pruned_bytes,
+        })
+    }
+
+    /// Enforce bounded retention for one namespace, including at process
+    /// restart before any new record is accepted.
+    ///
+    /// # Errors
+    /// Unsafe policy, poisoned lock, or unsafe/unreadable namespace records.
+    pub fn enforce_retention(
+        &self,
+        namespace: &str,
+        policy: EvidenceRetentionPolicy,
+    ) -> Result<EvidenceRetentionReport, EvidenceError> {
+        validate_retention_policy(namespace, &format!("{namespace}-retention"), policy)?;
+        let _guard = self
+            .retention_lock
+            .lock()
+            .map_err(|_| EvidenceError::RetentionLock)?;
+        self.enforce_retention_locked(namespace, policy, None, 0, 0)
     }
 
     /// Verify every record in the directory is an owner-only regular JSON file
@@ -228,6 +337,98 @@ impl EvidenceStore {
             Err(error) => Err(error.into()),
         }
     }
+
+    fn enforce_retention_locked(
+        &self,
+        namespace: &str,
+        policy: EvidenceRetentionPolicy,
+        protected: Option<&Path>,
+        reserved_records: usize,
+        reserved_bytes: u64,
+    ) -> Result<EvidenceRetentionReport, EvidenceError> {
+        let marker = format!("{namespace}-");
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(&self.directory)? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if !stem.starts_with(&marker) {
+                continue;
+            }
+            let metadata = validate_evidence_file(&path, MAX_RECORD_BYTES)?;
+            let modified = metadata
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            records.push((modified, path, metadata.len()));
+        }
+        records.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_os_str().cmp(right.1.as_os_str()))
+        });
+        let mut count = records.len();
+        let mut bytes = records
+            .iter()
+            .fold(0u64, |total, (_, _, len)| total.saturating_add(*len));
+        let mut pruned_records = 0usize;
+        let mut pruned_bytes = 0u64;
+        for (_, path, len) in records {
+            if count.saturating_add(reserved_records) <= policy.max_records
+                && bytes.saturating_add(reserved_bytes) <= policy.max_total_bytes
+            {
+                break;
+            }
+            if protected.is_some_and(|protected| protected == path) {
+                continue;
+            }
+            std::fs::remove_file(&path)?;
+            count = count.saturating_sub(1);
+            bytes = bytes.saturating_sub(len);
+            pruned_records = pruned_records.saturating_add(1);
+            pruned_bytes = pruned_bytes.saturating_add(len);
+        }
+        if count.saturating_add(reserved_records) > policy.max_records
+            || bytes.saturating_add(reserved_bytes) > policy.max_total_bytes
+        {
+            return Err(EvidenceError::RetentionQuota(
+                "protected/reserved records cannot fit policy".to_string(),
+            ));
+        }
+        if pruned_records > 0 {
+            File::open(&self.directory)?.sync_all()?;
+        }
+        Ok(EvidenceRetentionReport {
+            pruned_records,
+            pruned_bytes,
+            remaining_records: count.saturating_add(reserved_records),
+            remaining_bytes: bytes.saturating_add(reserved_bytes),
+        })
+    }
+}
+
+fn validate_retention_policy(
+    namespace: &str,
+    prefix: &str,
+    policy: EvidenceRetentionPolicy,
+) -> Result<(), EvidenceError> {
+    validate_record_id(namespace)?;
+    validate_record_id(prefix)?;
+    if !prefix.starts_with(&format!("{namespace}-")) {
+        return Err(EvidenceError::Configuration(
+            "retained prefix must belong to namespace".to_string(),
+        ));
+    }
+    if policy.max_records == 0 || policy.max_total_bytes == 0 {
+        return Err(EvidenceError::RetentionQuota(
+            "retention limits must be non-zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_evidence_file(path: &Path, max_bytes: u64) -> Result<std::fs::Metadata, EvidenceError> {
@@ -353,6 +554,78 @@ mod tests {
             store.verify_records(),
             Err(EvidenceError::InvalidRecord(_))
         ));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn retained_namespace_enforces_record_and_byte_limits_across_restart() {
+        let directory = std::env::temp_dir().join(format!(
+            "xindex-evidence-retained-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+        }
+        let policy = EvidenceRetentionPolicy {
+            max_records: 2,
+            max_total_bytes: 128,
+        };
+        let store = EvidenceStore::open(&directory).expect("open");
+        let first = store
+            .persist_hashed_retained(
+                "collector-quote",
+                "collector-quote-1",
+                &serde_json::json!({"round": 1}),
+                policy,
+            )
+            .expect("first");
+        store
+            .persist_hashed_retained(
+                "collector-quote",
+                "collector-quote-2",
+                &serde_json::json!({"round": 2}),
+                policy,
+            )
+            .expect("second");
+        let third = store
+            .persist_hashed_retained(
+                "collector-quote",
+                "collector-quote-3",
+                &serde_json::json!({"round": 3}),
+                policy,
+            )
+            .expect("third");
+        assert_eq!(third.pruned_records, 1);
+        assert!(!first.path.exists());
+
+        let reopened = EvidenceStore::open(&directory).expect("reopen");
+        let cleanup = reopened
+            .enforce_retention("collector-quote", policy)
+            .expect("restart cleanup");
+        assert_eq!(cleanup.remaining_records, 2);
+        assert!(cleanup.remaining_bytes <= policy.max_total_bytes);
+        assert!(matches!(
+            reopened.persist_hashed_retained(
+                "collector-quote",
+                "collector-quote-oversized",
+                &"x".repeat(256),
+                policy,
+            ),
+            Err(EvidenceError::RetentionQuota(_))
+        ));
+        assert_eq!(
+            reopened
+                .enforce_retention("collector-quote", policy)
+                .expect("final inventory")
+                .remaining_records,
+            2
+        );
         let _ = std::fs::remove_dir_all(directory);
     }
 

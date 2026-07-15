@@ -28,8 +28,13 @@ pub struct SignedMintSettlement {
     pub signature: String,
     /// Hash of the append-only pre-sign evidence envelope.
     pub evidence_hash: String,
-    /// Operator observation time, not part of the EIP-712 payload.
+    /// Operator observation time, signed into the EIP-712 payload.
     pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }
 
 /// Trigger a redemption outcome check. The proposed inbound transaction hash
@@ -55,6 +60,11 @@ pub struct SignedDeliverySettlement {
     pub signature: String,
     pub evidence_hash: String,
     pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }
 
 /// One operator's refund-only settlement signature.
@@ -69,6 +79,11 @@ pub struct SignedRefundSettlement {
     pub signature: String,
     pub evidence_hash: String,
     pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }
 
 /// One operator's fully-finalized combined streamed settlement signature.
@@ -84,4 +99,9 @@ pub struct SignedStreamedSettlement {
     pub signature: String,
     pub evidence_hash: String,
     pub observed_at: u64,
+    pub valid_until: u64,
+    pub source_chain_id: u64,
+    pub source_block_number: u64,
+    pub source_block_hash: String,
+    pub observation_epoch: u64,
 }

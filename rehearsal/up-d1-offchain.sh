@@ -48,7 +48,7 @@ cleanup() {
 trap cleanup EXIT
 
 # 1. mock THORNode on 2 ports.
-"$mock" "$asgard" 26659 26660 >"$out/mock-thornode.log" 2>&1 &
+"$mock" "$asgard" 26659 26660 26661 >"$out/mock-thornode.log" 2>&1 &
 pids="$pids $!"
 sleep 1
 
@@ -61,7 +61,7 @@ for trip in "9101 8551 $s0" "9102 8552 $s1" "9103 8553 $s2"; do
   RUST_LOG=info "$obs" \
     --rpc-url "$rpc" --thorchain-adapter "$THORCHAIN_ADAPTER_ADDR" \
     --attestation-oracle "$ATTESTATION_ORACLE_ADDR" \
-    --thornode-urls http://127.0.0.1:26659,http://127.0.0.1:26660 \
+    --thornode-urls http://127.0.0.1:26659,http://127.0.0.1:26660,http://127.0.0.1:26661 \
     --chain btc --btc-network signet --signer-mode remote \
     --signer-daemon-url "http://127.0.0.1:$2" --signer-daemon-address "$3" \
     --from-block 1 --listen-addr "127.0.0.1:$1" >"$out/observer-$i.log" 2>&1 &

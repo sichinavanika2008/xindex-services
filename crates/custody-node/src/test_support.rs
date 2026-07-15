@@ -80,6 +80,7 @@ pub fn signed_ric(
         redemption_id,
         U256::ZERO,
         asset_id,
+        chain.native_chain_id_hash(),
         amount,
         decimals,
         immediate_target_hash,

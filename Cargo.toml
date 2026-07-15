@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/xindex/xindex-services"
 
@@ -87,16 +87,10 @@ bs58 = "0.5"
 # base64: Solana JSON-RPC returns account data base64-encoded (base58 only
 # covers data < 129 bytes; the Squads Multisig account is larger). Pure-Rust.
 base64 = "0.22"
-# Turnkey custody wire (turnkey-client, DL-CUSTODY-TURNKEY-1). Turnkey API
-# requests are P-256 (NIST secp256r1) request stamps — a sibling of the
-# RustCrypto k256 (secp256k1) the workspace already uses, pure-Rust and
-# ring/openssl-free, so it adds no new crypto backend and keeps cargo
-# deny/audit clean. `ecdsa` gives the DER-encoded SHA-256 ECDSA stamp.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
+xindex-bitgo-adapter = { path = "crates/bitgo-adapter" }
 xindex-custody-core = { path = "crates/custody-core" }
-xindex-turnkey-client = { path = "crates/turnkey-client" }
 xindex-cosmos-tx = { path = "crates/cosmos-tx" }
 xindex-xrp-tx = { path = "crates/xrp-tx" }
 xindex-solana-tx = { path = "crates/solana-tx" }
