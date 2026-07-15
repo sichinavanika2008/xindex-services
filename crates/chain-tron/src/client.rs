@@ -111,7 +111,7 @@ pub trait TronChainClient: Send + Sync + 'static {
 /// Decode a hex string into a byte vec.
 fn unhex(s: &str) -> Result<Vec<u8>, TronChainError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(TronChainError::Decode("odd-length hex".into()));
     }
     (0..s.len())

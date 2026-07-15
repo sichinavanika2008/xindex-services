@@ -8,13 +8,13 @@
     "optimizerRuns": 200
   },
   "contracts": {
-    "AttestationOracle": "bf903d18ac6d6329f382ac62a0e5a62ddaf718d5197d9e305383f16f56628142",
-    "CustodyGuard": "21d865fe93ab548ebb656b74e73f213667b464f297b33f0c39d3471277aeabc0",
-    "IndexFactory": "95d750160af03dfa840dc674092a572d7282744df0d196998e96c4e3016648e7",
-    "IndexToken": "0881d4897f4c0f0cf02ea3f94ef927e9fe2e15f914c14a2bdcfa36613968d8a6",
-    "IntentQueue": "73ddc4537e5a1584b1b6db9ff329a67d16110233b14788fc00be88e57e2e3620",
+    "AttestationOracle": "b6e4ce81661a75f742740d61ce2b4b06e16c230a9a9b4c57a0698ea9a83d1e78",
+    "CustodyGuard": "57130c35478dede52514c293af3819e1b48a5d40b0b65fcfdb6d66aed2fa9690",
+    "IndexFactory": "f42119fcdbc37d1394359b523671a85e044d7bd7790d2ea6204e3494c548b837",
+    "IndexToken": "d5e9f3b86671f83eeb983e3817b690ee2f3117211e0d43716cc520833be7c752",
+    "IntentQueue": "977a7112b2e8d549d9ea606846d681e77efe61266e6225f1e132763fb32a65c7",
     "PriceAttestationOracle": "da76220cef37cf1fe2b47bde2856a60906255b16ec530c6cbbd6ef8345b8f8d5",
-    "ThorchainAdapter": "63a2f13f0426b66961a3e175a87156269ce433d692df030cca240e0c678b7727",
+    "ThorchainAdapter": "baf46d9d06fa2bb7cab1ee5d4360c01dad0cc91dd06f9964fbfd1fbdb2cb7be3",
     "ThorchainVaultRegistry": "5200a442d90fca01ceb2af6c876b538a56a9087255bfd6dd28a4b9ef9429e6b5"
   }
 }

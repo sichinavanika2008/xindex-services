@@ -1179,7 +1179,7 @@ async fn ensure_canonical_ready(state: &AppState) -> Result<(), (StatusCode, Jso
         .call()
         .await
         .map_err(|_| service_unavailable("on-chain observation epoch read failed"))?
-        .epoch;
+        ._0;
     if local_epoch != onchain_epoch {
         state.ready.store(false, Ordering::Release);
         return Err(service_unavailable(

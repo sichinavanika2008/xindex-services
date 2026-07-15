@@ -1008,7 +1008,7 @@ where
     let watcher_registry = Arc::clone(&registry);
     let watcher_chain_clone = Arc::clone(&watcher_chain);
     let watcher_cfg = WatcherConfig {
-        interval: Duration::from_secs(60),
+        interval: Duration::from_mins(1),
         stuck_timeout: Duration::from_secs(args.rebroadcast_stuck_timeout_secs),
         min_confirmations: args.rebroadcast_min_confirmations,
         final_depth: args.rebroadcast_final_depth,

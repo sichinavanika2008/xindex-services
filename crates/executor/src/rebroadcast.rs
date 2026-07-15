@@ -97,8 +97,8 @@ pub struct WatcherConfig {
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
-            interval: Duration::from_secs(60),
-            stuck_timeout: Duration::from_secs(3600),
+            interval: Duration::from_mins(1),
+            stuck_timeout: Duration::from_hours(1),
             min_confirmations: 6,
             final_depth: 100,
         }
@@ -566,8 +566,8 @@ mod tests {
         chain.push_status(Ok(confirmed));
 
         let cfg = WatcherConfig {
-            interval: Duration::from_secs(60),
-            stuck_timeout: Duration::from_secs(3600),
+            interval: Duration::from_mins(1),
+            stuck_timeout: Duration::from_hours(1),
             min_confirmations: 3,
             final_depth: 100,
         };

@@ -739,7 +739,7 @@ async fn finish_collection(
         .call()
         .await
         .map_err(|_| ApiError::Dependency("attestation_observation_epoch"))?
-        .epoch;
+        ._0;
     if context.observation_epoch != onchain_epoch {
         return Err(ApiError::Refused("observation_epoch_mismatch"));
     }
