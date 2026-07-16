@@ -11,7 +11,7 @@ take precedence over historical milestone prose.
 
 ## Current status
 
-The workspace contains 24 packages spanning shared protocol types, EVM and
+The workspace contains 25 packages spanning shared protocol types, EVM and
 native-chain clients, signers, custody, executors, relayers and operations.
 The published 2026-07-13 historical remote-HSM Gate-3 code candidate adds:
 
@@ -32,18 +32,37 @@ The published 2026-07-13 historical remote-HSM Gate-3 code candidate adds:
 - supervised metrics, checked-in Prometheus alerts, evidence verification,
   release topology validation and incident/retention runbooks.
 
-The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); it is disabled and not production-wired.
+The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); mainnet remains disabled and unapproved.
 Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.
 Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal custody providers.
-The reusable key-free request/policy adapter and offline capture validator are
-present, while the former provider implementations and operational runbooks
-have been removed. The validator
-checks internal transaction consistency but cannot authenticate caller-supplied
-provider identities or responses, so it remains fail-closed. BitGo remains
-disabled pending an authenticated provider-evidence envelope, live Testnet4
-and controlled THORChain-devnet evidence, transport/orchestration integration
-and independent custody review. Non-BTC production custody remains unselected
-and disabled. The canonical cross-repository decision is
+The reusable key-free request/policy adapter, offline capture validator and
+new `xindex-bitgo-client` transport/orchestration library and Testnet4-only
+`xindex-bitgo-custody` runtime are present, while
+the former provider implementations and operational runbooks have been
+removed. The client fixes official origins and coin/environment pairing,
+uses explicit BitGo Auth V2/V3 HMAC with a hashed bearer token, verifies and
+retains bounded authenticated response envelopes, and stores content-addressed
+artifacts plus a canonical validated wallet-topology snapshot in a durable
+SQLite write-ahead workflow, and permits at most one final-sign-and-broadcast
+POST per sequence. A send-reserved retry reconciles by `sequenceId`; a
+pending approval is polled only through read-only approval/transfer endpoints,
+rejection is terminal, and an approved final transaction must still equal the
+original exact PSBT policy. The coordinator reuses the provider-neutral
+RIC/output gate: the exact built PSBT must consume the durable redemption-leg
+one-shot and enter `intent_authorized` before any user-signed transaction can
+be retained; expired authorization fails closed. Pending approval never
+reopens the reservation. Its schema-v2 canonical manifest binds the HMAC
+version but is unsigned. Response HMAC authenticates the channel under the
+shared access token; it is not asymmetric independent provider provenance.
+No private-key or approval-mutation input exists. The dedicated runtime rejects
+production/mainnet, requires owner-only files and durable databases, and keeps
+every state-changing capability closed until an unexpired written authorization
+record, satoshi cap and matching authorization ID enable it; submit also
+requires the exact sequence acknowledgement. The legacy `xindex-redeem` binary
+is not wired to this path. BitGo remains unapproved pending live Testnet4 and
+controlled THORChain-devnet evidence, independent provenance/review and
+production activation. Non-BTC production custody remains unselected and
+disabled. The canonical cross-repository decision is
 [`memory/BITGO-CUSTODY.md`](../memory/BITGO-CUSTODY.md).
 
 Gate 4 now has a BitGo-aware closure runbook, a complete 23-drill evidence
@@ -61,8 +80,9 @@ preflight also found and locally fixed the
 pre-deployment THORChain change/memo output-order defect recorded as
 `BTC-ORDER-01`.
 
-The code-addressable Gate-3 findings are closed in the current local audit
-checkpoint on top of `f22b71a`. This is not production approval: real independent
+The code-addressable Gate-3 findings are closed through pushed checkpoint
+`9954f1c`; the BitGo client is a later intentional uncommitted delta. This is
+not production approval: real independent
 operator/HSM/source records, alert delivery and WORM-retention drills, testnet
 rehearsal, a pinned clean release commit, and independent audit evidence do not
 exist in this checkout. Do not connect it to value-bearing systems.

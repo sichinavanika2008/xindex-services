@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "environment": "test",
+  "auth_version": 2,
+  "wallet": {
+    "wallet_id": "REPLACE_BITGO_WALLET_ID",
+    "address_chain_code": 20,
+    "user_public_key": "REPLACE_COMPRESSED_USER_PUBLIC_KEY",
+    "backup_public_key": "REPLACE_COMPRESSED_BACKUP_PUBLIC_KEY",
+    "bitgo_public_key": "REPLACE_COMPRESSED_BITGO_PUBLIC_KEY",
+    "witness_script_hex": "REPLACE_CANONICAL_2_OF_3_WITNESS_SCRIPT_HEX"
+  },
+  "spend": {
+    "input_txid": "REPLACE_TESTNET4_INPUT_TXID",
+    "input_vout": 0,
+    "input_value_sats": 0,
+    "payout_script_pubkey_hex": "REPLACE_TESTNET4_PAYOUT_SCRIPTPUBKEY_HEX",
+    "payout_sats": 0,
+    "memo_hex": "REPLACE_EXACT_THORCHAIN_MEMO_HEX",
+    "max_fee_sats": 0,
+    "sequence_id": "REPLACE_UNIQUE_SEQUENCE_ID",
+    "require_change": true
+  },
+  "intent_verification": {
+    "ethereum_chain_id": 11155111,
+    "attestation_oracle": "REPLACE_SEPOLIA_ATTESTATION_ORACLE",
+    "signer_whitelist": [
+      "REPLACE_SET_B_SIGNER_1",
+      "REPLACE_SET_B_SIGNER_2",
+      "REPLACE_SET_B_SIGNER_3",
+      "REPLACE_SET_B_SIGNER_4",
+      "REPLACE_SET_B_SIGNER_5"
+    ],
+    "signer_quorum": 3,
+    "ric_max_age_secs": 900
+  },
+  "authorization": {
+    "authorization_id": "REPLACE_WRITTEN_AUTHORIZATION_ID",
+    "not_before_unix": 0,
+    "expires_at_unix": 0,
+    "max_loss_sats": 0,
+    "capabilities": []
+  }
+}

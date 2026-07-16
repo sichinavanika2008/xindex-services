@@ -27,7 +27,7 @@ the relevant runbook.
 
 ## Security-critical current state
 
-The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); it is disabled and not production-wired.
+The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); mainnet remains disabled and unapproved.
 Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.
 Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal custody providers.
 
@@ -42,8 +42,38 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   free of HTTP tokens, private-key inputs, signing, approvals and broadcast;
   preserve exact build fields, native P2WSH, non-RBF, absolute fee, ordered
   outputs and cryptographic user/BitGo role checks.
+- `xindex-bitgo-client` owns the fixed official origins, explicit Auth V2/V3
+  HMAC requests, hashed bearer transport, HMAC/freshness-verified response
+  envelopes and durable SQLite workflow. Request JSON must be serialized once
+  and those exact bytes authenticated and sent. Keep
+  private-key and approval-mutation inputs out of this crate. The irreversible
+  `tx/send` call must remain private to `BitGoCoordinator`, after an atomic
+  send reservation; retries reconcile by `sequenceId` and never blindly send
+  again. Before build completion, retain the exact wallet response and one
+  immutable canonical hot/on-chain 2-of-3 wallet snapshot. A pending approval
+  must never release the reservation: reconciliation may use only read-only
+  approval/transfer GETs, never an approval mutation; rejection is terminal,
+  and any approved/rebuilt final transaction must pass the original exact
+  policy and user/BitGo role-signature checks.
+- Preserve the coordinator's
+  `build -> intent_authorized -> user_signed` transition. The middle phase
+  exists only after the exact retained PSBT passes the provider-neutral
+  RIC/output bind and consumes the durable
+  `(BTC, redemptionId, legIndex)` one-shot. Never expose public receipt
+  injection, accept a user signature directly from `built`, or remove the
+  authorization-expiry check.
+- Its schema-v2 canonical evidence manifest is unsigned and tamper-detecting
+  only. A response HMAC is symmetric under the token and is not independent
+  provider provenance. Do not call the bundle authenticated until reviewer
+  trust anchors, signature verification and independent raw-chain/provider
+  corroboration are selected, pinned and independently reviewed.
+- `xindex-bitgo-custody` is the only runtime activation of the new coordinator.
+  Preserve its Testnet4-only/mainnet-refusal gate, owner-only single-link file
+  checks, durable databases, capability-empty default, authorization ID/time
+  window/satoshi cap checks and exact sequence acknowledgement before submit.
+  Never add a private-key input or silently repoint historical `xindex-redeem`.
 - No live BitGo account, wallet, key or transaction evidence exists. BitGo is
-  selected but disabled, not production-wired or production-approved.
+  selected with a disabled-by-default Testnet4 runtime, not production-approved.
 - THORChain BTC output order is fund-critical: VOUT0 Asgard, optional VOUT1
   change to VIN0, final VOUT memo. Preserve `BTC-ORDER-01` regressions and gate
   every provider-returned unsigned transaction before signing.

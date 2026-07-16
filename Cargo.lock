@@ -5543,6 +5543,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-bitgo-client"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "bitcoin",
+ "clap",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "wiremock",
+ "xindex-bitgo-adapter",
+ "xindex-custody-core",
+ "xindex-ops",
+ "xindex-shared",
+]
+
+[[package]]
 name = "xindex-bitgo-dev-gate"
 version = "0.0.1"
 dependencies = [

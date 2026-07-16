@@ -17,11 +17,29 @@ self-custody on-chain 2-of-3 multisig (user, offline backup and BitGo keys),
 not MPC. The active Cobo gate/crate/runbooks and the earlier Turnkey surfaces
 are removed and production-profile guards reject reintroduction. This does not
 close custody readiness: no live BitGo account, wallet, key, Testnet4 signature
-or transaction evidence exists; provider transport/orchestration, recovery,
-controlled THORChain devnet rehearsal and independent review remain open. A
-key-free request/policy adapter core now exists, but provider transport,
-durable orchestration and live response handling remain unimplemented and
-unapproved.
+or transaction evidence exists; recovery, controlled THORChain devnet rehearsal
+and independent review remain open. The 2026-07-16 local delta adds a key-free
+bounded Auth V2/V3 HMAC HTTP client, durable write-ahead workflow and one-shot send coordinator
+on top of the request/policy adapter. Build completion now requires retained
+provider wallet metadata plus one immutable validated topology snapshot; the
+public store rejects in-memory databases. Pending approvals are reconciled only
+with read-only approval/transfer GETs, rejection is terminal, and an approved
+provider rebuild must still pass the originally retained PSBT policy and exact
+user/BitGo signature roles. The coordinator binds the exact retained PSBT to
+the provider-neutral RIC/output gate, consumes the existing durable
+`(BTC, redemptionId, legIndex)` one-shot, persists a content-addressed
+authorization receipt, and blocks user-signature capture until the monotonic
+`intent_authorized` phase; expired authorization fails closed. Every provider
+response now fails closed on a missing/invalid/stale HMAC and is retained in a
+versioned authenticated-channel envelope; the schema-v2 manifest binds the
+selected auth version. Because response HMAC is symmetric under the access
+token, it is not independent provider attestation. The dedicated
+`xindex-bitgo-custody` runtime accepts no private key, rejects production,
+requires owner-only files and durable databases, and keeps each state-changing
+capability closed behind a written authorization ID/time window/satoshi cap;
+submit additionally requires the exact sequence acknowledgement. The legacy
+custody binary remains unchanged. Independent provenance, mainnet activation
+and every live qualification step remain unimplemented or unapproved.
 
 Audit log: 2026-05-09 (two-pass internal audit covering ~5,000 LOC).
 
@@ -1023,6 +1041,15 @@ This closes the local false-evidence defect only. No HTTP transport, token,
 approval or broadcast method was added. Live Testnet4 capture, provider
 response/rebuild handling, durable orchestration, recovery and independent
 custody review remain mandatory.
+
+**2026-07-16 follow-up.** The later local `xindex-bitgo-client` delta now owns
+the bounded HMAC token transport, response verification/envelopes, durable
+one-shot coordinator and disabled-by-default Testnet4 runtime described in the
+current transition section above. It adds no private-key or approval-mutation
+input and performed no live provider action. Current key-free coverage is 12
+gate, 16 adapter and 36 client/coordinator/runtime tests. Independent provider
+provenance, mainnet activation, live approval/finalization qualification,
+recovery and independent review remain open.
 
 ## External audit M-05 — systemic network resource bounds (2026-07-15)
 

@@ -7,6 +7,7 @@
 //! spend binders are being relocated here from the daemon as they are
 //! decoupled from its HTTP (`axum`) layer.
 
+pub mod btc_authorize;
 pub mod btc_bind;
 pub mod evm_bind;
 pub mod evm_tx;

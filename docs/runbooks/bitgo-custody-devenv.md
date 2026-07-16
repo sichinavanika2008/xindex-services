@@ -1,6 +1,7 @@
 # BitGo BTC custody development qualification
 
-> **Selected for future BTC custody; disabled and not production-wired.** This
+> **Selected for future BTC custody; Testnet4 runtime capability-closed and
+> production/mainnet disabled.** This
 > runbook tests whether BitGo can preserve the exact Xindex/THORChain Bitcoin
 > transaction shape. Selection is a design decision, not a live integration or
 > production approval. This document authorizes no account, wallet, key,
@@ -30,6 +31,7 @@ Current official references:
 - [BitGo UTXO address types](https://developers.bitgo.com/coins/chain-codes)
 - [BitGo transaction builder](https://developers.bitgo.com/reference/v2wallettxbuild)
 - [BitGo manual self-custody multisig withdrawal](https://developers.bitgo.com/docs/withdraw-wallet-type-self-custody-multisig-manual)
+- [BitGo HMAC request/response authentication](https://developers.bitgo.com/docs/hmac)
 - [THORChain UTXO transaction requirements](https://dev.thorchain.org/concepts/sending-transactions.html)
 
 ## Required transaction profile
@@ -98,12 +100,51 @@ unsigned PSBT, a user-signed PSBT or raw half-signed transaction, and a final
 transaction with exact user + BitGo signature roles. It can generate a retained
 `tx/send` JSON body only after the raw half-signed transaction passes.
 
-The crate intentionally has no HTTP client, access token, private-key input,
-approval operation or broadcast method. The documented BitGo `tx/send`
-endpoint combines final signing and broadcast, so invoking it remains a
-separate explicit authorization boundary. Transport configuration, response
-retrieval, pending-approval handling, durable orchestration and production
-integration remain unimplemented and unapproved.
+The adapter intentionally has no HTTP client, access token, private-key input,
+approval operation or broadcast method. The separate `xindex-bitgo-client`
+crate owns fixed official test/production origins, explicit BitGo Auth V2/V3
+HMAC request construction, hashed bearer-token transport, HMAC and freshness
+verification of every response, bounded response reads, exact `200`/`202`
+decoding, and a SQLite write-ahead workflow. Request JSON is serialized once;
+the identical bytes are authenticated and transmitted. Each retained response
+is a versioned envelope containing the method, path, status, timestamp, HMAC,
+body hash and exact bounded body. Its `tx/send` transport is private to
+`BitGoCoordinator`: the
+coordinator revalidates the stored unsigned and user-signed artifacts, reserves
+the irreversible call atomically, and permits only that reservation holder to
+POST. Build completion first retains the exact wallet response and one
+canonical hot/on-chain 2-of-3 topology snapshot. Before user-signature capture,
+`authorize_redeem` passes that exact retained PSBT through the provider-neutral
+RIC/output gate, consumes the durable `(BTC, redemptionId, legIndex)` one-shot,
+and retains a canonical authorization receipt plus its certificate expiry.
+Only `intent_authorized` may transition to `user_signed`; an expired receipt
+fails closed. A send-reserved retry performs only an exact `sequenceId` lookup.
+A pending approval never releases the reservation: the coordinator uses only
+read-only approval and
+transfer-by-approval GETs, makes rejection terminal, and accepts an approved
+final transaction only after approval/transfer/sequence/txid correlation and
+the original exact policy plus user/BitGo signature checks. A direct `200`
+send response is accepted only in `signed`, `unconfirmed` or `confirmed`
+state; terminal failure states do not become `broadcast`.
+
+The client accepts no private key and exposes no approval mutation. It also
+builds a schema-v2 canonical SHA-256 manifest over the content-addressed
+workflow artifacts and binds the selected HMAC version. Response HMAC prevents
+an untrusted transport from silently changing BitGo traffic, but it is a
+symmetric proof under the access token: the token holder could reproduce it,
+so it is not independent provider attestation or non-repudiation. The manifest
+remains unsigned; without separately pinned reviewer trust anchors, signatures
+and independent raw-chain/provider corroboration it is not closure provenance.
+
+The separate `xindex-bitgo-custody` runtime now activates this coordinator only
+for the staged Testnet4 workflow. It refuses `production`, accepts no private
+key, reads secrets and configuration only from absolute owner-only single-link
+files, requires a durable owner-only workflow database, and requires a matching
+authorization ID plus an unexpired satoshi cap and explicit per-operation
+capability. Final sign-and-broadcast additionally requires the exact sequence
+ID on the command line. The historical `xindex-redeem` binary remains unchanged.
+This is a runnable qualification seam, not permission to use a BitGo token or
+perform any external action.
 
 ## Current key-free verification
 
@@ -114,23 +155,54 @@ RUSTUP_TOOLCHAIN=1.95.0 cargo test --offline --locked \
   -p xindex-bitgo-dev-gate
 
 RUSTUP_TOOLCHAIN=1.95.0 cargo clippy --offline --locked \
-  -p xindex-bitgo-adapter -p xindex-bitgo-dev-gate \
-  --all-targets -- -D warnings
+  -p xindex-bitgo-adapter -p xindex-bitgo-client -p xindex-custody-core \
+  -p xindex-custody-node -p xindex-bitgo-dev-gate \
+  --all-targets --all-features -- -D warnings
 
 RUSTUP_TOOLCHAIN=1.95.0 cargo test --offline --locked \
   -p xindex-bitgo-adapter
+
+RUSTUP_TOOLCHAIN=1.95.0 cargo test --offline --locked \
+  -p xindex-bitgo-client
 ```
 
-The eleven gate tests and twelve adapter tests are deliberately key-free. They
-cover the valid unsigned shape remaining blocked without live artifacts, the
-unsafe memo-before-change order,
+The 12 gate, 16 adapter and 36 client/coordinator/runtime tests are deliberately
+key-free. They cover the valid unsigned shape remaining blocked without live
+artifacts, the unsafe memo-before-change order,
 PSBT signing-stage mutation, exact P2WSH commitment and captured role-key
 binding, RBF rejection, native-change build controls, rejection of a synthetic
 half-signed witness, rejection of a purported final transaction without
 witnesses, exact wire-field serialization, fee/change/sighash mutations,
-rejection of signer-added PSBT policy metadata, and verification of a static
-public half-signed example from BitGo's manual withdrawal guide. The tests
-verify existing public signatures; they never create or use a private key.
+rejection of signer-added PSBT policy metadata, transport redaction and body
+bounds, exact wallet/build/sequence/approval correlation, immutable wallet
+topology evidence, refusal of public in-memory stores, write-ahead idempotency,
+non-release of send and pending-approval reservations, terminal rejection,
+read-only approval reconciliation, rejection of an approved rebuild that
+differs from the exact retained policy, refusal to accept user signing before
+durable RIC one-shot authorization, expiry refusal, invalid-RIC non-transition,
+canonical authorization/artifact hashing, exact Auth V2/V3 HMAC vectors,
+response-HMAC rejection and capture, mainnet runtime refusal, closed runtime
+capabilities, terminal send-state refusal, and
+verification of static public half-signed/final examples from BitGo's manual
+withdrawal guide. The tests verify existing public signatures; they never
+create or use a private key.
+
+## Disabled runtime handoff
+
+`docs/runbooks/bitgo-custody-runtime.example.json` is deliberately invalid and
+capability-empty. Copy it to an absolute owner-only directory, replace every
+placeholder only after the corresponding L0-L3 authorization, and keep the
+configuration, token, IntentProof, signed transaction and both SQLite files at
+mode `0600` with one hard link. The containing directory must be owner-only.
+
+The runtime subcommands are `status`, `build`, `authorize`,
+`record-user-signed`, `submit`, and `manifest`. `status` performs no provider
+I/O. `build` is the only command allowed to create the workflow database.
+`submit` either crosses the one-shot final-sign-and-broadcast boundary or uses
+read-only reconciliation after an existing reservation. Merely compiling or
+invoking `--help` performs no BitGo action; do not run a provider-facing command
+until its separately written authorization names the exact network, wallet,
+sequence, time window, capability and maximum satoshis at risk.
 
 ## Live qualification stages
 
@@ -153,8 +225,23 @@ transaction is returned. This is acceptable for a capped Testnet4 compatibility
 test; it is not sufficient by itself for production pre-broadcast policy.
 BitGo also documents that a pending-approval withdrawal can be rebuilt with
 current fees after approval. Such a rebuild must not be treated as the already
-gated transaction: any final skeleton change fails this evaluator, and the
-approval/rebuild behavior needs its own production-policy qualification.
+gated transaction: the coordinator reads the resolved approval and associated
+transfer, but any final skeleton change fails the original exact-policy check.
+The real provider behavior still needs live, capped production-policy
+qualification.
+
+The one-shot boundary deliberately favors safety over availability. If the
+process dies after persisting `send_reserved` but before BitGo durably accepts
+the request, and an exact sequence lookup finds nothing, the workflow stays
+locked for operator investigation; it does not blindly POST again.
+
+The earlier authorization boundary uses two durable stores in a deliberate
+order: BitGo build state first, then custody replay consumption, then
+`intent_authorized`. If the process dies after replay consumption but before
+the workflow transition, retry the exact same RIC and unsigned txid; the replay
+arm is idempotent for that pair and the receipt can be persisted. A different
+certificate or transaction remains a one-shot conflict. Never manually insert
+or release an authorization receipt.
 
 ### L0 — account only
 
@@ -243,9 +330,9 @@ not executable until every placeholder is replaced with a real capture.
 BitGo remains disabled. L2 and L3 must preserve outputs, change, inputs, fee cap
 and the transaction skeleton during both signing stages, but internal
 consistency is not qualification. Closure additionally requires an
-authenticated provider-evidence envelope, pinned reviewer identities, policy,
-recovery, operator-separation, incident, commercial, legal,
-transport/orchestration integration and independent-review gates.
+authenticated provider-evidence envelope, pinned reviewer identities and
+manifest signatures, production custody-binary activation, policy, recovery,
+operator-separation, incident, commercial, legal and independent-review gates.
 
 The selected model deliberately accepts native Bitcoin 2-of-3 multisig instead
 of MPC for BTC. The Gate-4 closure procedure is

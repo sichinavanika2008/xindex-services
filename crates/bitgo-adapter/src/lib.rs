@@ -411,6 +411,44 @@ impl SpendPolicy {
     }
 }
 
+/// Domain-separated commitment to every independent field in one spend policy.
+///
+/// Durable provider orchestration stores this value before making a request.
+/// An idempotent retry must reproduce the same commitment; the same sequence
+/// ID can never be rebound to a different wallet, input, payout, memo, fee cap,
+/// signer topology, or output policy.
+#[must_use]
+pub fn spend_policy_commitment(policy: &SpendPolicy) -> alloy_primitives::B256 {
+    fn push_bytes(encoded: &mut Vec<u8>, value: &[u8]) {
+        let length = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        encoded.extend_from_slice(&length.to_be_bytes());
+        encoded.extend_from_slice(value);
+    }
+
+    let mut encoded = Vec::with_capacity(512);
+    encoded.extend_from_slice(b"XINDEX_BITGO_SPEND_POLICY_V1");
+    encoded.push(match policy.wallet.coin {
+        BitGoCoin::Btc => 0,
+        BitGoCoin::Tbtc4 => 1,
+    });
+    push_bytes(&mut encoded, policy.wallet.wallet_id.as_bytes());
+    encoded.extend_from_slice(&P2WSH_EXTERNAL_CHAIN_CODE.to_be_bytes());
+    encoded.extend_from_slice(&policy.wallet.user.to_bytes());
+    encoded.extend_from_slice(&policy.wallet.backup.to_bytes());
+    encoded.extend_from_slice(&policy.wallet.bitgo.to_bytes());
+    push_bytes(&mut encoded, policy.wallet.witness_script.as_bytes());
+    encoded.extend_from_slice(&policy.input.outpoint.txid.to_byte_array());
+    encoded.extend_from_slice(&policy.input.outpoint.vout.to_be_bytes());
+    encoded.extend_from_slice(&policy.input.value_sats.to_be_bytes());
+    push_bytes(&mut encoded, policy.payout_spk.as_bytes());
+    encoded.extend_from_slice(&policy.payout_sats.to_be_bytes());
+    push_bytes(&mut encoded, &policy.memo);
+    encoded.extend_from_slice(&policy.max_fee_sats.to_be_bytes());
+    push_bytes(&mut encoded, policy.sequence_id.as_bytes());
+    encoded.push(u8::from(policy.require_change));
+    keccak256(encoded)
+}
+
 /// `BitGo` UTXO transaction output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1160,6 +1198,30 @@ mod tests {
     }
 
     #[test]
+    fn spend_policy_commitment_is_stable_and_binds_mutable_fields() {
+        let first = policy();
+        let identical = policy();
+        assert_eq!(
+            spend_policy_commitment(&first),
+            spend_policy_commitment(&identical)
+        );
+
+        let mut changed_sequence = policy();
+        changed_sequence.sequence_id = "xindex-redemption-2".to_string();
+        assert_ne!(
+            spend_policy_commitment(&first),
+            spend_policy_commitment(&changed_sequence)
+        );
+
+        let mut changed_fee = policy();
+        changed_fee.max_fee_sats -= 1;
+        assert_ne!(
+            spend_policy_commitment(&first),
+            spend_policy_commitment(&changed_fee)
+        );
+    }
+
+    #[test]
     fn numeric_memo_uses_the_shared_canonical_encoding() {
         let policy = policy_with_memo(vec![0x01]);
         assert_eq!(policy.memo_spk.as_bytes(), [0x6a, 0x51]);
@@ -1236,6 +1298,44 @@ mod tests {
         let mut signed = unsigned.unsigned_tx.clone();
         signed.input[0].witness = Witness::from_slice(&[b"synthetic-public-witness"]);
         assert!(validate_user_signed_transaction(&unsigned, &signed, &policy()).is_err());
+    }
+
+    #[test]
+    #[expect(clippy::expect_used, reason = "static public BitGo test vector")]
+    fn official_user_and_bitgo_signatures_validate_for_native_p2wsh_roles() {
+        // Public final-transaction vector from BitGo's manual multisig guide.
+        // The guide's transaction uses a wrapped witness program in scriptSig;
+        // clearing it normalizes the same witness spend to native P2WSH without
+        // changing the BIP-143 signature digest. No key is created or used.
+        let encoded = alloy_primitives::hex::decode(
+            "010000000001010e4d3af014f9efe311062965d561b67f78a1759e7016605cd506ddd7041762d50000000023220020510ded26d712922bbb61bc68ef6766f836a03527820cbdc8b1551914eb467dafffffffff02102700000000000017a9145a581567fd2a630e61e34a696ab3bb887972886d87ad0f010000000000225120850d0ab466d15cb1565dd528d4d9709f3e46f41d41fe6d94aa01378e626983990400483045022100db45a8d94ee2144f7e29baa855d94a2bf0120707a7ab2fc93734ed94af972c460220558d00b91275aafc7805dfaaf9ab796adbe9f4e66dc467f7eb93b790671a323201473044022049e20c0073f42c9636408efc6c833ebf0e1a8ef13e8cb818dde2f4e2af7f7b7f022000cb3a321d65605b9d51d7f87e34306169607646c8d54a44011b021eff3dbe500169522103c10ac628c880629ed0fd2a0563a898f4882baca45e15668a4d3064cf1ea379882103e56f84be4460080618ef869bb7b07096880760f748ba23efab533c2359f923bd21020ae81372264b5eac5c9dc7fe0b9a32bad00771c3a2c71f6e2c971823c3182ed653ae00000000",
+        )
+        .expect("official transaction hex");
+        let mut signed: Transaction =
+            bitcoin::consensus::deserialize(&encoded).expect("official transaction");
+        assert_eq!(
+            signed.compute_txid().to_string(),
+            "5ea8d2b93997ed9fa3597a2f3113817c8216f573a0278c2533bb5db50fdb0dff"
+        );
+
+        signed.input[0].script_sig = ScriptBuf::new();
+        let mut unsigned_tx = signed.clone();
+        unsigned_tx.input[0].witness = Witness::new();
+        let wallet = wallet();
+        let mut unsigned = Psbt::from_unsigned_tx(unsigned_tx).expect("unsigned PSBT");
+        unsigned.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: wallet.custody_script_pubkey().clone(),
+        });
+        unsigned.inputs[0].witness_script = Some(wallet.witness_script().clone());
+
+        validate_witness_roles(
+            &unsigned,
+            &signed,
+            &wallet,
+            &[KeyRole::User, KeyRole::Bitgo],
+        )
+        .expect("official user and BitGo signatures");
     }
 
     #[test]

@@ -8,12 +8,8 @@
 //! (it inspects outputs + the certificate, the security anchor — the RIC is
 //! k-of-n signed independently of the coordinator that supplied the PSBT).
 
-use bitcoin::hashes::Hash;
-
-use xindex_custody_core::btc_bind::bind_outputs_to_cert;
-use xindex_custody_core::gates::{
-    consume_spend_certificate, validate_spend_certificate, CustodyConfig,
-};
+use xindex_custody_core::btc_authorize::authorize_btc_spend;
+use xindex_custody_core::gates::CustodyConfig;
 use xindex_custody_core::replay::ReplayStore;
 
 use crate::Decision;
@@ -33,45 +29,20 @@ pub async fn decide_redeem_spend<S: ReplayStore>(
     custody_spk: &bitcoin::ScriptBuf,
     now_unix: i64,
 ) -> Decision {
-    // TK-04: validate → bind → consume. The one-shot is recorded only after the
-    // output-set bind passes, so a bind-failing PSBT never pins the slot.
-    let txid = ctx.psbt.unsigned_tx.compute_txid().to_byte_array();
-    let (cert, consume_key) = match validate_spend_certificate(
-        config,
-        ctx.chain,
-        ctx.ric.as_ref(),
-        ctx.acc.as_ref(),
-        now_unix,
-    ) {
-        Ok(c) => c,
-        Err(r) => {
-            return Decision::Reject {
-                code: r.code,
-                message: r.message,
-            }
-        }
-    };
-    if let Err(r) = bind_outputs_to_cert(&ctx.psbt, custody_spk, &cert) {
-        return Decision::Reject {
+    match authorize_btc_spend(ctx, replay, config, custody_spk, now_unix).await {
+        Ok(_) => Decision::Approve,
+        Err(r) => Decision::Reject {
             code: r.code,
             message: r.message,
-        };
+        },
     }
-    if let Err(r) =
-        consume_spend_certificate(replay, ctx.chain, &consume_key, &txid, now_unix).await
-    {
-        return Decision::Reject {
-            code: r.code,
-            message: r.message,
-        };
-    }
-    Decision::Approve
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{keccak256, Address, B256, U256};
+    use bitcoin::hashes::Hash as _;
     use bitcoin::psbt::Psbt;
     use bitcoin::script::PushBytesBuf;
     use bitcoin::{

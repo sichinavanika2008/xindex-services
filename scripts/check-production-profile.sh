@@ -31,7 +31,7 @@ reject_text() {
 # from the independent observation/certification quorum and removed providers.
 for file in README.md AGENTS.md; do
     require_text "$file" \
-        'The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); it is disabled and not production-wired.'
+        'The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); mainnet remains disabled and unapproved.'
     require_text "$file" \
         'Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.'
     require_text "$file" \
@@ -202,7 +202,15 @@ done
 # Gate 4 must use the selected BitGo native BTC 2-of-3 model and strict evidence
 # verifier. The historical 3-of-5 custody rehearsal cannot become an implicit
 # fallback or be cited as current closure evidence.
-require_text docs/runbooks/bitgo-custody-devenv.md 'Selected for future BTC custody; disabled and not production-wired'
+require_text docs/runbooks/bitgo-custody-devenv.md \
+    'Selected for future BTC custody; Testnet4 runtime capability-closed and'
+require_text docs/runbooks/bitgo-custody-devenv.md 'production/mainnet disabled.'
+require_text crates/bitgo-client/src/bin/xindex-bitgo-custody.rs \
+    'BitGo production/mainnet is disabled pending completed qualification and review'
+require_text crates/bitgo-client/src/bin/xindex-bitgo-custody.rs \
+    'written BitGo authorization does not enable this capability'
+require_text crates/bitgo-client/src/bin/xindex-bitgo-custody.rs \
+    'final-sign-and-broadcast acknowledgement does not match sequence ID'
 require_text docs/runbooks/gate4-bitgo-rehearsal.md 'Status: BLOCKED / not complete'
 require_text docs/runbooks/gate4-bitgo-rehearsal.md 'xindex-gate4-check'
 require_text docs/runbooks/ctd1-signet-rehearsal.md 'Historical custody baseline'
