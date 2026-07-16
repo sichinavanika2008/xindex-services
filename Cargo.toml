@@ -21,6 +21,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Serde
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Exact decimal/rational arithmetic for provider price-limit encodings.
+num-bigint = "0.4"
 # Errors
 thiserror = "1"
 anyhow = "1"
@@ -106,6 +108,7 @@ xindex-chain-tron = { path = "crates/chain-tron" }
 xindex-chain-thor = { path = "crates/chain-thor" }
 xindex-chain-utxo = { path = "crates/chain-utxo" }
 xindex-multisig = { path = "crates/multisig" }
+xindex-native-router = { path = "crates/native-router" }
 xindex-safe-evm = { path = "crates/safe-evm" }
 xindex-signer = { path = "crates/signer" }
 xindex-signer-daemon = { path = "crates/signer-daemon" }

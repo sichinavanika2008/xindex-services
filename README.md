@@ -11,11 +11,12 @@ take precedence over historical milestone prose.
 
 ## Current status
 
-The workspace contains 25 packages spanning shared protocol types, EVM and
+The workspace contains 26 packages spanning shared protocol types, EVM and
 native-chain clients, signers, custody, executors, relayers and operations.
-The published 2026-07-13 historical remote-HSM Gate-3 code candidate adds:
+The published 2026-07-13 historical remote-HSM Gate-3 candidate plus its
+current local successors provide:
 
-- eight manifested current Solidity ABIs and an exact drift gate;
+- ten manifested current Solidity ABIs and an exact drift gate;
 - all seven current EIP-712 report types with Rust/Solidity vectors;
 - live fail-closed inbound-state and exact-quote signer/coordinator services,
   with three-source THOR agreement, durable reservations and serialized nonce
@@ -31,6 +32,20 @@ The published 2026-07-13 historical remote-HSM Gate-3 code candidate adds:
 - one-to-one logical/physical native and ERC-20 inflow ledgers; and
 - supervised metrics, checked-in Prometheus alerts, evidence verification,
   release topology validation and incident/retention runbooks.
+
+The local 2026-07-16 delta adds `xindex-native-router`, a fail-closed library
+core for the parent repository's new NativeRouteRegistry and
+MultiRailAsyncAdapter. It represents all 17 current Chainflip assets with exact
+contract IDs and dynamically catalogs every unambiguous Maya pool whose status
+is `Available`, plus CACAO. Live discovery can disable eligibility but never
+enable an Xindex asset. The core validates current provider state, quotes,
+Chainflip DCA/Maya streams, quote-recommended Chainflip slippage/live-price and
+retry bounds, zero broker commission, exact Vault/Router payloads,
+provider/native decimal scaling, independent-reference cost, deterministic
+lowest-cost selection, finalized multi-RPC registry state and exact Solidity
+EIP-712/mint hints. It is not wired into a production signer daemon, custody
+executor or broadcaster. Non-BTC custody and provider-specific native
+redemption builders remain absent and disabled.
 
 The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); mainnet remains disabled and unapproved.
 Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.
@@ -80,8 +95,9 @@ preflight also found and locally fixed the
 pre-deployment THORChain change/memo output-order defect recorded as
 `BTC-ORDER-01`.
 
-The code-addressable Gate-3 findings are closed through pushed checkpoint
-`9954f1c`; the BitGo client is a later intentional uncommitted delta. This is
+The code-addressable Gate-3 findings and BitGo successor are pushed through
+checkpoint `06ad537`; the Chainflip/Maya router and two new ABIs are a later
+intentional uncommitted delta. This is
 not production approval: real independent
 operator/HSM/source records, alert delivery and WORM-retention drills, testnet
 rehearsal, a pinned clean release commit, and independent audit evidence do not
@@ -111,6 +127,7 @@ readiness or launch gates.
 cargo fmt --all -- --check
 cargo clippy --offline --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --offline --locked --workspace --all-features --no-run
+cargo test --offline --locked -p xindex-native-router
 cargo deny check
 cargo audit --no-fetch --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0185
 ```

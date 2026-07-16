@@ -13,6 +13,8 @@
     "IndexFactory": "f42119fcdbc37d1394359b523671a85e044d7bd7790d2ea6204e3494c548b837",
     "IndexToken": "d5e9f3b86671f83eeb983e3817b690ee2f3117211e0d43716cc520833be7c752",
     "IntentQueue": "977a7112b2e8d549d9ea606846d681e77efe61266e6225f1e132763fb32a65c7",
+    "MultiRailAsyncAdapter": "08954890a4a783c05567463c7f9a0f4c67ad88679fef6b00f957ae2deda2d0e3",
+    "NativeRouteRegistry": "a776192257bd93e5a215061223d4e49646e1af58efeff3712f362d7ab091fa66",
     "PriceAttestationOracle": "da76220cef37cf1fe2b47bde2856a60906255b16ec530c6cbbd6ef8345b8f8d5",
     "ThorchainAdapter": "baf46d9d06fa2bb7cab1ee5d4360c01dad0cc91dd06f9964fbfd1fbdb2cb7be3",
     "ThorchainVaultRegistry": "5200a442d90fca01ceb2af6c876b538a56a9087255bfd6dd28a4b9ef9429e6b5"

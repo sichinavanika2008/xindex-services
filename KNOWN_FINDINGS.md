@@ -1288,3 +1288,54 @@ used.
 - M5 milestone closes a `⏳ Deferred` item → flip to ✅ + describe fix
 - Any analyzer (clippy / cargo-deny / cargo-audit) flags something we
   decide to accept → entry here with reasoning
+
+## Chainflip/Maya native-router integration (2026-07-16)
+
+**Implemented locally; production-blocked.** The new `xindex-native-router`
+package provides the fail-closed catalog, API schema, payload, finalized
+governance and lowest-cost selection core for the parent's
+`NativeRouteRegistry` and `MultiRailAsyncAdapter`.
+
+- Chainflip pins all 17 current asset IDs/decimals, gates them on live ingress
+  and egress flags, rejects unknown future IDs, low/unknown liquidity and
+  non-zero broker fees, reproduces the official half-up `minPriceX128`, binds
+  quote-recommended price/live-price limits and retry blocks, signs the DCA
+  span plus retry window, requires two identical encoders and validates exact
+  EVM `xSwapToken` calldata/destination bytes. EVM dispatch requires an
+  Ethereum ERC-20 source and rejects native ETH or a non-Ethereum source.
+- Maya catalogs every exact `Available` pool plus CACAO, refuses staged pools
+  and reduced-memo alias collisions, requires at least two agreeing current
+  Router/vault/halt snapshots, paces quotes to one per second, validates exact
+  memo asset/destination/floor/interval/quantity/expiry and converts provider
+  precision to governance-pinned native precision with explicit rounding. Its
+  ERC-20 Router builder refuses native `ETH.ETH` ingress and requires the full
+  source pool's embedded contract to equal the funding token.
+- At least two Ethereum RPCs must agree exactly on one canonical finalized
+  block, registry code, provider and asset config/hash, and endpoint code. Raw
+  bounded response evidence and derived hashes are retained.
+- Candidate cost is independently recomputed from an Xindex reference amount
+  plus expected-to-minimum tolerance. Routes above the 100-bps hard ceiling or
+  stricter governance ceiling are refused; the lowest eligible cost wins with
+  deterministic tie-breaking and cannot change after dispatch.
+- Solidity configuration hashes, the route EIP-712 type/domain/hash and mint
+  hint ABI encoding are byte-for-byte mirrored. The ABI manifest now contains
+  ten current parent contracts.
+
+Read-only live schema checks, with no key or transaction, caught and fixed the
+current Chainflip omission of `isOnChain`, Maya's compact BTC memo alias `b`,
+exact Maya provider-floor rounding, and the current Chainflip 50/75-bps plus
+300-block recommendation conversion. Regressions pin the captured response
+shapes without depending on live network tests.
+
+Open deployment blockers: this crate is not a signer-daemon executable or HSM
+runtime; it does not fetch the independent Chainlink/reference amount itself;
+it does not bind the complete approved adapter/factory release graph; endpoint
+runtime codehash cannot reveal a proxy implementation change; and there are no
+provider-specific native redemption/custody builders for all catalogued assets.
+Discovery therefore never enables an asset. Non-BTC custody remains unselected
+and disabled.
+
+Verification: 34/34 native-router tests, complete Rust 1.95.0 format, locked/
+offline strict workspace all-target/all-feature Clippy and all-feature test
+compilation, plus exact 10/10 parent ABI drift checks. No key, custody action,
+deployment, broadcast or transaction was used.

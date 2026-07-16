@@ -22,6 +22,8 @@ contracts=(
     IndexFactory
     IndexToken
     IntentQueue
+    MultiRailAsyncAdapter
+    NativeRouteRegistry
     PriceAttestationOracle
     ThorchainAdapter
     ThorchainVaultRegistry

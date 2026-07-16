@@ -5808,6 +5808,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "xindex-native-router"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "alloy-sol-types",
+ "num-bigint",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "wiremock",
+ "xindex-ops",
+]
+
+[[package]]
 name = "xindex-ops"
 version = "0.0.1"
 dependencies = [

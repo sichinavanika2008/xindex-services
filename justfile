@@ -150,7 +150,7 @@ finalize-m2:
 
 # ── Maintenance ───────────────────────────────────────────────────────────────
 
-# Re-pull all eight protocol ABIs from the adjacent Solidity repository.
+# Re-pull all ten protocol ABIs from the adjacent Solidity repository.
 # ABI arrays only: the services never deploy contracts, and excluding bytecode
 # avoids unlinked-library placeholders. Update manifest.json in the same
 # reviewed change when a deliberate Solidity ABI change occurs.
@@ -159,7 +159,7 @@ sync-abi:
     set -euo pipefail
     cd {{XINDEX}}
     forge build --offline
-    for contract in AttestationOracle CustodyGuard IndexFactory IndexToken IntentQueue PriceAttestationOracle ThorchainAdapter ThorchainVaultRegistry; do
+    for contract in AttestationOracle CustodyGuard IndexFactory IndexToken IntentQueue MultiRailAsyncAdapter NativeRouteRegistry PriceAttestationOracle ThorchainAdapter ThorchainVaultRegistry; do
         jq -cS '.abi' "out/$contract.sol/$contract.json" > "xindex services/crates/shared/abi/$contract.json.tmp"
         mv "xindex services/crates/shared/abi/$contract.json.tmp" "xindex services/crates/shared/abi/$contract.json"
     done
