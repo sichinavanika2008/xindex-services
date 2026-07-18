@@ -1,11 +1,11 @@
 # CTD-1 signet rehearsal — the closure gate
 
 > **Historical custody baseline.** This document records the former 3-of-5
-> native-custody closure design. The current Gate-4 procedure is
-> [`gate4-bitgo-rehearsal.md`](./gate4-bitgo-rehearsal.md), using BitGo
-> self-custody native Bitcoin 2-of-3 multisig while retaining the separate
-> 3-of-5 observation/certification quorum. This document alone cannot close
-> current Gate 4 and its Set-A ceremony must not be executed as a fallback.
+> native-custody closure design. The current Gate-4 procedure is the Vultisig
+> redesign in [`../../../memory/GATE-4-PREFLIGHT.md`](../../../memory/GATE-4-PREFLIGHT.md),
+> while retaining the separate 3-of-5 observation/certification quorum. This
+> document alone cannot close current Gate 4 and its Set-A ceremony must not be
+> executed as a fallback.
 
 > **Purpose.** CTD-1 (fleet-wide Critical: coordinator-trusted destination)
 > is code-complete: Slices A–E + the Slice C production tail are built and

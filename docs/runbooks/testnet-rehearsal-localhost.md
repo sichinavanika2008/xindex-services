@@ -3,8 +3,8 @@
 > **Historical custody harness.** This one-box harness uses deterministic
 > software keys and the former 3-of-5 native-custody path. It may be used only
 > for separately authorized local functional testing; it is not the selected
-> BitGo custody design and cannot satisfy
-> [`gate4-bitgo-rehearsal.md`](./gate4-bitgo-rehearsal.md).
+> Vultisig custody design and cannot satisfy
+> [`../../../memory/GATE-4-PREFLIGHT.md`](../../../memory/GATE-4-PREFLIGHT.md).
 
 > **What this is.** A single-machine functional rehearsal of the off-chain
 > signing fleet: five `xindex-signer-daemon` instances + five observers +

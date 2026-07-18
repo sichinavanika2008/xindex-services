@@ -2,7 +2,7 @@
 
 > Scope: device-side hardening for the internal HSM-backed signer
 > operators (the non-custodian members of the 3-of-5 sets). Institutional
-> custodians (Anchorage / BitGo / Coinbase Custody) follow their own
+> custodians follow their own
 > certified provisioning; this runbook governs the YubiHSM2 units Xindex
 > operates directly. Consumed by `key-ceremony.md` Phase 1. Protocol-
 > independent — no signer-daemon wire-protocol assumptions.

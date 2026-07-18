@@ -6,40 +6,41 @@ verdict and reasoning. No silent suppressions.
 
 > **Historical-record note (2026-07-10):** legacy AI-tool names and out-of-tree
 > paths in older entries are provenance only, not active instructions. Use
-> `AGENTS.md`, current source, tests, and the current BitGo qualification
-> runbook for present work. Turnkey and Cobo references below describe removed
+> `AGENTS.md`, current source, tests, and the current Vultisig custody record
+> for present work. Turnkey and Cobo references below describe removed
 > historical code.
 
-## Custody provider transition (2026-07-14)
+## Vultisig custody transition (2026-07-18)
 
-BitGo is the selected future BTC custody provider using native Bitcoin
-self-custody on-chain 2-of-3 multisig (user, offline backup and BitGo keys),
-not MPC. The active Cobo gate/crate/runbooks and the earlier Turnkey surfaces
-are removed and production-profile guards reject reintroduction. This does not
-close custody readiness: no live BitGo account, wallet, key, Testnet4 signature
-or transaction evidence exists; recovery, controlled THORChain devnet rehearsal
-and independent review remain open. The 2026-07-16 local delta adds a key-free
-bounded Auth V2/V3 HMAC HTTP client, durable write-ahead workflow and one-shot send coordinator
-on top of the request/policy adapter. Build completion now requires retained
-provider wallet metadata plus one immutable validated topology snapshot; the
-public store rejects in-memory databases. Pending approvals are reconciled only
-with read-only approval/transfer GETs, rejection is terminal, and an approved
-provider rebuild must still pass the originally retained PSBT policy and exact
-user/BitGo signature roles. The coordinator binds the exact retained PSBT to
-the provider-neutral RIC/output gate, consumes the existing durable
-`(BTC, redemptionId, legIndex)` one-shot, persists a content-addressed
-authorization receipt, and blocks user-signature capture until the monotonic
-`intent_authorized` phase; expired authorization fails closed. Every provider
-response now fails closed on a missing/invalid/stale HMAC and is retained in a
-versioned authenticated-channel envelope; the schema-v2 manifest binds the
-selected auth version. Because response HMAC is symmetric under the access
-token, it is not independent provider attestation. The dedicated
-`xindex-bitgo-custody` runtime accepts no private key, rejects production,
-requires owner-only files and durable databases, and keeps each state-changing
-capability closed behind a written authorization ID/time window/satoshi cap;
-submit additionally requires the exact sequence acknowledgement. The legacy
-custody binary remains unchanged. Independent provenance, mainnet activation
-and every live qualification step remain unimplemented or unapproved.
+Vultisig Wallet as a Service using DKLS threshold signing is the selected
+future custody direction. The retired provider-specific crates, runtime,
+qualification gate, Gate-4 checker, evidence templates and runbooks are removed.
+The provider-neutral RIC, one-shot, replay, exact transaction-binding and
+containment controls remain. No Vultisig dependency, vault, share, signature or
+transaction has been introduced.
+
+The local `xindex-vultisig-adapter` package is a key-free policy library, not a
+Vultisig runtime. It privately derives BIP143 hashes only after validating a v0
+PSBT and exact ordered inputs/values, transaction version, locktime, final
+sequence, explicit
+`SIGHASH_ALL`, witness UTXOs and fee bounds. Its public path crosses the
+custody-node RIC/ACC output binder and consumes the one-shot before exposing the
+hashes. Eleven deterministic mutation tests pass without a private key.
+
+Residual boundary: `BitcoinSpendPolicy` cannot authenticate the provenance of
+its permitted UTXOs. A future runtime must construct it from finalized,
+reorg-aware Xindex custody observations, persist the source block and policy
+identity, and refuse caller- or Vultisig-supplied outpoints/values. The current
+library is not evidence that this observation path exists.
+
+The reviewed upstream Verifier independently derives signing hashes and applies
+Recipes policies before threshold signing. Its current Bitcoin evaluator does
+not yet enforce Xindex's complete exact-input, sequence/RBF, `SIGHASH_ALL`,
+absolute-fee and Testnet4 policy. The local adapter closes the first four gaps
+around the retained output binder. Upstream/runtime integration, Testnet4
+isolation, finalized-transaction revalidation, aggregate evidence and
+independent review remain required. Mainnet activation and every live
+qualification step remain unimplemented and unapproved.
 
 Audit log: 2026-05-09 (two-pass internal audit covering ~5,000 LOC).
 
@@ -987,7 +988,7 @@ fully qualified and key-free. The authoritative report is
 
 ## BTC-ORDER-01 — Critical, pre-deployment — THORChain VOUT order (2026-07-14)
 
-Found during the key-free BitGo compatibility preflight. The shared Bitcoin
+Found during the key-free custody compatibility preflight. The shared Bitcoin
 builder emitted `[Asgard payout, OP_RETURN memo, custody change]`. The signer
 policy required the correct payout, memo and custody-only change set but did
 not bind their positions. Current THORChain rules require Asgard at VOUT0,
@@ -1003,53 +1004,12 @@ signer daemon delegates to that binder, and the redeem/swap-back assertions and
 fixtures use the same order. Eight key-free binder tests cover correct shapes,
 the former order, displaced payout, duplicate/second/zero change, duplicate
 memo and wrong memo; one public-script-only builder regression pins the emitted
-order. The BitGo development gate now has ten key-free
-input/layout/signature/mutation checks, and the shared adapter has twelve
-key-free request/policy regressions. Changed signer/custody/executor test
-targets compile locked/offline.
+order. Changed signer/custody/executor test targets compile locked/offline.
 
 No wallet, custody key, signature, broadcast, testnet transaction, or mainnet
 transaction was used. This closes the code defect only. Every future provider
 must still produce a captured unsigned transaction proving it preserves the
 exact order before any signer or broadcast path is enabled.
-
-## BITGO-GATE-01 — High, pre-deployment — synthetic signature evidence (2026-07-14)
-
-Found while continuing the selected BitGo qualification. The first offline
-gate version compared the unsigned transaction skeleton but treated any
-non-empty half-signed/final witness as signature evidence. A synthetic byte
-string could therefore pass `user_signature_preservation`; the final check did
-not prove that the two signatures belonged to the captured user and BitGo
-roles. The same schema did not bind exact role public keys/witness script and
-did not pin `changeAddressType=p2wsh`, `isReplaceableByFee=false`, or the input
-sequence. Severity is High because this could create false custody-qualification
-evidence, but BitGo is disabled and no live transaction path consumed the
-report.
-
-**Disposition: fixed in the local BitGo checkpoint.** Evidence schema
-v2 captures the exact compressed user/backup/BitGo keys, external chain code
-20, exact 2-of-3 witness script, native-P2WSH change type and non-RBF build
-intent. The shared `xindex-bitgo-adapter` generates the typed build/send
-payloads and validates exact input/output/fee policy. Both the adapter and gate
-recompute BIP-143 sighashes, require low-S `SIGHASH_ALL`, verify the user role
-before submission, require exact user + BitGo roles in descriptor order after
-finalization, and reject synthetic witnesses. Ten gate tests and twelve adapter
-tests pass locked/offline; a static public signature from BitGo's manual guide
-exercises verification without creating or using a private key.
-
-This closes the local false-evidence defect only. No HTTP transport, token,
-approval or broadcast method was added. Live Testnet4 capture, provider
-response/rebuild handling, durable orchestration, recovery and independent
-custody review remain mandatory.
-
-**2026-07-16 follow-up.** The later local `xindex-bitgo-client` delta now owns
-the bounded HMAC token transport, response verification/envelopes, durable
-one-shot coordinator and disabled-by-default Testnet4 runtime described in the
-current transition section above. It adds no private-key or approval-mutation
-input and performed no live provider action. Current key-free coverage is 12
-gate, 16 adapter and 36 client/coordinator/runtime tests. Independent provider
-provenance, mainnet activation, live approval/finalization qualification,
-recovery and independent review remain open.
 
 ## External audit M-05 — systemic network resource bounds (2026-07-15)
 
@@ -1126,15 +1086,14 @@ not production-approved.
 ## External audit M-09 — contradictory active custody documentation (2026-07-15)
 
 **Medium — fixed locally across both repositories.** Active entry points had
-simultaneously described BTC custody as a native 3-of-5 wallet, a Turnkey
-single-key/approver path, and the selected BitGo model. That could cause an
+simultaneously described multiple historical and current custody models. That could cause an
 operator or reviewer to deploy a removed trust model or confuse the 3-of-5
 observation threshold with custody authorization.
 
-`memory/BITGO-CUSTODY.md` is now the canonical decision. Root/nested READMEs,
+`memory/VULTISIG-CUSTODY.md` is now the canonical decision. Root/nested READMEs,
 both agent instruction entry points, and the active GitHub blockchain
-instruction state the same selected future model: disabled BitGo native P2WSH
-2-of-3 with user, independently held offline-backup, and BitGo roles.
+instruction state the same selected future model: unimplemented Vultisig Wallet
+as a Service using DKLS threshold signing.
 Observation, RIC, and settlement certification remain a distinct 3-of-5
 quorum. Turnkey and Cobo are prohibited as primary or fallback providers.
 
@@ -1151,8 +1110,8 @@ three architecture/separation/prohibition statements and the historical
 runbook marker; it passes. Shell syntax, formatting, and both repositories'
 whitespace checks pass.
 
-This is documentation/process closure, not custody readiness. BitGo transport,
-accounts, wallets, keys, authorizations, Testnet4/controlled-THORChain evidence,
+This is documentation/process closure, not custody readiness. Vultisig integration,
+vaults, shares, keys, authorizations, test-network evidence,
 recovery, ceremonies, and independent review remain absent.
 
 ## External audit L-04 — literal-text production safety gate (2026-07-15)
@@ -1189,22 +1148,21 @@ release gates and production approval remain open.
 binder previously concatenated all pushed bytes after `OP_RETURN` and ignored
 non-push instructions. Scripts containing an inserted `OP_NOP`, split pushes,
 trailing instructions, or non-minimal PUSHDATA widths could bind to the same
-certified memo. The offline BitGo gate separately compared a generated script,
-so rehearsal and shared adapter decisions were inconsistent.
+certified memo. A separate qualification check used a divergent decision.
 
 `xindex-custody-core::btc_bind` now exposes the single canonical parser and
-builder used by the certificate binder, BitGo adapter, and BitGo development
-gate. Accepted scripts contain exactly `OP_RETURN` and one non-empty minimal
+builder used by the certificate binder. Accepted scripts contain exactly
+`OP_RETURN` and one non-empty minimal
 push consuming the entire script. Minimality includes direct/PUSHDATA1/2/4
 boundaries and `OP_PUSHNUM_NEG1` / `OP_PUSHNUM_1..16` for their one-byte
 payloads. Empty, malformed, split, intervening, trailing, and wider encodings
 fail closed.
 
 TDD first demonstrated acceptance of `OP_RETURN OP_NOP <memo-push>`. Final
-key-free suites pass 59/59 custody-core, 14/14 adapter, and 12/12 development
-gate tests. Boundary regressions cover 1/75/76/255/256/65,535/65,536 bytes and
+key-free custody-core suite passes 59/59 tests. Boundary regressions cover
+1/75/76/255/256/65,535/65,536 bytes and
 every wider-than-needed PUSHDATA class. Strict all-target/all-feature Clippy
-passes for the three affected packages; signer-daemon and custody-node targets
+passes for the retained affected package; signer-daemon and custody-node targets
 compile without executing signing tests. The 8/8 compiled production-profile
 gate remains green. No key, provider, wallet, network, broadcast, or external
 transaction was used.

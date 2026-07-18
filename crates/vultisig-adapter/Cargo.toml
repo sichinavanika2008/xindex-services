@@ -1,5 +1,5 @@
 [package]
-name = "xindex-bitgo-adapter"
+name = "xindex-vultisig-adapter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,11 +10,11 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-alloy-primitives.workspace = true
-bitcoin.workspace = true
-serde.workspace = true
-thiserror.workspace = true
 xindex-custody-core.workspace = true
+xindex-custody-node.workspace = true
+xindex-shared.workspace = true
+bitcoin.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+alloy-primitives.workspace = true
+tokio.workspace = true

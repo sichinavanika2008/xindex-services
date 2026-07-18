@@ -8,12 +8,32 @@
 //! (it inspects outputs + the certificate, the security anchor — the RIC is
 //! k-of-n signed independently of the coordinator that supplied the PSBT).
 
-use xindex_custody_core::btc_authorize::authorize_btc_spend;
-use xindex_custody_core::gates::CustodyConfig;
+use xindex_custody_core::btc_authorize::{authorize_btc_spend, BtcSpendAuthorization};
+use xindex_custody_core::gates::{CustodyConfig, GateRejection};
 use xindex_custody_core::replay::ReplayStore;
 
 use crate::Decision;
 use xindex_custody_core::prepare::BindContext;
+
+/// Authorize an exact BTC spend through the provider-neutral decision boundary.
+///
+/// This receipt-returning form is used by adapters that must retain the
+/// verified certificate and consumed one-shot identity before exposing any
+/// signing material. [`decide_redeem_spend`] maps the same result to the
+/// legacy approve/reject decision.
+///
+/// # Errors
+/// A fail-closed gate rejection for an invalid/stale certificate, output
+/// mismatch, replay conflict, or replay-store failure.
+pub async fn authorize_certified_btc_spend<S: ReplayStore>(
+    ctx: &BindContext,
+    replay: &S,
+    config: CustodyConfig<'_>,
+    custody_spk: &bitcoin::ScriptBuf,
+    now_unix: i64,
+) -> Result<BtcSpendAuthorization, GateRejection> {
+    authorize_btc_spend(ctx, replay, config, custody_spk, now_unix).await
+}
 
 /// Decide a BTC redeem (or mint-cancel swap-back) spend: k-of-n RIC/ACC
 /// verification + one-shot consume ([`gate_spend_certificate`]) then the
@@ -29,7 +49,7 @@ pub async fn decide_redeem_spend<S: ReplayStore>(
     custody_spk: &bitcoin::ScriptBuf,
     now_unix: i64,
 ) -> Decision {
-    match authorize_btc_spend(ctx, replay, config, custody_spk, now_unix).await {
+    match authorize_certified_btc_spend(ctx, replay, config, custody_spk, now_unix).await {
         Ok(_) => Decision::Approve,
         Err(r) => Decision::Reject {
             code: r.code,

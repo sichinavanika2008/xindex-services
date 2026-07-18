@@ -5531,57 +5531,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xindex-bitgo-adapter"
-version = "0.0.1"
-dependencies = [
- "alloy-primitives",
- "bitcoin",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "xindex-custody-core",
-]
-
-[[package]]
-name = "xindex-bitgo-client"
-version = "0.0.1"
-dependencies = [
- "alloy-primitives",
- "anyhow",
- "bitcoin",
- "clap",
- "hmac",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "thiserror 1.0.69",
- "tokio",
- "wiremock",
- "xindex-bitgo-adapter",
- "xindex-custody-core",
- "xindex-ops",
- "xindex-shared",
-]
-
-[[package]]
-name = "xindex-bitgo-dev-gate"
-version = "0.0.1"
-dependencies = [
- "alloy-primitives",
- "anyhow",
- "base64",
- "bitcoin",
- "clap",
- "serde",
- "serde_json",
- "sha2",
- "xindex-bitgo-adapter",
- "xindex-custody-core",
-]
-
-[[package]]
 name = "xindex-chain-cosmos"
 version = "0.0.1"
 dependencies = [
@@ -6004,6 +5953,18 @@ dependencies = [
  "k256",
  "sha2",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "xindex-vultisig-adapter"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "bitcoin",
+ "tokio",
+ "xindex-custody-core",
+ "xindex-custody-node",
+ "xindex-shared",
 ]
 
 [[package]]

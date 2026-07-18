@@ -11,8 +11,9 @@ take precedence over historical milestone prose.
 
 ## Current status
 
-The workspace contains 26 packages spanning shared protocol types, EVM and
-native-chain clients, signers, custody, executors, relayers and operations.
+The workspace contains 24 packages, 62 targets and 24 binaries spanning shared
+protocol types, EVM and native-chain clients, signers, custody, executors,
+relayers and operations.
 The published 2026-07-13 historical remote-HSM Gate-3 candidate plus its
 current local successors provide:
 
@@ -47,57 +48,28 @@ EIP-712/mint hints. It is not wired into a production signer daemon, custody
 executor or broadcaster. Non-BTC custody and provider-specific native
 redemption builders remain absent and disabled.
 
-The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); mainnet remains disabled and unapproved.
+The selected future custody direction is Vultisig Wallet as a Service using DKLS threshold signing; no production vault, share, deployment, or key use is approved.
 Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.
 Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal custody providers.
-The reusable key-free request/policy adapter, offline capture validator and
-new `xindex-bitgo-client` transport/orchestration library and Testnet4-only
-`xindex-bitgo-custody` runtime are present, while
-the former provider implementations and operational runbooks have been
-removed. The client fixes official origins and coin/environment pairing,
-uses explicit BitGo Auth V2/V3 HMAC with a hashed bearer token, verifies and
-retains bounded authenticated response envelopes, and stores content-addressed
-artifacts plus a canonical validated wallet-topology snapshot in a durable
-SQLite write-ahead workflow, and permits at most one final-sign-and-broadcast
-POST per sequence. A send-reserved retry reconciles by `sequenceId`; a
-pending approval is polled only through read-only approval/transfer endpoints,
-rejection is terminal, and an approved final transaction must still equal the
-original exact PSBT policy. The coordinator reuses the provider-neutral
-RIC/output gate: the exact built PSBT must consume the durable redemption-leg
-one-shot and enter `intent_authorized` before any user-signed transaction can
-be retained; expired authorization fails closed. Pending approval never
-reopens the reservation. Its schema-v2 canonical manifest binds the HMAC
-version but is unsigned. Response HMAC authenticates the channel under the
-shared access token; it is not asymmetric independent provider provenance.
-No private-key or approval-mutation input exists. The dedicated runtime rejects
-production/mainnet, requires owner-only files and durable databases, and keeps
-every state-changing capability closed until an unexpired written authorization
-record, satoshi cap and matching authorization ID enable it; submit also
-requires the exact sequence acknowledgement. The legacy `xindex-redeem` binary
-is not wired to this path. BitGo remains unapproved pending live Testnet4 and
-controlled THORChain-devnet evidence, independent provenance/review and
-production activation. Non-BTC production custody remains unselected and
-disabled. The canonical cross-repository decision is
-[`memory/BITGO-CUSTODY.md`](../memory/BITGO-CUSTODY.md).
+The retired provider-specific adapter, client, runtime, qualification gate,
+Gate-4 checker, evidence templates and runbooks are removed. Provider-neutral
+RIC, replay, one-shot, exact transaction-binding, Bitcoin output-order and
+containment controls remain. The first key-free `xindex-vultisig-adapter`
+policy slice consumes the custody-node boundary; it is not a signer or custody
+runtime. The canonical cross-repository decision is
+[`memory/VULTISIG-CUSTODY.md`](../memory/VULTISIG-CUSTODY.md).
 
-Gate 4 now has a BitGo-aware closure runbook, a complete 23-drill evidence
-template and the offline `xindex-gate4-check` structural validator. A valid
-self-authored bundle is labeled `format_valid` and exits blocked, never passed.
-These additions make
-the open state auditable; they do not replace the missing live BitGo, Sepolia,
-Bitcoin Testnet4, controlled THORChain devnet, independent-operator and alert/WORM
-evidence.
+No Vultisig dependency is vendored yet. The adapter privately validates a v0
+PSBT and exact ordered Bitcoin inputs/values, version, locktime, final sequence, explicit
+`SIGHASH_ALL` and absolute fees, derives every BIP143 hash, then returns them
+only after RIC/ACC output validation and one-shot consumption. Gate 4 remains
+blocked on the upstream runtime, Testnet4 isolation, final-transaction checks,
+finalized/reorg-aware UTXO-policy provenance, aggregate-signature evidence,
+reshare epochs and failure-domain tests. See
+[`memory/GATE-4-PREFLIGHT.md`](../memory/GATE-4-PREFLIGHT.md).
 
-The BitGo adapter and gate test the exact P2WSH Bitcoin input, request fields,
-fee, signer roles and THORChain VOUT policy; the gate binds its report to the
-exact evidence-file SHA-256. No live BitGo evidence exists. The key-free
-preflight also found and locally fixed the
-pre-deployment THORChain change/memo output-order defect recorded as
-`BTC-ORDER-01`.
-
-The code-addressable Gate-3 findings and BitGo successor are pushed through
-checkpoint `06ad537`; the Chainflip/Maya router and two new ABIs are a later
-intentional uncommitted delta. This is
+The code-addressable Gate-3 findings are published, while the Chainflip/Maya
+router, ABI refresh and custody transition are later local work. This is
 not production approval: real independent
 operator/HSM/source records, alert delivery and WORM-retention drills, testnet
 rehearsal, a pinned clean release commit, and independent audit evidence do not

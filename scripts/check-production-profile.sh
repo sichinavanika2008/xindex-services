@@ -31,7 +31,7 @@ reject_text() {
 # from the independent observation/certification quorum and removed providers.
 for file in README.md AGENTS.md; do
     require_text "$file" \
-        'The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); mainnet remains disabled and unapproved.'
+        'The selected future custody direction is Vultisig Wallet as a Service using DKLS threshold signing; no production vault, share, deployment, or key use is approved.'
     require_text "$file" \
         'Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.'
     require_text "$file" \
@@ -39,6 +39,8 @@ for file in README.md AGENTS.md; do
 done
 require_text docs/runbooks/production-config.md \
     'The custody portions of this runbook describe the historical remote-HSM 3-of-5 baseline and are not the selected BTC custody architecture.'
+require_text docs/runbooks/production-config.md \
+    '../../../memory/VULTISIG-CUSTODY.md'
 
 # The retained historical remote-HSM signer profile must remain fail-closed
 # while it exists in source, even though it is not the selected BTC custody
@@ -176,8 +178,8 @@ require_text crates/chain-eth/src/bin/xindex-attest-redeem.rs \
 require_text crates/chain-eth/src/bin/xindex-observe-redeem.rs \
     'development-only until finalized checkpoints, reorg rollback, and durable event facts replace its in-memory source'
 
-# BitGo is the selected future BTC custody provider. Refuse reintroduction of
-# either removed Turnkey or Cobo crate, executable source or lockfile package.
+# Refuse reintroduction of either removed Turnkey or Cobo crate, executable
+# source or lockfile package.
 if find crates -iname '*turnkey*' -print -quit | rg --quiet '.'; then
     fail 'Turnkey-named source path reintroduced under crates/'
 fi
@@ -199,43 +201,19 @@ for removed in \
     fi
 done
 
-# Gate 4 must use the selected BitGo native BTC 2-of-3 model and strict evidence
-# verifier. The historical 3-of-5 custody rehearsal cannot become an implicit
-# fallback or be cited as current closure evidence.
-require_text docs/runbooks/bitgo-custody-devenv.md \
-    'Selected for future BTC custody; Testnet4 runtime capability-closed and'
-require_text docs/runbooks/bitgo-custody-devenv.md 'production/mainnet disabled.'
-require_text crates/bitgo-client/src/bin/xindex-bitgo-custody.rs \
-    'BitGo production/mainnet is disabled pending completed qualification and review'
-require_text crates/bitgo-client/src/bin/xindex-bitgo-custody.rs \
-    'written BitGo authorization does not enable this capability'
-require_text crates/bitgo-client/src/bin/xindex-bitgo-custody.rs \
-    'final-sign-and-broadcast acknowledgement does not match sequence ID'
-require_text docs/runbooks/gate4-bitgo-rehearsal.md 'Status: BLOCKED / not complete'
-require_text docs/runbooks/gate4-bitgo-rehearsal.md 'xindex-gate4-check'
+# Gate 4 now has a first key-free Vultisig policy slice; the remaining redesign
+# still precedes any vault, share, signature, transaction or network operation.
+# The historical 3-of-5 custody rehearsal cannot become an implicit fallback
+# or be cited as current closure evidence.
 require_text docs/runbooks/ctd1-signet-rehearsal.md 'Historical custody baseline'
-require_text crates/ops/src/bin/xindex-gate4-check.rs \
-    'const REQUIRED_DRILLS: [&str; 23]'
-require_text crates/ops/src/bin/xindex-gate4-check.rs \
-    'environment must equal sepolia+thorchain-devnet+btc-testnet4'
-require_text crates/ops/src/bin/xindex-gate4-check.rs \
-    'overall: "format_valid"'
-require_text crates/ops/src/bin/xindex-gate4-check.rs \
-    'Ok(()) => ExitCode::from(2)'
-require_text crates/bitgo-dev-gate/src/main.rs \
-    'evidence_sha256'
-require_text crates/bitgo-dev-gate/src/main.rs \
-    'validate_adapter_unsigned'
-require_text crates/bitgo-dev-gate/src/main.rs \
-    'lack authenticated provider provenance'
-require_text crates/bitgo-adapter/src/lib.rs \
-    'This crate deliberately contains no HTTP client, access token, private-key'
-require_text crates/bitgo-adapter/src/lib.rs \
-    'pub fn validate_unsigned'
-require_text crates/bitgo-adapter/src/lib.rs \
-    'pub fn validate_user_signed_transaction'
-require_text crates/bitgo-adapter/src/lib.rs \
-    'pub fn validate_final_transaction'
+if [[ -f ../memory/VULTISIG-CUSTODY.md ]]; then
+    require_text ../memory/VULTISIG-CUSTODY.md \
+        'The first key-free Vultisig adapter slice is implemented in'
+fi
+if [[ -f ../memory/GATE-4-PREFLIGHT.md ]]; then
+    require_text ../memory/GATE-4-PREFLIGHT.md \
+        'No Vultisig keygen, vault, share, signature, transaction, broadcast or network'
+fi
 
 # Permissionless posters use node/HSM-managed accounts. These production
 # binaries must not regress to parsing a local signer or accepting a key env.

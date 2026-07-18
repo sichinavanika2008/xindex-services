@@ -6,11 +6,11 @@
 > mean a mis-filled config refuses to boot rather than running with a safety
 > feature silently off.
 
-> **Custody status: historical / disabled.** The custody portions of this runbook describe the historical remote-HSM 3-of-5 baseline and are not the selected BTC custody architecture. The selected-but-disabled BitGo native-P2WSH 2-of-3 model and its external gates are canonical in [`../../../memory/BITGO-CUSTODY.md`](../../../memory/BITGO-CUSTODY.md). Registry, observation, RIC, settlement-certification, and price quorum material below remains a separate non-custody domain.
+> **Custody status: historical / disabled.** The custody portions of this runbook describe the historical remote-HSM 3-of-5 baseline and are not the selected BTC custody architecture. The selected-but-unimplemented Vultisig Wallet-as-a-Service direction and its external gates are canonical in [`../../../memory/VULTISIG-CUSTODY.md`](../../../memory/VULTISIG-CUSTODY.md). Registry, observation, RIC, settlement-certification, and price quorum material below remains a separate non-custody domain.
 
 The historical Gate-3 baseline assumed five signer operators, one signer daemon
 per key role, and one observer per chain. Do not populate or launch its custody
-role as a substitute for the selected BitGo boundary. Non-BTC production
+role as a substitute for the selected Vultisig boundary. Production
 custody remains unselected and disabled.
 
 ## 0. Startup checks (already enforced in code)
@@ -140,8 +140,8 @@ reviewed local target files.
 The price collector additionally requires the approved 7-of-11 roster.
 Registry, settlement observation, RIC, and settlement certification use
 separate 3-of-5 quorums. The retained remote-HSM custody role is also shaped
-3-of-5 in code but is historical and prohibited as a fallback; future BTC
-custody uses the distinct selected BitGo 2-of-3 role set. Validate any real
+3-of-5 in code but is historical and prohibited as a fallback; future custody
+uses a distinct, still-unselected Vultisig participant set. Validate any real
 dual-reviewed operator/source registry with `xindex-topology-check`; see
 [`gate3-operations.md`](gate3-operations.md). A checked-in example roster is
 intentionally absent because placeholders are not production evidence.
@@ -177,12 +177,12 @@ gate green · `cert_caps` + on-chain `CustodyGuard` caps filled · the daemon
 boots past `assert_production_safe()`. Cosmos additionally: `--nosort-pubkeys`
 at the ceremony (the gaiad multisig-address fund-safety fix).
 
-BitGo is the selected future BTC custody provider, using self-custody native
-Bitcoin on-chain 2-of-3 multisig (user, offline backup and BitGo keys) with
-explicit P2WSH addresses. This is not MPC. Turnkey and Cobo code have been
-removed and neither is an alternative or emergency profile. BitGo remains
-disabled. Its key-free request/policy adapter core is present, but live
-Testnet4 qualification, controlled THORChain-devnet rehearsal, durable
-transport/orchestration integration and independent custody review must pass.
-Non-BTC production custody remains disabled pending a separate provider design
+Vultisig Wallet as a Service using DKLS threshold signing is the selected
+future custody direction. Its exact participant set, threshold, hosted versus
+self-hosted boundary and Bitcoin address policy are not selected. The retired
+provider-specific code is removed. A first key-free Bitcoin policy adapter
+exists, but no Vultisig SDK/runtime, vault or share exists; Testnet4 isolation,
+finalized-transaction revalidation, durable orchestration, aggregate evidence,
+reshare/recovery ceremonies and independent custody review must pass.
+Production custody remains disabled pending a reviewed design
 and qualification.

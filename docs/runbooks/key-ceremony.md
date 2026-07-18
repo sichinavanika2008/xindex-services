@@ -20,8 +20,7 @@ in each set, never two in the same set.
 | **B — Ethereum attestation** | secp256k1, EIP-712 signer | `AttestationOracle` `_isSigner` set, threshold 3 | Forges a k-of-n attestation |
 
 Both are **3-of-5**. The 5 signer organisations are the same five
-parties for both sets (a mix of institutional custodians — e.g.
-Anchorage / BitGo / Coinbase Custody — and internal YubiHSM2 operators),
+parties for both sets (a mix of institutional custodians and internal YubiHSM2 operators),
 but each party generates and holds an independent key per set.
 
 ## Invariants the ceremony must guarantee

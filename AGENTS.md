@@ -14,10 +14,10 @@ only; they are not required to understand or work on this repository.
 
 1. Current Rust source, tests, and Git history.
 2. The recent sections of this repository's KNOWN_FINDINGS.md.
-3. docs/runbooks/bitgo-custody-devenv.md for the selected future BTC custody
-   model and its fail-closed qualification gates.
-4. docs/runbooks/gate4-bitgo-rehearsal.md for the current testnet/failure-drill
-   closure gate and evidence format.
+3. ../memory/VULTISIG-CUSTODY.md for the selected Wallet-as-a-Service custody
+   direction and its fail-closed qualification gates.
+4. ../memory/GATE-4-PREFLIGHT.md for the current key-free redesign and later
+   testnet/failure-drill boundary.
 5. ../AGENTS.md and this file.
 6. Older README milestone tables and historical plans.
 
@@ -27,66 +27,45 @@ the relevant runbook.
 
 ## Security-critical current state
 
-The selected future BTC custody model is BitGo native P2WSH 2-of-3 (user, independently held offline backup, and BitGo); mainnet remains disabled and unapproved.
+The selected future custody direction is Vultisig Wallet as a Service using DKLS threshold signing; no production vault, share, deployment, or key use is approved.
 Observation, RIC, and settlement certification remain a separate 3-of-5 quorum; 3-of-5 is not BTC custody.
 Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal custody providers.
 
-- This native-P2WSH model is not MPC. The canonical cross-repository decision
-  is [`memory/BITGO-CUSTODY.md`](../memory/BITGO-CUSTODY.md).
-- The BitGo capture validator is offline-only and cannot authenticate
-  caller-supplied provider provenance. It must remain blocked until a reviewed,
-  independently pinned evidence envelope is implemented. Do not create an account,
-  wallet or key, use credentials, configure real custody addresses, fund,
-  sign, approve or broadcast without explicit user authorization.
-- `xindex-bitgo-adapter` is the shared key-free request/policy core. Keep it
-  free of HTTP tokens, private-key inputs, signing, approvals and broadcast;
-  preserve exact build fields, native P2WSH, non-RBF, absolute fee, ordered
-  outputs and cryptographic user/BitGo role checks.
-- `xindex-bitgo-client` owns the fixed official origins, explicit Auth V2/V3
-  HMAC requests, hashed bearer transport, HMAC/freshness-verified response
-  envelopes and durable SQLite workflow. Request JSON must be serialized once
-  and those exact bytes authenticated and sent. Keep
-  private-key and approval-mutation inputs out of this crate. The irreversible
-  `tx/send` call must remain private to `BitGoCoordinator`, after an atomic
-  send reservation; retries reconcile by `sequenceId` and never blindly send
-  again. Before build completion, retain the exact wallet response and one
-  immutable canonical hot/on-chain 2-of-3 wallet snapshot. A pending approval
-  must never release the reservation: reconciliation may use only read-only
-  approval/transfer GETs, never an approval mutation; rejection is terminal,
-  and any approved/rebuilt final transaction must pass the original exact
-  policy and user/BitGo role-signature checks.
-- Preserve the coordinator's
-  `build -> intent_authorized -> user_signed` transition. The middle phase
-  exists only after the exact retained PSBT passes the provider-neutral
-  RIC/output bind and consumes the durable
-  `(BTC, redemptionId, legIndex)` one-shot. Never expose public receipt
-  injection, accept a user signature directly from `built`, or remove the
-  authorization-expiry check.
-- Its schema-v2 canonical evidence manifest is unsigned and tamper-detecting
-  only. A response HMAC is symmetric under the token and is not independent
-  provider provenance. Do not call the bundle authenticated until reviewer
-  trust anchors, signature verification and independent raw-chain/provider
-  corroboration are selected, pinned and independently reviewed.
-- `xindex-bitgo-custody` is the only runtime activation of the new coordinator.
-  Preserve its Testnet4-only/mainnet-refusal gate, owner-only single-link file
-  checks, durable databases, capability-empty default, authorization ID/time
-  window/satoshi cap checks and exact sequence acknowledgement before submit.
-  Never add a private-key input or silently repoint historical `xindex-redeem`.
-- No live BitGo account, wallet, key or transaction evidence exists. BitGo is
-  selected with a disabled-by-default Testnet4 runtime, not production-approved.
+- The canonical cross-repository decision is
+  [`memory/VULTISIG-CUSTODY.md`](../memory/VULTISIG-CUSTODY.md).
+- The retired provider-specific crates, runtime, qualification gate, Gate-4
+  checker, evidence templates and runbooks are removed. Do not restore or
+  silently repoint historical `xindex-redeem` behavior.
+- No Vultisig SDK, Verifier, Recipes or DKLS package is vendored yet. Pin exact
+  source, dependency, binary and licence identities before adding one.
+- `xindex-vultisig-adapter` is the key-free Bitcoin policy core. Preserve its
+  public boundary: signing hashes are returned only after
+  `authorize_vultisig_btc_spend` crosses custody-node and consumes the RIC/ACC
+  one-shot. Do not expose its pure validator/hash derivation or add transport,
+  signing or broadcast behavior without an explicit reviewed design.
+- `BitcoinSpendPolicy` is trusted policy input, not proof of observation. A
+  future runtime must construct it from Xindex's finalized, reorg-aware custody
+  UTXO inventory and bind the observation/policy identity into evidence. Never
+  deserialize permitted outpoints or values from the signing request.
+- A Vultisig signer must derive hashes from the complete decoded transaction,
+  apply the installed Xindex policy and consume the RIC/custody one-shot before
+  releasing a threshold share. Never expose arbitrary blind-hash signing.
+- Bitcoin policy must bind exact inputs/values, sequence/RBF, mandatory
+  `SIGHASH_ALL`, absolute fee, ordered outputs, canonical memo, change and final
+  transaction. The reviewed upstream output policy does not yet cover all of
+  these fields.
+- Threshold ECDSA exposes an aggregate signature, not participant roles in the
+  Bitcoin witness. Evidence must bind participant set, threshold, policy,
+  session and reshare epoch without pretending those roles are on-chain.
+- Do not create a vault, share, credential, custody address, fund, sign, reshare,
+  recover or broadcast without explicit user authorization.
 - THORChain BTC output order is fund-critical: VOUT0 Asgard, optional VOUT1
   change to VIN0, final VOUT memo. Preserve `BTC-ORDER-01` regressions and gate
   every provider-returned unsigned transaction before signing.
-- Before mainnet funds, prove the exact BitGo user/backup/provider key topology,
-  explicit P2WSH and PSBT policy, BTC Testnet4 plus controlled THORChain-devnet
-  execution, recovery and tamper rejection; then complete the custody re-audit,
-  operational rehearsals and ceremonies. Non-BTC custody remains disabled.
-- Gate 4 is not complete. The current BitGo-aware 23-drill
-  `xindex-gate4-check` validates shape and local hashes only, reports
-  `format_valid`, and exits blocked. Closure requires authenticated
-  provider/reviewer provenance, commit resolution, independent review and
-  explicit user acceptance. The older 3-of-5 custody rehearsal is historical
-  and cannot substitute.
+- Gate 4 is not complete. Its replacement begins with key-free Vultisig policy,
+  aggregate-evidence and failure-domain tests; later key use and test-network
+  rehearsal require separate authorization. The older 3-of-5 custody rehearsal
+  is historical and cannot substitute.
 - EVM-family THORChain router addresses in the chain registry are deliberately
   zero-address placeholders. They are not deployment configuration.
 
@@ -94,8 +73,9 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
 
 - custody-node contains the provider-neutral approval decision core. Preserve
   reconstructed-payload binding, fee caps, replay protection, one-shot
-  consumption, and fail-closed behavior. bitgo-dev-gate qualifies the selected
-  BTC transaction boundary without creating, signing or broadcasting.
+  consumption, and fail-closed behavior. The policy adapter consumes this
+  boundary; a future Vultisig runtime must preserve it and add final-transaction
+  revalidation rather than replace it.
 - executor contains chain-family redemption construction. Native custody
   spends must remain bound to independently verified intent evidence.
 - signer-daemon, observer, relayer, and shared contain the EIP-712 and
