@@ -10,14 +10,17 @@ verdict and reasoning. No silent suppressions.
 > for present work. Turnkey and Cobo references below describe removed
 > historical code.
 
-## Vultisig custody transition (2026-07-18)
+## Vultisig custody transition (2026-07-18; evidence update 2026-07-19)
 
 Vultisig Wallet as a Service using DKLS threshold signing is the selected
 future custody direction. The retired provider-specific crates, runtime,
 qualification gate, Gate-4 checker, evidence templates and runbooks are removed.
 The provider-neutral RIC, one-shot, replay, exact transaction-binding and
-containment controls remain. No Vultisig dependency, vault, share, signature or
-transaction has been introduced.
+containment controls remain. No Vultisig dependency, vault, share,
+runtime-produced signature or live signing action has been introduced;
+finalization tests use fixed signature bytes copied from an upstream secp256k1
+debug/round-trip fixture and locally verify the assembled message/key tuple;
+they do not generate a key or signature.
 
 The local `xindex-vultisig-adapter` package is a key-free policy library, not a
 Vultisig runtime. It privately derives BIP143 hashes only after validating a v0
@@ -25,20 +28,106 @@ PSBT and exact ordered inputs/values, transaction version, locktime, final
 sequence, explicit
 `SIGHASH_ALL`, witness UTXOs and fee bounds. Its public path crosses the
 custody-node RIC/ACC output binder and consumes the one-shot before exposing the
-hashes. Eleven deterministic mutation tests pass without a private key.
+hashes. The immutable approval subsequently binds the exact finalized non-witness
+body, strict P2WPKH witnesses, mandatory `SIGHASH_ALL`, aggregate public key and
+every ECDSA signature to those independently derived hashes. Its only public
+policy constructor requires the exact Testnet4 chain hash and carries that
+identity into approval/finalization. It now accepts only an opaque
+`FinalizedBitcoinPolicyInputs` capability issued by the SQLite-backed
+`xindex-chain-utxo::finalized_inventory`; caller-supplied raw outpoints, values,
+scripts and provenance fields cannot cross the public constructor. The journal
+enforces exact Testnet4/custody configuration and the six-block protocol floor,
+records sequential block and UTXO creation/spend facts transactionally, advances
+an observation epoch on rollback, and rejects stale capabilities after reorg or
+spend. A persistent random journal ID is part of the provenance commitment, so
+a separately initialized database with otherwise identical facts cannot
+revalidate the issuing journal's capability through the API. Authorization and
+final handoff both recheck currentness.
 
-Residual boundary: `BitcoinSpendPolicy` cannot authenticate the provenance of
-its permitted UTXOs. A future runtime must construct it from finalized,
-reorg-aware Xindex custody observations, persist the source block and policy
-identity, and refuse caller- or Vultisig-supplied outpoints/values. The current
-library is not evidence that this observation path exists.
+The final receipt can now be consumed into a non-cloneable
+`VultisigBitcoinEvidence` handoff. Its domain-separated serialized record binds
+chain, txid/wtxid/exact bytes, aggregate public key, policy/provenance, custody
+certificate subject/digest/expiry and Set-B authorization signers, a referenced
+upstream release-manifest digest, vault ID, canonical distinct configured DKLS
+participant set, threshold, session and reshare epoch. The schema deliberately
+calls these configured participants rather than claiming signer-role visibility
+in the aggregate Bitcoin witness. A supplied manifest digest does not itself
+prove the referenced release was approved.
+
+`xindex-executor` now has a deliberately pre-broadcast, key-free preparation
+boundary. `prepare_vultisig_bitcoin_broadcast` consumes only the evidence
+capability, repeats exact Testnet4/canonical-byte/txid/wtxid checks, requires an
+abstract write-ahead sink, and returns a non-cloneable prepared capability that
+exposes identities but no transaction bytes. It performs no network action and
+is not wired into a binary. An independent review rejected the first generic
+`UtxoChainClient` broadcaster design: evidence-side Testnet4 identity did not
+authenticate the destination endpoint, the parsed-transaction interface could
+not prove exact witness-byte submission, and no durable restart/ambiguity state
+machine made the path mandatory. Those unsafe claims and the broadcast call
+were removed rather than accepted as defense in name only.
+
+Thirty deterministic adapter tests, including nine finalization
+regressions, high-S and uncompressed-key rejection, a VIN1-specific cross-input
+hash-selection check, provenance-currentness boundaries and five aggregate-
+evidence regressions, pass without a private key or signing operation. Twelve
+focused finalized-inventory tests cover
+commit/rollback/replacement, restart-stable provenance, configuration and schema
+constraints, spend/reorg invalidation, fail-closed database errors and matching-
+journal substitution. The finalization fixture starts from crate-private policy
+validation, not a successful public RIC/one-shot authorization, so it does not
+yet prove that public success path end to end.
+
+The key-free `trusted_observer` follow-on closes the raw writer/source boundary.
+It is the only non-test owner of the crate-private SQLite writer, yields the
+read-only source used by `VultisigBitcoinPolicyRuntime`, requires at least two
+exact HTTPS DNS-host origins, authenticates exact Testnet4 genesis before
+storage open, durably pins the source-set commitment, and derives block/UTXO
+facts only from canonical raw bytes returned identically by every source. It
+checks block hash, bounded Testnet4 PoW target, Merkle/witness commitments,
+weight, BIP34 height and sequential parent linkage. Equal source tips are
+required before sync and resampled after each at-most-64-block batch; only a
+checkpoint caught up to the second sample receives a two-minute freshness
+lease. Coinbase outputs are excluded rather than exposed after six confirmations.
+Owner-only canonical SQLite paths reject symlinks, hard links, permissive parent
+directories and unexpected sidecars. Twelve deterministic observer regressions
+cover these boundaries, source drift/genesis rejection, tip disagreement and a
+tip advance during sync.
+
+Residual boundary: this is authenticated configured-source observation, not an
+independent Bitcoin consensus implementation or deployed production observer.
+No binary pins the approved URLs, supplies operator/certificate identities,
+drives the sync loop, monitors lease failures, or hands the final receipt to a
+broadcaster. Distinct DNS hosts do not prove independent operators. The local
+checks do not validate scripts, every transaction/consensus rule, header
+difficulty transitions or chainwork, so all configured sources remain trusted
+for those facts. Owner-only storage does not stop same-UID direct SQLite edits
+or copied-database substitution. Coin selection/reservation, runtime evidence production, a concrete durable
+and idempotent evidence sink, authenticated exact-byte Testnet4 transport,
+pending/accepted restart reconciliation and mandatory broadcast handoff remain
+open. The abstract preparation helper does not close those production gaps. The
+runtime must continue refusing raw caller- or Vultisig-supplied values and must
+not treat this library as full-node proof.
+
+The final key-free Rust 1.95.0 gate passes format, 8/8 compiled production-
+profile behaviors and supplemental lints, all ten current-parent ABI checks,
+locked/offline strict whole-workspace all-target/all-feature Clippy, all-feature
+test compilation, and cargo-deny with configured warnings. Focused execution is
+55/55 chain-utxo tests, 30/30 adapter tests and nine compile-fail doctests. The
+unchanged production-profile wrapper passes directly.
 
 The reviewed upstream Verifier independently derives signing hashes and applies
 Recipes policies before threshold signing. Its current Bitcoin evaluator does
 not yet enforce Xindex's complete exact-input, sequence/RBF, `SIGHASH_ALL`,
 absolute-fee and Testnet4 policy. The local adapter closes the first four gaps
-around the retained output binder. Upstream/runtime integration, Testnet4
-isolation, finalized-transaction revalidation, aggregate evidence and
+around the retained output binder, requires the exact Testnet4 chain identity
+and provides finalized-transaction revalidation intended for a future mandatory
+broadcast boundary. The executor library can consume the evidence into an
+abstract write-ahead preparation capability, but no runtime produces it, no
+concrete durable sink persists it, and no broadcaster consumes the prepared
+capability. A future runtime/broadcaster must make that path mandatory and add a
+genesis-authenticated exact-byte Testnet4 target plus durable ambiguity/restart
+reconciliation. Upstream/runtime integration and an approved release manifest,
+deployed approved-source ownership, independent operator/full-node evidence and
 independent review remain required. Mainnet activation and every live
 qualification step remain unimplemented and unapproved.
 

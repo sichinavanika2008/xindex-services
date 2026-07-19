@@ -5638,12 +5638,15 @@ dependencies = [
  "bech32",
  "bitcoin",
  "bitcoincash-addr",
+ "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "wiremock",
+ "xindex-ops",
  "xindex-shared",
 ]
 
@@ -5743,6 +5746,7 @@ dependencies = [
  "xindex-shared",
  "xindex-solana-tx",
  "xindex-tron-tx",
+ "xindex-vultisig-adapter",
  "xindex-xrp-tx",
 ]
 
@@ -5961,7 +5965,10 @@ version = "0.0.1"
 dependencies = [
  "alloy-primitives",
  "bitcoin",
+ "serde",
+ "serde_json",
  "tokio",
+ "xindex-chain-utxo",
  "xindex-custody-core",
  "xindex-custody-node",
  "xindex-shared",

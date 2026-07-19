@@ -14,6 +14,7 @@ xindex-shared.workspace = true
 xindex-chain-eth.workspace = true
 xindex-chain-evm.workspace = true
 xindex-chain-utxo.workspace = true
+xindex-vultisig-adapter.workspace = true
 xindex-chain-thor.workspace = true
 xindex-multisig.workspace = true
 xindex-safe-evm.workspace = true

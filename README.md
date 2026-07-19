@@ -54,19 +54,76 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
 The retired provider-specific adapter, client, runtime, qualification gate,
 Gate-4 checker, evidence templates and runbooks are removed. Provider-neutral
 RIC, replay, one-shot, exact transaction-binding, Bitcoin output-order and
-containment controls remain. The first key-free `xindex-vultisig-adapter`
-policy slice consumes the custody-node boundary; it is not a signer or custody
-runtime. The canonical cross-repository decision is
+containment controls remain. The key-free `xindex-vultisig-adapter` policy,
+finalization and aggregate-evidence slices consume the custody-node boundary;
+they are not a signer or custody runtime. The canonical cross-repository decision is
 [`memory/VULTISIG-CUSTODY.md`](../memory/VULTISIG-CUSTODY.md).
 
 No Vultisig dependency is vendored yet. The adapter privately validates a v0
-PSBT and exact ordered Bitcoin inputs/values, version, locktime, final sequence, explicit
-`SIGHASH_ALL` and absolute fees, derives every BIP143 hash, then returns them
-only after RIC/ACC output validation and one-shot consumption. Gate 4 remains
-blocked on the upstream runtime, Testnet4 isolation, final-transaction checks,
-finalized/reorg-aware UTXO-policy provenance, aggregate-signature evidence,
-reshare epochs and failure-domain tests. See
+PSBT and exact ordered Bitcoin inputs/values, version, locktime, final sequence,
+explicit `SIGHASH_ALL` and absolute fees, derives every BIP143 hash, then returns
+them only after RIC/ACC output validation and one-shot consumption. The immutable
+approval then revalidates the exact finalized body, strict two-item P2WPKH
+witnesses, mandatory `SIGHASH_ALL`, canonical 33-byte compressed aggregate
+public key and each ECDSA signature.
+
+The finalized receipt can now be consumed into a non-cloneable
+`VultisigBitcoinEvidence` handoff. Its domain-separated serialized record binds
+the exact transaction, aggregate key, policy/provenance, custody certificate,
+referenced upstream release-manifest digest, vault, canonical distinct
+configured DKLS participant set, threshold, session and reshare epoch. It does
+not claim configured participant roles are visible in the Bitcoin witness.
+
+`xindex-executor::prepare_vultisig_bitcoin_broadcast` is an optional key-free
+preparation boundary: it consumes only that evidence, repeats the exact
+Testnet4/canonical-byte/txid/wtxid checks, requires an abstract write-ahead sink,
+and returns a non-cloneable prepared capability without exposing transaction
+bytes. It intentionally performs no broadcast and is not runtime wiring. The
+initial generic-chain-client broadcaster was rejected during review because it
+did not authenticate the destination as Testnet4 or guarantee exact witness-byte
+submission.
+
+The adapter's only public policy constructor now consumes an opaque capability
+issued by `xindex-chain-utxo::finalized_inventory`, not caller-supplied UTXO
+fields. That SQLite journal is Testnet4-only, enforces the protocol six-block
+finality floor and exact custody script, records sequential block and
+creation/spend facts transactionally, invalidates capabilities across rollback
+epochs or spends, and commits a durable random journal ID so an independently
+created matching database cannot substitute for the issuer through the normal
+API. Authorization rechecks the capability immediately before custody and final
+handoff rechecks it after validating the exact bytes.
+
+The new `xindex-chain-utxo::trusted_observer` is the sole non-test journal
+writer. It accepts at least two exact HTTPS DNS-host sources, authenticates the
+Testnet4 genesis bytes before opening its owner-only/non-symlink SQLite file,
+durably pins the source-set commitment, requires equal source tips, corroborates
+canonical raw block bytes and local PoW/commitments, and resamples tips before
+granting a two-minute policy-freshness lease. A source-pinned
+`VultisigBitcoinPolicyRuntime` carries its read-only policy source through
+issuance, authorization and final handoff. Coinbase outputs are deliberately
+excluded until their 100-block maturity is modeled.
+
+These remain library primitives: no workspace binary pins an approved endpoint
+set, drives or monitors the observer, produces the evidence, supplies a concrete
+durable/idempotent evidence sink, or consumes the prepared capability in a
+broadcaster. Configured HTTPS sources are still trusted for canonical-chain
+selection, transaction validity and difficulty transitions; distinct hostnames
+do not prove independent operators. Owner-only storage does not prevent same-UID
+direct edits or copied-database substitution. A future broadcaster must make
+the prepared path unskippable, own a genesis-authenticated exact-byte Testnet4
+target, and reconcile explicit pending/accepted state across ambiguous outcomes
+and restarts. Gate 4 remains blocked on that runtime/deployment wiring,
+full-node or independently reviewed source topology, upstream integration and
+approved release manifest, runtime evidence production/persistence, real
+participant/reshare topology and failure-domain tests. See
 [`memory/GATE-4-PREFLIGHT.md`](../memory/GATE-4-PREFLIGHT.md).
+
+The key-free Rust 1.95.0 gate passes format, 8/8 compiled production-profile
+behaviors and supplemental lints, all ten ABI manifest/current-parent checks,
+locked/offline strict whole-workspace all-target/all-feature Clippy, all-feature
+test compilation and cargo-deny with configured warnings. Focused execution is
+55/55 chain-utxo tests, 30/30 adapter tests and nine compile-fail doctests. The
+unchanged production-profile wrapper passes directly.
 
 The code-addressable Gate-3 findings are published, while the Chainflip/Maya
 router, ABI refresh and custody transition are later local work. This is

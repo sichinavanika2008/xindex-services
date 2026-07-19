@@ -26,6 +26,7 @@ pub mod ric_collector;
 pub mod solana_redeem;
 pub mod solana_redeem_store;
 pub mod tron_redeem;
+pub mod vultisig_broadcast;
 pub mod xrp_redeem;
 
 pub use broadcast_registry::{
@@ -50,4 +51,9 @@ pub use solana_redeem_store::{
 pub use tron_redeem::{
     member_evm_address, SignTronFuture, TronCosigner, TronRedeemConfig, TronRedeemError,
     TronRedeemExecutor, TronRedeemLegOutcome, TronRedeemTask,
+};
+pub use vultisig_broadcast::{
+    prepare_vultisig_bitcoin_broadcast, PreparedVultisigBitcoinBroadcast,
+    VultisigBroadcastPreparationError, VultisigBroadcastPreparationFailure,
+    VultisigEvidenceWriteAheadSink,
 };

@@ -39,33 +39,93 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
 - No Vultisig SDK, Verifier, Recipes or DKLS package is vendored yet. Pin exact
   source, dependency, binary and licence identities before adding one.
 - `xindex-vultisig-adapter` is the key-free Bitcoin policy core. Preserve its
-  public boundary: signing hashes are returned only after
-  `authorize_vultisig_btc_spend` crosses custody-node and consumes the RIC/ACC
-  one-shot. Do not expose its pure validator/hash derivation or add transport,
-  signing or broadcast behavior without an explicit reviewed design.
-- `BitcoinSpendPolicy` is trusted policy input, not proof of observation. A
-  future runtime must construct it from Xindex's finalized, reorg-aware custody
-  UTXO inventory and bind the observation/policy identity into evidence. Never
-  deserialize permitted outpoints or values from the signing request.
+  public boundary: signing hashes are returned only after the source-pinned
+  `VultisigBitcoinPolicyRuntime::authorize` path crosses custody-node and
+  consumes the RIC/ACC one-shot. Its immutable approval provides exact
+  finalized-transaction, P2WPKH-witness, canonical 33-byte compressed
+  aggregate-public-key and ECDSA revalidation. The non-cloneable
+  `VultisigBitcoinEvidence` capability can only be created by consuming
+  `FinalizedBitcoinSpend`; it binds the reviewed-release manifest digest,
+  configured participant topology, threshold, session, reshare epoch,
+  policy/provenance, custody certificate, aggregate key and exact transaction.
+  `xindex-executor::prepare_vultisig_bitcoin_broadcast` is now an optional,
+  key-free write-ahead preparation boundary: it consumes that evidence,
+  rechecks exact Testnet4/canonical bytes/txid/wtxid, requires an abstract
+  fail-closed persistence sink, and returns a non-cloneable prepared capability
+  with no byte extraction. It deliberately performs no broadcast. No concrete
+  durable sink, runtime, target-bound Testnet4 transport or broadcaster consumes
+  the prepared capability, so the mandatory handoff remains open. The first
+  attempted generic-client broadcaster was rejected in review because checking
+  the evidence chain hash does not authenticate the destination endpoint and a
+  parsed-transaction API cannot prove exact-witness-byte submission. A future
+  broadcaster must consume the prepared capability, own an authenticated
+  genesis-pinned Testnet4 exact-byte transport, persist/reconcile explicit
+  pending/accepted state across restart and ambiguity, and check chain hash,
+  txid and wtxid. Do not expose the pure validator/hash derivation or add
+  transport, signing or broadcast behavior without an explicit reviewed design.
+- `xindex-chain-utxo::{trusted_observer,finalized_inventory}` form the key-free
+  observation/provenance boundary. The observer is the only non-test owner of
+  journal mutation authority. It requires at least two exact HTTPS DNS-host
+  sources, authenticates Testnet4 genesis before opening storage, pins their
+  ordered URL/ID commitment durably, requires equal tip heights before sync,
+  corroborates canonical raw block bytes from every source, and resamples equal
+  tips before granting a two-minute policy lease. The journal records sequential
+  checkpoints and exact non-coinbase custody UTXO creation/spend facts, rolls
+  reorgs back atomically while advancing an epoch, and issues opaque capabilities
+  only for exact six-confirmation-or-deeper unspent P2WPKH inputs. A durable
+  random journal ID prevents a separately created matching database from
+  substituting for the issuing journal through the API.
+- `BitcoinSpendPolicy::new_testnet4` accepts only that opaque capability; raw
+  outpoints, values, scripts and provenance fields have no public constructor or
+  deserialization path. Authorization and finalized-transaction handoff both
+  recheck the capability against current journal state. Preserve those checks
+  immediately before custody one-shot consumption and after finalized-byte
+  validation.
+- The raw SQLite writer/source constructors are crate-private; only the observer
+  yields a read-only source, and the Vultisig policy runtime pins that source for
+  issuance, authorization, and final handoff. Preserve this authority boundary.
+  The `test-utils` journal harness is feature-gated and must never be used by a
+  deployed runtime.
+- This is an authenticated configured-source library, not an independent full
+  node or deployed production observer. HTTPS hostnames are not pinned operator
+  identities, distinct hosts do not prove independent operators, and local
+  checks do not validate Bitcoin scripts, all consensus rules, or difficulty
+  transitions. No binary pins an approved endpoint set, runs the sync/freshness
+  loop, or monitors it. Owner-only non-symlink SQLite handling does not protect
+  against same-UID direct edits or copied database snapshots. Preserve these
+  residuals, require equal source tips, keep coinbase outputs excluded until
+  100-block maturity is modeled, and make the validated final receipt mandatory
+  at a future broadcaster. Never deserialize permitted outpoints or values from
+  a signing request or describe the current library as production chain proof.
+- Preserve `BitcoinSpendPolicy::new_testnet4` as the only public policy
+  constructor. It must reject every chain hash except Testnet4 and carry that
+  identity through approval/finalization. The observer must continue deriving
+  it from exact endpoint-returned genesis bytes; `tb` address encoding alone is
+  not network evidence.
 - A Vultisig signer must derive hashes from the complete decoded transaction,
   apply the installed Xindex policy and consume the RIC/custody one-shot before
   releasing a threshold share. Never expose arbitrary blind-hash signing.
 - Bitcoin policy must bind exact inputs/values, sequence/RBF, mandatory
   `SIGHASH_ALL`, absolute fee, ordered outputs, canonical memo, change and final
-  transaction. The reviewed upstream output policy does not yet cover all of
-  these fields.
+  transaction. Preserve the local pre-signing and final-transaction checks; the
+  reviewed upstream output policy does not yet cover all of these fields.
 - Threshold ECDSA exposes an aggregate signature, not participant roles in the
   Bitcoin witness. Evidence must bind participant set, threshold, policy,
-  session and reshare epoch without pretending those roles are on-chain.
+  session and reshare epoch without pretending those roles are on-chain. The
+  local evidence schema enforces that distinction, but no upstream runtime
+  populates or persists it yet.
 - Do not create a vault, share, credential, custody address, fund, sign, reshare,
   recover or broadcast without explicit user authorization.
 - THORChain BTC output order is fund-critical: VOUT0 Asgard, optional VOUT1
   change to VIN0, final VOUT memo. Preserve `BTC-ORDER-01` regressions and gate
   every provider-returned unsigned transaction before signing.
-- Gate 4 is not complete. Its replacement begins with key-free Vultisig policy,
-  aggregate-evidence and failure-domain tests; later key use and test-network
-  rehearsal require separate authorization. The older 3-of-5 custody rehearsal
-  is historical and cannot substitute.
+- Gate 4 is not complete. The key-free policy, local aggregate-evidence schema,
+  and abstract executor write-ahead preparation boundary exist; a concrete
+  durable/idempotent sink, authenticated exact-byte Testnet4 broadcaster,
+  restart/ambiguity reconciliation, upstream runtime population,
+  failure-domain tests and independent review remain. Later key use and
+  test-network rehearsal require separate authorization. The older 3-of-5
+  custody rehearsal is historical and cannot substitute.
 - EVM-family THORChain router addresses in the chain registry are deliberately
   zero-address placeholders. They are not deployment configuration.
 
@@ -74,8 +134,8 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
 - custody-node contains the provider-neutral approval decision core. Preserve
   reconstructed-payload binding, fee caps, replay protection, one-shot
   consumption, and fail-closed behavior. The policy adapter consumes this
-  boundary; a future Vultisig runtime must preserve it and add final-transaction
-  revalidation rather than replace it.
+  boundary; a future Vultisig runtime must preserve it and call the adapter's
+  final-transaction revalidation before broadcast rather than replace it.
 - executor contains chain-family redemption construction. Native custody
   spends must remain bound to independently verified intent evidence.
 - signer-daemon, observer, relayer, and shared contain the EIP-712 and

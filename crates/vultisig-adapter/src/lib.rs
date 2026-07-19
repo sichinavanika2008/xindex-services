@@ -5,22 +5,70 @@
 //! Bitcoin PSBT fields that Xindex must bind before a DKLS participant may
 //! release a signing share, derives every per-input `SIGHASH_ALL` digest from
 //! that PSBT, and then composes with custody-node's existing RIC/ACC one-shot
-//! authorization.
+//! authorization. The resulting immutable approval provides a primitive that
+//! revalidates the exact finalized transaction body, witness shape, aggregate
+//! public key and every ECDSA signature. The final receipt can then be consumed
+//! into a non-cloneable aggregate-evidence handoff. The executor library offers
+//! an optional key-free write-ahead preparation step for that handoff, but no
+//! runtime, concrete durable sink, target-bound transport, or broadcaster is
+//! wired yet.
+
+mod evidence;
+
+pub use evidence::{
+    VultisigBitcoinEvidence, VultisigBitcoinEvidenceRecord, VultisigParticipantIdentity,
+    VultisigSessionContext,
+};
 
 use std::fmt;
 
 use bitcoin::absolute::LockTime;
-use bitcoin::hashes::Hash as _;
+use bitcoin::blockdata::constants::ChainHash;
+use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::hashes::{sha256, Hash as _};
 use bitcoin::psbt::{Input as PsbtInput, Psbt, PsbtSighashType};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut};
+use xindex_chain_utxo::finalized_inventory::{
+    FinalizedBitcoinPolicyInputs, FinalizedBitcoinPolicySource, InventoryError,
+};
+use xindex_chain_utxo::trusted_observer::Testnet4FinalizedInventoryObserver;
 use xindex_custody_core::btc_authorize::BtcSpendAuthorization;
 use xindex_custody_core::gates::{CustodyConfig, GateRejection};
 use xindex_custody_core::prepare::BindContext;
 use xindex_custody_core::replay::ReplayStore;
 use xindex_custody_node::btc::authorize_certified_btc_spend;
 use xindex_shared::chain_registry::ChainId;
+
+const POLICY_ID_DOMAIN: &[u8] = b"XINDEX/VULTISIG/BTC-SPEND-POLICY/V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BitcoinPolicyProvenance {
+    finalized: Option<Box<FinalizedBitcoinPolicyInputs>>,
+}
+
+impl BitcoinPolicyProvenance {
+    fn from_finalized(capability: FinalizedBitcoinPolicyInputs) -> Self {
+        Self {
+            finalized: Some(Box::new(capability)),
+        }
+    }
+
+    #[cfg(test)]
+    const fn fixture() -> Self {
+        Self { finalized: None }
+    }
+
+    fn finalized(&self) -> Result<&FinalizedBitcoinPolicyInputs, PolicyError> {
+        self.finalized.as_deref().ok_or_else(|| {
+            PolicyError::new(
+                "vultisig_provenance",
+                "test-only Bitcoin spend policy has no finalized inventory provenance",
+            )
+        })
+    }
+}
 
 /// One independently observed Bitcoin UTXO that the policy permits spending.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +82,7 @@ impl BitcoinInputPolicy {
     ///
     /// # Errors
     /// Returns a fail-closed policy error when `value_sats` is zero.
-    pub fn new(outpoint: OutPoint, value_sats: u64) -> Result<Self, PolicyError> {
+    fn new(outpoint: OutPoint, value_sats: u64) -> Result<Self, PolicyError> {
         if value_sats == 0 {
             return Err(PolicyError::new(
                 "vultisig_policy_input",
@@ -61,24 +109,84 @@ impl BitcoinInputPolicy {
 }
 
 /// Exact Xindex policy for one aggregate-key P2WPKH Bitcoin spend.
+///
+/// The former raw policy-construction shape is deliberately unreachable from
+/// external crates:
+///
+/// ```compile_fail
+/// use bitcoin::blockdata::constants::ChainHash;
+/// use bitcoin::ScriptBuf;
+/// use xindex_vultisig_adapter::{BitcoinInputPolicy, BitcoinSpendPolicy};
+///
+/// let _ = BitcoinSpendPolicy::new_testnet4(
+///     ChainHash::TESTNET4,
+///     Vec::<BitcoinInputPolicy>::new(),
+///     ScriptBuf::new(),
+///     1,
+/// );
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitcoinSpendPolicy {
+    chain_hash: ChainHash,
     inputs: Vec<BitcoinInputPolicy>,
     custody_script_pubkey: ScriptBuf,
     max_fee_sats: u64,
+    provenance: BitcoinPolicyProvenance,
+    provenance_id: [u8; 32],
+    policy_id: [u8; 32],
 }
 
 impl BitcoinSpendPolicy {
-    /// Construct a policy over the complete ordered input set.
+    /// Construct a Testnet4-only rehearsal policy from an opaque finalized,
+    /// reorg-aware custody-inventory capability.
+    ///
+    /// Raw outpoints, values, scripts, and chain identity cannot be supplied to
+    /// this public constructor. They are copied from `finalized_inputs`, whose
+    /// fields have no public constructor or deserialization path.
     ///
     /// # Errors
-    /// Returns a fail-closed policy error for an empty or duplicate input set,
-    /// a non-P2WPKH custody script, or a zero fee ceiling.
-    pub fn new(
+    /// Returns a fail-closed policy error for a non-Testnet4 capability, an
+    /// empty or duplicate input set, a non-P2WPKH custody script, or an invalid
+    /// fee ceiling.
+    pub fn new_testnet4(
+        finalized_inputs: FinalizedBitcoinPolicyInputs,
+        max_fee_sats: u64,
+    ) -> Result<Self, PolicyError> {
+        let observed_chain_hash = finalized_inputs.chain_hash();
+        let custody_script_pubkey = finalized_inputs.custody_script_pubkey().clone();
+        let inputs = finalized_inputs
+            .inputs()
+            .iter()
+            .map(|input| BitcoinInputPolicy::new(input.outpoint(), input.value_sats()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let provenance_id = finalized_inputs.provenance_id();
+        Self::build(
+            observed_chain_hash,
+            inputs,
+            custody_script_pubkey,
+            max_fee_sats,
+            BitcoinPolicyProvenance::from_finalized(finalized_inputs),
+            provenance_id,
+        )
+    }
+
+    fn build(
+        observed_chain_hash: ChainHash,
         inputs: Vec<BitcoinInputPolicy>,
         custody_script_pubkey: ScriptBuf,
         max_fee_sats: u64,
+        provenance: BitcoinPolicyProvenance,
+        provenance_id: [u8; 32],
     ) -> Result<Self, PolicyError> {
+        if observed_chain_hash != ChainHash::TESTNET4 {
+            return Err(PolicyError::new(
+                "vultisig_network",
+                format!(
+                    "observed Bitcoin chain hash {observed_chain_hash} is not Testnet4 {}",
+                    ChainHash::TESTNET4
+                ),
+            ));
+        }
         if inputs.is_empty() {
             return Err(PolicyError::new(
                 "vultisig_policy_inputs",
@@ -117,11 +225,39 @@ impl BitcoinSpendPolicy {
                 ),
             ));
         }
+        let policy_id = compute_policy_id(provenance_id, max_fee_sats);
         Ok(Self {
+            chain_hash: observed_chain_hash,
             inputs,
             custody_script_pubkey,
             max_fee_sats,
+            provenance,
+            provenance_id,
+            policy_id,
         })
+    }
+
+    #[cfg(test)]
+    fn new_testnet4_fixture(
+        observed_chain_hash: ChainHash,
+        inputs: Vec<BitcoinInputPolicy>,
+        custody_script_pubkey: ScriptBuf,
+        max_fee_sats: u64,
+    ) -> Result<Self, PolicyError> {
+        Self::build(
+            observed_chain_hash,
+            inputs,
+            custody_script_pubkey,
+            max_fee_sats,
+            BitcoinPolicyProvenance::fixture(),
+            [0; 32],
+        )
+    }
+
+    /// Exact rehearsal-chain identity bound into this policy.
+    #[must_use]
+    pub const fn chain_hash(&self) -> ChainHash {
+        self.chain_hash
     }
 
     /// Complete ordered permitted input set.
@@ -141,17 +277,103 @@ impl BitcoinSpendPolicy {
     pub const fn max_fee_sats(&self) -> u64 {
         self.max_fee_sats
     }
+
+    /// Finalized inventory provenance identity bound into this policy.
+    #[must_use]
+    pub const fn provenance_id(&self) -> [u8; 32] {
+        self.provenance_id
+    }
+
+    /// Domain-separated policy identity: provenance plus exact fee ceiling and
+    /// policy version.
+    #[must_use]
+    pub const fn policy_id(&self) -> [u8; 32] {
+        self.policy_id
+    }
+
+    fn provenance(&self) -> Result<&FinalizedBitcoinPolicyInputs, PolicyError> {
+        self.provenance.finalized()
+    }
+}
+
+/// Source-pinned Vultisig Bitcoin policy composition root.
+///
+/// Production construction requires the trusted Testnet4 observer. Callers do
+/// not select a finalized-inventory source independently at authorization or
+/// final handoff time.
+#[derive(Debug, Clone)]
+pub struct VultisigBitcoinPolicyRuntime {
+    policy_source: FinalizedBitcoinPolicySource,
+}
+
+impl VultisigBitcoinPolicyRuntime {
+    /// Pin this policy runtime to one authenticated observer inventory.
+    #[must_use]
+    pub fn from_observer(observer: &Testnet4FinalizedInventoryObserver) -> Self {
+        Self {
+            policy_source: observer.policy_source(),
+        }
+    }
+
+    #[cfg(test)]
+    const fn from_test_source(policy_source: FinalizedBitcoinPolicySource) -> Self {
+        Self { policy_source }
+    }
+
+    /// Issue one exact spend policy from the pinned finalized inventory.
+    ///
+    /// # Errors
+    /// Missing/stale inputs or an invalid fee ceiling.
+    pub async fn issue_policy(
+        &self,
+        ordered_outpoints: &[OutPoint],
+        max_fee_sats: u64,
+    ) -> Result<BitcoinSpendPolicy, AdapterError> {
+        let inputs = self
+            .policy_source
+            .issue_policy_inputs(ordered_outpoints)
+            .await?;
+        Ok(BitcoinSpendPolicy::new_testnet4(inputs, max_fee_sats)?)
+    }
+
+    /// Validate the complete PSBT and consume the custody one-shot against the
+    /// same pinned observer source used for final handoff.
+    ///
+    /// # Errors
+    /// Policy, provenance, or custody authorization rejection.
+    pub async fn authorize<S: ReplayStore>(
+        &self,
+        ctx: &BindContext,
+        replay: &S,
+        config: CustodyConfig<'_>,
+        policy: &BitcoinSpendPolicy,
+        now_unix: i64,
+    ) -> Result<AuthorizedBitcoinSpend, AdapterError> {
+        authorize_vultisig_btc_spend(ctx, replay, config, &self.policy_source, policy, now_unix)
+            .await
+    }
 }
 
 /// Immutable result of full PSBT policy validation and local hash derivation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitcoinPolicyApproval {
+    chain_hash: ChainHash,
     unsigned_txid: [u8; 32],
     fee_sats: u64,
     signing_hashes: Vec<[u8; 32]>,
+    custody_script_pubkey: ScriptBuf,
+    provenance: BitcoinPolicyProvenance,
+    provenance_id: [u8; 32],
+    policy_id: [u8; 32],
 }
 
 impl BitcoinPolicyApproval {
+    /// Exact rehearsal-chain identity carried from the validated policy.
+    #[must_use]
+    pub const fn chain_hash(&self) -> ChainHash {
+        self.chain_hash
+    }
+
     /// Unsigned transaction ID committed by the policy decision.
     #[must_use]
     pub const fn unsigned_txid(&self) -> [u8; 32] {
@@ -169,13 +391,202 @@ impl BitcoinPolicyApproval {
     pub fn signing_hashes(&self) -> &[[u8; 32]] {
         &self.signing_hashes
     }
+
+    /// Finalized inventory provenance identity carried from policy approval.
+    #[must_use]
+    pub const fn provenance_id(&self) -> [u8; 32] {
+        self.provenance_id
+    }
+
+    /// Exact domain-separated transaction-policy identity.
+    #[must_use]
+    pub const fn policy_id(&self) -> [u8; 32] {
+        self.policy_id
+    }
+
+    fn provenance(&self) -> Result<&FinalizedBitcoinPolicyInputs, PolicyError> {
+        self.provenance.finalized()
+    }
+
+    fn validate_finalized_transaction_bytes(
+        &self,
+        transaction_bytes: Vec<u8>,
+    ) -> Result<ValidatedBitcoinTransaction, PolicyError> {
+        let transaction =
+            deserialize::<bitcoin::Transaction>(&transaction_bytes).map_err(|error| {
+                PolicyError::new(
+                    "vultisig_final_encoding",
+                    format!("finalized transaction is not one exact consensus encoding: {error}"),
+                )
+            })?;
+        if serialize(&transaction).as_slice() != transaction_bytes.as_slice() {
+            return Err(PolicyError::new(
+                "vultisig_final_encoding",
+                "finalized transaction bytes are not canonical consensus encoding",
+            ));
+        }
+        let txid = transaction.compute_txid().to_byte_array();
+        if txid != self.unsigned_txid {
+            return Err(PolicyError::new(
+                "vultisig_final_txid",
+                "finalized transaction body does not equal the authorized unsigned transaction",
+            ));
+        }
+        if transaction.input.len() != self.signing_hashes.len() {
+            return Err(PolicyError::new(
+                "vultisig_final_witness",
+                "finalized transaction input count does not equal the authorized signing-hash count",
+            ));
+        }
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let mut aggregate_public_key = [0u8; 33];
+        for (index, input) in transaction.input.iter().enumerate() {
+            if input.witness.len() != 2 {
+                return Err(PolicyError::new(
+                    "vultisig_final_witness",
+                    format!(
+                        "VIN{index} must contain exactly one aggregate signature and one compressed public key"
+                    ),
+                ));
+            }
+            let mut witness = input.witness.iter();
+            let signature_bytes = witness
+                .next()
+                .ok_or_else(|| PolicyError::new("vultisig_final_witness", "missing signature"))?;
+            let signature = bitcoin::ecdsa::Signature::from_slice(signature_bytes).map_err(|_| {
+                PolicyError::new(
+                    "vultisig_final_signature",
+                    format!("VIN{index} aggregate signature is not strict DER plus a standard sighash byte"),
+                )
+            })?;
+            if signature.sighash_type != EcdsaSighashType::All {
+                return Err(PolicyError::new(
+                    "vultisig_final_sighash",
+                    format!("VIN{index} aggregate signature must use SIGHASH_ALL"),
+                ));
+            }
+            let public_key_bytes = witness.next().ok_or_else(|| {
+                PolicyError::new("vultisig_final_witness", "missing aggregate public key")
+            })?;
+            if public_key_bytes.len() != 33 || !matches!(public_key_bytes[0], 0x02 | 0x03) {
+                return Err(PolicyError::new(
+                    "vultisig_final_pubkey",
+                    format!("VIN{index} aggregate public key is not compressed secp256k1"),
+                ));
+            }
+            let public_key =
+                bitcoin::CompressedPublicKey::from_slice(public_key_bytes).map_err(|_| {
+                    PolicyError::new(
+                        "vultisig_final_pubkey",
+                        format!("VIN{index} aggregate public key is not compressed secp256k1"),
+                    )
+                })?;
+            bind_aggregate_public_key(&mut aggregate_public_key, index, public_key_bytes)?;
+            if ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash()) != self.custody_script_pubkey {
+                return Err(PolicyError::new(
+                    "vultisig_final_pubkey",
+                    format!(
+                        "VIN{index} aggregate public key does not match the authorized custody script"
+                    ),
+                ));
+            }
+            let message = bitcoin::secp256k1::Message::from_digest(self.signing_hashes[index]);
+            public_key
+                .verify(&secp, &message, &signature)
+                .map_err(|_| {
+                    PolicyError::new(
+                        "vultisig_final_signature",
+                        format!(
+                            "VIN{index} aggregate signature does not verify against the independently derived hash"
+                        ),
+                    )
+                })?;
+        }
+        Ok(ValidatedBitcoinTransaction {
+            chain_hash: self.chain_hash,
+            transaction_bytes: transaction_bytes.into_boxed_slice(),
+            txid,
+            wtxid: transaction.compute_wtxid().to_byte_array(),
+            input_count: transaction.input.len(),
+            aggregate_public_key,
+        })
+    }
+}
+
+fn bind_aggregate_public_key(
+    aggregate_public_key: &mut [u8; 33],
+    input_index: usize,
+    public_key_bytes: &[u8],
+) -> Result<(), PolicyError> {
+    if input_index == 0 {
+        aggregate_public_key.copy_from_slice(public_key_bytes);
+    } else if aggregate_public_key.as_slice() != public_key_bytes {
+        return Err(PolicyError::new(
+            "vultisig_final_pubkey",
+            "every input must use the same authorized aggregate public key",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_finalized_handoff(
+    policy_source: &FinalizedBitcoinPolicySource,
+    approval: &BitcoinPolicyApproval,
+    transaction_bytes: Vec<u8>,
+) -> Result<ValidatedBitcoinTransaction, AdapterError> {
+    let validated = approval.validate_finalized_transaction_bytes(transaction_bytes)?;
+    policy_source.assert_current(approval.provenance()?).await?;
+    Ok(validated)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ValidatedBitcoinTransaction {
+    chain_hash: ChainHash,
+    transaction_bytes: Box<[u8]>,
+    txid: [u8; 32],
+    wtxid: [u8; 32],
+    input_count: usize,
+    aggregate_public_key: [u8; 33],
+}
+
+impl ValidatedBitcoinTransaction {
+    #[must_use]
+    const fn chain_hash(&self) -> ChainHash {
+        self.chain_hash
+    }
+
+    #[must_use]
+    fn transaction_bytes(&self) -> &[u8] {
+        &self.transaction_bytes
+    }
+
+    #[must_use]
+    const fn txid(&self) -> [u8; 32] {
+        self.txid
+    }
+
+    #[must_use]
+    const fn wtxid(&self) -> [u8; 32] {
+        self.wtxid
+    }
+
+    #[must_use]
+    const fn input_count(&self) -> usize {
+        self.input_count
+    }
+
+    #[must_use]
+    const fn aggregate_public_key(&self) -> [u8; 33] {
+        self.aggregate_public_key
+    }
 }
 
 /// Receipt exposed only after both the Vultisig policy and custody one-shot pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct AuthorizedBitcoinSpend {
     policy: BitcoinPolicyApproval,
     custody: BtcSpendAuthorization,
+    policy_source: FinalizedBitcoinPolicySource,
 }
 
 impl AuthorizedBitcoinSpend {
@@ -186,6 +597,114 @@ impl AuthorizedBitcoinSpend {
     }
 
     /// RIC/ACC verification and consumed one-shot receipt.
+    #[must_use]
+    pub const fn custody(&self) -> &BtcSpendAuthorization {
+        &self.custody
+    }
+
+    /// Consume the post-one-shot authorization and revalidate the exact raw
+    /// finalized transaction bytes into an opaque broadcast capability.
+    ///
+    /// The returned value owns the canonical bytes that passed body, witness,
+    /// aggregate-key, sighash, and per-input signature verification. A future
+    /// broadcaster must accept this capability instead of a bare transaction.
+    /// No current runtime consumes it.
+    ///
+    /// # Errors
+    /// Returns a fail-closed provenance or policy rejection when inventory
+    /// state is stale, the bytes are not one exact canonical transaction, or
+    /// the transaction differs from the approval.
+    pub async fn finalize(
+        self,
+        transaction_bytes: Vec<u8>,
+    ) -> Result<FinalizedBitcoinSpend, AdapterError> {
+        let validated =
+            validate_finalized_handoff(&self.policy_source, &self.policy, transaction_bytes)
+                .await?;
+        Ok(FinalizedBitcoinSpend {
+            transaction: validated,
+            custody: self.custody,
+            provenance_id: self.policy.provenance_id,
+            policy_id: self.policy.policy_id,
+        })
+    }
+}
+
+/// Opaque capability owning the exact finalized bytes validated after the
+/// custody one-shot. This type has no public constructor and is not cloneable.
+///
+/// ```compile_fail
+/// use xindex_vultisig_adapter::FinalizedBitcoinSpend;
+///
+/// fn inspect(capability: &FinalizedBitcoinSpend) {
+///     let _ = &capability.transaction;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use xindex_vultisig_adapter::FinalizedBitcoinSpend;
+///
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<FinalizedBitcoinSpend>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+pub struct FinalizedBitcoinSpend {
+    transaction: ValidatedBitcoinTransaction,
+    custody: BtcSpendAuthorization,
+    provenance_id: [u8; 32],
+    policy_id: [u8; 32],
+}
+
+impl FinalizedBitcoinSpend {
+    /// Exact rehearsal-chain identity carried from the post-one-shot policy.
+    #[must_use]
+    pub const fn chain_hash(&self) -> ChainHash {
+        self.transaction.chain_hash()
+    }
+
+    /// Exact canonical consensus bytes that passed final revalidation.
+    #[must_use]
+    pub fn transaction_bytes(&self) -> &[u8] {
+        self.transaction.transaction_bytes()
+    }
+
+    /// Transaction ID of the exact approved non-witness body.
+    #[must_use]
+    pub const fn txid(&self) -> [u8; 32] {
+        self.transaction.txid()
+    }
+
+    /// Witness transaction ID of the fully signed transaction.
+    #[must_use]
+    pub const fn wtxid(&self) -> [u8; 32] {
+        self.transaction.wtxid()
+    }
+
+    /// Number of independently revalidated input witnesses.
+    #[must_use]
+    pub const fn input_count(&self) -> usize {
+        self.transaction.input_count()
+    }
+
+    /// Canonical compressed aggregate public key verified in every witness.
+    #[must_use]
+    pub const fn aggregate_public_key(&self) -> [u8; 33] {
+        self.transaction.aggregate_public_key()
+    }
+
+    /// Finalized custody-inventory provenance identity checked before handoff.
+    #[must_use]
+    pub const fn provenance_id(&self) -> [u8; 32] {
+        self.provenance_id
+    }
+
+    /// Exact transaction-policy identity checked before handoff.
+    #[must_use]
+    pub const fn policy_id(&self) -> [u8; 32] {
+        self.policy_id
+    }
+
+    /// RIC/ACC verification and consumed one-shot receipt bound to the bytes.
     #[must_use]
     pub const fn custody(&self) -> &BtcSpendAuthorization {
         &self.custody
@@ -228,11 +747,13 @@ impl fmt::Display for PolicyError {
 
 impl std::error::Error for PolicyError {}
 
-/// A policy rejection or the existing custody authorization rejection.
+/// A policy, provenance, or existing custody authorization rejection.
 #[derive(Debug, Clone)]
 pub enum AdapterError {
     /// The decoded Bitcoin transaction failed Xindex's Vultisig policy.
     Policy(PolicyError),
+    /// Finalized custody-inventory provenance is unavailable or stale.
+    Provenance(InventoryError),
     /// RIC/ACC verification, output binding, or one-shot consumption failed.
     Custody(GateRejection),
 }
@@ -243,6 +764,7 @@ impl AdapterError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Policy(error) => error.code(),
+            Self::Provenance(error) => error.code(),
             Self::Custody(error) => error.code,
         }
     }
@@ -252,6 +774,7 @@ impl fmt::Display for AdapterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Policy(error) => error.fmt(formatter),
+            Self::Provenance(error) => error.fmt(formatter),
             Self::Custody(error) => write!(formatter, "{}: {}", error.code, error.message),
         }
     }
@@ -268,6 +791,12 @@ impl From<PolicyError> for AdapterError {
 impl From<GateRejection> for AdapterError {
     fn from(error: GateRejection) -> Self {
         Self::Custody(error)
+    }
+}
+
+impl From<InventoryError> for AdapterError {
+    fn from(error: InventoryError) -> Self {
+        Self::Provenance(error)
     }
 }
 
@@ -300,9 +829,14 @@ fn validate_and_derive_signing_hashes(
     let fee_sats = implied_fee_sats(psbt, policy)?;
     let signing_hashes = derive_signing_hashes(psbt, policy)?;
     Ok(BitcoinPolicyApproval {
+        chain_hash: policy.chain_hash(),
         unsigned_txid: psbt.unsigned_tx.compute_txid().to_byte_array(),
         fee_sats,
         signing_hashes,
+        custody_script_pubkey: policy.custody_script_pubkey().clone(),
+        provenance: policy.provenance.clone(),
+        provenance_id: policy.provenance_id,
+        policy_id: policy.policy_id,
     })
 }
 
@@ -537,6 +1071,15 @@ fn derive_signing_hashes(
     Ok(signing_hashes)
 }
 
+fn compute_policy_id(provenance_id: [u8; 32], max_fee_sats: u64) -> [u8; 32] {
+    let mut preimage = Vec::with_capacity(POLICY_ID_DOMAIN.len() + 32 + 8 + 8);
+    preimage.extend_from_slice(&(POLICY_ID_DOMAIN.len() as u64).to_be_bytes());
+    preimage.extend_from_slice(POLICY_ID_DOMAIN);
+    preimage.extend_from_slice(&provenance_id);
+    preimage.extend_from_slice(&max_fee_sats.to_be_bytes());
+    sha256::Hash::hash(&preimage).to_byte_array()
+}
+
 /// Run the full key-free Vultisig policy, then consume the existing custody
 /// authorization one-shot and return both immutable receipts.
 ///
@@ -546,12 +1089,14 @@ fn derive_signing_hashes(
 ///
 /// # Errors
 /// Returns [`AdapterError::Policy`] before one-shot consumption for a PSBT
-/// policy failure, or [`AdapterError::Custody`] for the existing certificate,
-/// output-binding, replay, or persistence gate.
-pub async fn authorize_vultisig_btc_spend<S: ReplayStore>(
+/// policy failure, [`AdapterError::Provenance`] when the finalized inventory is
+/// stale or unavailable, or [`AdapterError::Custody`] for the existing
+/// certificate, output-binding, replay, or persistence gate.
+async fn authorize_vultisig_btc_spend<S: ReplayStore>(
     ctx: &BindContext,
     replay: &S,
     config: CustodyConfig<'_>,
+    policy_source: &FinalizedBitcoinPolicySource,
     policy: &BitcoinSpendPolicy,
     now_unix: i64,
 ) -> Result<AuthorizedBitcoinSpend, AdapterError> {
@@ -563,6 +1108,7 @@ pub async fn authorize_vultisig_btc_spend<S: ReplayStore>(
         .into());
     }
     let policy_approval = validate_and_derive_signing_hashes(&ctx.psbt, policy)?;
+    policy_source.assert_current(policy.provenance()?).await?;
     let custody = authorize_certified_btc_spend(
         ctx,
         replay,
@@ -574,6 +1120,7 @@ pub async fn authorize_vultisig_btc_spend<S: ReplayStore>(
     Ok(AuthorizedBitcoinSpend {
         policy: policy_approval,
         custody,
+        policy_source: policy_source.clone(),
     })
 }
 
@@ -584,10 +1131,16 @@ mod tests {
     use super::*;
     use alloy_primitives::Address;
     use bitcoin::absolute::LockTime;
+    use bitcoin::blockdata::constants::ChainHash;
+
     use bitcoin::psbt::Psbt;
     use bitcoin::sighash::EcdsaSighashType;
     use bitcoin::transaction::Version;
     use bitcoin::{Amount, Sequence, Transaction, TxIn, TxOut, Txid, WPubkeyHash, Witness};
+    use xindex_chain_utxo::finalized_inventory::{
+        FinalizedBitcoinBlock, FinalizedBitcoinInventoryTestHarness, FinalizedBitcoinOutput,
+        InventoryError, MIN_FINALIZED_BITCOIN_CONFIRMATIONS,
+    };
     use xindex_custody_core::btc_bind::canonical_op_return_script;
     use xindex_custody_core::gates::CustodyConfig;
     use xindex_custody_core::prepare::BindContext;
@@ -608,16 +1161,84 @@ mod tests {
         }
     }
 
-    fn policy() -> BitcoinSpendPolicy {
-        BitcoinSpendPolicy::new(
+    fn policy_for_custody(custody_script_pubkey: ScriptBuf) -> BitcoinSpendPolicy {
+        BitcoinSpendPolicy::new_testnet4_fixture(
+            ChainHash::TESTNET4,
             vec![
                 BitcoinInputPolicy::new(outpoint(0x11, 1), 120_000).expect("input 0"),
                 BitcoinInputPolicy::new(outpoint(0x22, 2), 80_000).expect("input 1"),
             ],
-            p2wpkh(0xcc),
+            custody_script_pubkey,
             10_000,
         )
         .expect("policy")
+    }
+
+    fn policy() -> BitcoinSpendPolicy {
+        policy_for_custody(p2wpkh(0xcc))
+    }
+
+    async fn finalized_policy_for_custody(
+        custody_script_pubkey: ScriptBuf,
+    ) -> (
+        FinalizedBitcoinInventoryTestHarness,
+        FinalizedBitcoinPolicySource,
+        BitcoinSpendPolicy,
+    ) {
+        let store = FinalizedBitcoinInventoryTestHarness::in_memory(
+            "vultisig-adapter-test",
+            custody_script_pubkey.clone(),
+            MIN_FINALIZED_BITCOIN_CONFIRMATIONS,
+        )
+        .await
+        .expect("inventory");
+        let source = store.policy_source();
+        let block_100 = FinalizedBitcoinBlock::new(
+            100,
+            bitcoin::BlockHash::from_byte_array([100; 32]),
+            bitcoin::BlockHash::from_byte_array([99; 32]),
+            vec![
+                FinalizedBitcoinOutput::new(
+                    outpoint(0x11, 1),
+                    120_000,
+                    custody_script_pubkey.clone(),
+                )
+                .expect("input 0"),
+                FinalizedBitcoinOutput::new(outpoint(0x22, 2), 80_000, custody_script_pubkey)
+                    .expect("input 1"),
+            ],
+            Vec::new(),
+        )
+        .expect("block 100");
+        store
+            .commit_block(block_100.clone())
+            .await
+            .expect("block 100");
+        let mut parent_hash = block_100.block_hash();
+        for height in 101u64..=105 {
+            let tag = u8::try_from(height).expect("test height");
+            let block_hash = bitcoin::BlockHash::from_byte_array([tag; 32]);
+            store
+                .commit_block(
+                    FinalizedBitcoinBlock::new(
+                        height,
+                        block_hash,
+                        parent_hash,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .expect("confirmation block"),
+                )
+                .await
+                .expect("confirmation block");
+            parent_hash = block_hash;
+        }
+        let inputs = source
+            .issue_policy_inputs(&[outpoint(0x11, 1), outpoint(0x22, 2)])
+            .await
+            .expect("finalized policy inputs");
+        let policy = BitcoinSpendPolicy::new_testnet4(inputs, 10_000).expect("policy");
+        (store, source, policy)
     }
 
     fn psbt_for(policy: &BitcoinSpendPolicy) -> Psbt {
@@ -667,12 +1288,92 @@ mod tests {
         assert_eq!(error.code(), code);
     }
 
+    fn fixed_aggregate_public_key() -> bitcoin::CompressedPublicKey {
+        let public_key_bytes = alloy_primitives::hex::decode(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .expect("generator public key");
+        bitcoin::CompressedPublicKey::from_slice(&public_key_bytes).expect("aggregate key")
+    }
+
+    fn finalized_fixture_for_policy(
+        policy: &BitcoinSpendPolicy,
+    ) -> (Transaction, BitcoinPolicyApproval) {
+        // Verification-only fixed tuple: signature bytes copied from an
+        // upstream secp256k1 debug/round-trip fixture are locally verified for
+        // message = 1 and aggregate public key = G. No private key or signing
+        // operation occurs.
+        let compact_signature = alloy_primitives::hex::decode(
+            "6673ffad2147741f04772b6f921f0ba6af0c1e77fc439e65c36dedf4092e8898\
+             4c1a971652e0ada880120ef8025e709fff2080c4a39aae068d12eed009b68c89",
+        )
+        .expect("fixed compact signature");
+        let signature = bitcoin::ecdsa::Signature::sighash_all(
+            bitcoin::secp256k1::ecdsa::Signature::from_compact(&compact_signature)
+                .expect("fixed signature"),
+        )
+        .to_vec();
+        let public_key_bytes = alloy_primitives::hex::decode(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .expect("generator public key");
+        let mut signing_hash = [0u8; 32];
+        signing_hash[31] = 1;
+
+        let psbt = psbt_for(policy);
+        let mut approval =
+            validate_and_derive_signing_hashes(&psbt, policy).expect("approved fixture");
+        approval.signing_hashes.fill(signing_hash);
+        let mut transaction = psbt.unsigned_tx;
+        for input in &mut transaction.input {
+            input.witness =
+                Witness::from_slice(&[signature.as_slice(), public_key_bytes.as_slice()]);
+        }
+        (transaction, approval)
+    }
+
+    fn finalized_fixture() -> (Transaction, BitcoinPolicyApproval) {
+        let public_key = fixed_aggregate_public_key();
+        let policy = policy_for_custody(ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash()));
+        finalized_fixture_for_policy(&policy)
+    }
+
+    #[test]
+    fn policy_requires_exact_testnet4_chain_hash() {
+        let input = BitcoinInputPolicy::new(outpoint(0x11, 0), 1).expect("input");
+        for wrong_chain in [
+            ChainHash::BITCOIN,
+            ChainHash::TESTNET3,
+            ChainHash::SIGNET,
+            ChainHash::REGTEST,
+        ] {
+            let error = BitcoinSpendPolicy::new_testnet4_fixture(
+                wrong_chain,
+                vec![input.clone()],
+                p2wpkh(0xcc),
+                1,
+            )
+            .expect_err("non-Testnet4 chain identity must fail");
+            assert_eq!(error.code(), "vultisig_network");
+        }
+
+        let policy = BitcoinSpendPolicy::new_testnet4_fixture(
+            ChainHash::TESTNET4,
+            vec![input],
+            p2wpkh(0xcc),
+            1,
+        )
+        .expect("exact Testnet4 chain hash");
+        assert_eq!(policy.chain_hash(), ChainHash::TESTNET4);
+    }
+
     #[test]
     fn honest_psbt_derives_every_hash_and_exact_fee() {
         let policy = policy();
         let psbt = psbt_for(&policy);
         let approval =
             validate_and_derive_signing_hashes(&psbt, &policy).expect("honest PSBT must pass");
+        assert_eq!(approval.chain_hash(), ChainHash::TESTNET4);
         assert_eq!(approval.fee_sats(), 1_000);
         let signing_hashes: Vec<_> = approval
             .signing_hashes()
@@ -693,12 +1394,223 @@ mod tests {
     }
 
     #[test]
+    fn finalized_transaction_returns_exact_committed_ids() {
+        let (transaction, approval) = finalized_fixture();
+        let finalized = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect("fixed verification fixture must pass");
+        assert_eq!(finalized.chain_hash(), ChainHash::TESTNET4);
+        assert_eq!(finalized.txid(), transaction.compute_txid().to_byte_array());
+        assert_eq!(
+            finalized.wtxid(),
+            transaction.compute_wtxid().to_byte_array()
+        );
+        assert_eq!(finalized.input_count(), 2);
+    }
+
+    #[test]
+    fn finalized_capability_owns_exact_canonical_bytes_after_authorization() {
+        let (transaction, approval) = finalized_fixture();
+        let canonical_bytes = serialize(&transaction);
+        let mut caller_copy = canonical_bytes.clone();
+        let validated = approval
+            .validate_finalized_transaction_bytes(canonical_bytes.clone())
+            .expect("canonical fixed transaction must pass");
+
+        caller_copy[0] ^= 0x01;
+        assert_eq!(validated.transaction_bytes(), canonical_bytes);
+        assert_eq!(validated.txid(), transaction.compute_txid().to_byte_array());
+        assert_eq!(
+            validated.wtxid(),
+            transaction.compute_wtxid().to_byte_array()
+        );
+
+        let mut trailing_bytes = canonical_bytes;
+        trailing_bytes.push(0x00);
+        let error = approval
+            .validate_finalized_transaction_bytes(trailing_bytes)
+            .expect_err("trailing bytes must not be detached from the validated transaction");
+        assert_eq!(error.code(), "vultisig_final_encoding");
+    }
+
+    #[test]
+    fn finalized_transaction_rejects_mutated_non_witness_body() {
+        let (mut transaction, approval) = finalized_fixture();
+        transaction.output[0].value = Amount::from_sat(149_999);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("mutated settlement amount must fail");
+        assert_eq!(error.code(), "vultisig_final_txid");
+    }
+
+    #[test]
+    fn finalized_transaction_requires_one_complete_p2wpkh_witness_per_input() {
+        let (mut transaction, approval) = finalized_fixture();
+        transaction.input[1].witness = Witness::new();
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("missing aggregate signature witness must fail");
+        assert_eq!(error.code(), "vultisig_final_witness");
+
+        let mut elements = transaction.input[0]
+            .witness
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        elements.push(vec![0x01]);
+        transaction.input[0].witness = Witness::from_slice(&elements);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("extra witness stack items must fail");
+        assert_eq!(error.code(), "vultisig_final_witness");
+    }
+
+    #[test]
+    fn finalized_transaction_requires_sighash_all_witness_signatures() {
+        let (mut transaction, approval) = finalized_fixture();
+        let mut elements = transaction.input[0]
+            .witness
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        *elements[0].last_mut().expect("sighash byte") = EcdsaSighashType::Single as u8;
+        transaction.input[0].witness =
+            Witness::from_slice(&[elements[0].as_slice(), elements[1].as_slice()]);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("non-ALL aggregate signature must fail");
+        assert_eq!(error.code(), "vultisig_final_sighash");
+
+        *elements[0].last_mut().expect("sighash byte") =
+            EcdsaSighashType::AllPlusAnyoneCanPay as u8;
+        transaction.input[0].witness =
+            Witness::from_slice(&[elements[0].as_slice(), elements[1].as_slice()]);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("ANYONECANPAY aggregate signature must fail");
+        assert_eq!(error.code(), "vultisig_final_sighash");
+    }
+
+    #[test]
+    fn finalized_transaction_requires_the_authorized_aggregate_public_key() {
+        let (mut transaction, approval) = finalized_fixture();
+        let mut elements = transaction.input[0]
+            .witness
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        elements[1][0] = 0x03;
+        transaction.input[0].witness =
+            Witness::from_slice(&[elements[0].as_slice(), elements[1].as_slice()]);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("substituted aggregate public key must fail");
+        assert_eq!(error.code(), "vultisig_final_pubkey");
+    }
+
+    #[test]
+    fn finalized_transaction_rejects_uncompressed_witness_public_key() {
+        let (mut transaction, approval) = finalized_fixture();
+        let mut elements = transaction.input[0]
+            .witness
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        elements[1] = bitcoin::secp256k1::PublicKey::from_slice(&elements[1])
+            .expect("fixed aggregate public key")
+            .serialize_uncompressed()
+            .to_vec();
+        transaction.input[0].witness =
+            Witness::from_slice(&[elements[0].as_slice(), elements[1].as_slice()]);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("uncompressed witness public key must fail");
+        assert_eq!(error.code(), "vultisig_final_pubkey");
+    }
+
+    #[test]
+    fn finalized_transaction_verifies_each_aggregate_signature() {
+        let (mut transaction, approval) = finalized_fixture();
+        let mut elements = transaction.input[1]
+            .witness
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        elements[0][10] ^= 0x01;
+        bitcoin::ecdsa::Signature::from_slice(&elements[0])
+            .expect("scalar mutation must remain strict DER");
+        transaction.input[1].witness =
+            Witness::from_slice(&[elements[0].as_slice(), elements[1].as_slice()]);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("altered aggregate signature scalar must fail verification");
+        assert_eq!(error.code(), "vultisig_final_signature");
+
+        elements[0] = vec![0x30, 0x01, 0x00, EcdsaSighashType::All as u8];
+        transaction.input[1].witness =
+            Witness::from_slice(&[elements[0].as_slice(), elements[1].as_slice()]);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("malformed DER aggregate signature must fail parsing");
+        assert_eq!(error.code(), "vultisig_final_signature");
+    }
+
+    #[test]
+    fn finalized_transaction_rejects_high_s_aggregate_signature() {
+        let (mut transaction, approval) = finalized_fixture();
+        // Strict-DER high-S counterpart of the fixed low-S fixture. It is
+        // derived as `curve_order - s`; no key or signing operation is used.
+        let high_s = alloy_primitives::hex::decode(
+            "304502206673ffad2147741f04772b6f921f0ba6af0c1e77fc439e65c36dedf4092e8898\
+             022100b3e568e9ad1f52577fedf107fda18f5ebb8e5c220badf23532bf6fbcc67fb4b8\
+             01",
+        )
+        .expect("fixed tuple's high-S counterpart");
+        let public_key = transaction.input[0]
+            .witness
+            .iter()
+            .nth(1)
+            .expect("aggregate public key")
+            .to_vec();
+        transaction.input[0].witness =
+            Witness::from_slice(&[high_s.as_slice(), public_key.as_slice()]);
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("non-canonical high-S aggregate signature must fail");
+        assert_eq!(error.code(), "vultisig_final_signature");
+    }
+
+    #[test]
+    fn finalized_transaction_uses_the_matching_hash_for_each_input() {
+        let (transaction, mut approval) = finalized_fixture();
+        approval.signing_hashes[1][0] ^= 0x01;
+        let error = approval
+            .validate_finalized_transaction_bytes(serialize(&transaction))
+            .expect_err("VIN1 signature must not be verified against the VIN0 hash");
+        assert_eq!(error.code(), "vultisig_final_signature");
+        assert!(
+            error.message().starts_with("VIN1 "),
+            "wrong input rejected: {error}"
+        );
+    }
+
+    #[test]
     fn policy_rejects_empty_duplicate_zero_and_non_p2wpkh_inputs() {
-        let empty = BitcoinSpendPolicy::new(Vec::new(), p2wpkh(0xcc), 1);
+        let empty = BitcoinSpendPolicy::new_testnet4_fixture(
+            ChainHash::TESTNET4,
+            Vec::new(),
+            p2wpkh(0xcc),
+            1,
+        );
         assert_eq!(empty.expect_err("empty").code(), "vultisig_policy_inputs");
 
         let exact = BitcoinInputPolicy::new(outpoint(0x11, 0), 1).expect("input");
-        let duplicate = BitcoinSpendPolicy::new(vec![exact.clone(), exact], p2wpkh(0xcc), 1);
+        let duplicate = BitcoinSpendPolicy::new_testnet4_fixture(
+            ChainHash::TESTNET4,
+            vec![exact.clone(), exact],
+            p2wpkh(0xcc),
+            1,
+        );
         assert_eq!(
             duplicate.expect_err("duplicate").code(),
             "vultisig_policy_inputs"
@@ -711,7 +1623,8 @@ mod tests {
             "vultisig_policy_input"
         );
         assert_eq!(
-            BitcoinSpendPolicy::new(
+            BitcoinSpendPolicy::new_testnet4_fixture(
+                ChainHash::TESTNET4,
                 vec![BitcoinInputPolicy::new(outpoint(0x11, 0), 1).expect("input")],
                 ScriptBuf::new(),
                 1,
@@ -721,7 +1634,8 @@ mod tests {
             "vultisig_policy_custody"
         );
         assert_eq!(
-            BitcoinSpendPolicy::new(
+            BitcoinSpendPolicy::new_testnet4_fixture(
+                ChainHash::TESTNET4,
                 vec![BitcoinInputPolicy::new(outpoint(0x11, 0), 1).expect("input")],
                 p2wpkh(0xcc),
                 0,
@@ -731,7 +1645,8 @@ mod tests {
             "vultisig_policy_fee"
         );
         assert_eq!(
-            BitcoinSpendPolicy::new(
+            BitcoinSpendPolicy::new_testnet4_fixture(
+                ChainHash::TESTNET4,
                 vec![BitcoinInputPolicy::new(outpoint(0x11, 0), 1).expect("input")],
                 p2wpkh(0xcc),
                 ChainId::Btc.max_redeem_fee_base_units() + 1,
@@ -874,7 +1789,8 @@ mod tests {
 
     #[tokio::test]
     async fn full_adapter_reaches_custody_gate_only_after_policy_passes() {
-        let policy = policy();
+        let (_store, source, policy) = finalized_policy_for_custody(p2wpkh(0xcc)).await;
+        let runtime = VultisigBitcoinPolicyRuntime::from_test_source(source);
         let intent_policy = IntentPolicy {
             signer_whitelist: Vec::new(),
             intent_quorum: 1,
@@ -887,34 +1803,159 @@ mod tests {
             ric: None,
             acc: None,
         };
-        let error = authorize_vultisig_btc_spend(
-            &valid,
-            &replay,
-            custody_config(&intent_policy),
-            &policy,
-            NOW,
-        )
-        .await
-        .expect_err("missing RIC must fail at custody boundary");
+        let error = runtime
+            .authorize(
+                &valid,
+                &replay,
+                custody_config(&intent_policy),
+                &policy,
+                NOW,
+            )
+            .await
+            .expect_err("missing RIC must fail at custody boundary");
         assert!(matches!(error, AdapterError::Custody(_)));
 
         let mut invalid = valid;
         invalid.psbt.unsigned_tx.version = Version::ONE;
-        let error = authorize_vultisig_btc_spend(
-            &invalid,
-            &replay,
-            custody_config(&intent_policy),
-            &policy,
-            NOW,
-        )
-        .await
-        .expect_err("invalid tx must fail at policy boundary");
+        let error = runtime
+            .authorize(
+                &invalid,
+                &replay,
+                custody_config(&intent_policy),
+                &policy,
+                NOW,
+            )
+            .await
+            .expect_err("invalid tx must fail at policy boundary");
         assert!(matches!(error, AdapterError::Policy(_)));
     }
 
     #[tokio::test]
+    async fn stale_reorged_provenance_rejects_before_custody_one_shot() {
+        let custody_script = p2wpkh(0xcc);
+        let store = FinalizedBitcoinInventoryTestHarness::in_memory(
+            "vultisig-authorization-test",
+            custody_script.clone(),
+            MIN_FINALIZED_BITCOIN_CONFIRMATIONS,
+        )
+        .await
+        .expect("inventory");
+        let source = store.policy_source();
+        let funding = outpoint(0x11, 1);
+        let block_100 = FinalizedBitcoinBlock::new(
+            100,
+            bitcoin::BlockHash::from_byte_array([100; 32]),
+            bitcoin::BlockHash::from_byte_array([99; 32]),
+            vec![
+                FinalizedBitcoinOutput::new(funding, 200_000, custody_script)
+                    .expect("funding output"),
+            ],
+            Vec::new(),
+        )
+        .expect("block 100");
+        store
+            .commit_block(block_100.clone())
+            .await
+            .expect("block 100");
+        let mut parent_hash = block_100.block_hash();
+        for height in 101u64..=105 {
+            let tag = u8::try_from(height).expect("test height");
+            let block_hash = bitcoin::BlockHash::from_byte_array([tag; 32]);
+            store
+                .commit_block(
+                    FinalizedBitcoinBlock::new(
+                        height,
+                        block_hash,
+                        parent_hash,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .expect("confirmation block"),
+                )
+                .await
+                .expect("confirmation block");
+            parent_hash = block_hash;
+        }
+        let inputs = source
+            .issue_policy_inputs(&[funding])
+            .await
+            .expect("finalized policy inputs");
+        let policy = BitcoinSpendPolicy::new_testnet4(inputs, 10_000).expect("policy");
+        let ctx = BindContext {
+            chain: ChainId::Btc,
+            psbt: psbt_for(&policy),
+            ric: None,
+            acc: None,
+        };
+        store
+            .rollback_to(100, block_100.block_hash())
+            .await
+            .expect("rollback");
+
+        let intent_policy = IntentPolicy {
+            signer_whitelist: Vec::new(),
+            intent_quorum: 1,
+            ric_max_age_secs: 3_600,
+        };
+        let error = authorize_vultisig_btc_spend(
+            &ctx,
+            &InMemoryReplayStore::new(),
+            custody_config(&intent_policy),
+            &source,
+            &policy,
+            NOW,
+        )
+        .await
+        .expect_err("stale provenance must reject before missing RIC");
+        assert!(matches!(
+            error,
+            AdapterError::Provenance(InventoryError::Stale(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_handoff_validates_bytes_then_rechecks_provenance() {
+        let public_key = fixed_aggregate_public_key();
+        let (store, source, policy) =
+            finalized_policy_for_custody(ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash())).await;
+        let (transaction, approval) = finalized_fixture_for_policy(&policy);
+        store
+            .rollback_to(100, bitcoin::BlockHash::from_byte_array([100; 32]))
+            .await
+            .expect("rollback");
+
+        let malformed = validate_finalized_handoff(&source, &approval, vec![0xff])
+            .await
+            .expect_err("malformed final bytes must reject before the handoff recheck");
+        assert!(matches!(malformed, AdapterError::Policy(_)));
+
+        let stale = validate_finalized_handoff(&source, &approval, serialize(&transaction))
+            .await
+            .expect_err("valid final bytes still require current provenance before handoff");
+        assert!(matches!(
+            stale,
+            AdapterError::Provenance(InventoryError::Stale(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_and_approval_carry_provenance_and_versioned_policy_ids() {
+        let (_store, _source, policy) = finalized_policy_for_custody(p2wpkh(0xcc)).await;
+        let provenance = policy.provenance().expect("production provenance").clone();
+        let repriced = BitcoinSpendPolicy::new_testnet4(provenance, 9_000)
+            .expect("same provenance with stricter fee ceiling");
+        assert_eq!(policy.provenance_id(), repriced.provenance_id());
+        assert_ne!(policy.policy_id(), repriced.policy_id());
+
+        let approval = validate_and_derive_signing_hashes(&psbt_for(&policy), &policy)
+            .expect("policy approval");
+        assert_eq!(approval.provenance_id(), policy.provenance_id());
+        assert_eq!(approval.policy_id(), policy.policy_id());
+    }
+
+    #[tokio::test]
     async fn non_btc_chain_rejects_before_policy_or_custody() {
-        let policy = policy();
+        let (_store, source, policy) = finalized_policy_for_custody(p2wpkh(0xcc)).await;
         let intent_policy = IntentPolicy {
             signer_whitelist: Vec::new(),
             intent_quorum: 1,
@@ -930,6 +1971,7 @@ mod tests {
             &ctx,
             &InMemoryReplayStore::new(),
             custody_config(&intent_policy),
+            &source,
             &policy,
             NOW,
         )
