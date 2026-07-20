@@ -53,7 +53,9 @@ pub use tron_redeem::{
     TronRedeemExecutor, TronRedeemLegOutcome, TronRedeemTask,
 };
 pub use vultisig_broadcast::{
-    prepare_vultisig_bitcoin_broadcast, PreparedVultisigBitcoinBroadcast,
-    VultisigBroadcastPreparationError, VultisigBroadcastPreparationFailure,
-    VultisigEvidenceWriteAheadSink,
+    PreparedVultisigBitcoinBroadcast, SqliteVultisigBitcoinBroadcastStore,
+    Testnet4EsploraBroadcastTarget, VultisigBitcoinBroadcastRuntime, VultisigBitcoinBroadcastState,
+    VultisigBitcoinFinalityPolicy, VultisigBroadcastPreparationError,
+    VultisigBroadcastPreparationFailure, VultisigBroadcastRuntimeError,
+    VultisigBroadcastSubmissionFailure,
 };

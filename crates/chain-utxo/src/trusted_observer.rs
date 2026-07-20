@@ -23,7 +23,7 @@ use bitcoin::blockdata::constants::{genesis_block, ChainHash};
 use bitcoin::consensus::Params;
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hashes::{sha256, Hash as _};
-use bitcoin::{Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction};
+use bitcoin::{Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, Txid, Wtxid};
 use reqwest::{Client, Url};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -36,7 +36,12 @@ use crate::finalized_inventory::{
 
 const SOURCE_SET_DOMAIN: &[u8] = b"XINDEX/BTC/TESTNET4-ESPLORA-SOURCE-SET/V1";
 const OBSERVATION_DOMAIN: &[u8] = b"XINDEX/BTC/TESTNET4-CORROBORATED-BLOCK/V1";
+const TRANSACTION_STATUS_SAMPLE_DOMAIN: &[u8] = b"XINDEX/BTC/TESTNET4-TRANSACTION-STATUS-SAMPLE/V1";
+const CHECKPOINT_SAMPLE_DOMAIN: &[u8] = b"XINDEX/BTC/TESTNET4-CHECKPOINT-SAMPLE/V1";
+const FINAL_TRANSACTION_OBSERVATION_DOMAIN: &[u8] =
+    b"XINDEX/BTC/TESTNET4-FINAL-TRANSACTION-OBSERVATION/V1";
 const MAX_TEXT_RESPONSE_BYTES: usize = 256;
+const MAX_TRANSACTION_STATUS_BYTES: usize = 512;
 const MAX_RAW_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
 const MAX_BLOCKS_PER_SYNC: u32 = 64;
@@ -295,6 +300,114 @@ pub struct ObserverSyncReport {
     rolled_back_blocks: u32,
 }
 
+/// Opaque, non-deserializable observation of one exact finalized Testnet4
+/// transaction from the configured source set and retained inventory.
+///
+/// Fields and construction are private. The only public issuance path is
+/// [`Testnet4FinalizedInventoryObserver::observe_finalized_transaction`].
+/// The capability proves agreement among configured sources; it does not claim
+/// that those sources are independent full nodes or independent operators.
+///
+/// ```compile_fail
+/// use xindex_chain_utxo::trusted_observer::FinalizedBitcoinTransactionObservation;
+///
+/// fn bypass(observation: &FinalizedBitcoinTransactionObservation) {
+///     let _ = observation.exact_transaction_sha256;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use xindex_chain_utxo::trusted_observer::FinalizedBitcoinTransactionObservation;
+///
+/// fn requires_deserialize<T: serde::de::DeserializeOwned>() {}
+/// requires_deserialize::<FinalizedBitcoinTransactionObservation>();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
+#[must_use = "a finalized transaction observation must be consumed by the sealed runtime"]
+pub struct FinalizedBitcoinTransactionObservation {
+    chain_hash: ChainHash,
+    txid: Txid,
+    wtxid: Wtxid,
+    exact_transaction_sha256: [u8; 32],
+    block_hash: BlockHash,
+    block_height: u32,
+    corroborated_tip: u32,
+    confirmations: u32,
+    required_confirmations: u32,
+    source_set_id: [u8; 32],
+    evidence_hash: [u8; 32],
+}
+
+impl FinalizedBitcoinTransactionObservation {
+    /// Exact Bitcoin genesis/chain identity authenticated by every source.
+    #[must_use]
+    pub const fn chain_hash(&self) -> ChainHash {
+        self.chain_hash
+    }
+
+    /// Locally derived transaction ID of the canonical transaction bytes.
+    #[must_use]
+    pub const fn txid(&self) -> Txid {
+        self.txid
+    }
+
+    /// Locally derived witness transaction ID of the canonical bytes.
+    #[must_use]
+    pub const fn wtxid(&self) -> Wtxid {
+        self.wtxid
+    }
+
+    /// Single SHA-256 digest of the exact canonical serialized transaction.
+    #[must_use]
+    pub const fn exact_transaction_sha256(&self) -> [u8; 32] {
+        self.exact_transaction_sha256
+    }
+
+    /// Corroborated canonical block containing the transaction.
+    #[must_use]
+    pub const fn block_hash(&self) -> BlockHash {
+        self.block_hash
+    }
+
+    /// Height of the corroborated canonical block.
+    #[must_use]
+    pub const fn block_height(&self) -> u32 {
+        self.block_height
+    }
+
+    /// Equal source-tip height sampled around the observation.
+    #[must_use]
+    pub const fn corroborated_tip(&self) -> u32 {
+        self.corroborated_tip
+    }
+
+    /// Checked inclusive confirmation count at the corroborated tip.
+    #[must_use]
+    pub const fn confirmations(&self) -> u32 {
+        self.confirmations
+    }
+
+    /// Non-bypassable confirmation floor configured for this inventory.
+    #[must_use]
+    pub const fn required_confirmations(&self) -> u32 {
+        self.required_confirmations
+    }
+
+    /// Durable identity of the exact configured observer source set.
+    #[must_use]
+    pub const fn source_set_id(&self) -> [u8; 32] {
+        self.source_set_id
+    }
+
+    /// Domain-separated commitment to the transaction, canonical location,
+    /// finality calculation, inventory/source identities, and both status
+    /// samples.
+    #[must_use]
+    pub const fn evidence_hash(&self) -> [u8; 32] {
+        self.evidence_hash
+    }
+}
+
 impl ObserverSyncReport {
     /// Latest tip height corroborated by every approved source.
     #[must_use]
@@ -329,6 +442,7 @@ pub struct Testnet4FinalizedInventoryObserver {
     freshness: ObservationFreshness,
     sync_lock: Arc<Mutex<()>>,
     custody_script_pubkey: ScriptBuf,
+    required_confirmations: u32,
     start_height: u32,
     source_set_id: [u8; 32],
     sources: Vec<EsploraSourceClient>,
@@ -372,6 +486,7 @@ impl Testnet4FinalizedInventoryObserver {
             freshness,
             sync_lock: Arc::new(Mutex::new(())),
             custody_script_pubkey: config.custody_script_pubkey,
+            required_confirmations: config.required_confirmations,
             start_height: config.start_height,
             source_set_id: config.source_set_id,
             sources,
@@ -388,6 +503,119 @@ impl Testnet4FinalizedInventoryObserver {
     #[must_use]
     pub const fn source_set_id(&self) -> [u8; 32] {
         self.source_set_id
+    }
+
+    /// Observe one exact transaction only after every configured source agrees
+    /// on its canonical block and a current source-set-pinned inventory remains
+    /// caught up through the same corroborated tip.
+    ///
+    /// This method accepts only a transaction ID. Block location, raw bytes,
+    /// witness ID, confirmation count, source identities, and all evidence are
+    /// derived locally while holding the observer synchronization lock. The
+    /// source status and tip/checkpoint are sampled twice around raw-block
+    /// corroboration and durable-inventory checks.
+    ///
+    /// # Errors
+    /// Fails closed for an unconfirmed or under-confirmed transaction, source
+    /// disagreement, a stale/mismatched retained inventory, malformed or
+    /// oversized responses, a missing/duplicate transaction, or any change
+    /// between the two samples.
+    pub async fn observe_finalized_transaction(
+        &self,
+        txid: Txid,
+    ) -> Result<FinalizedBitcoinTransactionObservation, ObserverError> {
+        let _sync_guard = self.sync_lock.lock().await;
+        self.freshness.invalidate()?;
+
+        let first_status = self.corroborated_transaction_status(txid).await?;
+        let TransactionStatus::Confirmed {
+            block_height,
+            block_hash,
+        } = first_status.status
+        else {
+            return Err(ObserverError::TransactionUnconfirmed(txid));
+        };
+        let first_tip = self.corroborated_source_tip().await?;
+        let confirmations = confirmation_count(first_tip, block_height, txid)?;
+        if confirmations < self.required_confirmations {
+            return Err(ObserverError::InsufficientConfirmations {
+                txid,
+                observed: confirmations,
+                required: self.required_confirmations,
+            });
+        }
+
+        let observed_block = self.corroborated_block(block_height).await?;
+        let exact_transaction =
+            derive_exact_transaction(&observed_block.block, txid, block_height, block_hash)?;
+
+        let first_tip_checkpoint = self.corroborated_checkpoint(first_tip).await?;
+        self.verify_retained_snapshot(
+            block_height,
+            block_hash,
+            first_tip,
+            first_tip_checkpoint.block_hash,
+        )
+        .await?;
+
+        let second_status = self.corroborated_transaction_status(txid).await?;
+        if second_status.status != first_status.status {
+            return Err(ObserverError::SourceDisagreement(format!(
+                "transaction {txid} status changed during finality observation"
+            )));
+        }
+        let second_tip = self.corroborated_source_tip().await?;
+        if second_tip != first_tip {
+            return Err(ObserverError::SourceDisagreement(format!(
+                "Testnet4 tip changed from {first_tip} to {second_tip} during finality observation"
+            )));
+        }
+        let second_tip_checkpoint = self.corroborated_checkpoint(second_tip).await?;
+        if second_tip_checkpoint.block_hash != first_tip_checkpoint.block_hash {
+            return Err(ObserverError::SourceDisagreement(format!(
+                "Testnet4 checkpoint at height {second_tip} changed during finality observation"
+            )));
+        }
+        self.verify_retained_snapshot(
+            block_height,
+            block_hash,
+            second_tip,
+            second_tip_checkpoint.block_hash,
+        )
+        .await?;
+
+        let evidence_hash = compute_final_transaction_observation_hash(
+            self.source_set_id,
+            txid,
+            exact_transaction.wtxid,
+            exact_transaction.sha256,
+            block_height,
+            block_hash,
+            first_tip,
+            first_tip_checkpoint.block_hash,
+            confirmations,
+            self.required_confirmations,
+            observed_block.observation_evidence_hash,
+            first_status.evidence_hash,
+            second_status.evidence_hash,
+            first_tip_checkpoint.evidence_hash,
+            second_tip_checkpoint.evidence_hash,
+        );
+        self.freshness.refresh(POLICY_OBSERVATION_LEASE)?;
+
+        Ok(FinalizedBitcoinTransactionObservation {
+            chain_hash: ChainHash::TESTNET4,
+            txid,
+            wtxid: exact_transaction.wtxid,
+            exact_transaction_sha256: exact_transaction.sha256,
+            block_hash,
+            block_height,
+            corroborated_tip: first_tip,
+            confirmations,
+            required_confirmations: self.required_confirmations,
+            source_set_id: self.source_set_id,
+            evidence_hash,
+        })
     }
 
     /// Corroborate and commit at most 64 blocks, handling only reorgs whose
@@ -528,6 +756,98 @@ impl Testnet4FinalizedInventoryObserver {
             .ok_or_else(|| ObserverError::Config("observer source set is empty".to_string()))
     }
 
+    async fn corroborated_transaction_status(
+        &self,
+        txid: Txid,
+    ) -> Result<CorroboratedTransactionStatus, ObserverError> {
+        let mut evidence = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            evidence.push(source.fetch_transaction_status(txid).await?);
+        }
+        let first = evidence
+            .first()
+            .ok_or_else(|| ObserverError::Config("observer source set is empty".to_string()))?;
+        if evidence
+            .iter()
+            .skip(1)
+            .any(|candidate| candidate.status != first.status)
+        {
+            return Err(ObserverError::SourceDisagreement(format!(
+                "approved sources disagree on transaction {txid} confirmation status"
+            )));
+        }
+        Ok(CorroboratedTransactionStatus {
+            status: first.status,
+            evidence_hash: compute_transaction_status_sample_hash(
+                self.source_set_id,
+                txid,
+                first.status,
+                &evidence,
+            ),
+        })
+    }
+
+    async fn corroborated_checkpoint(
+        &self,
+        height: u32,
+    ) -> Result<CorroboratedCheckpoint, ObserverError> {
+        let mut evidence = Vec::with_capacity(self.sources.len());
+        for source in &self.sources {
+            let (block_hash, response_hash) = source.fetch_block_hash(height).await?;
+            evidence.push(SourceCheckpointEvidence {
+                source_id: source.source.source_id.clone(),
+                response_hash,
+                block_hash,
+            });
+        }
+        let first = evidence
+            .first()
+            .ok_or_else(|| ObserverError::Config("observer source set is empty".to_string()))?;
+        if evidence
+            .iter()
+            .skip(1)
+            .any(|candidate| candidate.block_hash != first.block_hash)
+        {
+            return Err(ObserverError::SourceDisagreement(format!(
+                "approved sources disagree on the canonical block at Testnet4 height {height}"
+            )));
+        }
+        Ok(CorroboratedCheckpoint {
+            block_hash: first.block_hash,
+            evidence_hash: compute_checkpoint_sample_hash(
+                self.source_set_id,
+                height,
+                first.block_hash,
+                &evidence,
+            ),
+        })
+    }
+
+    async fn verify_retained_snapshot(
+        &self,
+        transaction_height: u32,
+        transaction_block_hash: BlockHash,
+        corroborated_tip: u32,
+        corroborated_tip_hash: BlockHash,
+    ) -> Result<(), ObserverError> {
+        let canonical_transaction_hash = self
+            .inventory
+            .canonical_hash(u64::from(transaction_height))
+            .await?;
+        if canonical_transaction_hash != Some(transaction_block_hash) {
+            return Err(ObserverError::Finality(format!(
+                "retained inventory does not contain transaction block {transaction_block_hash} at height {transaction_height}"
+            )));
+        }
+        let latest = self.inventory.latest_checkpoint().await?;
+        if latest != Some((u64::from(corroborated_tip), corroborated_tip_hash)) {
+            return Err(ObserverError::Finality(format!(
+                "retained inventory is not caught up through corroborated Testnet4 tip {corroborated_tip}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn corroborated_block(&self, height: u32) -> Result<CorroboratedBlock, ObserverError> {
         let mut evidence = Vec::with_capacity(self.sources.len());
         for source in &self.sources {
@@ -643,6 +963,22 @@ pub enum ObserverError {
     /// Approved sources returned different canonical data.
     #[error("observer source disagreement: {0}")]
     SourceDisagreement(String),
+    /// Every source agreed that the requested transaction is not confirmed.
+    #[error("Bitcoin transaction {0} is not confirmed by the approved source set")]
+    TransactionUnconfirmed(Txid),
+    /// The corroborated transaction has not reached the configured floor.
+    #[error("Bitcoin transaction {txid} has {observed} confirmations, requires {required}")]
+    InsufficientConfirmations {
+        /// Requested transaction.
+        txid: Txid,
+        /// Inclusive confirmations at the corroborated tip.
+        observed: u32,
+        /// Source-set-pinned inventory floor.
+        required: u32,
+    },
+    /// Finality evidence could not be bound to the retained canonical snapshot.
+    #[error("Bitcoin finality observation failed: {0}")]
+    Finality(String),
     /// A reorg did not retain any locally journaled common ancestor.
     #[error("Bitcoin reorg extends below the trusted inventory checkpoint")]
     ReorgBeyondCheckpoint,
@@ -697,6 +1033,21 @@ impl EsploraSourceClient {
         })
     }
 
+    async fn fetch_transaction_status(
+        &self,
+        txid: Txid,
+    ) -> Result<SourceTransactionStatusEvidence, ObserverError> {
+        let bytes = self
+            .get_bounded(&format!("tx/{txid}/status"), MAX_TRANSACTION_STATUS_BYTES)
+            .await?;
+        let status = parse_transaction_status(&bytes)?;
+        Ok(SourceTransactionStatusEvidence {
+            source_id: self.source.source_id.clone(),
+            response_hash: sha256::Hash::hash(&bytes).to_byte_array(),
+            status,
+        })
+    }
+
     async fn get_bounded(
         &self,
         relative_path: &str,
@@ -741,6 +1092,83 @@ struct SourceBlockEvidence {
 struct CorroboratedBlock {
     block: Block,
     observation_evidence_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExactObservedTransaction {
+    wtxid: Wtxid,
+    sha256: [u8; 32],
+}
+
+fn derive_exact_transaction(
+    block: &Block,
+    txid: Txid,
+    block_height: u32,
+    expected_block_hash: BlockHash,
+) -> Result<ExactObservedTransaction, ObserverError> {
+    if block.block_hash() != expected_block_hash {
+        return Err(ObserverError::Finality(format!(
+            "transaction {txid} status block hash does not match corroborated block at height {block_height}"
+        )));
+    }
+    let mut matching = block
+        .txdata
+        .iter()
+        .filter(|transaction| transaction.compute_txid() == txid);
+    let transaction = matching.next().ok_or_else(|| {
+        ObserverError::Finality(format!(
+            "transaction {txid} is absent from its corroborated status block"
+        ))
+    })?;
+    if matching.next().is_some() {
+        return Err(ObserverError::Finality(format!(
+            "transaction {txid} appears more than once in its corroborated status block"
+        )));
+    }
+    if transaction.compute_txid() != txid {
+        return Err(ObserverError::Finality(
+            "locally derived transaction ID changed during observation".to_string(),
+        ));
+    }
+    Ok(ExactObservedTransaction {
+        wtxid: transaction.compute_wtxid(),
+        sha256: sha256::Hash::hash(&serialize(transaction)).to_byte_array(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransactionStatus {
+    Unconfirmed,
+    Confirmed {
+        block_height: u32,
+        block_hash: BlockHash,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct SourceTransactionStatusEvidence {
+    source_id: String,
+    response_hash: [u8; 32],
+    status: TransactionStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CorroboratedTransactionStatus {
+    status: TransactionStatus,
+    evidence_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+struct SourceCheckpointEvidence {
+    source_id: String,
+    response_hash: [u8; 32],
+    block_hash: BlockHash,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CorroboratedCheckpoint {
+    block_hash: BlockHash,
+    evidence_hash: [u8; 32],
 }
 
 async fn authenticate_testnet4_sources(
@@ -824,6 +1252,253 @@ fn parse_u32_text(bytes: &[u8], label: &str) -> Result<u32, ObserverError> {
         .map_err(|error| ObserverError::Decode(format!("{label}: {error}")))
 }
 
+fn parse_transaction_status(bytes: &[u8]) -> Result<TransactionStatus, ObserverError> {
+    let mut parser = StatusJsonParser::new(bytes);
+    parser.expect_byte(b'{', "transaction status must be a JSON object")?;
+    let mut confirmed = None;
+    let mut block_height = None;
+    let mut block_height_seen = false;
+    let mut block_hash = None;
+    let mut block_hash_seen = false;
+    let mut block_time_seen = false;
+
+    if !parser.consume_byte(b'}') {
+        loop {
+            let key = parser.parse_string("transaction status field name")?;
+            parser.expect_byte(b':', "transaction status field requires ':'")?;
+            match key {
+                "confirmed" => {
+                    if confirmed.is_some() {
+                        return Err(ObserverError::Decode(
+                            "transaction status repeats confirmed".to_string(),
+                        ));
+                    }
+                    confirmed = Some(parser.parse_bool("confirmed")?);
+                }
+                "block_height" => {
+                    if block_height_seen {
+                        return Err(ObserverError::Decode(
+                            "transaction status repeats block_height".to_string(),
+                        ));
+                    }
+                    block_height_seen = true;
+                    block_height = parser.parse_optional_u32("block_height")?;
+                }
+                "block_hash" => {
+                    if block_hash_seen {
+                        return Err(ObserverError::Decode(
+                            "transaction status repeats block_hash".to_string(),
+                        ));
+                    }
+                    block_hash_seen = true;
+                    block_hash = parser.parse_optional_block_hash()?;
+                }
+                "block_time" => {
+                    if block_time_seen {
+                        return Err(ObserverError::Decode(
+                            "transaction status repeats block_time".to_string(),
+                        ));
+                    }
+                    block_time_seen = true;
+                    let _ = parser.parse_optional_u64("block_time")?;
+                }
+                _ => {
+                    return Err(ObserverError::Decode(format!(
+                        "transaction status contains unsupported field {key}"
+                    )));
+                }
+            }
+            if parser.consume_byte(b'}') {
+                break;
+            }
+            parser.expect_byte(b',', "transaction status fields require ','")?;
+        }
+    }
+    parser.finish()?;
+
+    match confirmed {
+        Some(true) => Ok(TransactionStatus::Confirmed {
+            block_height: block_height.ok_or_else(|| {
+                ObserverError::Decode("confirmed transaction status omits block_height".to_string())
+            })?,
+            block_hash: block_hash.ok_or_else(|| {
+                ObserverError::Decode("confirmed transaction status omits block_hash".to_string())
+            })?,
+        }),
+        Some(false) => {
+            if block_height.is_some() || block_hash.is_some() {
+                return Err(ObserverError::Decode(
+                    "unconfirmed transaction status supplies a canonical block".to_string(),
+                ));
+            }
+            Ok(TransactionStatus::Unconfirmed)
+        }
+        None => Err(ObserverError::Decode(
+            "transaction status omits confirmed".to_string(),
+        )),
+    }
+}
+
+struct StatusJsonParser<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> StatusJsonParser<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn finish(&mut self) -> Result<(), ObserverError> {
+        self.skip_whitespace();
+        if self.position != self.bytes.len() {
+            return Err(ObserverError::Decode(
+                "transaction status has trailing JSON data".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .bytes
+            .get(self.position)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.position = self.position.saturating_add(1);
+        }
+    }
+
+    fn consume_byte(&mut self, expected: u8) -> bool {
+        self.skip_whitespace();
+        if self.bytes.get(self.position) == Some(&expected) {
+            self.position = self.position.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8, message: &str) -> Result<(), ObserverError> {
+        if self.consume_byte(expected) {
+            Ok(())
+        } else {
+            Err(ObserverError::Decode(message.to_string()))
+        }
+    }
+
+    fn parse_string(&mut self, label: &str) -> Result<&'a str, ObserverError> {
+        self.skip_whitespace();
+        if self.bytes.get(self.position) != Some(&b'"') {
+            return Err(ObserverError::Decode(format!(
+                "{label} must be a JSON string"
+            )));
+        }
+        self.position = self.position.saturating_add(1);
+        let start = self.position;
+        while let Some(byte) = self.bytes.get(self.position).copied() {
+            match byte {
+                b'"' => {
+                    let value = std::str::from_utf8(&self.bytes[start..self.position])
+                        .map_err(|_| ObserverError::Decode(format!("{label} is not UTF-8")))?;
+                    self.position = self.position.saturating_add(1);
+                    return Ok(value);
+                }
+                b'\\' => {
+                    return Err(ObserverError::Decode(format!(
+                        "{label} must not use JSON escapes"
+                    )));
+                }
+                0x00..=0x1f => {
+                    return Err(ObserverError::Decode(format!(
+                        "{label} contains a JSON control byte"
+                    )));
+                }
+                _ => self.position = self.position.saturating_add(1),
+            }
+        }
+        Err(ObserverError::Decode(format!("{label} is not terminated")))
+    }
+
+    fn parse_bool(&mut self, label: &str) -> Result<bool, ObserverError> {
+        self.skip_whitespace();
+        let remaining = &self.bytes[self.position..];
+        if remaining.starts_with(b"true") {
+            self.position = self.position.saturating_add(4);
+            Ok(true)
+        } else if remaining.starts_with(b"false") {
+            self.position = self.position.saturating_add(5);
+            Ok(false)
+        } else {
+            Err(ObserverError::Decode(format!(
+                "{label} must be a JSON boolean"
+            )))
+        }
+    }
+
+    fn parse_optional_u32(&mut self, label: &str) -> Result<Option<u32>, ObserverError> {
+        self.parse_optional_u64(label)?
+            .map(|value| {
+                u32::try_from(value)
+                    .map_err(|_| ObserverError::Decode(format!("{label} exceeds the u32 range")))
+            })
+            .transpose()
+    }
+
+    fn parse_optional_u64(&mut self, label: &str) -> Result<Option<u64>, ObserverError> {
+        self.skip_whitespace();
+        if self.bytes[self.position..].starts_with(b"null") {
+            self.position = self.position.saturating_add(4);
+            return Ok(None);
+        }
+        let start = self.position;
+        while self
+            .bytes
+            .get(self.position)
+            .is_some_and(u8::is_ascii_digit)
+        {
+            self.position = self.position.saturating_add(1);
+        }
+        if start == self.position {
+            return Err(ObserverError::Decode(format!(
+                "{label} must be a non-negative JSON integer or null"
+            )));
+        }
+        if self.position.saturating_sub(start) > 1 && self.bytes[start] == b'0' {
+            return Err(ObserverError::Decode(format!(
+                "{label} has a non-canonical leading zero"
+            )));
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.position])
+            .map_err(|_| ObserverError::Decode(format!("{label} is not UTF-8")))?;
+        text.parse::<u64>()
+            .map(Some)
+            .map_err(|error| ObserverError::Decode(format!("{label}: {error}")))
+    }
+
+    fn parse_optional_block_hash(&mut self) -> Result<Option<BlockHash>, ObserverError> {
+        self.skip_whitespace();
+        if self.bytes[self.position..].starts_with(b"null") {
+            self.position = self.position.saturating_add(4);
+            return Ok(None);
+        }
+        let text = self.parse_string("block_hash")?;
+        BlockHash::from_str(text)
+            .map(Some)
+            .map_err(|_| ObserverError::Decode("block_hash is invalid".to_string()))
+    }
+}
+
+fn confirmation_count(tip: u32, block_height: u32, txid: Txid) -> Result<u32, ObserverError> {
+    tip.checked_sub(block_height)
+        .and_then(|depth| depth.checked_add(1))
+        .ok_or_else(|| {
+            ObserverError::Finality(format!(
+                "transaction {txid} block height {block_height} is above corroborated tip {tip}"
+            ))
+        })
+}
+
 fn compute_source_set_id(sources: &[Testnet4EsploraSource]) -> [u8; 32] {
     let mut bytes = Vec::new();
     push_bytes(&mut bytes, SOURCE_SET_DOMAIN);
@@ -853,6 +1528,98 @@ fn compute_observation_evidence_hash(
         bytes.extend_from_slice(&source.height_response_hash);
         bytes.extend_from_slice(&source.raw_response_hash);
     }
+    sha256::Hash::hash(&bytes).to_byte_array()
+}
+
+fn compute_transaction_status_sample_hash(
+    source_set_id: [u8; 32],
+    txid: Txid,
+    status: TransactionStatus,
+    evidence: &[SourceTransactionStatusEvidence],
+) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    push_bytes(&mut bytes, TRANSACTION_STATUS_SAMPLE_DOMAIN);
+    bytes.extend_from_slice(ChainHash::TESTNET4.as_bytes());
+    bytes.extend_from_slice(&source_set_id);
+    bytes.extend_from_slice(txid.as_byte_array());
+    match status {
+        TransactionStatus::Unconfirmed => bytes.push(0),
+        TransactionStatus::Confirmed {
+            block_height,
+            block_hash,
+        } => {
+            bytes.push(1);
+            bytes.extend_from_slice(&block_height.to_be_bytes());
+            bytes.extend_from_slice(block_hash.as_byte_array());
+        }
+    }
+    bytes.extend_from_slice(&(evidence.len() as u64).to_be_bytes());
+    for source in evidence {
+        push_bytes(&mut bytes, source.source_id.as_bytes());
+        bytes.extend_from_slice(&source.response_hash);
+    }
+    sha256::Hash::hash(&bytes).to_byte_array()
+}
+
+fn compute_checkpoint_sample_hash(
+    source_set_id: [u8; 32],
+    height: u32,
+    block_hash: BlockHash,
+    evidence: &[SourceCheckpointEvidence],
+) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    push_bytes(&mut bytes, CHECKPOINT_SAMPLE_DOMAIN);
+    bytes.extend_from_slice(ChainHash::TESTNET4.as_bytes());
+    bytes.extend_from_slice(&source_set_id);
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(block_hash.as_byte_array());
+    bytes.extend_from_slice(&(evidence.len() as u64).to_be_bytes());
+    for source in evidence {
+        push_bytes(&mut bytes, source.source_id.as_bytes());
+        bytes.extend_from_slice(&source.response_hash);
+    }
+    sha256::Hash::hash(&bytes).to_byte_array()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the final observation commitment intentionally enumerates every authoritative field"
+)]
+fn compute_final_transaction_observation_hash(
+    source_set_id: [u8; 32],
+    txid: Txid,
+    wtxid: Wtxid,
+    exact_transaction_sha256: [u8; 32],
+    block_height: u32,
+    block_hash: BlockHash,
+    corroborated_tip: u32,
+    corroborated_tip_hash: BlockHash,
+    confirmations: u32,
+    required_confirmations: u32,
+    block_evidence_hash: [u8; 32],
+    first_status_evidence_hash: [u8; 32],
+    second_status_evidence_hash: [u8; 32],
+    first_tip_evidence_hash: [u8; 32],
+    second_tip_evidence_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    push_bytes(&mut bytes, FINAL_TRANSACTION_OBSERVATION_DOMAIN);
+    bytes.extend_from_slice(ChainHash::TESTNET4.as_bytes());
+    bytes.extend_from_slice(&source_set_id);
+    bytes.extend_from_slice(txid.as_byte_array());
+    bytes.extend_from_slice(wtxid.as_byte_array());
+    bytes.extend_from_slice(&exact_transaction_sha256);
+    bytes.extend_from_slice(&block_height.to_be_bytes());
+    bytes.extend_from_slice(block_hash.as_byte_array());
+    bytes.extend_from_slice(&corroborated_tip.to_be_bytes());
+    bytes.extend_from_slice(corroborated_tip_hash.as_byte_array());
+    bytes.extend_from_slice(&confirmations.to_be_bytes());
+    bytes.extend_from_slice(&required_confirmations.to_be_bytes());
+    bytes.extend_from_slice(&block_evidence_hash);
+    bytes.extend_from_slice(&first_status_evidence_hash);
+    bytes.extend_from_slice(&second_status_evidence_hash);
+    bytes.extend_from_slice(&first_tip_evidence_hash);
+    bytes.extend_from_slice(&second_tip_evidence_hash);
     sha256::Hash::hash(&bytes).to_byte_array()
 }
 
@@ -930,6 +1697,135 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(tip.to_string()))
             .mount(server)
             .await;
+    }
+
+    async fn mount_checkpoint(server: &MockServer, height: u32, block_hash: BlockHash) {
+        Mock::given(method("GET"))
+            .and(path(format!("/block-height/{height}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(block_hash.to_string()))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_status(server: &MockServer, txid: Txid, body: impl Into<Vec<u8>>) {
+        Mock::given(method("GET"))
+            .and(path(format!("/tx/{txid}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_status_sequence(
+        server: &MockServer,
+        txid: Txid,
+        first: impl Into<Vec<u8>>,
+        second: impl Into<Vec<u8>>,
+    ) {
+        Mock::given(method("GET"))
+            .and(path(format!("/tx/{txid}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(first))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/tx/{txid}/status")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(second))
+            .with_priority(2)
+            .mount(server)
+            .await;
+    }
+
+    fn confirmed_status(block_height: u32, block_hash: BlockHash) -> String {
+        format!(
+            "{{\"confirmed\":true,\"block_height\":{block_height},\"block_hash\":\"{block_hash}\",\"block_time\":1}}"
+        )
+    }
+
+    async fn seed_inventory_through(
+        observer: &Testnet4FinalizedInventoryObserver,
+        tip: u32,
+    ) -> BlockHash {
+        let mut parent = BlockHash::all_zeros();
+        for height in 0..=tip {
+            let block_hash = if height == 0 {
+                genesis_block(Network::Testnet4).block_hash()
+            } else {
+                BlockHash::from_byte_array([u8::try_from(height).expect("small test height"); 32])
+            };
+            let block = FinalizedBitcoinBlock::new(
+                u64::from(height),
+                block_hash,
+                parent,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("synthetic inventory checkpoint");
+            observer
+                .inventory
+                .commit_block(block)
+                .await
+                .expect("seed retained checkpoint");
+            parent = block_hash;
+        }
+        parent
+    }
+
+    struct FinalityFixture {
+        observer: Testnet4FinalizedInventoryObserver,
+        first: MockServer,
+        second: MockServer,
+        directory: PathBuf,
+        transaction: Transaction,
+    }
+
+    impl FinalityFixture {
+        fn cleanup(self) {
+            let Self {
+                observer,
+                first,
+                second,
+                directory,
+                transaction: _,
+            } = self;
+            drop(observer);
+            drop(first);
+            drop(second);
+            std::fs::remove_dir_all(directory).expect("remove finality fixture");
+        }
+    }
+
+    async fn finality_fixture(name: &str, tip: u32) -> FinalityFixture {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount_genesis(&first, tip).await;
+        mount_genesis(&second, tip).await;
+        let directory = private_test_directory(name);
+        let database = directory.join("inventory.sqlite");
+        let config = Testnet4ObserverConfig::new_for_test(
+            name,
+            &database,
+            custody_script(),
+            MIN_FINALIZED_BITCOIN_CONFIRMATIONS,
+            0,
+            vec![("first", &first.uri()), ("second", &second.uri())],
+        )
+        .expect("finality test config");
+        let observer = Testnet4FinalizedInventoryObserver::open(config)
+            .await
+            .expect("finality test observer");
+        let tip_hash = seed_inventory_through(&observer, tip).await;
+        if tip != 0 {
+            mount_checkpoint(&first, tip, tip_hash).await;
+            mount_checkpoint(&second, tip, tip_hash).await;
+        }
+        FinalityFixture {
+            observer,
+            first,
+            second,
+            directory,
+            transaction: genesis_block(Network::Testnet4).txdata[0].clone(),
+        }
     }
 
     #[test]
@@ -1077,6 +1973,241 @@ mod tests {
         freshness.invalidate().expect("invalidate observer lease");
         assert!(freshness.finish_check(generation).is_err());
         assert!(freshness.begin_check().is_err());
+    }
+
+    #[test]
+    fn transaction_status_parser_is_strict_and_fail_closed() {
+        let block_hash = genesis_block(Network::Testnet4).block_hash();
+        assert_eq!(
+            parse_transaction_status(confirmed_status(0, block_hash).as_bytes())
+                .expect("valid confirmed status"),
+            TransactionStatus::Confirmed {
+                block_height: 0,
+                block_hash,
+            }
+        );
+        assert_eq!(
+            parse_transaction_status(br#"{"confirmed":false}"#).expect("valid unconfirmed status"),
+            TransactionStatus::Unconfirmed
+        );
+        assert!(parse_transaction_status(
+            br#"{"confirmed":true,"confirmed":true,"block_height":0,"block_hash":null}"#
+        )
+        .is_err());
+        assert!(parse_transaction_status(br#"{"confirmed":false,"unknown":1}"#).is_err());
+        assert!(parse_transaction_status(br#"{"confirmed":false} trailing"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn finalized_transaction_observation_binds_exact_bytes_and_source_set() {
+        let fixture = finality_fixture("finality-happy", 5).await;
+        let txid = fixture.transaction.compute_txid();
+        let status = confirmed_status(0, genesis_block(Network::Testnet4).block_hash());
+        mount_status(&fixture.first, txid, status.clone()).await;
+        mount_status(&fixture.second, txid, status).await;
+
+        let observation = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect("stable six-confirmation observation");
+        let exact_bytes = serialize(&fixture.transaction);
+        assert_eq!(observation.chain_hash(), ChainHash::TESTNET4);
+        assert_eq!(observation.txid(), txid);
+        assert_eq!(observation.wtxid(), fixture.transaction.compute_wtxid());
+        assert_eq!(
+            observation.exact_transaction_sha256(),
+            sha256::Hash::hash(&exact_bytes).to_byte_array()
+        );
+        assert_eq!(
+            observation.block_hash(),
+            genesis_block(Network::Testnet4).block_hash()
+        );
+        assert_eq!(observation.block_height(), 0);
+        assert_eq!(observation.corroborated_tip(), 5);
+        assert_eq!(observation.confirmations(), 6);
+        assert_eq!(
+            observation.required_confirmations(),
+            MIN_FINALIZED_BITCOIN_CONFIRMATIONS
+        );
+        assert_eq!(
+            observation.source_set_id(),
+            fixture.observer.source_set_id()
+        );
+        assert_ne!(observation.source_set_id(), [0; 32]);
+        assert_ne!(observation.evidence_hash(), [0; 32]);
+
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_transaction_is_rejected() {
+        let fixture = finality_fixture("finality-unconfirmed", 5).await;
+        let txid = fixture.transaction.compute_txid();
+        mount_status(&fixture.first, txid, br#"{"confirmed":false}"#).await;
+        mount_status(&fixture.second, txid, br#"{"confirmed":false}"#).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("unconfirmed transaction must fail closed");
+        assert!(matches!(error, ObserverError::TransactionUnconfirmed(id) if id == txid));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn source_status_height_disagreement_is_rejected() {
+        let fixture = finality_fixture("finality-status-disagreement", 5).await;
+        let txid = fixture.transaction.compute_txid();
+        let block_hash = genesis_block(Network::Testnet4).block_hash();
+        mount_status(&fixture.first, txid, confirmed_status(0, block_hash)).await;
+        mount_status(&fixture.second, txid, confirmed_status(1, block_hash)).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("source-supplied height disagreement must fail closed");
+        assert!(matches!(error, ObserverError::SourceDisagreement(_)));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn status_block_hash_must_match_corroborated_raw_block() {
+        let fixture = finality_fixture("finality-wrong-hash", 5).await;
+        let txid = fixture.transaction.compute_txid();
+        let wrong_hash = BlockHash::from_byte_array([0x99; 32]);
+        let status = confirmed_status(0, wrong_hash);
+        mount_status(&fixture.first, txid, status.clone()).await;
+        mount_status(&fixture.second, txid, status).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("status block hash cannot override raw block validation");
+        assert!(matches!(error, ObserverError::Finality(_)));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn status_block_must_contain_the_requested_transaction() {
+        let fixture = finality_fixture("finality-missing-transaction", 5).await;
+        let txid = Txid::from_byte_array([0x77; 32]);
+        let status = confirmed_status(0, genesis_block(Network::Testnet4).block_hash());
+        mount_status(&fixture.first, txid, status.clone()).await;
+        mount_status(&fixture.second, txid, status).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("status cannot substitute for transaction inclusion");
+        assert!(matches!(error, ObserverError::Finality(_)));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn configured_confirmation_floor_is_enforced() {
+        let fixture = finality_fixture("finality-confirmations", 4).await;
+        let txid = fixture.transaction.compute_txid();
+        let status = confirmed_status(0, genesis_block(Network::Testnet4).block_hash());
+        mount_status(&fixture.first, txid, status.clone()).await;
+        mount_status(&fixture.second, txid, status).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("five confirmations must not satisfy the six-block floor");
+        assert!(matches!(
+            error,
+            ObserverError::InsufficientConfirmations {
+                txid: id,
+                observed: 5,
+                required: MIN_FINALIZED_BITCOIN_CONFIRMATIONS,
+            } if id == txid
+        ));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn retained_inventory_must_be_caught_up_through_corroborated_tip() {
+        let fixture = finality_fixture("finality-stale-inventory", 5).await;
+        let txid = fixture.transaction.compute_txid();
+        let height_four_hash = fixture
+            .observer
+            .inventory
+            .canonical_hash(4)
+            .await
+            .expect("canonical height query")
+            .expect("height four checkpoint");
+        fixture
+            .observer
+            .inventory
+            .rollback_to(4, height_four_hash)
+            .await
+            .expect("stale inventory fixture");
+        let status = confirmed_status(0, genesis_block(Network::Testnet4).block_hash());
+        mount_status(&fixture.first, txid, status.clone()).await;
+        mount_status(&fixture.second, txid, status).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("inventory behind the corroborated tip must fail closed");
+        assert!(matches!(error, ObserverError::Finality(_)));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn reorg_between_status_samples_is_rejected() {
+        let fixture = finality_fixture("finality-status-race", 5).await;
+        let txid = fixture.transaction.compute_txid();
+        let first_status = confirmed_status(0, genesis_block(Network::Testnet4).block_hash());
+        let changed_status = confirmed_status(0, BlockHash::from_byte_array([0x88; 32]));
+        mount_status_sequence(
+            &fixture.first,
+            txid,
+            first_status.clone(),
+            changed_status.clone(),
+        )
+        .await;
+        mount_status_sequence(&fixture.second, txid, first_status, changed_status).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("status reorg between samples must fail closed");
+        assert!(matches!(error, ObserverError::SourceDisagreement(_)));
+        fixture.cleanup();
+    }
+
+    #[tokio::test]
+    async fn oversized_transaction_status_is_rejected_before_parsing() {
+        let fixture = finality_fixture("finality-status-limit", 5).await;
+        let txid = fixture.transaction.compute_txid();
+        mount_status(
+            &fixture.first,
+            txid,
+            vec![b' '; MAX_TRANSACTION_STATUS_BYTES.saturating_add(1)],
+        )
+        .await;
+        mount_status(&fixture.second, txid, br#"{"confirmed":false}"#).await;
+
+        let error = fixture
+            .observer
+            .observe_finalized_transaction(txid)
+            .await
+            .expect_err("oversized status body must fail closed");
+        assert!(matches!(
+            error,
+            ObserverError::ResponseTooLarge(MAX_TRANSACTION_STATUS_BYTES)
+        ));
+        fixture.cleanup();
     }
 
     #[tokio::test]

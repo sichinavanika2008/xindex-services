@@ -74,14 +74,30 @@ referenced upstream release-manifest digest, vault, canonical distinct
 configured DKLS participant set, threshold, session and reshare epoch. It does
 not claim configured participant roles are visible in the Bitcoin witness.
 
-`xindex-executor::prepare_vultisig_bitcoin_broadcast` is an optional key-free
-preparation boundary: it consumes only that evidence, repeats the exact
-Testnet4/canonical-byte/txid/wtxid checks, requires an abstract write-ahead sink,
-and returns a non-cloneable prepared capability without exposing transaction
-bytes. It intentionally performs no broadcast and is not runtime wiring. The
-initial generic-chain-client broadcaster was rejected during review because it
-did not authenticate the destination as Testnet4 or guarantee exact witness-byte
-submission.
+`VultisigBitcoinBroadcastRuntime::prepare` is now the integrated key-free
+preparation boundary. It consumes the non-cloneable evidence, repeats exact
+Testnet4/canonical-byte/txid/wtxid checks, and durably writes the complete
+evidence plus exact bytes before returning a prepared handle. The same sealed
+runtime owns a target- and observer-policy-bound file-backed SQLite
+`prepared → submitting → accepted → finalized` state machine. Its production
+target requires a normalized HTTPS DNS URL, reviewed operator identity record,
+normal WebPKI validation and an exact leaf-certificate pin set; it also
+authenticates exact Testnet4 genesis and POSTs lower hex derived directly from
+persisted bytes. The broadcast store requires a canonical private parent and
+owner-only regular database file and rejects symlinks, hard links, wrong modes,
+unexpected sidecars and later path replacement. CAS admits one initial
+`prepared → submitting` claimant, possible sends remain durable ambiguity,
+byte-identical raw transactions are required for reconciliation, and a durable
+prepared row can resume after restart even if the process failed after commit
+but before returning its handle. Explicit recovery may idempotently resend only
+the same stored bytes. Terminal finalization consumes the observer's opaque
+final-transaction capability and atomically binds the expected source set,
+exact transaction identities/bytes, confirmation arithmetic, canonical block
+and observation evidence. There is no public raw-byte or generic-client
+submission route. The audit evidence intentionally carries the signed bytes;
+Rust types do not make them globally non-copyable or the wider system
+non-bypassable. The initial generic-client broadcaster was rejected because it
+did not authenticate Testnet4 or guarantee exact witness bytes.
 
 The adapter's only public policy constructor now consumes an opaque capability
 issued by `xindex-chain-utxo::finalized_inventory`, not caller-supplied UTXO
@@ -101,20 +117,25 @@ canonical raw block bytes and local PoW/commitments, and resamples tips before
 granting a two-minute policy-freshness lease. A source-pinned
 `VultisigBitcoinPolicyRuntime` carries its read-only policy source through
 issuance, authorization and final handoff. Coinbase outputs are deliberately
-excluded until their 100-block maturity is modeled.
+excluded until their 100-block maturity is modeled. The observer also issues a
+non-forgeable final-transaction observation only after stable two-sample
+status/tip/checkpoint corroboration, exact block/transaction-byte derivation,
+the configured confirmation floor and a caught-up retained inventory all agree.
 
 These remain library primitives: no workspace binary pins an approved endpoint
-set, drives or monitors the observer, produces the evidence, supplies a concrete
-durable/idempotent evidence sink, or consumes the prepared capability in a
-broadcaster. Configured HTTPS sources are still trusted for canonical-chain
-selection, transaction validity and difficulty transitions; distinct hostnames
-do not prove independent operators. Owner-only storage does not prevent same-UID
-direct edits or copied-database substitution. A future broadcaster must make
-the prepared path unskippable, own a genesis-authenticated exact-byte Testnet4
-target, and reconcile explicit pending/accepted state across ambiguous outcomes
-and restarts. Gate 4 remains blocked on that runtime/deployment wiring,
-full-node or independently reviewed source topology, upstream integration and
-approved release manifest, runtime evidence production/persistence, real
+set, drives or monitors the observer, produces the evidence, or makes the
+sealed runtime mandatory. Configured HTTPS sources are still trusted for
+canonical-chain selection, transaction validity and difficulty transitions;
+the single exact-pinned broadcast target is still trusted for availability and
+its acceptance response. Distinct hostnames do not prove independent operators.
+Owner-only storage does not prevent same-UID direct edits or copied-database
+substitution. `accepted` means exact target response or exact raw
+reconciliation; only a matching configured-source observation advances the row
+to `finalized`, and that observation is not independent full-node consensus.
+Gate 4 remains blocked on binary/mandatory runtime wiring, actual approved
+endpoint/operator/certificate and source identities, full-node or independently
+reviewed source topology, upstream integration and approved release manifest,
+runtime evidence production/persistence, ongoing confirmation monitoring, real
 participant/reshare topology and failure-domain tests. See
 [`memory/GATE-4-PREFLIGHT.md`](../memory/GATE-4-PREFLIGHT.md).
 
@@ -122,7 +143,9 @@ The key-free Rust 1.95.0 gate passes format, 8/8 compiled production-profile
 behaviors and supplemental lints, all ten ABI manifest/current-parent checks,
 locked/offline strict whole-workspace all-target/all-feature Clippy, all-feature
 test compilation and cargo-deny with configured warnings. Focused execution is
-55/55 chain-utxo tests, 30/30 adapter tests and nine compile-fail doctests. The
+65/65 chain-utxo tests, 30/30 adapter tests, 28/28 executor Vultisig broadcast
+tests and five adapter compile-fail doctests. The executor passes 104/104
+library tests and 5/5 doctests offline/locked. The
 unchanged production-profile wrapper passes directly.
 
 The code-addressable Gate-3 findings are published, while the Chainflip/Maya

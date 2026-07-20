@@ -48,21 +48,33 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   `FinalizedBitcoinSpend`; it binds the reviewed-release manifest digest,
   configured participant topology, threshold, session, reshare epoch,
   policy/provenance, custody certificate, aggregate key and exact transaction.
-  `xindex-executor::prepare_vultisig_bitcoin_broadcast` is now an optional,
-  key-free write-ahead preparation boundary: it consumes that evidence,
-  rechecks exact Testnet4/canonical bytes/txid/wtxid, requires an abstract
-  fail-closed persistence sink, and returns a non-cloneable prepared capability
-  with no byte extraction. It deliberately performs no broadcast. No concrete
-  durable sink, runtime, target-bound Testnet4 transport or broadcaster consumes
-  the prepared capability, so the mandatory handoff remains open. The first
+  `VultisigBitcoinBroadcastRuntime::prepare` is the integrated key-free
+  write-ahead boundary: it consumes that evidence, rechecks exact
+  Testnet4/canonical bytes/txid/wtxid, durably writes the complete record and
+  exact bytes, and only then returns a non-cloneable prepared capability with
+  no byte extraction. The same sealed runtime owns a target- and finality-
+  policy-bound file-backed SQLite
+  `prepared → submitting → accepted → finalized` state machine. Production
+  target construction requires a normalized HTTPS DNS URL, reviewed operator
+  identity record and exact leaf-certificate pin set while retaining normal
+  WebPKI validation; the runtime also authenticates exact Testnet4 genesis,
+  submits persisted-byte lower hex, and reconciles only byte-identical raw
+  bytes. The store requires canonical owner-only paths and rejects symlinks,
+  hard links, wrong modes, unexpected sidecars and later path replacement. CAS
+  admits one initial `prepared → submitting` claimant, possible sends remain
+  ambiguous, and runtime-owned durable prepared rows resume after restart,
+  including a commit completed before the in-memory handle returned. Explicit
+  ambiguous recovery may idempotently resend only the same stored bytes.
+  Terminal finalization consumes only
+  `FinalizedBitcoinTransactionObservation`, requires its configured source-set
+  identity, txid, wtxid, exact-byte digest and confirmation arithmetic to match
+  the immutable row, and durably records the observation evidence. The first
   attempted generic-client broadcaster was rejected in review because checking
   the evidence chain hash does not authenticate the destination endpoint and a
-  parsed-transaction API cannot prove exact-witness-byte submission. A future
-  broadcaster must consume the prepared capability, own an authenticated
-  genesis-pinned Testnet4 exact-byte transport, persist/reconcile explicit
-  pending/accepted state across restart and ambiguity, and check chain hash,
-  txid and wtxid. Do not expose the pure validator/hash derivation or add
-  transport, signing or broadcast behavior without an explicit reviewed design.
+  parsed-transaction API cannot prove exact-witness-byte submission. The
+  runtime remains optional library composition, not binary/mandatory wiring or
+  production approval. Do not expose the pure validator/hash derivation or a
+  public raw-byte/generic-client submission path.
 - `xindex-chain-utxo::{trusted_observer,finalized_inventory}` form the key-free
   observation/provenance boundary. The observer is the only non-test owner of
   journal mutation authority. It requires at least two exact HTTPS DNS-host
@@ -74,7 +86,10 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   reorgs back atomically while advancing an epoch, and issues opaque capabilities
   only for exact six-confirmation-or-deeper unspent P2WPKH inputs. A durable
   random journal ID prevents a separately created matching database from
-  substituting for the issuing journal through the API.
+  substituting for the issuing journal through the API. The same observer can
+  issue an opaque final-transaction observation only after two stable status,
+  tip and checkpoint samples bind exact canonical bytes and the retained
+  inventory remains caught up through the corroborated tip.
 - `BitcoinSpendPolicy::new_testnet4` accepts only that opaque capability; raw
   outpoints, values, scripts and provenance fields have no public constructor or
   deserialization path. Authorization and finalized-transaction handoff both
@@ -120,10 +135,13 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   change to VIN0, final VOUT memo. Preserve `BTC-ORDER-01` regressions and gate
   every provider-returned unsigned transaction before signing.
 - Gate 4 is not complete. The key-free policy, local aggregate-evidence schema,
-  and abstract executor write-ahead preparation boundary exist; a concrete
-  durable/idempotent sink, authenticated exact-byte Testnet4 broadcaster,
-  restart/ambiguity reconciliation, upstream runtime population,
-  failure-domain tests and independent review remain. Later key use and
+  integrated target/finality-bound durable state machine, exact-pinned
+  Testnet4 transport, secure broadcast-store metadata checks and local
+  configured-source finality transition exist. Binary/mandatory upstream
+  wiring, actual approved endpoint/operator/certificate and source identities,
+  independent consensus evidence, upstream runtime population, ongoing
+  confirmation monitoring, failure-domain tests and independent review remain.
+  Later key use and
   test-network rehearsal require separate authorization. The older 3-of-5
   custody rehearsal is historical and cannot substitute.
 - EVM-family THORChain router addresses in the chain registry are deliberately

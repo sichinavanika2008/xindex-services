@@ -1,4 +1,4 @@
-//! Shared exact-peer mutual-TLS transport for production HTTP roles.
+//! Shared exact-peer TLS transport for production HTTP roles.
 //!
 //! Every peer first passes normal rustls `WebPKI` chain, time, purpose,
 //! signature, and (for servers) hostname validation. The presented end-entity
@@ -8,6 +8,9 @@
 //! intermediates during the handshake. Separate entries allow an intentional
 //! rotation overlap. The helper deliberately does not read files itself:
 //! callers control owner/mode checks before supplying PEM.
+//! Outbound clients may either present a pinned mTLS identity or authenticate
+//! only the server; both modes use the same exact server verifier and explicit
+//! roots, never the platform root store.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +40,8 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::network::{async_client_builder, blocking_client_builder, HttpClientPolicy};
+
+const EXACT_LEAF_PIN_SET_ID_DOMAIN: &[u8] = b"XINDEX/TLS/EXACT-LEAF-PIN-SET/V1";
 
 /// Systemic resource policy for production mTLS HTTP listeners.
 ///
@@ -122,6 +127,23 @@ impl std::fmt::Debug for PinnedCertStore {
             .field("trust_anchors", &self.roots.len())
             .field("exact_leaf_pins", &self.leaf_sha256.len())
             .finish()
+    }
+}
+
+impl PinnedCertStore {
+    /// Domain-separated identity of the canonical exact-leaf pin set.
+    ///
+    /// Pin order and duplicate PEM entries do not affect this value. Callers
+    /// may bind it into an endpoint identity without retaining certificate PEM
+    /// or exposing private-key material.
+    #[must_use]
+    pub fn exact_leaf_pin_set_id(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(EXACT_LEAF_PIN_SET_ID_DOMAIN);
+        for pin in &self.leaf_sha256 {
+            hasher.update(pin);
+        }
+        hasher.finalize().into()
     }
 }
 
@@ -310,10 +332,25 @@ pub fn pinned_cert_store(cert_pems: &[Vec<u8>]) -> Result<PinnedCertStore, TlsEr
             .add(trust_anchor)
             .map_err(|error| TlsError::Rustls(error.to_string()))?;
     }
+    leaf_sha256.sort_unstable();
+    leaf_sha256.dedup();
     if roots.is_empty() || leaf_sha256.is_empty() {
         return Err(TlsError::NoPinnedCerts);
     }
     Ok(PinnedCertStore { roots, leaf_sha256 })
+}
+
+fn exact_server_cert_verifier(
+    pinned_server: PinnedCertStore,
+) -> Result<Arc<ExactServerCertVerifier>, TlsError> {
+    let verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(pinned_server.roots), provider())
+            .build()
+            .map_err(|error| TlsError::Rustls(error.to_string()))?;
+    Ok(Arc::new(ExactServerCertVerifier {
+        inner: verifier,
+        leaf_sha256: pinned_server.leaf_sha256,
+    }))
 }
 
 /// Build a server configuration requiring a pinned client certificate.
@@ -351,14 +388,7 @@ pub fn client_config(
     client_key: PrivateKeyDer<'static>,
     pinned_server: PinnedCertStore,
 ) -> Result<ClientConfig, TlsError> {
-    let verifier =
-        WebPkiServerVerifier::builder_with_provider(Arc::new(pinned_server.roots), provider())
-            .build()
-            .map_err(|error| TlsError::Rustls(error.to_string()))?;
-    let verifier = Arc::new(ExactServerCertVerifier {
-        inner: verifier,
-        leaf_sha256: pinned_server.leaf_sha256,
-    });
+    let verifier = exact_server_cert_verifier(pinned_server)?;
     ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|error| TlsError::Rustls(error.to_string()))?
@@ -369,6 +399,40 @@ pub fn client_config(
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(client_chain, client_key)
         .map_err(|error| TlsError::Rustls(error.to_string()))
+}
+
+fn server_authenticated_client_config(
+    pinned_server: PinnedCertStore,
+) -> Result<ClientConfig, TlsError> {
+    let verifier = exact_server_cert_verifier(pinned_server)?;
+    Ok(ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| TlsError::Rustls(error.to_string()))?
+        .dangerous()
+        // `dangerous` is rustls's API for installing a custom verifier. This
+        // verifier is not permissive: it delegates every standard WebPKI
+        // decision first and only then adds the exact leaf-pin requirement.
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+/// Start a bounded async reqwest HTTPS client that authenticates only the
+/// server with normal `WebPKI` validation plus an exact configured leaf pin.
+///
+/// The client presents no certificate. Trust comes only from the explicit
+/// roots in `pinned_server`; platform roots and plaintext HTTP are disabled.
+///
+/// # Errors
+/// Invalid HTTP policy, trust bundle, or TLS configuration.
+pub fn exact_pinned_https_async_client_builder(
+    policy: HttpClientPolicy,
+    pinned_server: PinnedCertStore,
+) -> Result<reqwest::ClientBuilder, TlsError> {
+    let tls = server_authenticated_client_config(pinned_server)?;
+    Ok(async_client_builder(policy)
+        .map_err(|error| TlsError::HttpClient(error.to_string()))?
+        .https_only(true)
+        .use_preconfigured_tls(tls))
 }
 
 /// Start a bounded async reqwest mTLS client whose server passes normal
@@ -514,6 +578,10 @@ mod tests {
     use axum::http::StatusCode;
     use axum::routing::{get, post};
     use axum::Router;
+    use rcgen::{
+        BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
     use rustls::pki_types::ServerName;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -534,7 +602,18 @@ mod tests {
         task: tokio::task::JoinHandle<std::io::Result<()>>,
     }
 
+    struct HttpsTestServer {
+        address: SocketAddr,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
     impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl Drop for HttpsTestServer {
         fn drop(&mut self) {
             self.task.abort();
         }
@@ -546,6 +625,33 @@ mod tests {
         Identity {
             cert_pem: generated.cert.pem().into_bytes(),
             key_pem: generated.key_pair.serialize_pem().into_bytes(),
+        }
+    }
+
+    fn certificate_authority() -> (Certificate, KeyPair) {
+        let mut params = CertificateParams::new(Vec::new()).expect("CA parameters");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let key = KeyPair::generate().expect("CA key");
+        let certificate = params.self_signed(&key).expect("CA certificate");
+        (certificate, key)
+    }
+
+    fn ca_signed_server(name: &str, ca: &Certificate, ca_key: &KeyPair) -> Identity {
+        let mut params = CertificateParams::new(vec![name.to_string()]).expect("leaf parameters");
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().expect("leaf key");
+        let certificate = params
+            .signed_by(&key, ca, ca_key)
+            .expect("leaf certificate");
+        Identity {
+            cert_pem: format!("{}{}", certificate.pem(), ca.pem()).into_bytes(),
+            key_pem: key.serialize_pem().into_bytes(),
         }
     }
 
@@ -580,6 +686,31 @@ mod tests {
             client_key_pem: client.key_pem,
             task,
         }
+    }
+
+    async fn start_https_server(
+        identity: &Identity,
+        policy: TlsServerPolicy,
+        app: Router,
+    ) -> HttpsTestServer {
+        let config = ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                load_cert_chain(&identity.cert_pem).expect("server chain"),
+                load_private_key(&identity.key_pem).expect("server key"),
+            )
+            .expect("server TLS");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let task = tokio::spawn(serve_mtls_with_policy(
+            listener,
+            Arc::new(config),
+            app,
+            policy,
+        ));
+        HttpsTestServer { address, task }
     }
 
     async fn connect_tls(server: &TestServer) -> Result<TlsStream<TcpStream>, String> {
@@ -627,6 +758,172 @@ mod tests {
             pinned_cert_store(&[]),
             Err(TlsError::NoPinnedCerts)
         ));
+    }
+
+    #[test]
+    fn exact_leaf_pin_set_id_is_canonical_and_leaf_specific() {
+        let first = identity("first");
+        let second = identity("second");
+        let ordered = pinned_cert_store(&[first.cert_pem.clone(), second.cert_pem.clone()])
+            .expect("ordered pins");
+        let reversed_with_duplicate = pinned_cert_store(&[
+            second.cert_pem.clone(),
+            first.cert_pem.clone(),
+            second.cert_pem.clone(),
+        ])
+        .expect("reversed pins");
+        let first_only =
+            pinned_cert_store(std::slice::from_ref(&first.cert_pem)).expect("first pin");
+
+        assert_eq!(
+            ordered.exact_leaf_pin_set_id(),
+            reversed_with_duplicate.exact_leaf_pin_set_id(),
+            "configured order and duplicate entries must not change the pin-set identity"
+        );
+        assert_ne!(
+            ordered.exact_leaf_pin_set_id(),
+            first_only.exact_leaf_pin_set_id(),
+            "removing an exact leaf must change the pin-set identity"
+        );
+
+        let mut pins: [[u8; 32]; 2] = [
+            Sha256::digest(load_cert_chain(&first.cert_pem).expect("first chain")[0].as_ref())
+                .into(),
+            Sha256::digest(load_cert_chain(&second.cert_pem).expect("second chain")[0].as_ref())
+                .into(),
+        ];
+        pins.sort_unstable();
+        let mut expected = Sha256::new();
+        expected.update(EXACT_LEAF_PIN_SET_ID_DOMAIN);
+        for pin in pins {
+            expected.update(pin);
+        }
+        let expected: [u8; 32] = expected.finalize().into();
+        assert_eq!(ordered.exact_leaf_pin_set_id(), expected);
+    }
+
+    #[tokio::test]
+    async fn https_builder_authenticates_server_without_client_identity() {
+        let (ca, ca_key) = certificate_authority();
+        let server_identity = ca_signed_server("server", &ca, &ca_key);
+        let server = start_https_server(
+            &server_identity,
+            policy(),
+            Router::new().route("/health", get(|| async { "ok" })),
+        )
+        .await;
+        let client = exact_pinned_https_async_client_builder(
+            HttpClientPolicy {
+                connect_timeout: Duration::from_millis(250),
+                request_timeout: Duration::from_secs(1),
+                max_response_bytes: 4 * 1024,
+            },
+            pinned_cert_store(std::slice::from_ref(&server_identity.cert_pem)).expect("server pin"),
+        )
+        .expect("bounded exact-pin HTTPS builder")
+        .resolve("server", server.address)
+        .build()
+        .expect("reqwest client");
+
+        let response = client
+            .get(format!("https://server:{}/health", server.address.port()))
+            .send()
+            .await
+            .expect("pinned server-auth-only request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("response body"), "ok");
+    }
+
+    #[tokio::test]
+    async fn https_builder_rejects_plaintext_before_connect() {
+        let server_identity = identity("server");
+        let plaintext_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("plaintext listener");
+        let address = plaintext_listener
+            .local_addr()
+            .expect("plaintext listener address");
+        let client = exact_pinned_https_async_client_builder(
+            HttpClientPolicy::default(),
+            pinned_cert_store(std::slice::from_ref(&server_identity.cert_pem)).expect("server pin"),
+        )
+        .expect("HTTPS-only builder")
+        .resolve("server", address)
+        .build()
+        .expect("HTTPS-only client");
+
+        assert!(
+            client
+                .get(format!("http://server:{}/health", address.port()))
+                .send()
+                .await
+                .is_err(),
+            "plaintext HTTP must fail"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), plaintext_listener.accept())
+                .await
+                .is_err(),
+            "plaintext HTTP must be rejected before opening a socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn https_builder_rejects_same_ca_sibling_and_wrong_hostname() {
+        let (ca, ca_key) = certificate_authority();
+        let configured = ca_signed_server("server", &ca, &ca_key);
+        let sibling = ca_signed_server("server", &ca, &ca_key);
+        let sibling_server = start_https_server(
+            &sibling,
+            policy(),
+            Router::new().route("/health", get(|| async { "ok" })),
+        )
+        .await;
+        let sibling_client = exact_pinned_https_async_client_builder(
+            HttpClientPolicy::default(),
+            pinned_cert_store(std::slice::from_ref(&configured.cert_pem)).expect("configured pin"),
+        )
+        .expect("sibling-check builder")
+        .resolve("server", sibling_server.address)
+        .build()
+        .expect("sibling-check client");
+        assert!(
+            sibling_client
+                .get(format!(
+                    "https://server:{}/health",
+                    sibling_server.address.port()
+                ))
+                .send()
+                .await
+                .is_err(),
+            "a sibling leaf must fail even when its root and hostname are valid"
+        );
+
+        let configured_server = start_https_server(
+            &configured,
+            policy(),
+            Router::new().route("/health", get(|| async { "ok" })),
+        )
+        .await;
+        let wrong_hostname_client = exact_pinned_https_async_client_builder(
+            HttpClientPolicy::default(),
+            pinned_cert_store(std::slice::from_ref(&configured.cert_pem)).expect("configured pin"),
+        )
+        .expect("hostname-check builder")
+        .resolve("wrong-server", configured_server.address)
+        .build()
+        .expect("hostname-check client");
+        assert!(
+            wrong_hostname_client
+                .get(format!(
+                    "https://wrong-server:{}/health",
+                    configured_server.address.port()
+                ))
+                .send()
+                .await
+                .is_err(),
+            "an exact pin must not bypass WebPKI hostname validation"
+        );
     }
 
     #[tokio::test]
