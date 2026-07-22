@@ -68,6 +68,8 @@ use xindex_ops::tls::{exact_pinned_https_async_client_builder, PinnedCertStore};
 use xindex_vultisig_adapter::VultisigBitcoinEvidence;
 
 const TARGET_ID_DOMAIN: &[u8] = b"XINDEX/BTC/TESTNET4-ESPLORA-BROADCAST-TARGET/V2";
+const CONNECTOR_HANDOFF_RECEIPT_DOMAIN: &[u8] =
+    b"XINDEX/VULTISIG/BTC-CONNECTOR-BROADCAST-HANDOFF/V1";
 #[cfg(test)]
 const LOOPBACK_OPERATOR_ID: &str = "loopback-test-only";
 #[cfg(test)]
@@ -163,6 +165,69 @@ impl PreparedVultisigBitcoinBroadcast {
     #[must_use]
     pub const fn evidence_id(&self) -> [u8; 32] {
         self.evidence_id
+    }
+}
+
+/// Connector completion identities committed atomically with one broadcast
+/// evidence row by the integrated runtime.
+pub(crate) struct VultisigConnectorHandoffCandidate<'a> {
+    pub(crate) connector_target_id: [u8; 32],
+    pub(crate) completion_id: [u8; 32],
+    pub(crate) session_id: &'a str,
+    pub(crate) wire_sha256: [u8; 32],
+    pub(crate) operation_id: [u8; 32],
+    pub(crate) transaction_sha256: [u8; 32],
+}
+
+/// Fully validated durable connector-to-broadcast receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableVultisigConnectorHandoff {
+    connector_target_id: [u8; 32],
+    completion_id: [u8; 32],
+    session_id: String,
+    wire_sha256: [u8; 32],
+    operation_id: [u8; 32],
+    transaction_sha256: [u8; 32],
+    receipt_id: [u8; 32],
+    evidence_id: [u8; 32],
+    state: VultisigBitcoinBroadcastState,
+}
+
+impl DurableVultisigConnectorHandoff {
+    pub(crate) const fn connector_target_id(&self) -> [u8; 32] {
+        self.connector_target_id
+    }
+
+    pub(crate) const fn completion_id(&self) -> [u8; 32] {
+        self.completion_id
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) const fn wire_sha256(&self) -> [u8; 32] {
+        self.wire_sha256
+    }
+
+    pub(crate) const fn operation_id(&self) -> [u8; 32] {
+        self.operation_id
+    }
+
+    pub(crate) const fn transaction_sha256(&self) -> [u8; 32] {
+        self.transaction_sha256
+    }
+
+    pub(crate) const fn receipt_id(&self) -> [u8; 32] {
+        self.receipt_id
+    }
+
+    pub(crate) const fn evidence_id(&self) -> [u8; 32] {
+        self.evidence_id
+    }
+
+    pub(crate) const fn state(&self) -> VultisigBitcoinBroadcastState {
+        self.state
     }
 }
 
@@ -813,6 +878,166 @@ impl SqliteVultisigBitcoinBroadcastStore {
         self.persist_candidate(&candidate).await
     }
 
+    async fn persist_connector_handoff(
+        &self,
+        evidence: &VultisigBitcoinEvidence,
+        identities: PreparedIdentities,
+        target_id: [u8; 32],
+        finality_policy: VultisigBitcoinFinalityPolicy,
+        connector: &VultisigConnectorHandoffCandidate<'_>,
+    ) -> Result<DurableVultisigConnectorHandoff, VultisigBroadcastRuntimeError> {
+        let record = serde_json::to_vec(evidence.record()).map_err(|_| {
+            VultisigBroadcastRuntimeError::CorruptStore("evidence record serialization failed")
+        })?;
+        let candidate = StoredVultisigBroadcast {
+            evidence_id: identities.evidence_id,
+            target_id,
+            finality_source_set_id: finality_policy.source_set_id,
+            minimum_finality_confirmations: finality_policy.minimum_confirmations,
+            chain_hash: *evidence.chain_hash().as_bytes(),
+            txid: identities.txid,
+            wtxid: identities.wtxid,
+            evidence_record_sha256: sha256::Hash::hash(&record).to_byte_array(),
+            evidence_record: record,
+            tx_bytes: evidence.transaction_bytes().to_vec(),
+            state: VultisigBitcoinBroadcastState::Prepared,
+            finality: None,
+        };
+        self.persist_stored_connector_handoff(&candidate, connector)
+            .await
+    }
+
+    async fn persist_stored_connector_handoff(
+        &self,
+        candidate: &StoredVultisigBroadcast,
+        connector: &VultisigConnectorHandoffCandidate<'_>,
+    ) -> Result<DurableVultisigConnectorHandoff, VultisigBroadcastRuntimeError> {
+        self.revalidate_storage()?;
+        validate_stored(candidate)?;
+        validate_connector_handoff_candidate(connector, candidate)?;
+        let receipt_id = connector_handoff_receipt_id(connector, candidate);
+        let result = sqlx::query(
+            "INSERT INTO vultisig_bitcoin_broadcasts
+             (evidence_id, target_id, finality_source_set_id,
+              minimum_finality_confirmations, chain_hash, txid, wtxid,
+              evidence_record, evidence_record_sha256, tx_bytes, state,
+              connector_target_id, connector_completion_id,
+              connector_session_id, connector_wire_sha256,
+              connector_operation_id, connector_transaction_sha256,
+              connector_handoff_receipt_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared',
+                     ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(candidate.evidence_id.as_slice())
+        .bind(candidate.target_id.as_slice())
+        .bind(candidate.finality_source_set_id.as_slice())
+        .bind(i64::from(candidate.minimum_finality_confirmations))
+        .bind(candidate.chain_hash.as_slice())
+        .bind(candidate.txid.as_byte_array().as_slice())
+        .bind(candidate.wtxid.as_byte_array().as_slice())
+        .bind(candidate.evidence_record.as_slice())
+        .bind(candidate.evidence_record_sha256.as_slice())
+        .bind(candidate.tx_bytes.as_slice())
+        .bind(connector.connector_target_id.as_slice())
+        .bind(connector.completion_id.as_slice())
+        .bind(connector.session_id)
+        .bind(connector.wire_sha256.as_slice())
+        .bind(connector.operation_id.as_slice())
+        .bind(connector.transaction_sha256.as_slice())
+        .bind(receipt_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        self.revalidate_storage()?;
+        if result.rows_affected() > 1 {
+            return Err(VultisigBroadcastRuntimeError::CorruptStore(
+                "connector handoff insert affected multiple rows",
+            ));
+        }
+        let stored = self.load(candidate.evidence_id).await?.ok_or(
+            VultisigBroadcastRuntimeError::CorruptStore(
+                "connector handoff broadcast row is missing",
+            ),
+        )?;
+        if !same_immutable_content(&stored, candidate) {
+            return Err(VultisigBroadcastRuntimeError::EvidenceConflict);
+        }
+        let handoff = self
+            .connector_handoff(connector.completion_id)
+            .await?
+            .ok_or(VultisigBroadcastRuntimeError::EvidenceConflict)?;
+        if handoff.connector_target_id != connector.connector_target_id
+            || handoff.completion_id != connector.completion_id
+            || handoff.session_id != connector.session_id
+            || handoff.wire_sha256 != connector.wire_sha256
+            || handoff.operation_id != connector.operation_id
+            || handoff.transaction_sha256 != connector.transaction_sha256
+            || handoff.receipt_id != receipt_id
+            || handoff.evidence_id != candidate.evidence_id
+        {
+            return Err(VultisigBroadcastRuntimeError::EvidenceConflict);
+        }
+        match handoff.state {
+            VultisigBitcoinBroadcastState::Prepared => Ok(handoff),
+            VultisigBitcoinBroadcastState::Submitting => {
+                Err(VultisigBroadcastRuntimeError::AmbiguousState)
+            }
+            VultisigBitcoinBroadcastState::Accepted | VultisigBitcoinBroadcastState::Finalized => {
+                Err(VultisigBroadcastRuntimeError::AlreadyAccepted)
+            }
+        }
+    }
+
+    pub(crate) async fn connector_handoff(
+        &self,
+        completion_id: [u8; 32],
+    ) -> Result<Option<DurableVultisigConnectorHandoff>, VultisigBroadcastRuntimeError> {
+        if completion_id == [0; 32] {
+            return Err(VultisigBroadcastRuntimeError::CorruptStore(
+                "connector completion identity is zero",
+            ));
+        }
+        self.revalidate_storage()?;
+        let row = sqlx::query(
+            "SELECT connector_target_id, connector_completion_id,
+                    connector_session_id, connector_wire_sha256,
+                    connector_operation_id, connector_transaction_sha256,
+                    connector_handoff_receipt_id, evidence_id, state
+             FROM vultisig_bitcoin_broadcasts
+             WHERE connector_completion_id = ?",
+        )
+        .bind(completion_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        self.revalidate_storage()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let handoff = DurableVultisigConnectorHandoff {
+            connector_target_id: exact_array(row.try_get("connector_target_id")?)?,
+            completion_id: exact_array(row.try_get("connector_completion_id")?)?,
+            session_id: row.try_get("connector_session_id")?,
+            wire_sha256: exact_array(row.try_get("connector_wire_sha256")?)?,
+            operation_id: exact_array(row.try_get("connector_operation_id")?)?,
+            transaction_sha256: exact_array(row.try_get("connector_transaction_sha256")?)?,
+            receipt_id: exact_array(row.try_get("connector_handoff_receipt_id")?)?,
+            evidence_id: exact_array(row.try_get("evidence_id")?)?,
+            state: VultisigBitcoinBroadcastState::parse(row.try_get("state")?)?,
+        };
+        let stored = self.load(handoff.evidence_id).await?.ok_or(
+            VultisigBroadcastRuntimeError::CorruptStore(
+                "connector handoff names a missing broadcast row",
+            ),
+        )?;
+        validate_stored_connector_handoff(&handoff, &stored)?;
+        if handoff.completion_id != completion_id {
+            return Err(VultisigBroadcastRuntimeError::CorruptStore(
+                "queried connector completion differs from the stored row",
+            ));
+        }
+        Ok(Some(handoff))
+    }
+
     async fn persist_candidate(
         &self,
         candidate: &StoredVultisigBroadcast,
@@ -940,6 +1165,31 @@ impl SqliteVultisigBitcoinBroadcastStore {
                 }
                 Ok(stored)
             })
+            .collect()
+    }
+
+    async fn prepared_connector_completion_ids_for_runtime(
+        &self,
+        target_id: [u8; 32],
+        finality_policy: VultisigBitcoinFinalityPolicy,
+    ) -> Result<Vec<[u8; 32]>, VultisigBroadcastRuntimeError> {
+        self.revalidate_storage()?;
+        let rows = sqlx::query(
+            "SELECT connector_completion_id
+             FROM vultisig_bitcoin_broadcasts
+             WHERE target_id = ? AND finality_source_set_id = ?
+               AND minimum_finality_confirmations = ? AND state = 'prepared'
+               AND connector_completion_id IS NOT NULL
+             ORDER BY evidence_id",
+        )
+        .bind(target_id.as_slice())
+        .bind(finality_policy.source_set_id.as_slice())
+        .bind(i64::from(finality_policy.minimum_confirmations))
+        .fetch_all(&self.pool)
+        .await?;
+        self.revalidate_storage()?;
+        rows.into_iter()
+            .map(|row| exact_array(row.try_get("connector_completion_id")?))
             .collect()
     }
 
@@ -1437,6 +1687,83 @@ fn same_immutable_content(left: &StoredVultisigBroadcast, right: &StoredVultisig
         && left.tx_bytes == right.tx_bytes
 }
 
+fn validate_connector_handoff_candidate(
+    connector: &VultisigConnectorHandoffCandidate<'_>,
+    stored: &StoredVultisigBroadcast,
+) -> Result<(), VultisigBroadcastRuntimeError> {
+    if connector.connector_target_id == [0; 32]
+        || connector.completion_id == [0; 32]
+        || connector.wire_sha256 == [0; 32]
+        || connector.operation_id == [0; 32]
+        || connector.transaction_sha256 == [0; 32]
+        || !is_uuid_v4(connector.session_id)
+        || connector.transaction_sha256 != sha256::Hash::hash(&stored.tx_bytes).to_byte_array()
+    {
+        return Err(VultisigBroadcastRuntimeError::CorruptStore(
+            "connector handoff identity is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stored_connector_handoff(
+    handoff: &DurableVultisigConnectorHandoff,
+    stored: &StoredVultisigBroadcast,
+) -> Result<(), VultisigBroadcastRuntimeError> {
+    let candidate = VultisigConnectorHandoffCandidate {
+        connector_target_id: handoff.connector_target_id,
+        completion_id: handoff.completion_id,
+        session_id: &handoff.session_id,
+        wire_sha256: handoff.wire_sha256,
+        operation_id: handoff.operation_id,
+        transaction_sha256: handoff.transaction_sha256,
+    };
+    validate_connector_handoff_candidate(&candidate, stored)?;
+    if handoff.evidence_id != stored.evidence_id
+        || handoff.state != stored.state
+        || handoff.receipt_id != connector_handoff_receipt_id(&candidate, stored)
+    {
+        return Err(VultisigBroadcastRuntimeError::CorruptStore(
+            "stored connector handoff commitment is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn connector_handoff_receipt_id(
+    connector: &VultisigConnectorHandoffCandidate<'_>,
+    stored: &StoredVultisigBroadcast,
+) -> [u8; 32] {
+    let mut preimage = Vec::new();
+    push_handoff_field(&mut preimage, CONNECTOR_HANDOFF_RECEIPT_DOMAIN);
+    push_handoff_field(&mut preimage, &connector.connector_target_id);
+    push_handoff_field(&mut preimage, &connector.completion_id);
+    push_handoff_field(&mut preimage, connector.session_id.as_bytes());
+    push_handoff_field(&mut preimage, &connector.wire_sha256);
+    push_handoff_field(&mut preimage, &connector.operation_id);
+    push_handoff_field(&mut preimage, &connector.transaction_sha256);
+    push_handoff_field(&mut preimage, &stored.evidence_id);
+    push_handoff_field(&mut preimage, &stored.target_id);
+    push_handoff_field(&mut preimage, stored.txid.as_byte_array());
+    push_handoff_field(&mut preimage, stored.wtxid.as_byte_array());
+    sha256::Hash::hash(&preimage).to_byte_array()
+}
+
+fn push_handoff_field(preimage: &mut Vec<u8>, value: &[u8]) {
+    preimage.extend_from_slice(&u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    preimage.extend_from_slice(value);
+}
+
+fn is_uuid_v4(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        })
+        && value.as_bytes()[14] == b'4'
+        && matches!(value.as_bytes()[19], b'8' | b'9' | b'a' | b'b')
+}
+
 fn validate_stored(stored: &StoredVultisigBroadcast) -> Result<(), VultisigBroadcastRuntimeError> {
     if stored.finality_source_set_id == [0; 32]
         || stored.minimum_finality_confirmations < MIN_FINALIZED_BITCOIN_CONFIRMATIONS
@@ -1815,7 +2142,7 @@ impl Testnet4EsploraBroadcastTarget {
     }
 
     #[cfg(test)]
-    fn new_loopback(base_url: &str) -> Result<Self, VultisigBroadcastRuntimeError> {
+    pub(crate) fn new_loopback(base_url: &str) -> Result<Self, VultisigBroadcastRuntimeError> {
         let parsed = normalize_loopback_target_url(base_url)?;
         let client = async_client(broadcast_http_policy())
             .map_err(|_| VultisigBroadcastRuntimeError::Transport("client_build"))?;
@@ -1983,6 +2310,10 @@ impl VultisigBitcoinBroadcastRuntime {
         }
     }
 
+    pub(crate) async fn close(self) {
+        self.store.pool.close().await;
+    }
+
     /// Consume aggregate evidence, repeat the exact Testnet4/canonical
     /// transaction/txid/wtxid checks, and durably persist a target-bound row
     /// before returning an opaque, non-cloneable handle.
@@ -2071,6 +2402,96 @@ impl VultisigBitcoinBroadcastRuntime {
                 error: VultisigBroadcastPreparationError::Persistence(error),
             }),
         }
+    }
+
+    pub(crate) async fn prepare_connector_handoff(
+        &self,
+        evidence: VultisigBitcoinEvidence,
+        connector: VultisigConnectorHandoffCandidate<'_>,
+    ) -> Result<
+        (
+            PreparedVultisigBitcoinBroadcast,
+            DurableVultisigConnectorHandoff,
+        ),
+        VultisigBroadcastPreparationFailure,
+    > {
+        let candidate = PreparationCandidate {
+            chain_hash: evidence.chain_hash(),
+            transaction_bytes: evidence.transaction_bytes(),
+            expected_txid: Txid::from_byte_array(evidence.txid()),
+            expected_wtxid: Wtxid::from_byte_array(evidence.wtxid()),
+            evidence_id: evidence.record().evidence_id_sha256(),
+        };
+        let identities = match validate_preparation(&candidate) {
+            Ok(identities) => identities,
+            Err(error) => {
+                return Err(VultisigBroadcastPreparationFailure {
+                    evidence: Box::new(evidence),
+                    error,
+                });
+            }
+        };
+        match self
+            .store
+            .persist_connector_handoff(
+                &evidence,
+                identities,
+                self.target.target_id,
+                self.finality_policy,
+                &connector,
+            )
+            .await
+        {
+            Ok(handoff) => {
+                let stored = match self.load_for_target(handoff.evidence_id).await {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        return Err(VultisigBroadcastPreparationFailure {
+                            evidence: Box::new(evidence),
+                            error: VultisigBroadcastPreparationError::Persistence(error),
+                        });
+                    }
+                };
+                Ok((prepared_handle(&stored), handoff))
+            }
+            Err(error) => Err(VultisigBroadcastPreparationFailure {
+                evidence: Box::new(evidence),
+                error: VultisigBroadcastPreparationError::Persistence(error),
+            }),
+        }
+    }
+
+    pub(crate) async fn connector_handoff(
+        &self,
+        completion_id: [u8; 32],
+    ) -> Result<Option<DurableVultisigConnectorHandoff>, VultisigBroadcastRuntimeError> {
+        let handoff = self.store.connector_handoff(completion_id).await?;
+        if let Some(handoff) = &handoff {
+            let _ = self.load_for_target(handoff.evidence_id).await?;
+        }
+        Ok(handoff)
+    }
+
+    pub(crate) async fn discover_prepared_connector_handoffs(
+        &self,
+    ) -> Result<Vec<DurableVultisigConnectorHandoff>, VultisigBroadcastRuntimeError> {
+        let completion_ids = self
+            .store
+            .prepared_connector_completion_ids_for_runtime(
+                self.target.target_id,
+                self.finality_policy,
+            )
+            .await?;
+        let mut handoffs = Vec::with_capacity(completion_ids.len());
+        for completion_id in completion_ids {
+            let handoff = self.connector_handoff(completion_id).await?.ok_or(
+                VultisigBroadcastRuntimeError::CorruptStore(
+                    "prepared connector row has no durable handoff",
+                ),
+            )?;
+            handoffs.push(handoff);
+        }
+        Ok(handoffs)
     }
 
     /// Discover every fully validated durable `prepared` row bound to this
@@ -3085,6 +3506,78 @@ mod tests {
             store.state(candidate.evidence_id).await,
             Err(VultisigBroadcastRuntimeError::CorruptStore(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connector_handoff_and_evidence_commit_atomically_and_survive_restart() {
+        let database_path = temporary_database();
+        let candidate = stored_candidate(&synthetic_transaction(), [0x24; 32], [0x25; 32]);
+        let connector = VultisigConnectorHandoffCandidate {
+            connector_target_id: [0x26; 32],
+            completion_id: [0x27; 32],
+            session_id: "123e4567-e89b-42d3-a456-426614174002",
+            wire_sha256: [0x28; 32],
+            operation_id: [0x29; 32],
+            transaction_sha256: sha256::Hash::hash(&candidate.tx_bytes).to_byte_array(),
+        };
+        let store = SqliteVultisigBitcoinBroadcastStore::connect(&database_path)
+            .await
+            .expect("store");
+        let first = store
+            .persist_stored_connector_handoff(&candidate, &connector)
+            .await
+            .expect("atomic handoff");
+        let replay = store
+            .persist_stored_connector_handoff(&candidate, &connector)
+            .await
+            .expect("idempotent atomic handoff");
+        assert_eq!(first, replay);
+        assert_eq!(first.evidence_id(), candidate.evidence_id);
+        assert_ne!(first.receipt_id(), [0; 32]);
+        let standalone =
+            stored_candidate(&synthetic_transaction(), [0x2b; 32], candidate.target_id);
+        store
+            .persist_candidate(&standalone)
+            .await
+            .expect("standalone prepared row");
+        assert_eq!(
+            store
+                .prepared_connector_completion_ids_for_runtime(
+                    candidate.target_id,
+                    test_finality_policy(),
+                )
+                .await
+                .expect("integrated prepared rows"),
+            vec![connector.completion_id]
+        );
+        store.pool.close().await;
+        drop(store);
+
+        let reopened = SqliteVultisigBitcoinBroadcastStore::connect(&database_path)
+            .await
+            .expect("restart store");
+        assert_eq!(
+            reopened
+                .connector_handoff(connector.completion_id)
+                .await
+                .expect("restart lookup"),
+            Some(first)
+        );
+
+        let conflicting = VultisigConnectorHandoffCandidate {
+            completion_id: [0x2a; 32],
+            ..connector
+        };
+        assert!(matches!(
+            reopened
+                .persist_stored_connector_handoff(&candidate, &conflicting)
+                .await,
+            Err(VultisigBroadcastRuntimeError::EvidenceConflict)
+        ));
+        reopened.pool.close().await;
+        drop(reopened);
+        remove_database_files(&database_path);
     }
 
     #[cfg(unix)]

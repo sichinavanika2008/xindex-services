@@ -1,0 +1,19 @@
+[package]
+name = "xindex-zcash-tx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bitcoin.workspace = true
+blake2b_simd.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+alloy-primitives.workspace = true

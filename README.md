@@ -142,10 +142,12 @@ participant/reshare topology and failure-domain tests. See
 The key-free Rust 1.95.0 gate passes format, 8/8 compiled production-profile
 behaviors and supplemental lints, all ten ABI manifest/current-parent checks,
 locked/offline strict whole-workspace all-target/all-feature Clippy, all-feature
-test compilation and cargo-deny with configured warnings. Focused execution is
-65/65 chain-utxo tests, 30/30 adapter tests, 28/28 executor Vultisig broadcast
-tests and five adapter compile-fail doctests. The executor passes 104/104
-library tests and 5/5 doctests offline/locked. The
+test compilation, plus cargo-deny bans, licences and sources. Advisories fail
+only on the already-locked, newly yanked transitive `spin 0.9.8`. Focused
+execution is 65/65 chain-utxo tests, 48/48 adapter unit tests, 3/3 adapter
+integration tests, 13/13 connector unit tests and 30/30 executor Vultisig tests.
+The adapter, connector and executor pass 5/5, 3/3 and 5/5 doctests respectively;
+the executor passes 106/106 library tests offline/locked. The
 unchanged production-profile wrapper passes directly.
 
 The code-addressable Gate-3 findings are published, while the Chainflip/Maya

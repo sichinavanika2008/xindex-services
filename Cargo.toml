@@ -16,6 +16,7 @@ tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "signal", "
 alloy = { version = "0.8", features = ["full", "node-bindings"] }
 alloy-sol-types = "0.8"
 alloy-primitives = "0.8"
+alloy-rlp = "0.3"
 # HTTP client (rustls, no system openssl)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # Serde
@@ -65,6 +66,10 @@ bitcoincash-addr = "0.5"
 # LegacyAminoPubKey multisig-address derivation; secp256k1 (verify +
 # low-S) reuses k256 as the safe-evm crate does.
 sha2 = "0.10"
+# Zcash ZIP-243 uses BLAKE2b-256 personalization, which `sha2` cannot express.
+# Pin the reviewed pure-Rust implementation used by the transparent Sapling
+# profile so consensus digests do not depend on a platform crypto provider.
+blake2b_simd = "=1.0.4"
 # XRP stack (xrp-tx, Phase 4.4). Hand-rolled STObject codec — no
 # xrpl-rust/bs58. XRPL AccountIDs are RIPEMD160(SHA256(pubkey)); the
 # signing digest is SHA512Half (SHA-512 then first 32 bytes). digest 0.10
@@ -89,15 +94,19 @@ bs58 = "0.5"
 # base64: Solana JSON-RPC returns account data base64-encoded (base58 only
 # covers data < 129 bytes; the Squads Multisig account is larger). Pure-Rust.
 base64 = "0.22"
+getrandom = "0.3"
+md-5 = "0.10"
 # Inter-crate
 xindex-shared = { path = "crates/shared" }
 xindex-custody-core = { path = "crates/custody-core" }
 xindex-custody-node = { path = "crates/custody-node" }
 xindex-vultisig-adapter = { path = "crates/vultisig-adapter" }
+xindex-vultisig-connector = { path = "crates/vultisig-connector" }
 xindex-cosmos-tx = { path = "crates/cosmos-tx" }
 xindex-xrp-tx = { path = "crates/xrp-tx" }
 xindex-solana-tx = { path = "crates/solana-tx" }
 xindex-tron-tx = { path = "crates/tron-tx" }
+xindex-zcash-tx = { path = "crates/zcash-tx" }
 xindex-chain-eth = { path = "crates/chain-eth" }
 xindex-chain-evm = { path = "crates/chain-evm" }
 xindex-chain-cosmos = { path = "crates/chain-cosmos" }

@@ -10,7 +10,7 @@ verdict and reasoning. No silent suppressions.
 > for present work. Turnkey and Cobo references below describe removed
 > historical code.
 
-## Vultisig custody transition (2026-07-18; evidence update 2026-07-20)
+## Vultisig custody transition (2026-07-18; evidence update 2026-07-21)
 
 Vultisig Wallet as a Service using DKLS threshold signing is the selected
 future custody direction. The retired provider-specific crates, runtime,
@@ -54,11 +54,15 @@ calls these configured participants rather than claiming signer-role visibility
 in the aggregate Bitcoin witness. A supplied manifest digest does not itself
 prove the referenced release was approved.
 
-`xindex-executor` now integrates the key-free evidence-to-prepared boundary into
-the accepted local sealed runtime. `prepare` consumes the non-cloneable evidence
-and persists complete evidence plus exact bytes before returning its handle, so
-a committed row lost before the in-memory return remains discoverable after
-restart. The target- and observer-policy-bound file-backed SQLite lifecycle is
+`xindex-executor::VultisigBitcoinRuntime` now composes the accepted key-free
+Bitcoin Testnet4 lifecycle: current finalized-inventory policy and RIC/custody
+one-shot, durable connector preparation, Vultisig relay/verifier completion,
+local aggregate-signature/final-transaction validation, evidence persistence,
+connector cleanup, exact-byte broadcast recovery and configured-source
+finality. Connector completion identities, complete evidence and canonical
+transaction bytes are committed atomically before the connector live row is
+tombstoned. The target- and observer-policy-bound file-backed broadcast
+lifecycle is
 `prepared → submitting → accepted → finalized`. Production target construction
 requires a normalized HTTPS DNS URL, reviewed operator identity record, normal
 WebPKI validation and exact leaf-certificate pins; the target ID commits all of
@@ -74,20 +78,102 @@ exact-byte digest and confirmation arithmetic, and atomically persists the
 canonical block and observation evidence. Ordinary errors retain the prepared
 capability. There is no public raw-byte or generic-client submission route. The
 first `UtxoChainClient` design remains rejected because it did not authenticate
-the endpoint or prove exact witness-byte submission. This accepted slice is
-optional library code, not mandatory binary/upstream wiring or production
-approval.
+the endpoint or prove exact witness-byte submission. Recovery observes the same
+connector session and can reconcile an already committed downstream handoff
+without repeating an ambiguous Verifier or relay-start POST. The composition is
+mandatory inside this library API and supplemental production-profile guard,
+not a deployed binary or production approval.
 
-Thirty deterministic adapter tests, including nine finalization
+`xindex-vultisig-connector` now provides the first exact-pinned Verifier/relay
+transport boundary. Its only production constructor opens an adapter-owned
+SQLite journal bound to the normalized relay and ordered verifier URLs, exact
+leaf-pin sets, party namespaces, and every verifier's configured reviewed
+source-manifest digest, exact binary digest, hash-derivation capability set and
+distinct participant identity. This V3 identity detects release/configuration
+drift but is not remote process
+attestation. It generates one `UUIDv4` session plus
+independent encryption key, seals them with the non-cloneable authorized
+request, and durably stores that authorization, the exact wire commitment and a
+pessimistic recovery phase before network use. The private recovery record is
+accepted only from a live authorization, retains the strict Bitcoin
+operation/policy/provenance commitments and is rebuilt through the existing
+prepared-spend and vault-config validators; there is no public raw
+authorization deserializer. The connector then consumes the prepared operation
+before attempting every configured verifier exactly once. The pinned Verifier commit
+`0c84b9b34ff46289679aad292905ceac2bd810f7` has no request-digest-bound
+idempotency receipt: a duplicate session returns empty success instead of the
+original task ID, task IDs are random, and a failed session-store write is
+logged while enqueue continues. An ambiguous verifier POST therefore returns a
+non-cloneable pending operation owning the original request, exact session,
+phase and acknowledged task IDs. `resume` observes only that relay session and
+never repeats a verifier POST. An ambiguous relay `/start` is likewise observed
+without repeating `/start`. Preparation, transport and local finalization
+errors retain the relevant capability. Every unsafe transition is preceded by
+a durable checkpoint, and later phases plus verifier outcomes are checkpointed
+before control advances.
+
+This closes the local returned-error, future-cancellation and process-crash
+state-loss gap. Cancellation or process loss releases only the in-process
+claim; restart recovery rehydrates the exact authorization and latest phase
+only as observation-only pending state. Existing rows cannot be persisted as
+fresh sends, duplicate active claims fail closed, and unique live/terminal
+authorization commitments plus a cross-table trigger prevent the same sealed
+authorization from becoming fresh work under another session ID, including
+after cleanup. A claim from another journal is rejected before network use. The initial durable phase is
+deliberately pessimistic, so a crash after preparation but before the first
+POST can strand a session rather than permit an unprovable resend. Exact
+verifier responses are checkpointed before `Finalizing`, and recovery replays
+them without another network fetch. A completion-, consumer- and receipt-bound
+acknowledgement atomically replaces secret-bearing live state with a
+commitment-only terminal tombstone that survives restart and blocks session
+reuse. An unacknowledged completion remains recoverable in `Finalizing`. The
+integrated executor runtime is the downstream consumer and durably commits its
+handoff before invoking the terminal protocol; no production binary invokes
+that runtime. The journal is
+neither encrypted nor independently authenticated, and owner-only metadata
+cannot prevent same-UID edits or copied databases. Three compile-fail doctests make the prepared
+capability non-cloneable, prevent a pending operation from being resubmitted
+through `sign`, and prevent bypass of acknowledgement through the removed
+completion-parts extraction path.
+
+The adapter exhaustively classifies every Xindex chain's Vultisig name,
+derivation path, key family, request and local final transaction, but the
+current approved connector configuration refuses Zcash, Gaia and Noble before
+randomness or network use. Gaia and Noble can pass only when every configured
+verifier is bound to an exact reviewed source/binary identity declaring direct
+Cosmos `SignDoc` derivation. An isolated pinned-source patch for that path and
+Noble `uusdc`/address policy passes focused tests, but the exact Recipes and
+`vultisig-go` trees have no in-tree licence grant; no patch, dependency, manifest or
+binary was imported or approved. The current Zcash metadata profile remains
+unconditionally rejected because pinned Recipes consumes caller-supplied `ZSH`
+hashes instead of independently recomputing ZIP-243 and the request lacks the
+complete prevout data required to fix that signer-side. Local recomputation
+does not satisfy the independent derivation gate.
+
+Forty-eight deterministic adapter unit tests, including nine finalization
 regressions, high-S and uncompressed-key rejection, a VIN1-specific cross-input
 hash-selection check, provenance-currentness boundaries and five aggregate-
 evidence regressions, pass without a private key or signing operation. Twelve
 focused finalized-inventory tests cover
 commit/rollback/replacement, restart-stable provenance, configuration and schema
 constraints, spend/reorg invalidation, fail-closed database errors and matching-
-journal substitution. The finalization fixture starts from crate-private policy
-validation, not a successful public RIC/one-shot authorization, so it does not
-yet prove that public success path end to end.
+journal substitution. The integrated lifecycle fixture uses a feature-gated
+fabricated custody receipt and copied upstream signature bytes, so it proves the
+composed handoff without claiming a live RIC ceremony or Vultisig signing.
+Six adapter journal tests cover exact restart rehydration, target drift,
+duplicate claims, existing-row resend refusal, drop/recovery,
+foreign-journal claims, terminal redaction, restart-stable tombstones and
+database-level live-state resurrection refusal. Ten direct UTXO profile tests
+additionally reject empty/mismatched PSBT input maps, duplicate outpoints and
+Taproot signature material while pinning the BTC/LTC/BCH/DOGE signing
+algorithms. Five Zcash
+tests reject duplicate transparent outpoints and bind the Sapling-v4 profile.
+Thirteen connector tests cover per-release profile qualification, missing release
+identity refusal, exact session material, V3 source/binary/capability/participant target
+binding, strict durable-state round-tripping, exact response
+persistence, restart replay without network refetch,
+completion/acknowledgement identity binding, the normal lifecycle and both
+ambiguous-POST paths without a second POST.
 
 The key-free `trusted_observer` follow-on closes the raw writer/source boundary.
 It is the only non-test owner of the crate-private SQLite writer, yields the
@@ -112,15 +198,16 @@ final-transaction binding, under-confirmation and reorg/status mutations.
 Residual boundary: this is authenticated configured-source observation, not an
 independent Bitcoin consensus implementation or deployed production observer.
 No binary pins the approved URLs, supplies operator/certificate identities,
-drives the sync loop, monitors lease failures, or hands the final receipt to a
-broadcaster. Distinct DNS hosts do not prove independent operators. The local
+drives the sync loop, monitors lease failures, accepts production Vultisig jobs,
+or invokes the composed runtime. Distinct DNS hosts do not prove independent
+operators. The local
 checks do not validate scripts, every transaction/consensus rule, header
 difficulty transitions or chainwork, so all configured sources remain trusted
 for those facts. Owner-only storage does not stop same-UID direct SQLite edits
-or copied-database substitution. Coin selection/reservation, runtime evidence
-production, actual approved broadcast endpoint/operator/certificate and source
+or copied-database substitution. Coin selection/reservation, production job
+ingress, actual approved broadcast endpoint/operator/certificate and source
 identities, ongoing confirmation monitoring, independent consensus and
-mandatory upstream/binary wiring remain open. The local metadata and finality
+upstream/binary wiring remain open. The local metadata and finality
 transitions do not close those production gaps. The
 runtime must continue refusing raw caller- or Vultisig-supplied values and must
 not treat this library as full-node proof.
@@ -128,21 +215,38 @@ not treat this library as full-node proof.
 The final key-free Rust 1.95.0 gate passes format, 8/8 compiled production-
 profile behaviors and supplemental lints, all ten current-parent ABI checks,
 locked/offline strict whole-workspace all-target/all-feature Clippy, all-feature
-test compilation, and cargo-deny with configured warnings. Focused execution is
-65/65 chain-utxo tests, 30/30 adapter tests, 28/28 executor Vultisig broadcast
-tests, 104/104 executor library tests, 5/5 executor doctests and five adapter
-compile-fail doctests. The
-unchanged production-profile wrapper passes directly.
+test compilation. Affected execution is 65 chain-utxo unit tests plus 10 direct-
+profile tests and five doctests; 48 adapter unit tests plus three cross-chain
+tests and five doctests; 13 connector unit tests plus three doctests; five Zcash
+tests; 37 Cosmos unit tests plus three direct-profile tests; 59 custody-core
+unit tests plus two EVM-profile tests; and 34 custody-node tests. The retained
+executor slice passes 29 focused Vultisig broadcast tests, one integrated
+lifecycle regression, 106 library tests and five doctests. Frozen `cargo-deny`
+fails only advisories because the existing
+lock contains newly yanked transitive `spin 0.9.8` through
+`flume → sqlx-sqlite`; bans, licenses and sources pass. Resolving this requires
+a separate dependency update and complete retest. The production-profile
+wrapper, including the composed-lifecycle supplemental guards, passes directly.
 
-The reviewed upstream Verifier independently derives signing hashes and applies
-Recipes policies before threshold signing. Its current Bitcoin evaluator does
+The release-identity/runtime follow-on passes Rust formatting, locked/offline
+strict all-target/all-feature Clippy for the affected crates, the 48+3+5 all-
+chain adapter slice, 13/13 connector unit tests and 3/3 connector doctests.
+Focused chain,
+Cosmos engine, metarule and Verifier derivation tests pass in isolated pinned Go
+worktrees. This does not amend the
+earlier whole-workspace counts or qualify the unlicensed/unbuilt upstream
+patch.
+
+The reviewed upstream Verifier independently derives signing hashes for its
+qualified profiles and applies Recipes policies before threshold signing. Its
+current Bitcoin evaluator does
 not yet enforce Xindex's complete exact-input, sequence/RBF, `SIGHASH_ALL`,
 absolute-fee and Testnet4 policy. The local adapter closes the first four gaps
 around the retained output binder, requires the exact Testnet4 chain identity
-and provides finalized-transaction revalidation intended for a future mandatory
-broadcast boundary. The executor library now provides the concrete sealed
-target-bound state machine and exact-byte target described above. A future
-binary/upstream runtime must make that path mandatory. Upstream/runtime
+and provides finalized-transaction revalidation. The executor library now
+provides the concrete composed connector/evidence/broadcast/finality boundary
+described above. A future production binary and approved upstream runtime must
+invoke it with reviewed identities. Upstream/runtime
 integration and an approved release manifest,
 deployed approved-source ownership, independent operator/full-node evidence and
 independent review remain required. Mainnet activation and every live

@@ -14,6 +14,7 @@ test-utils = []
 
 [dependencies]
 bitcoin.workspace = true
+blake2b_simd.workspace = true
 bdk_esplora.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -33,3 +34,4 @@ xindex-ops.workspace = true
 [dev-dependencies]
 wiremock.workspace = true
 serde_json.workspace = true
+alloy-primitives.workspace = true

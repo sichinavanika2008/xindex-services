@@ -9,10 +9,15 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-utils = []
+
 [dependencies]
 xindex-shared.workspace = true
+xindex-zcash-tx.workspace = true
 alloy.workspace = true
 alloy-primitives.workspace = true
+alloy-rlp.workspace = true
 alloy-sol-types.workspace = true
 bitcoin.workspace = true
 sqlx.workspace = true

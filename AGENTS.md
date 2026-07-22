@@ -48,12 +48,14 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   `FinalizedBitcoinSpend`; it binds the reviewed-release manifest digest,
   configured participant topology, threshold, session, reshare epoch,
   policy/provenance, custody certificate, aggregate key and exact transaction.
-  `VultisigBitcoinBroadcastRuntime::prepare` is the integrated key-free
-  write-ahead boundary: it consumes that evidence, rechecks exact
-  Testnet4/canonical bytes/txid/wtxid, durably writes the complete record and
-  exact bytes, and only then returns a non-cloneable prepared capability with
-  no byte extraction. The same sealed runtime owns a target- and finality-
-  policy-bound file-backed SQLite
+  `VultisigBitcoinRuntime` is the key-free Bitcoin Testnet4 composition root.
+  It makes finalized-inventory authorization and the RIC/custody one-shot,
+  connector preparation/signing, local aggregate-signature and final-transaction
+  verification, evidence persistence, connector cleanup, exact-byte broadcast
+  recovery and configured-source finality one ordered API. The connector
+  completion and complete evidence/canonical transaction bytes are committed
+  atomically before the live connector row is tombstoned. The contained
+  broadcast runtime owns a target- and finality-policy-bound file-backed SQLite
   `prepared → submitting → accepted → finalized` state machine. Production
   target construction requires a normalized HTTPS DNS URL, reviewed operator
   identity record and exact leaf-certificate pin set while retaining normal
@@ -63,7 +65,9 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   hard links, wrong modes, unexpected sidecars and later path replacement. CAS
   admits one initial `prepared → submitting` claimant, possible sends remain
   ambiguous, and runtime-owned durable prepared rows resume after restart,
-  including a commit completed before the in-memory handle returned. Explicit
+  including a commit completed before the in-memory handle returned. Integrated
+  post-cleanup discovery requires a matching connector tombstone and excludes
+  standalone broadcast-library rows before returning a submission-ready handle. Explicit
   ambiguous recovery may idempotently resend only the same stored bytes.
   Terminal finalization consumes only
   `FinalizedBitcoinTransactionObservation`, requires its configured source-set
@@ -72,9 +76,39 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   attempted generic-client broadcaster was rejected in review because checking
   the evidence chain hash does not authenticate the destination endpoint and a
   parsed-transaction API cannot prove exact-witness-byte submission. The
-  runtime remains optional library composition, not binary/mandatory wiring or
-  production approval. Do not expose the pure validator/hash derivation or a
+  composition is mandatory inside this API and is enforced by the supplemental
+  production-profile guard. No production binary or approved upstream Vultisig
+  release invokes it yet. Do not expose the pure validator/hash derivation or a
   public raw-byte/generic-client submission path.
+- `xindex-vultisig-connector` production construction requires an
+  adapter-owned, target-bound SQLite journal. Preserve the rule that a live
+  authorization, exact session/wire commitment and pessimistic pre-POST phase
+  are durable before any unsafe network request. Cancellation/process loss must
+  release only the in-process claim; recovery must remain observation-only and
+  must never recreate an existing row as a fresh Verifier or relay-start POST.
+  Preserve the unique live/terminal authorization commitments and cross-table
+  trigger that prevent the same sealed authorization from becoming fresh work
+  under another session ID, including after terminal cleanup.
+  Keep journal-claim validation before network use and keep recovery rebuilding
+  through the private adapter authority rather than adding a public raw
+  authorization deserializer. `Finalizing` must replay only the exact responses
+  checkpointed before entering that phase. Preserve the completion-, consumer-
+  and receipt-bound terminal acknowledgement, its atomic live-row deletion and
+  commitment-only tombstone, and permanent session-reuse refusal. An
+  unacknowledged completion must retain its recoverable `Finalizing` row. The
+  V3 target identity must continue binding every verifier's non-zero reviewed
+  source-manifest digest, exact binary digest and declared hash-derivation
+  capabilities plus a distinct participant identity, as well as its URL,
+  leaf-pin set, order and party namespace.
+  Every verifier, not merely one member of the topology, must carry the
+  capability required by a profile. This configured identity is not remote
+  process attestation. Do not make the current caller-metadata-based Zcash
+  profile capability-qualified; it needs a complete signer-side transaction
+  envelope and independent ZIP-243 derivation first. Gaia/Noble activation also
+  remains blocked until an exact licensed, reviewed and built upstream release
+  exists. The liveness-conservative pre-POST row, missing production-binary
+  invocation, lack of at-rest encryption/authentication and same-UID/copied-
+  database risk are explicit residuals.
 - `xindex-chain-utxo::{trusted_observer,finalized_inventory}` form the key-free
   observation/provenance boundary. The observer is the only non-test owner of
   journal mutation authority. It requires at least two exact HTTPS DNS-host
@@ -106,7 +140,8 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   identities, distinct hosts do not prove independent operators, and local
   checks do not validate Bitcoin scripts, all consensus rules, or difficulty
   transitions. No binary pins an approved endpoint set, runs the sync/freshness
-  loop, or monitors it. Owner-only non-symlink SQLite handling does not protect
+  loop, invokes the composed lifecycle, or monitors it. Owner-only non-symlink
+  SQLite handling does not protect
   against same-UID direct edits or copied database snapshots. Preserve these
   residuals, require equal source tips, keep coinbase outputs excluded until
   100-block maturity is modeled, and make the validated final receipt mandatory
@@ -135,12 +170,15 @@ Turnkey and Cobo are prohibited as current, backup, emergency, or rehearsal cust
   change to VIN0, final VOUT memo. Preserve `BTC-ORDER-01` regressions and gate
   every provider-returned unsigned transaction before signing.
 - Gate 4 is not complete. The key-free policy, local aggregate-evidence schema,
-  integrated target/finality-bound durable state machine, exact-pinned
-  Testnet4 transport, secure broadcast-store metadata checks and local
-  configured-source finality transition exist. Binary/mandatory upstream
+  integrated target/finality-bound durable state machines, journal-backed
+  exact-pinned Vultisig transport, exact-byte Testnet4 broadcast transport,
+  secure store metadata checks and local configured-source finality transition
+  now form one composed lifecycle. Production binary/upstream
   wiring, actual approved endpoint/operator/certificate and source identities,
+  exact licensed Recipes/`vultisig-go` sources and an approved verifier binary,
   independent consensus evidence, upstream runtime population, ongoing
-  confirmation monitoring, failure-domain tests and independent review remain.
+  confirmation monitoring,
+  failure-domain tests and independent review remain.
   Later key use and
   test-network rehearsal require separate authorization. The older 3-of-5
   custody rehearsal is historical and cannot substitute.

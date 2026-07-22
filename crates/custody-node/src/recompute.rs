@@ -14,9 +14,10 @@ use bitcoin::hashes::Hash;
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 
 use xindex_cosmos_tx::amino::CosmosSendSignDoc;
+use xindex_cosmos_tx::tx::{build_direct_signing_package, CosmosTxParams};
 use xindex_custody_core::evm_tx::{evm_signing_hash, EvmUnsignedParams};
 use xindex_custody_core::prepare::{
-    AccountPrepared, AccountSigning, BindContext, EvmPrepared, PreparedSpend,
+    AccountPrepared, AccountSigning, BindContext, EvmPrepared, PreparedSpend, ZcashBindContext,
 };
 use xindex_shared::chain_registry::{ChainId, EvmTxType};
 use xindex_shared::signer_wire::TronAssetKind;
@@ -56,6 +57,8 @@ fn payloads_equal(a: &str, b: &str) -> bool {
 pub fn verify_payload_and_fee(spend: &PreparedSpend, prepare_key: &str) -> Result<(), Rejection> {
     match spend {
         PreparedSpend::Btc(ctx) => verify_btc(ctx, prepare_key),
+        PreparedSpend::DirectUtxo(ctx) => verify_direct_utxo(ctx, prepare_key),
+        PreparedSpend::Zcash(ctx) => verify_zcash(ctx, prepare_key),
         PreparedSpend::Evm(e) => verify_evm(e, prepare_key),
         PreparedSpend::Account(a) => verify_account(a, prepare_key),
     }
@@ -127,6 +130,7 @@ fn verify_account(a: &AccountPrepared, prepare_key: &str) -> Result<(), Rejectio
 fn recompute_account_payload(a: &AccountPrepared) -> Result<String, Rejection> {
     match &a.signing {
         AccountSigning::Cosmos { .. } => recompute_cosmos(a),
+        AccountSigning::CosmosDirect { .. } => recompute_cosmos_direct(a),
         AccountSigning::Xrp { .. } => recompute_xrp(a),
         AccountSigning::Tron { .. } => recompute_tron(a),
         AccountSigning::Solana { .. } => recompute_solana(a),
@@ -161,6 +165,49 @@ fn recompute_cosmos(a: &AccountPrepared) -> Result<String, Rejection> {
         .sign_bytes_sha256(&sequence.to_string())
         .map_err(|e| reject("payload_recompute_failed", format!("cosmos amino: {e}")))?;
     Ok(hex0x(&digest))
+}
+
+fn recompute_cosmos_direct(a: &AccountPrepared) -> Result<String, Rejection> {
+    if !matches!(a.chain, ChainId::Gaia | ChainId::Noble) {
+        return Err(reject(
+            "payload_recompute_failed",
+            "protobuf-direct Cosmos signing requires GAIA or Noble",
+        ));
+    }
+    let AccountSigning::CosmosDirect {
+        from_address,
+        cosmos_chain_id,
+        account_number,
+        sequence,
+        denom,
+        fee_amount,
+        gas_limit,
+        signing_pub_key,
+    } = &a.signing
+    else {
+        return Err(reject(
+            "payload_recompute_failed",
+            "not a direct Cosmos signing",
+        ));
+    };
+    let pubkey: [u8; 33] = signing_pub_key.as_slice().try_into().map_err(|_| {
+        reject(
+            "payload_recompute_failed",
+            "direct Cosmos signing public key is not 33 bytes",
+        )
+    })?;
+    let params = CosmosTxParams {
+        from_address,
+        to_address: &a.to_address,
+        denom,
+        send_amount: &a.amount_dec,
+        fee_amount: &fee_amount.to_string(),
+        gas_limit: *gas_limit,
+        memo: &a.memo,
+        sequence: *sequence,
+    };
+    let package = build_direct_signing_package(&pubkey, &params, cosmos_chain_id, *account_number);
+    Ok(hex0x(&package.signing_hash()))
 }
 
 fn recompute_xrp(a: &AccountPrepared) -> Result<String, Rejection> {
@@ -232,7 +279,7 @@ fn recompute_tron(a: &AccountPrepared) -> Result<String, Rejection> {
         expiration: *expiration,
         timestamp: *timestamp,
         fee_limit: *fee_limit,
-        memo: Vec::new(),
+        memo: a.memo.as_bytes().to_vec(),
         permission_id: *permission_id,
     };
     let raw_data = match asset {
@@ -326,18 +373,167 @@ fn verify_btc(ctx: &BindContext, prepare_key: &str) -> Result<(), Rejection> {
     enforce_fee_cap(ctx.chain, u128::from(implied_fee))
 }
 
+fn verify_direct_utxo(ctx: &BindContext, prepare_key: &str) -> Result<(), Rejection> {
+    let first_input = ctx.psbt.inputs.first().ok_or_else(|| {
+        reject(
+            "payload_recompute_failed",
+            "direct aggregate-key PSBT has no inputs",
+        )
+    })?;
+    if first_input.bip32_derivation.len() != 1 {
+        return Err(reject(
+            "payload_recompute_failed",
+            "direct aggregate-key PSBT input 0 must bind exactly one public key",
+        ));
+    }
+    let aggregate_key = first_input
+        .bip32_derivation
+        .keys()
+        .next()
+        .ok_or_else(|| {
+            reject(
+                "payload_recompute_failed",
+                "direct aggregate-key PSBT input 0 has no public key",
+            )
+        })?
+        .serialize();
+    let hashes = xindex_chain_utxo::single_key::derive_single_key_psbt_sighashes(
+        ctx.chain,
+        &ctx.psbt,
+        &aggregate_key,
+    )
+    .map_err(|error| {
+        reject(
+            "payload_recompute_failed",
+            format!("direct aggregate-key PSBT: {error}"),
+        )
+    })?;
+    if !hashes
+        .iter()
+        .any(|hash| payloads_equal(&hex0x(hash), prepare_key))
+    {
+        return Err(reject(
+            "payload_binding_mismatch",
+            "signing payload is not a reviewed direct-key sighash of any PSBT input (TK-01)",
+        ));
+    }
+
+    let mut sum_in = 0u64;
+    for input_index in 0..ctx.psbt.inputs.len() {
+        let value = direct_utxo_input_value(ctx, input_index)?;
+        sum_in = sum_in.checked_add(value).ok_or_else(|| {
+            reject(
+                "payload_recompute_failed",
+                "direct aggregate-key PSBT input value sum overflowed",
+            )
+        })?;
+    }
+    let sum_out = ctx
+        .psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .try_fold(0u64, |sum, output| {
+            sum.checked_add(output.value.to_sat()).ok_or_else(|| {
+                reject(
+                    "payload_recompute_failed",
+                    "direct aggregate-key PSBT output value sum overflowed",
+                )
+            })
+        })?;
+    let implied_fee = sum_in.checked_sub(sum_out).ok_or_else(|| {
+        reject(
+            "utxo_fee_underflow",
+            "direct aggregate-key PSBT outputs exceed inputs",
+        )
+    })?;
+    enforce_fee_cap(ctx.chain, u128::from(implied_fee))
+}
+
+fn verify_zcash(ctx: &ZcashBindContext, prepare_key: &str) -> Result<(), Rejection> {
+    let hashes = ctx.transaction.signing_hashes().map_err(|error| {
+        reject(
+            "payload_recompute_failed",
+            format!("transparent Zcash signing hashes: {error}"),
+        )
+    })?;
+    if !hashes
+        .iter()
+        .any(|hash| payloads_equal(&hex0x(hash), prepare_key))
+    {
+        return Err(reject(
+            "payload_binding_mismatch",
+            "signing payload is not a ZIP-243 hash of any transparent Zcash input (TK-01)",
+        ));
+    }
+    let fee = ctx.transaction.fee_zatoshis().map_err(|error| {
+        reject(
+            "payload_recompute_failed",
+            format!("transparent Zcash fee: {error}"),
+        )
+    })?;
+    enforce_fee_cap(ChainId::Zec, u128::from(fee))
+}
+
+fn direct_utxo_input_value(ctx: &BindContext, input_index: usize) -> Result<u64, Rejection> {
+    let input = &ctx.psbt.inputs[input_index];
+    match ctx.chain {
+        ChainId::Btc | ChainId::Ltc => input
+            .witness_utxo
+            .as_ref()
+            .map(|output| output.value.to_sat())
+            .ok_or_else(|| {
+                reject(
+                    "payload_recompute_failed",
+                    format!("direct SegWit PSBT input {input_index} has no witness UTXO"),
+                )
+            }),
+        ChainId::Bch | ChainId::Doge => {
+            let previous = input.non_witness_utxo.as_ref().ok_or_else(|| {
+                reject(
+                    "payload_recompute_failed",
+                    format!("direct legacy PSBT input {input_index} has no previous transaction"),
+                )
+            })?;
+            let vout = ctx.psbt.unsigned_tx.input[input_index].previous_output.vout;
+            previous
+                .output
+                .get(usize::try_from(vout).unwrap_or(usize::MAX))
+                .map(|output| output.value.to_sat())
+                .ok_or_else(|| {
+                    reject(
+                        "payload_recompute_failed",
+                        format!("direct legacy PSBT input {input_index} has invalid vout {vout}"),
+                    )
+                })
+        }
+        _ => Err(reject(
+            "payload_recompute_failed",
+            format!("chain {:?} has no direct PSBT signing profile", ctx.chain),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![expect(clippy::expect_used, reason = "test code")]
     use super::*;
+    use bitcoin::bip32::{DerivationPath, Fingerprint};
     use bitcoin::psbt::Psbt;
+    use bitcoin::psbt::PsbtSighashType;
     use bitcoin::{
         absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
         Transaction, TxIn, TxOut, Txid, Witness,
     };
     use xindex_custody_core::prepare::AccountPrepared;
+    use xindex_zcash_tx::{SaplingV4Transaction, TransparentInput, TransparentOutput};
 
     const MEMO: &str = "=:ETH.USDT:0xrecipient:990000";
+    const VULTISIG_AGGREGATE_KEY: [u8; 33] = [
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
+    ];
 
     fn cosmos_prepared(fee_amount: u128) -> AccountPrepared {
         AccountPrepared {
@@ -353,6 +549,47 @@ mod tests {
                 denom: "uatom".to_string(),
                 fee_amount,
                 gas_limit: 200_000,
+            },
+            ric: None,
+            spend_identity: 7u64.to_be_bytes().to_vec(),
+        }
+    }
+
+    fn cosmos_direct_prepared(chain: ChainId) -> AccountPrepared {
+        AccountPrepared {
+            chain,
+            to_address: match chain {
+                ChainId::Gaia => "cosmos1asgardvault",
+                ChainId::Noble => "noble1asgardvault",
+                _ => unreachable!("direct Cosmos fixture requires GAIA or Noble"),
+            }
+            .to_string(),
+            amount_dec: "5000000".to_string(),
+            memo: MEMO.to_string(),
+            signing: AccountSigning::CosmosDirect {
+                from_address: match chain {
+                    ChainId::Gaia => "cosmos1custody",
+                    ChainId::Noble => "noble1custody",
+                    _ => unreachable!("direct Cosmos fixture requires GAIA or Noble"),
+                }
+                .to_string(),
+                cosmos_chain_id: match chain {
+                    ChainId::Gaia => "cosmoshub-4",
+                    ChainId::Noble => "noble-1",
+                    _ => unreachable!("direct Cosmos fixture requires GAIA or Noble"),
+                }
+                .to_string(),
+                account_number: 42,
+                sequence: 7,
+                denom: match chain {
+                    ChainId::Gaia => "uatom",
+                    ChainId::Noble => "uusdc",
+                    _ => unreachable!("direct Cosmos fixture requires GAIA or Noble"),
+                }
+                .to_string(),
+                fee_amount: 5_000,
+                gas_limit: 200_000,
+                signing_pub_key: vec![0x02; 33],
             },
             ric: None,
             spend_identity: 7u64.to_be_bytes().to_vec(),
@@ -386,6 +623,75 @@ mod tests {
         let err =
             verify_payload_and_fee(&PreparedSpend::Account(a), "0xnotthehash").expect_err("bind");
         assert_eq!(err.0, "payload_binding_mismatch");
+    }
+
+    #[test]
+    fn vultisig_cosmos_direct_recompute_matches_for_gaia_and_noble() {
+        for chain in [ChainId::Gaia, ChainId::Noble] {
+            let prepared = cosmos_direct_prepared(chain);
+            let key = recompute_account_payload(&prepared).expect("direct recompute");
+            assert!(
+                verify_payload_and_fee(&PreparedSpend::Account(prepared), &key).is_ok(),
+                "{chain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vultisig_cosmos_direct_hash_is_not_legacy_amino_hash() {
+        let direct = cosmos_direct_prepared(ChainId::Gaia);
+        let direct_key = recompute_account_payload(&direct).expect("direct recompute");
+        let amino_key = recompute_account_payload(&cosmos_prepared(5_000)).expect("amino");
+
+        assert_ne!(direct_key, amino_key);
+    }
+
+    #[test]
+    fn tron_recompute_binds_the_certified_memo_into_raw_data() {
+        let raw_address = [0x41; 21];
+        let address = xindex_tron_tx::addr::encode_base58check(&raw_address);
+        let prepared = AccountPrepared {
+            chain: ChainId::Tron,
+            to_address: address.clone(),
+            amount_dec: "2500000".to_string(),
+            memo: MEMO.to_string(),
+            signing: AccountSigning::Tron {
+                owner_address: address,
+                asset: TronAssetKind::Trx,
+                contract_address: None,
+                ref_block_bytes: [0x01, 0x02],
+                ref_block_hash: [0x03; 8],
+                expiration: 1_800_000_000_000,
+                timestamp: 1_799_999_940_000,
+                fee_limit: 0,
+                permission_id: 0,
+            },
+            ric: None,
+            spend_identity: vec![0x77; 32],
+        };
+        let tapos = Tapos {
+            ref_block_bytes: [0x01, 0x02],
+            ref_block_hash: [0x03; 8],
+            expiration: 1_800_000_000_000,
+            timestamp: 1_799_999_940_000,
+            fee_limit: 0,
+            memo: MEMO.as_bytes().to_vec(),
+            permission_id: 0,
+        };
+        let expected_raw = build_trx_raw_data(
+            &TrxTransfer {
+                owner: raw_address,
+                to: raw_address,
+                amount: 2_500_000,
+            },
+            &tapos,
+        );
+        let expected_key = hex0x(&txid(&expected_raw));
+
+        assert_eq!(
+            recompute_account_payload(&prepared).expect("TRON recompute"),
+            expected_key
+        );
     }
 
     fn p2wpkh_spk(tag: u8) -> ScriptBuf {
@@ -444,6 +750,123 @@ mod tests {
             },
             key,
         )
+    }
+
+    fn direct_utxo_ctx(chain: ChainId) -> (BindContext, String) {
+        let public_key = bitcoin::PublicKey::from_slice(&VULTISIG_AGGREGATE_KEY)
+            .expect("fixed aggregate public key");
+        let previous_script = match chain {
+            ChainId::Btc | ChainId::Ltc => {
+                ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash().expect("compressed public key"))
+            }
+            ChainId::Bch | ChainId::Doge => ScriptBuf::new_p2pkh(&public_key.pubkey_hash()),
+            _ => unreachable!("direct UTXO fixture chain"),
+        };
+        let previous = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(200_000),
+                script_pubkey: previous_script,
+            }],
+        };
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: previous.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(199_000),
+                script_pubkey: ScriptBuf::new_p2pkh(&public_key.pubkey_hash()),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned).expect("PSBT");
+        psbt.inputs[0].bip32_derivation.insert(
+            public_key.inner,
+            (Fingerprint::default(), DerivationPath::default()),
+        );
+        match chain {
+            ChainId::Btc | ChainId::Ltc => {
+                psbt.inputs[0].witness_utxo = Some(previous.output[0].clone());
+                psbt.inputs[0].sighash_type = Some(EcdsaSighashType::All.into());
+            }
+            ChainId::Bch => {
+                psbt.inputs[0].non_witness_utxo = Some(previous);
+                psbt.inputs[0].sighash_type = Some(PsbtSighashType::from_u32(0x41));
+            }
+            ChainId::Doge => {
+                psbt.inputs[0].non_witness_utxo = Some(previous);
+                psbt.inputs[0].sighash_type = Some(EcdsaSighashType::All.into());
+            }
+            _ => unreachable!("direct UTXO fixture chain"),
+        }
+        let sighashes = xindex_chain_utxo::single_key::derive_single_key_psbt_sighashes(
+            chain,
+            &psbt,
+            &VULTISIG_AGGREGATE_KEY,
+        )
+        .expect("direct UTXO sighash");
+        (
+            BindContext {
+                chain,
+                psbt,
+                ric: None,
+                acc: None,
+            },
+            hex0x(&sighashes[0]),
+        )
+    }
+
+    #[test]
+    fn vultisig_zcash_recompute_matches_zip243_and_enforces_fee() {
+        let transaction = SaplingV4Transaction::new(
+            VULTISIG_AGGREGATE_KEY,
+            vec![TransparentInput::new([0x44; 32], 1, 200_000)],
+            vec![TransparentOutput::new(199_000, vec![0x51])],
+        )
+        .expect("valid Zcash transaction");
+        let prepare_key = hex0x(&transaction.signing_hashes().expect("ZIP-243 hash")[0]);
+        let spend = PreparedSpend::Zcash(Box::new(ZcashBindContext {
+            transaction,
+            ric: None,
+            acc: None,
+        }));
+
+        assert!(verify_payload_and_fee(&spend, &prepare_key).is_ok());
+        assert_eq!(
+            verify_payload_and_fee(&spend, "0xdeadbeef")
+                .expect_err("wrong Zcash signing payload")
+                .0,
+            "payload_binding_mismatch"
+        );
+    }
+
+    #[test]
+    fn vultisig_direct_utxo_recompute_matches_all_psbt_chains() {
+        for chain in [ChainId::Btc, ChainId::Ltc, ChainId::Bch, ChainId::Doge] {
+            let (context, prepare_key) = direct_utxo_ctx(chain);
+            assert!(
+                verify_payload_and_fee(
+                    &PreparedSpend::DirectUtxo(Box::new(context)),
+                    &prepare_key,
+                )
+                .is_ok(),
+                "{chain:?}"
+            );
+        }
     }
 
     /// TK-01: the recompute matches input-0's BIP-143 sighash under an honest key

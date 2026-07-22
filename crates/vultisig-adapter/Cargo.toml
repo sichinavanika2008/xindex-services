@@ -9,16 +9,30 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-utils = ["xindex-chain-utxo/test-utils", "xindex-custody-core/test-utils"]
+
 [dependencies]
 xindex-custody-core.workspace = true
 xindex-custody-node.workspace = true
 xindex-chain-utxo.workspace = true
 xindex-shared.workspace = true
+xindex-cosmos-tx.workspace = true
+xindex-xrp-tx.workspace = true
+xindex-solana-tx.workspace = true
+xindex-tron-tx.workspace = true
+xindex-zcash-tx.workspace = true
 bitcoin.workspace = true
+alloy-primitives.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+sha2.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-alloy-primitives.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 xindex-chain-utxo = { workspace = true, features = ["test-utils"] }

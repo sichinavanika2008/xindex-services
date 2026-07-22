@@ -20,6 +20,25 @@ use thiserror::Error;
 use crate::gates::{CertifiedSpend, GateRejection};
 use xindex_shared::signer_wire::error_codes;
 
+/// Borrowed value/script view shared by Bitcoin PSBT and transparent Zcash
+/// output binders.
+#[derive(Debug, Clone, Copy)]
+pub struct UtxoOutputRef<'a> {
+    value: u64,
+    script_pubkey: &'a Script,
+}
+
+impl<'a> UtxoOutputRef<'a> {
+    /// Construct an exact transparent-output view.
+    #[must_use]
+    pub const fn new(value: u64, script_pubkey: &'a Script) -> Self {
+        Self {
+            value,
+            script_pubkey,
+        }
+    }
+}
+
 /// Why an `OP_RETURN` script is not one canonical, non-empty data push.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CanonicalOpReturnError {
@@ -121,18 +140,36 @@ pub fn bind_outputs_to_cert(
     descriptor_spk: &bitcoin::ScriptBuf,
     spend: &CertifiedSpend,
 ) -> Result<(), GateRejection> {
+    let outputs = psbt
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|output| UtxoOutputRef::new(output.value.to_sat(), &output.script_pubkey))
+        .collect::<Vec<_>>();
+    bind_transparent_outputs_to_cert(&outputs, descriptor_spk, spend)
+}
+
+/// Bind an ordered transparent output set to a certified payout, optional
+/// custody change, and one canonical memo output.
+///
+/// # Errors
+/// [`GateRejection`] on a wrong payout, memo, change, output count, or order.
+pub fn bind_transparent_outputs_to_cert(
+    outputs: &[UtxoOutputRef<'_>],
+    descriptor_spk: &bitcoin::ScriptBuf,
+    spend: &CertifiedSpend,
+) -> Result<(), GateRejection> {
     let want_sats = u64::try_from(spend.amount).map_err(|_| {
         GateRejection::unprocessable(
             spend.mismatch_code,
             "certified amount does not fit u64 sats",
         )
     })?;
-    let outputs = &psbt.unsigned_tx.output;
     if !(2..=3).contains(&outputs.len()) {
         return Err(GateRejection::unprocessable(
             spend.mismatch_code,
             format!(
-                "THORChain BTC spend must have exactly 2 outputs (no change) or 3 outputs (with change), found {}",
+                "THORChain UTXO spend must have exactly 2 outputs (no change) or 3 outputs (with change), found {}",
                 outputs.len()
             ),
         ));
@@ -147,12 +184,12 @@ pub fn bind_outputs_to_cert(
             "VOUT0 is not the certified Asgard payout",
         ));
     }
-    if payout.value.to_sat() != want_sats {
+    if payout.value != want_sats {
         return Err(GateRejection::unprocessable(
             spend.mismatch_code,
             format!(
                 "VOUT0 pays {} sats, certificate authorizes {want_sats}",
-                payout.value.to_sat()
+                payout.value
             ),
         ));
     }
@@ -161,7 +198,7 @@ pub fn bind_outputs_to_cert(
         let change = &outputs[1];
         if change.script_pubkey.is_op_return()
             || change.script_pubkey.as_bytes() != descriptor_spk.as_bytes()
-            || change.value == bitcoin::Amount::ZERO
+            || change.value == 0
         {
             return Err(GateRejection::unprocessable(
                 error_codes::PSBT_UNEXPECTED_OUTPUT,
@@ -178,13 +215,13 @@ pub fn bind_outputs_to_cert(
             format!("VOUT{memo_index} is not the THORChain OP_RETURN memo"),
         ));
     }
-    if memo.value != bitcoin::Amount::ZERO {
+    if memo.value != 0 {
         return Err(GateRejection::unprocessable(
             spend.mismatch_code,
             "OP_RETURN output carries value (memo outputs must be zero-value)",
         ));
     }
-    let payload = parse_canonical_op_return_payload(&memo.script_pubkey).map_err(|error| {
+    let payload = parse_canonical_op_return_payload(memo.script_pubkey).map_err(|error| {
         GateRejection::unprocessable(
             spend.mismatch_code,
             format!("non-canonical OP_RETURN memo: {error}"),

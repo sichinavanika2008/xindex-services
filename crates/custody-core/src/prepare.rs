@@ -25,6 +25,7 @@ use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use tokio::sync::Mutex;
 use xindex_shared::chain_registry::ChainId;
 use xindex_shared::signer_wire::{AcquireCancelProof, IntentProof, TronAssetKind};
+use xindex_zcash_tx::SaplingV4Transaction;
 
 /// A prepare-store failure.
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +46,17 @@ pub struct BindContext {
     pub chain: ChainId,
     /// The unsigned PSBT the executor will submit to the custody boundary.
     pub psbt: Psbt,
+    /// The k-of-n RIC authorizing a redeem spend (XOR [`Self::acc`]).
+    pub ric: Option<IntentProof>,
+    /// The k-of-n ACC authorizing a mint-cancel swap-back (XOR [`Self::ric`]).
+    pub acc: Option<AcquireCancelProof>,
+}
+
+/// Transparent Sapling-v4 Zcash spend plus its authorizing certificate.
+#[derive(Debug, Clone)]
+pub struct ZcashBindContext {
+    /// Exact direct aggregate-key transaction profile.
+    pub transaction: SaplingV4Transaction,
     /// The k-of-n RIC authorizing a redeem spend (XOR [`Self::acc`]).
     pub ric: Option<IntentProof>,
     /// The k-of-n ACC authorizing a mint-cancel swap-back (XOR [`Self::ric`]).
@@ -115,6 +127,29 @@ pub enum AccountSigning {
         /// Gas limit.
         gas_limit: u64,
     },
+    /// Vultisig single-key Cosmos protobuf `SIGN_MODE_DIRECT` inputs.
+    ///
+    /// Kept distinct from [`Self::Cosmos`] so enabling Vultisig cannot
+    /// silently change the legacy-Amino bytes used by existing multisig
+    /// accounts.
+    CosmosDirect {
+        /// Custody account (`MsgSend.from_address`).
+        from_address: String,
+        /// Consensus chain id bound into the protobuf `SignDoc`.
+        cosmos_chain_id: String,
+        /// Account number bound into the protobuf `SignDoc`.
+        account_number: u64,
+        /// Account sequence bound into `AuthInfo.SignerInfo`.
+        sequence: u64,
+        /// Native micro-denom.
+        denom: String,
+        /// Custody-funded fee amount (micro-denom).
+        fee_amount: u128,
+        /// Gas limit.
+        gas_limit: u64,
+        /// Exact Vultisig-derived compressed secp256k1 signing public key.
+        signing_pub_key: Vec<u8>,
+    },
     /// XRP single-sign `Payment` inputs.
     Xrp {
         /// Custody classic r-address (`Account`).
@@ -166,7 +201,9 @@ impl AccountSigning {
     #[must_use]
     pub fn declared_fee_base_units(&self) -> Option<u128> {
         match self {
-            Self::Cosmos { fee_amount, .. } => Some(*fee_amount),
+            Self::Cosmos { fee_amount, .. } | Self::CosmosDirect { fee_amount, .. } => {
+                Some(*fee_amount)
+            }
             Self::Xrp { fee_drops, .. } => Some(*fee_drops),
             Self::Tron { fee_limit, .. } => Some(u128::from(*fee_limit)),
             Self::Solana { .. } => None,
@@ -202,10 +239,44 @@ pub enum PreparedSpend {
     /// A BTC redeem / swap-back PSBT. Boxed — a PSBT is far larger than the
     /// other variants (`clippy::large_enum_variant`).
     Btc(Box<BindContext>),
+    /// A direct aggregate-key UTXO PSBT. This remains distinct from the legacy
+    /// script-multisig profile so neither path can silently accept the other.
+    DirectUtxo(Box<BindContext>),
+    /// Transparent Sapling-v4 Zcash spend. Kept outside PSBT framing because
+    /// ZIP-243 commits input values and the active consensus branch directly.
+    Zcash(Box<ZcashBindContext>),
     /// An EVM `depositWithExpiry` redeem leg.
     Evm(EvmPrepared),
     /// An account-model (Cosmos / XRP / TRON) redeem send.
     Account(AccountPrepared),
+}
+
+impl PreparedSpend {
+    /// Encode the complete prepared spend in the same stable representation
+    /// used by [`SqlitePrepareStore`]. This is data, not an authorization
+    /// capability: callers must still cross custody-node's policy and one-shot
+    /// boundary before signing.
+    ///
+    /// # Errors
+    /// Serialization failure.
+    pub fn encode_durable(&self) -> Result<Vec<u8>, PrepareError> {
+        serde_json::to_vec(&StoredSpend::from_spend(self))
+            .map_err(|error| PrepareError::Decode(error.to_string()))
+    }
+
+    /// Decode a prepared spend previously produced by
+    /// [`Self::encode_durable`]. Every family-specific representation is
+    /// parsed and validated before it is returned.
+    ///
+    /// This does not authorize the spend.
+    ///
+    /// # Errors
+    /// Malformed, incomplete, or invalid stored data.
+    pub fn decode_durable(bytes: &[u8]) -> Result<Self, PrepareError> {
+        let stored = serde_json::from_slice::<StoredSpend>(bytes)
+            .map_err(|error| PrepareError::Decode(error.to_string()))?;
+        stored.into_spend()
+    }
 }
 
 /// Prepare-store API. The executor `put`s the unsigned spend + cert keyed by
@@ -291,8 +362,8 @@ impl SqlitePrepareStore {
 
 impl PrepareStore for SqlitePrepareStore {
     async fn put(&self, request_id: String, spend: PreparedSpend) -> Result<(), PrepareError> {
-        let json = serde_json::to_string(&StoredSpend::from_spend(&spend))
-            .map_err(|e| PrepareError::Decode(e.to_string()))?;
+        let json = String::from_utf8(spend.encode_durable()?)
+            .map_err(|error| PrepareError::Decode(error.to_string()))?;
         sqlx::query(
             "INSERT OR REPLACE INTO prepared_spends (request_id, spend_json, created_at_unix) \
              VALUES (?, ?, strftime('%s','now'))",
@@ -314,11 +385,7 @@ impl PrepareStore for SqlitePrepareStore {
                 .map_err(|e| PrepareError::Db(e.to_string()))?;
         match row {
             None => Ok(None),
-            Some((json,)) => {
-                let stored: StoredSpend =
-                    serde_json::from_str(&json).map_err(|e| PrepareError::Decode(e.to_string()))?;
-                Ok(Some(stored.into_spend()?))
-            }
+            Some((json,)) => Ok(Some(PreparedSpend::decode_durable(json.as_bytes())?)),
         }
     }
 }
@@ -354,6 +421,8 @@ struct StoredSpend {
     evm_signing: Option<EvmSigning>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     account_signing: Option<AccountSigning>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    zcash_transaction: Option<SaplingV4Transaction>,
 }
 
 fn require<T>(field: Option<T>, name: &str) -> Result<T, PrepareError> {
@@ -377,6 +446,7 @@ impl StoredSpend {
             spend_identity_hex: None,
             evm_signing: None,
             account_signing: None,
+            zcash_transaction: None,
         };
         match spend {
             PreparedSpend::Btc(ctx) => Self {
@@ -384,6 +454,18 @@ impl StoredSpend {
                 ric: ctx.ric.clone(),
                 acc: ctx.acc.clone(),
                 ..base(ctx.chain, "btc")
+            },
+            PreparedSpend::DirectUtxo(ctx) => Self {
+                psbt_hex: Some(alloy_primitives::hex::encode(ctx.psbt.serialize())),
+                ric: ctx.ric.clone(),
+                acc: ctx.acc.clone(),
+                ..base(ctx.chain, "direct_utxo")
+            },
+            PreparedSpend::Zcash(ctx) => Self {
+                zcash_transaction: Some(ctx.transaction.clone()),
+                ric: ctx.ric.clone(),
+                acc: ctx.acc.clone(),
+                ..base(ChainId::Zec, "zcash")
             },
             PreparedSpend::Evm(e) => Self {
                 to_hex: Some(format!("{:#x}", e.to)),
@@ -423,6 +505,32 @@ impl StoredSpend {
                     acc: self.acc,
                 })))
             }
+            "direct_utxo" => {
+                let psbt = Psbt::deserialize(&hexd(self.psbt_hex, "psbt_hex")?)
+                    .map_err(|e| PrepareError::Decode(format!("bad psbt: {e}")))?;
+                Ok(PreparedSpend::DirectUtxo(Box::new(BindContext {
+                    chain: self.chain,
+                    psbt,
+                    ric: self.ric,
+                    acc: self.acc,
+                })))
+            }
+            "zcash" => {
+                if self.chain != ChainId::Zec {
+                    return Err(PrepareError::Decode(
+                        "stored Zcash spend carries a non-ZEC chain".to_string(),
+                    ));
+                }
+                let transaction = require(self.zcash_transaction, "zcash_transaction")?;
+                transaction.validate().map_err(|error| {
+                    PrepareError::Decode(format!("bad Zcash transaction: {error}"))
+                })?;
+                Ok(PreparedSpend::Zcash(Box::new(ZcashBindContext {
+                    transaction,
+                    ric: self.ric,
+                    acc: self.acc,
+                })))
+            }
             "evm" => {
                 let to = Address::from_str(&require(self.to_hex, "to_hex")?)
                     .map_err(|e| PrepareError::Decode(format!("bad to: {e}")))?;
@@ -458,6 +566,13 @@ impl StoredSpend {
 mod tests {
     use super::*;
     use bitcoin::{absolute::LockTime, transaction::Version, Transaction};
+    use xindex_zcash_tx::{TransparentInput, TransparentOutput};
+
+    const AGGREGATE_KEY: [u8; 33] = [
+        0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+        0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16,
+        0xf8, 0x17, 0x98,
+    ];
 
     fn empty_psbt() -> Psbt {
         let tx = Transaction {
@@ -515,6 +630,21 @@ mod tests {
             ric: None,
             spend_identity: vec![7],
         })
+    }
+
+    #[expect(clippy::expect_used, reason = "fixed Zcash fixture")]
+    fn zcash_spend() -> PreparedSpend {
+        let transaction = SaplingV4Transaction::new(
+            AGGREGATE_KEY,
+            vec![TransparentInput::new([0x44; 32], 1, 200_000)],
+            vec![TransparentOutput::new(199_000, vec![0x51])],
+        )
+        .expect("valid Zcash fixture");
+        PreparedSpend::Zcash(Box::new(ZcashBindContext {
+            transaction,
+            ric: None,
+            acc: None,
+        }))
     }
 
     #[tokio::test]
@@ -581,6 +711,20 @@ mod tests {
             assert_eq!(a.to_address, "cosmos1exampledestination");
             assert_eq!(a.amount_dec, "1000000");
             assert_eq!(a.spend_identity, vec![7]);
+        }
+
+        store
+            .put("z".to_string(), zcash_spend())
+            .await
+            .expect("put Zcash");
+        let got_zcash = store.get("z").await.expect("get Zcash");
+        assert!(
+            matches!(&got_zcash, Some(PreparedSpend::Zcash(_))),
+            "expected Zcash, got {got_zcash:?}"
+        );
+        if let Some(PreparedSpend::Zcash(context)) = got_zcash {
+            assert_eq!(context.transaction.aggregate_public_key(), AGGREGATE_KEY);
+            assert_eq!(context.transaction.fee_zatoshis().expect("fee"), 1_000);
         }
     }
 

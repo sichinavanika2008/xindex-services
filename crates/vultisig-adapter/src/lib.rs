@@ -9,15 +9,39 @@
 //! revalidates the exact finalized transaction body, witness shape, aggregate
 //! public key and every ECDSA signature. The final receipt can then be consumed
 //! into a non-cloneable aggregate-evidence handoff. The executor library offers
-//! an optional key-free write-ahead preparation step for that handoff, but no
-//! runtime, concrete durable sink, target-bound transport, or broadcaster is
+//! an optional key-free write-ahead preparation step for that handoff. This
+//! crate also owns the target-bound durable authorization journal used by the
+//! separate connector; no runtime binary, upstream signer, or broadcaster is
 //! wired yet.
 
+mod chain;
 mod evidence;
+mod journal;
+mod request;
+mod response;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod test_utils;
 
+pub use chain::{
+    vultisig_chain_profile, VultisigChainProfile, VultisigHashDerivation, VultisigSignatureScheme,
+};
 pub use evidence::{
     VultisigBitcoinEvidence, VultisigBitcoinEvidenceRecord, VultisigParticipantIdentity,
     VultisigSessionContext,
+};
+pub use journal::{
+    RecoveredVultisigKeysign, SqliteVultisigKeysignJournal, VultisigKeysignJournalClaim,
+    VultisigKeysignJournalError, VultisigKeysignTerminalReceipt,
+};
+pub use request::{
+    prepare_vultisig_keysign, AuthorizedVultisigKeysign, VultisigBitcoinEvidenceConfig,
+    VultisigBitcoinRecoveryMaterial, VultisigKeysignMessage, VultisigPluginKeysignRequest,
+    VultisigPublicKey, VultisigRequestError, VultisigSigningPayload, VultisigVaultConfig,
+};
+pub use response::{
+    finalize_vultisig_keysign, VerifiedVultisigTransaction, VultisigFinalizationFailure,
+    VultisigKeysignResponse, VultisigResponseError,
 };
 
 use std::fmt;
@@ -36,7 +60,7 @@ use xindex_chain_utxo::finalized_inventory::{
 use xindex_chain_utxo::trusted_observer::Testnet4FinalizedInventoryObserver;
 use xindex_custody_core::btc_authorize::BtcSpendAuthorization;
 use xindex_custody_core::gates::{CustodyConfig, GateRejection};
-use xindex_custody_core::prepare::BindContext;
+use xindex_custody_core::prepare::{BindContext, PreparedSpend};
 use xindex_custody_core::replay::ReplayStore;
 use xindex_custody_node::btc::authorize_certified_btc_spend;
 use xindex_shared::chain_registry::ChainId;
@@ -315,7 +339,7 @@ impl VultisigBitcoinPolicyRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     const fn from_test_source(policy_source: FinalizedBitcoinPolicySource) -> Self {
         Self { policy_source }
     }
@@ -351,6 +375,151 @@ impl VultisigBitcoinPolicyRuntime {
     ) -> Result<AuthorizedBitcoinSpend, AdapterError> {
         authorize_vultisig_btc_spend(ctx, replay, config, &self.policy_source, policy, now_unix)
             .await
+    }
+
+    /// Cross the strict finalized-inventory and custody boundary, then seal
+    /// the same PSBT as a direct Vultisig Bitcoin keysign request.
+    ///
+    /// The returned capability owns both the post-one-shot finalizer and the
+    /// only request that may enter the durable connector. This is the
+    /// production composition boundary used by the integrated runtime.
+    ///
+    /// # Errors
+    /// Policy/custody rejection, key mismatch, or disagreement between the
+    /// independently derived policy hashes and sealed request fails closed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one boundary keeps every strict authorization input explicit"
+    )]
+    pub async fn authorize_keysign<S: ReplayStore>(
+        &self,
+        ctx: &BindContext,
+        replay: &S,
+        config: CustodyConfig<'_>,
+        policy: &BitcoinSpendPolicy,
+        vault: VultisigVaultConfig,
+        evidence: VultisigBitcoinEvidenceConfig,
+        now_unix: i64,
+    ) -> Result<AuthorizedVultisigBitcoinKeysign, AdapterError> {
+        let finalizer = self
+            .authorize(ctx, replay, config, policy, now_unix)
+            .await?;
+        let prepare_key = finalizer
+            .policy
+            .signing_hashes
+            .first()
+            .ok_or_else(|| {
+                PolicyError::new(
+                    "vultisig_keysign_hashes",
+                    "strict Bitcoin approval has no signing hashes",
+                )
+            })
+            .map(|hash| format!("0x{}", alloy_primitives::hex::encode(hash)))?;
+        let mut request = request::build_from_parts(
+            prepare_key,
+            PreparedSpend::DirectUtxo(Box::new(ctx.clone())),
+            vault,
+        )?;
+        let sealed_hashes = request
+            .payloads()
+            .iter()
+            .map(request::VultisigSigningPayload::message)
+            .collect::<Vec<_>>();
+        if sealed_hashes.len() != finalizer.policy.signing_hashes.len()
+            || sealed_hashes
+                .iter()
+                .zip(&finalizer.policy.signing_hashes)
+                .any(|(sealed, approved)| *sealed != approved)
+        {
+            return Err(PolicyError::new(
+                "vultisig_keysign_hashes",
+                "sealed Vultisig request hashes differ from the strict Bitcoin approval",
+            )
+            .into());
+        }
+        request::attach_bitcoin_authorization(
+            &mut request,
+            policy.max_fee_sats,
+            finalizer.policy.policy_id,
+            finalizer.policy.provenance_id,
+            evidence,
+        )?;
+        let operation_id = request.bitcoin_operation_id().ok_or_else(|| {
+            PolicyError::new(
+                "vultisig_keysign_operation",
+                "strict Bitcoin request has no operation identity",
+            )
+        })?;
+        Ok(AuthorizedVultisigBitcoinKeysign {
+            request,
+            finalizer,
+            operation_id,
+        })
+    }
+
+    /// Re-cross current finalized inventory and the idempotent custody
+    /// one-shot for a connector request recovered after process loss.
+    ///
+    /// # Errors
+    /// Stale/missing inventory, one-shot conflict, policy failure, or signing
+    /// hash drift fails closed.
+    pub async fn recover_authorization<S: ReplayStore>(
+        &self,
+        material: &VultisigBitcoinRecoveryMaterial,
+        replay: &S,
+        config: CustodyConfig<'_>,
+        now_unix: i64,
+    ) -> Result<AuthorizedBitcoinSpend, AdapterError> {
+        let outpoints = material
+            .context()
+            .psbt
+            .unsigned_tx
+            .input
+            .iter()
+            .map(|input| input.previous_output)
+            .collect::<Vec<_>>();
+        let policy = self
+            .issue_policy(&outpoints, material.max_fee_sats())
+            .await?;
+        let authorization = self
+            .authorize(material.context(), replay, config, &policy, now_unix)
+            .await?;
+        if authorization.policy().signing_hashes() != material.expected_signing_hashes() {
+            return Err(PolicyError::new(
+                "vultisig_recovery_hashes",
+                "current-policy recovery hashes differ from the durable sealed request",
+            )
+            .into());
+        }
+        Ok(authorization)
+    }
+}
+
+/// Post-policy Bitcoin keysign capability consumed by the integrated runtime.
+///
+/// It joins the exact sealed Vultisig request to the strict final-transaction
+/// validator that crossed the same finalized-inventory and custody one-shot
+/// boundary. It is deliberately non-cloneable.
+#[derive(Debug)]
+pub struct AuthorizedVultisigBitcoinKeysign {
+    request: AuthorizedVultisigKeysign,
+    finalizer: AuthorizedBitcoinSpend,
+    operation_id: [u8; 32],
+}
+
+impl AuthorizedVultisigBitcoinKeysign {
+    /// Stable content identity retained by connector recovery.
+    #[must_use]
+    pub const fn operation_id(&self) -> [u8; 32] {
+        self.operation_id
+    }
+
+    /// Consume the joined capability into the sealed connector request and
+    /// strict finalizer. Production callers should pass both immediately to
+    /// the integrated executor runtime.
+    #[must_use]
+    pub fn into_parts(self) -> (AuthorizedVultisigKeysign, AuthorizedBitcoinSpend) {
+        (self.request, self.finalizer)
     }
 }
 
@@ -608,7 +777,7 @@ impl AuthorizedBitcoinSpend {
     /// The returned value owns the canonical bytes that passed body, witness,
     /// aggregate-key, sighash, and per-input signature verification. A future
     /// broadcaster must accept this capability instead of a bare transaction.
-    /// No current runtime consumes it.
+    /// The integrated Bitcoin Testnet4 runtime consumes it before persistence.
     ///
     /// # Errors
     /// Returns a fail-closed provenance or policy rejection when inventory
@@ -756,6 +925,8 @@ pub enum AdapterError {
     Provenance(InventoryError),
     /// RIC/ACC verification, output binding, or one-shot consumption failed.
     Custody(GateRejection),
+    /// Sealed Vultisig request construction or durable reconstruction failed.
+    Request(VultisigRequestError),
 }
 
 impl AdapterError {
@@ -766,6 +937,7 @@ impl AdapterError {
             Self::Policy(error) => error.code(),
             Self::Provenance(error) => error.code(),
             Self::Custody(error) => error.code,
+            Self::Request(_) => "vultisig_request",
         }
     }
 }
@@ -776,6 +948,7 @@ impl fmt::Display for AdapterError {
             Self::Policy(error) => error.fmt(formatter),
             Self::Provenance(error) => error.fmt(formatter),
             Self::Custody(error) => write!(formatter, "{}: {}", error.code, error.message),
+            Self::Request(error) => error.fmt(formatter),
         }
     }
 }
@@ -797,6 +970,12 @@ impl From<GateRejection> for AdapterError {
 impl From<InventoryError> for AdapterError {
     fn from(error: InventoryError) -> Self {
         Self::Provenance(error)
+    }
+}
+
+impl From<VultisigRequestError> for AdapterError {
+    fn from(error: VultisigRequestError) -> Self {
+        Self::Request(error)
     }
 }
 

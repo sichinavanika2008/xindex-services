@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Cache-Control" content="no-store" />
+<title>Xindex — onchain index protocol</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.4/dist/ethers.umd.min.js"></script>
+<script>document.write('<scr' + 'ipt src="addresses.js?t=' + Date.now() + '"></scr' + 'ipt>');</script>
+<style>
+  :root {
+    --bg:#0a0b0d; --panel:#0f1113; --panel2:#15181b; --panel3:#1b1f23;
+    --txt:#e7edee; --mut:#8a9499; --mut2:#565f63;
+    --mint:#3fe0b0; --mint2:#5cf0c4; --mint-dim:rgba(63,224,176,.11); --mint-line:rgba(63,224,176,.42);
+    --red:#ff5d6e; --red-dim:rgba(255,93,110,.12);
+    --line:rgba(231,237,238,.08); --line2:rgba(231,237,238,.045);
+    --sans:"Inter",system-ui,-apple-system,sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:var(--sans); font-size:14px;
+    line-height:1.5; -webkit-font-smoothing:antialiased; overflow-x:hidden; }
+  .num, .mono { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  a { color:var(--mint); text-decoration:none; }
+  a:hover { color:var(--mint2); }
+  .wrap { max-width:1180px; margin:0 auto; padding:0 24px; }
+  .hidden { display:none !important; }
+  ::selection { background:var(--mint); color:#04130d; }
+  .lbl { font-family:var(--mono); font-size:10px; letter-spacing:.13em; text-transform:uppercase; color:var(--mut2); }
+
+  /* top bar */
+  .topbar { position:sticky; top:0; z-index:40; height:54px; display:flex; align-items:center; justify-content:space-between;
+    padding:0 24px; background:rgba(10,11,13,.82); backdrop-filter:saturate(150%) blur(10px); border-bottom:1px solid var(--line); }
+  .brand { display:flex; align-items:center; gap:9px; font-family:var(--mono); font-weight:600; font-size:15px; letter-spacing:.05em; }
+  .brand .mk { width:8px; height:17px; background:var(--mint); border-radius:1.5px; box-shadow:0 0 12px rgba(63,224,176,.5); }
+  .navlinks { display:flex; gap:22px; margin-left:30px; }
+  .navlinks a { font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--mut); }
+  .navlinks a:hover { color:var(--txt); }
+  .nav-right { display:flex; align-items:center; gap:14px; }
+  .chips { display:flex; align-items:stretch; border:1px solid var(--line); border-radius:7px; overflow:hidden; background:var(--panel); }
+  .chip-bal { font-family:var(--mono); font-size:12px; padding:7px 12px; border-right:1px solid var(--line2); white-space:nowrap; display:flex; gap:7px; align-items:center; }
+  .chip-bal:last-child { border-right:0; }
+  .chip-bal b { color:var(--txt); font-weight:500; }
+  .chip-lbl { color:var(--mut2); font-size:9.5px; letter-spacing:.1em; }
+  .live { width:6px; height:6px; border-radius:50%; background:var(--mint); box-shadow:0 0 0 0 rgba(63,224,176,.5); animation:pulse 2.2s ease-out infinite; }
+  @keyframes pulse { 0% { box-shadow:0 0 0 0 rgba(63,224,176,.5); } 70%,100% { box-shadow:0 0 0 6px rgba(63,224,176,0); } }
+
+  /* buttons */
+  button { font-family:inherit; cursor:pointer; border:0; }
+  .btn { background:var(--mint); color:#04130d; font-weight:600; font-size:13px; padding:10px 18px; border-radius:8px;
+    letter-spacing:.005em; transition:filter .12s, transform .07s; }
+  .btn:hover { filter:brightness(1.09); }
+  .btn:active { transform:translateY(1px); }
+  .btn:disabled { background:var(--panel2); color:var(--mut2); cursor:not-allowed; filter:none; }
+  .btn.ghost { background:transparent; color:var(--txt); border:1px solid var(--line); }
+  .btn.ghost:hover { border-color:var(--mint-line); color:var(--mint); filter:none; }
+  .btn.sm { padding:8px 13px; font-size:12px; }
+  .btn .spin { display:inline-block; width:11px; height:11px; border:1.5px solid rgba(4,19,13,.3); border-top-color:#04130d; border-radius:50%; animation:spin .65s linear infinite; vertical-align:-1px; margin-right:7px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* hero */
+  .hero { display:grid; grid-template-columns:1.05fr .95fr; gap:46px; align-items:center; padding:60px 0 56px; border-bottom:1px solid var(--line); }
+  .eyebrow { display:flex; align-items:center; gap:9px; font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--mut); margin-bottom:22px; }
+  .hero h1 { font-size:clamp(34px,4.6vw,52px); line-height:1.03; letter-spacing:-.025em; font-weight:700; margin:0 0 18px; }
+  .hero h1 .g { color:var(--mint); }
+  .hero p { color:var(--mut); font-size:16px; max-width:430px; margin:0 0 26px; line-height:1.55; }
+  .hero-cta { display:flex; gap:12px; align-items:center; margin-bottom:30px; }
+  .flow { display:flex; gap:0; border-top:1px solid var(--line); padding-top:16px; }
+  .flow span { font-family:var(--mono); font-size:11.5px; color:var(--mut); padding-right:22px; }
+  .flow span b { color:var(--mint); font-weight:500; }
+
+  /* markets panel */
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
+  .panel-head { display:flex; align-items:center; justify-content:space-between; padding:11px 14px; border-bottom:1px solid var(--line); }
+  .panel-head .lbl { color:var(--mut); }
+  .markets { display:grid; grid-template-columns:1fr 1fr; }
+  .mx-cell { display:flex; align-items:center; gap:9px; padding:10px 13px; border-bottom:1px solid var(--line2); border-right:1px solid var(--line2); transition:background .12s; }
+  .mx-cell:hover { background:var(--panel2); }
+  .mx-cell:nth-child(2n) { border-right:0; }
+  .mx-ic { position:relative; width:20px; height:20px; border-radius:50%; overflow:hidden; background:var(--cc); flex:none; }
+  .mx-ic img { position:absolute; inset:0; width:100%; height:100%; }
+  .mx-tk { font-family:var(--mono); font-size:12px; font-weight:500; color:var(--txt); }
+  .mx-nm { font-size:11.5px; color:var(--mut2); margin-left:auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:84px; }
+
+  /* sections */
+  .card { padding:48px 0; border-bottom:1px solid var(--line); transition:opacity .25s; }
+  .card.locked { opacity:.34; pointer-events:none; }
+  .step { font-family:var(--mono); font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--mut2); margin-bottom:14px; }
+  .step b { color:var(--mint); font-weight:500; }
+  .card h2 { font-size:clamp(22px,2.4vw,30px); letter-spacing:-.015em; font-weight:600; margin:0 0 8px; }
+  .card .sub { color:var(--mut); font-size:14px; max-width:580px; margin:0 0 26px; }
+
+  /* builder: catalog + basket */
+  .builder { display:grid; grid-template-columns:1fr .92fr; gap:18px; align-items:start; }
+  .catalog, .basket { background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .catalog-head { display:flex; align-items:center; gap:11px; padding:11px 12px; border-bottom:1px solid var(--line); }
+  .srch { display:flex; align-items:center; gap:8px; flex:1; background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:8px 11px; transition:border-color .12s; }
+  .srch:focus-within { border-color:var(--mint-line); }
+  .srch svg { width:14px; height:14px; color:var(--mut2); flex:none; }
+  .srch input { background:transparent; border:0; color:var(--txt); font:inherit; font-size:13px; width:100%; }
+  .srch input:focus { outline:none; }
+  .catalog-head .lbl { white-space:nowrap; }
+  .chain-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:1px; background:var(--line2); max-height:336px; overflow-y:auto; }
+  .coin-card { background:var(--panel); padding:12px; cursor:pointer; position:relative; user-select:none; transition:background .12s; }
+  .coin-card:hover { background:var(--panel2); }
+  .coin-card.on { background:var(--mint-dim); box-shadow:inset 0 0 0 1px var(--mint-line); }
+  .coin-top { display:flex; align-items:center; gap:10px; }
+  .coin { position:relative; width:30px; height:30px; border-radius:50%; display:grid; place-items:center; font-size:11px; font-weight:700; color:#fff; flex:none; background:var(--cc); overflow:hidden; }
+  .coin img { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  .coin-name { font-size:12.5px; font-weight:500; line-height:1.2; }
+  .coin-card .tick { position:absolute; top:8px; right:9px; width:16px; height:16px; border-radius:50%; background:var(--mint); color:#04130d; font-size:9px; display:none; place-items:center; font-weight:700; }
+  .coin-card.on .tick { display:grid; }
+  .catalog-empty { grid-column:1/-1; background:var(--panel); color:var(--mut2); font-family:var(--mono); font-size:12px; text-align:center; padding:30px 12px; }
+
+  .basket-head { display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--line); font-size:13px; font-weight:600; }
+  .basket-list { padding:4px 14px; min-height:132px; max-height:288px; overflow-y:auto; }
+  .basket-empty { color:var(--mut2); font-family:var(--mono); font-size:12px; text-align:center; padding:42px 12px; line-height:1.7; }
+  .brow { display:grid; grid-template-columns:22px 58px 1fr 56px 22px; align-items:center; gap:9px; padding:10px 0; border-bottom:1px solid var(--line2); }
+  .brow:last-child { border-bottom:0; }
+  .brow-id { display:flex; flex-direction:column; line-height:1.18; min-width:0; }
+  .brow-tk { font-family:var(--mono); font-size:12px; color:var(--txt); }
+  .brow-nm { font-size:9.5px; color:var(--mut2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .pctwrap { display:flex; align-items:center; gap:3px; font-family:var(--mono); font-size:12px; color:var(--mut2); }
+  .pctin { width:42px; background:var(--bg); border:1px solid var(--line); border-radius:5px; color:var(--txt); font-family:var(--mono); font-size:12px; text-align:right; padding:4px 5px; }
+  .pctin:focus { outline:none; border-color:var(--mint-line); }
+  .brow-x { background:transparent; color:var(--mut2); font-size:17px; line-height:1; width:22px; height:22px; border-radius:6px; transition:.12s; }
+  .brow-x:hover { color:var(--red); background:var(--red-dim); }
+  input[type=range].wslider { -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:3px; outline:none; cursor:pointer; background:var(--panel3); }
+  input[type=range].wslider::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:14px; height:14px; border-radius:50%; background:var(--mint); cursor:pointer; box-shadow:0 0 0 3px var(--mint-dim); }
+  input[type=range].wslider::-moz-range-thumb { width:13px; height:13px; border:0; border-radius:50%; background:var(--mint); cursor:pointer; box-shadow:0 0 0 3px var(--mint-dim); }
+  .basket-foot { border-top:1px solid var(--line); padding:14px; display:flex; flex-direction:column; gap:13px; }
+  .meter { display:flex; align-items:center; gap:12px; }
+  .meter-track { flex:1; height:7px; background:var(--panel3); border-radius:4px; overflow:hidden; }
+  #meter-fill { display:block; height:100%; width:0; background:var(--mut2); border-radius:4px; transition:width .25s ease, background .2s; }
+  #meter-fill.ok { background:var(--mint); } #meter-fill.over { background:var(--red); }
+
+  /* composition bars (position view) */
+  .alloc { background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:14px 16px; margin:0; }
+  .alloc.empty { color:var(--mut2); font-family:var(--mono); font-size:12px; text-align:center; padding:26px; letter-spacing:.02em; }
+  .bar-row { display:grid; grid-template-columns:20px 50px 1fr 58px; align-items:center; gap:11px; padding:8px 0; border-bottom:1px solid var(--line2); }
+  .bar-row:last-child { border-bottom:0; }
+  .bar-ic { position:relative; width:20px; height:20px; border-radius:50%; overflow:hidden; background:var(--cc); }
+  .bar-ic img { position:absolute; inset:0; width:100%; height:100%; }
+  .bar-tk { font-family:var(--mono); font-size:12.5px; color:var(--txt); }
+  .bar-track { height:6px; background:var(--panel3); border-radius:3px; overflow:hidden; }
+  .bar-fill { height:100%; border-radius:3px; transition:width .4s cubic-bezier(.3,.8,.3,1); }
+  .bar-w { font-family:var(--mono); font-size:12.5px; color:var(--mut); text-align:right; }
+  .sumline { font-family:var(--mono); font-size:11.5px; color:var(--mint); letter-spacing:.02em; white-space:nowrap; }
+  .sumline.bad { color:var(--red); }
+
+  /* fields */
+  .field { display:flex; flex-direction:column; gap:7px; }
+  .field label { font-family:var(--mono); font-size:10px; color:var(--mut2); text-transform:uppercase; letter-spacing:.11em; }
+  .field input { background:var(--bg); border:1px solid var(--line); color:var(--txt); padding:11px 13px; font:inherit; font-size:14px; border-radius:8px; transition:border-color .12s; }
+  .field input:focus { outline:none; border-color:var(--mint-line); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; } .row.end { justify-content:flex-end; }
+
+  .amount-box { display:flex; align-items:center; gap:10px; border:1px solid var(--line); border-radius:9px; padding:9px 9px 9px 15px; background:var(--bg); transition:border-color .12s; }
+  .amount-box:focus-within { border-color:var(--mint-line); }
+  .amount-box input { background:transparent; border:0; color:var(--txt); font-family:var(--mono); font-size:27px; font-weight:500; width:100%; letter-spacing:-.02em; }
+  .amount-box input:focus { outline:none; }
+  .amount-box .ticker { display:flex; align-items:center; gap:6px; border:1px solid var(--line); border-radius:7px; padding:8px 13px; font-family:var(--mono); font-weight:500; font-size:13px; color:var(--mut); white-space:nowrap; }
+  .hintline { font-size:12.5px; color:var(--mut); margin-top:11px; } .hintline b { color:var(--txt); font-family:var(--mono); }
+
+  .status { display:none; align-items:center; gap:10px; margin-top:16px; padding:12px 14px; border:1px solid var(--line); border-radius:8px; font-family:var(--mono); font-size:12.5px; background:var(--bg); }
+  .status.show { display:flex; }
+  .status.work { border-color:var(--mint-line); } .status.ok { border-color:var(--mint-line); } .status.err { border-color:rgba(255,93,110,.4); }
+  .status .dot { width:8px; height:8px; border-radius:50%; flex:none; background:var(--mut2); }
+  .status.work .dot { background:var(--mint); animation:pulse 1.3s ease-out infinite; } .status.ok .dot { background:var(--mint); } .status.err .dot { background:var(--red); }
+  .status .sp { width:13px; height:13px; border:2px solid var(--line); border-top-color:var(--mint); border-radius:50%; animation:spin .65s linear infinite; flex:none; }
+
+  /* position panel */
+  .token-head { display:flex; align-items:center; gap:14px; margin-bottom:24px; padding-bottom:20px; border-bottom:1px solid var(--line); }
+  .token-logo { width:50px; height:50px; border-radius:50%; background:radial-gradient(circle at 34% 28%, var(--mint2), var(--mint) 70%); color:#04130d; display:grid; place-items:center; font-family:var(--mono); font-weight:700; font-size:15px; flex:none; box-shadow:0 6px 18px rgba(63,224,176,.28), inset 0 1px 1px rgba(255,255,255,.4); }
+  .token-id { flex:1; min-width:0; } .token-id h2 { margin:0 0 5px; font-size:23px; }
+  .token-meta { color:var(--mut); font-size:12px; display:flex; gap:9px; align-items:center; flex-wrap:wrap; font-family:var(--mono); }
+  .token-meta b { color:var(--txt); } .token-meta .dotsep { color:var(--mut2); }
+  .mono-inline { font-family:var(--mono); font-size:11px; color:var(--mut); border:1px solid var(--line); border-radius:6px; padding:3px 8px; }
+  .token-grid { display:grid; grid-template-columns:1fr 1.05fr; gap:30px; }
+  .token-col { display:flex; flex-direction:column; }
+  .token-sub { font-family:var(--mono); font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--mut2); margin-bottom:12px; }
+  .token-actions { display:flex; flex-direction:column; gap:16px; }
+  .token-act { border:1px solid var(--line); border-radius:11px; padding:17px; background:var(--panel); }
+  .stat { font-size:12px; color:var(--mut); font-family:var(--mono); text-transform:uppercase; letter-spacing:.1em; margin-top:18px; }
+  .stat b { display:block; font-size:34px; color:var(--txt); font-weight:500; font-family:var(--mono); letter-spacing:-.01em; margin-top:7px; text-transform:none; }
+  .stat .unit { font-size:13px; color:var(--mut); }
+
+  /* portfolios — each index is one coin */
+  #portfolios-list { display:grid; grid-template-columns:repeat(auto-fill,minmax(158px,1fr)); gap:12px; }
+  .pf-coin { position:relative; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px 16px 18px; text-align:center; cursor:pointer; transition:border-color .12s, background .12s, transform .08s; }
+  .pf-coin:hover { border-color:var(--mint-line); background:var(--panel2); }
+  .pf-coin:active { transform:translateY(1px); }
+  .pf-coin.active { border-color:var(--mint-line); background:var(--mint-dim); }
+  .pf-coin-badge { width:58px; height:58px; margin:0 auto 13px; border-radius:50%; background:radial-gradient(circle at 34% 28%, var(--mint2), var(--mint) 70%); color:#04130d; display:grid; place-items:center; font-family:var(--mono); font-weight:700; font-size:16px; letter-spacing:.02em; box-shadow:0 6px 18px rgba(63,224,176,.28), inset 0 1px 1px rgba(255,255,255,.4); }
+  .pf-coin-name { font-size:14px; font-weight:600; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .pf-coin-sub { font-family:var(--mono); font-size:11px; color:var(--mut2); }
+  .pf-coin-active { display:none; position:absolute; top:9px; right:9px; font-family:var(--mono); font-size:8px; letter-spacing:.08em; text-transform:uppercase; color:var(--mint); border:1px solid var(--mint-line); border-radius:4px; padding:2px 5px; }
+  .pf-coin.active .pf-coin-active { display:block; }
+
+  /* console */
+  .activity { border-bottom:1px solid var(--line); }
+  .activity summary { cursor:pointer; padding:16px 0; font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--mut); list-style:none; display:flex; align-items:center; gap:10px; }
+  .activity summary::-webkit-details-marker { display:none; }
+  .activity summary::before { content:"[+]"; color:var(--mint); } .activity[open] summary::before { content:"[\2212]"; }
+  #log { font-family:var(--mono); font-size:11.5px; padding:13px 15px; margin:0 0 20px; max-height:230px; overflow:auto; white-space:pre-wrap; color:var(--mut); background:var(--panel); border:1px solid var(--line); border-radius:9px; }
+
+  /* modal */
+  .overlay { position:fixed; inset:0; background:rgba(4,5,6,.74); display:none; place-items:center; z-index:80; backdrop-filter:blur(2px); }
+  .overlay.show { display:grid; }
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:13px; padding:30px; width:404px; max-width:92vw; position:relative; box-shadow:0 30px 90px rgba(0,0,0,.6); }
+  .modal h3 { margin:0 0 6px; font-size:20px; font-weight:600; letter-spacing:-.01em; } .modal>p { color:var(--mut); font-size:13px; margin:0 0 22px; }
+  .opt { display:flex; align-items:center; gap:13px; width:100%; text-align:left; background:var(--bg); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:10px; color:var(--txt); transition:border-color .12s, background .12s; }
+  .opt:hover { border-color:var(--mint-line); background:var(--panel2); }
+  .opt .ic { width:38px; height:38px; border-radius:9px; display:grid; place-items:center; font-family:var(--mono); font-size:13px; font-weight:600; flex:none; }
+  .opt .t { font-weight:500; font-size:14px; } .opt .d { font-family:var(--mono); font-size:11px; color:var(--mut2); }
+  .modal .note { font-family:var(--mono); font-size:10.5px; color:var(--mut2); text-align:center; margin-top:9px; letter-spacing:.02em; }
+  .modal .x { position:absolute; top:18px; right:20px; color:var(--mut); cursor:pointer; font-size:22px; line-height:1; }
+  .modal .x:hover { color:var(--mint); }
+
+  /* toasts */
+  #toasts { position:fixed; right:22px; bottom:22px; display:flex; flex-direction:column; gap:9px; z-index:90; }
+  .toast { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-left:3px solid var(--mint); border-radius:8px; padding:13px 16px; font-family:var(--mono); font-size:12.5px; min-width:240px; max-width:370px; box-shadow:0 16px 50px rgba(0,0,0,.5); animation:slide .22s ease; }
+  .toast.ok { border-left-color:var(--mint); } .toast.err { border-left-color:var(--red); }
+  @keyframes slide { from { transform:translateX(18px); opacity:0; } }
+
+  /* forge */
+  .forge { position:fixed; inset:0; z-index:100; display:none; place-items:center; background:rgba(10,11,13,.94); }
+  .forge.show { display:grid; }
+  .forge.out { animation:forge-fade .4s ease forwards; }
+  @keyframes forge-fade { to { opacity:0; } }
+  .forge-stage { position:relative; width:340px; height:340px; }
+  .forge-cap { position:absolute; top:-6px; left:50%; transform:translateX(-50%); white-space:nowrap; font-family:var(--mono); font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--mut); transition:opacity .3s; }
+  .forge-coin { position:absolute; left:50%; top:50%; width:50px; height:50px; border-radius:50%; overflow:hidden; display:grid; place-items:center; font-weight:700; font-size:13px; color:#fff; background:var(--cc);
+    transform:translate(calc(-50% + var(--tx)),calc(-50% + var(--ty)));
+    animation:forge-in .5s cubic-bezier(.2,.8,.3,1) var(--d) both; }
+  .forge-coin img { position:absolute; inset:0; width:100%; height:100%; }
+  @keyframes forge-in { from { transform:translate(calc(-50% + var(--tx) * 2.3),calc(-50% + var(--ty) * 2.3)) scale(.2); opacity:0; } }
+  .forge-coin.fuse { animation:forge-fuse .7s cubic-bezier(.55,0,.3,1) var(--fd) forwards; }
+  @keyframes forge-fuse { 55% { opacity:1; } to { transform:translate(-50%,-50%) scale(.1); opacity:0; } }
+  .forge-flash { position:absolute; left:50%; top:50%; width:110px; height:110px; border-radius:50%; transform:translate(-50%,-50%) scale(.2); opacity:0; background:radial-gradient(circle,rgba(63,224,176,.95),rgba(63,224,176,0) 70%); }
+  .forge-flash.go { animation:forge-flash .85s ease-out forwards; }
+  @keyframes forge-flash { 0% { opacity:.95; transform:translate(-50%,-50%) scale(.2); } 100% { opacity:0; transform:translate(-50%,-50%) scale(3.4); } }
+  .forge-core { position:absolute; left:50%; top:50%; width:104px; height:104px; border-radius:22px; transform:translate(-50%,-50%) scale(0); opacity:0;
+    background:var(--mint); display:grid; place-items:center; font-family:var(--mono); font-weight:700; font-size:28px; color:#04130d; box-shadow:0 0 50px rgba(63,224,176,.4); }
+  .forge-core.go { animation:forge-pop .85s cubic-bezier(.2,.8,.25,1.3) forwards; }
+  @keyframes forge-pop { 0% { transform:translate(-50%,-50%) scale(0); opacity:0; } 60% { opacity:1; } 100% { transform:translate(-50%,-50%) scale(1); opacity:1; } }
+  .forge-label { position:absolute; left:50%; top:70%; transform:translateX(-50%); white-space:nowrap; font-family:var(--mono); font-size:15px; letter-spacing:.04em; color:var(--txt); opacity:0; }
+  .forge-label.go { animation:forge-up .5s ease forwards; }
+  @keyframes forge-up { from { opacity:0; transform:translateX(-50%) translateY(14px); } to { opacity:1; transform:translateX(-50%) translateY(0); } }
+
+  footer { font-family:var(--mono); color:var(--mut2); font-size:11px; letter-spacing:.04em; text-transform:uppercase; padding:26px 0 44px; }
+
+  @media (max-width:880px){ .hero { grid-template-columns:1fr; gap:36px; } .token-grid,.grid2 { grid-template-columns:1fr; } .navlinks { display:none; } }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div style="display:flex;align-items:center">
+      <div class="brand"><div class="mk"></div> XINDEX</div>
+      <div class="navlinks">
+        <a href="#builder">Build</a><a href="#tokenCard">Invest</a><a href="#portfoliosCard">Portfolio</a>
+      </div>
+    </div>
+    <div class="nav-right">
+      <div id="balances" class="chips hidden">
+        <span class="chip-bal"><span class="chip-lbl">GAS</span> <b id="bal-eth">0</b></span>
+        <span class="chip-bal"><span class="chip-lbl">USDT</span> <b id="bal-usdt">0</b></span>
+        <span class="chip-bal" id="acct-chip"></span>
+      </div>
+      <button class="btn" id="connectBtn">Connect</button>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <section class="hero">
+      <div>
+        <div class="eyebrow"><span class="live"></span> Onchain index protocol · Sepolia testnet</div>
+        <h1>Own <span class="g">every chain</span>, in one token.</h1>
+        <p>Build an index of real Bitcoin, Ethereum, Cosmos and more — held natively across chains, fully under your control. Invest with USDT, redeem anytime.</p>
+        <div class="hero-cta">
+          <button class="btn" id="heroCta">Launch app</button>
+          <a href="#builder" class="btn ghost sm">Explore</a>
+        </div>
+        <div class="flow">
+          <span><b>01</b> Build</span><span><b>02</b> Invest</span><span><b>03</b> Redeem</span>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><span class="lbl">Supported markets</span><span class="lbl" id="hero-matrix-foot"></span></div>
+        <div class="markets" id="hero-matrix"></div>
+      </div>
+    </section>
+
+    <main>
+      <section class="card locked" id="builder">
+        <div class="step"><b>01</b> / Build</div>
+        <h2>Choose your assets</h2>
+        <p class="sub">Search 15 native markets, add them to your index, and tune each weight. Allocations must total 100%.</p>
+        <div class="builder">
+          <div class="catalog">
+            <div class="catalog-head">
+              <span class="srch"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></svg><input id="asset-search" placeholder="Search markets…" autocomplete="off" /></span>
+              <span class="lbl" id="asset-count"></span>
+            </div>
+            <div class="chain-grid" id="chains"></div>
+          </div>
+          <div class="basket">
+            <div class="basket-head"><span>Your index</span><span class="lbl" id="basket-n">0 assets</span></div>
+            <div class="basket-list" id="basket-list"></div>
+            <div class="basket-foot">
+              <div class="meter"><div class="meter-track"><span id="meter-fill"></span></div><span id="sumline" class="sumline"></span></div>
+              <div class="grid2">
+                <div class="field"><label>Index name</label><input id="b-name" value="My Index" /></div>
+                <div class="field"><label>Ticker</label><input id="b-sym" value="MYX" /></div>
+              </div>
+              <div class="row" style="justify-content:space-between">
+                <div class="row" style="gap:8px">
+                  <button class="btn ghost sm" id="btn-balance">Split evenly</button>
+                  <button class="btn ghost sm" id="btn-normalize">Normalize</button>
+                </div>
+                <button class="btn" id="createBtn" disabled>Create index</button>
+              </div>
+              <div class="status" id="create-status"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card hidden" id="portfoliosCard">
+        <div class="step">Portfolios</div>
+        <h2>My indexes</h2>
+        <p class="sub">Indexes you've created on this device. Select one to invest or redeem.</p>
+        <div id="portfolios-list"></div>
+      </section>
+
+      <section class="card locked" id="tokenCard">
+        <div class="token-head">
+          <div class="token-logo" id="token-logo">—</div>
+          <div class="token-id">
+            <h2 id="pos-title">Your index</h2>
+            <div class="token-meta"><b id="inv-name">—</b> <span class="dotsep">/</span> <span id="token-assetcount">—</span> <span class="dotsep">/</span> <span class="mono-inline" id="pos-addr"></span></div>
+          </div>
+          <button class="btn ghost sm" id="newPortfolioBtn">+ New index</button>
+        </div>
+        <div class="token-grid">
+          <div class="token-col">
+            <div class="token-sub">Composition</div>
+            <div class="alloc" id="pos-alloc" style="margin:0"></div>
+            <div class="stat">Your balance<b id="pos-shares">0 <span class="unit">shares</span></b></div>
+          </div>
+          <div class="token-actions">
+            <div class="token-act">
+              <div class="token-sub">Invest</div>
+              <div class="amount-box">
+                <input id="mint-amt" type="number" value="1000" min="0" />
+                <span class="ticker">USDT</span>
+              </div>
+              <div class="hintline" id="mint-hint">Balance <b id="usdt-have">0</b> USDT · <a href="#" id="faucet">get 10,000 test USDT</a></div>
+              <button class="btn" id="mintBtn" style="margin-top:13px; width:100%">Invest</button>
+              <div class="status" id="mint-status"></div>
+            </div>
+            <div class="token-act">
+              <div class="token-sub">Redeem</div>
+              <div class="field"><label>Shares → USDT</label><input id="burn-amt" type="number" value="0" min="0" /></div>
+              <div class="row" style="margin-top:11px">
+                <button class="btn ghost sm" id="btn-half">Half</button>
+                <button class="btn ghost sm" id="btn-max">Max</button>
+                <button class="btn" id="burnBtn" style="flex:1">Cash out</button>
+              </div>
+              <div class="status" id="burn-status"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <details class="activity"><summary>Activity log</summary><div id="log"></div></details>
+    <footer>Testnet only · public test network · no real funds at risk.</footer>
+  </div>
+
+  <div class="overlay" id="overlay">
+    <div class="modal">
+      <span class="x" id="modal-x">&times;</span>
+      <h3>Connect a wallet</h3>
+      <p>Testnet demo. The wallet below is funded and ready — no setup needed.</p>
+      <button class="opt" id="opt-demo"><span class="ic" style="background:var(--mint);color:#04130d">D</span>
+        <span><span class="t">Demo wallet</span><span class="d">Funded · one click</span></span></button>
+      <button class="opt" id="opt-mm"><span class="ic" style="background:var(--panel3);color:var(--txt);border:1px solid var(--line)">MM</span>
+        <span><span class="t">MetaMask</span><span class="d">Connect to the testnet</span></span></button>
+      <div class="note">Test funds only · nothing here touches real value.</div>
+    </div>
+  </div>
+  <div class="forge" id="forge">
+    <div class="forge-stage" id="forge-stage">
+      <div class="forge-cap" id="forge-cap">Minting index token</div>
+      <div class="forge-flash" id="forge-flash"></div>
+      <div class="forge-core" id="forge-core"><span id="forge-sym"></span></div>
+      <div class="forge-label" id="forge-label"></div>
+    </div>
+  </div>
+  <div id="toasts"></div>
+
+<script>
+const X = window.XINDEX;
+const AC = ethers.AbiCoder.defaultAbiCoder();
+const FACTORY_ABI = [
+  "function createIndex((address[],uint16[],address[],string,string,address,bytes32[],uint8[]) cfg) returns (address)",
+  "event IndexCreated(address indexed indexToken, address indexed creator, address[] tokens, uint16[] weightsBps, address[] adapters, string name, string symbol, address intentQueue)",
+];
+const TOKEN_ABI = [
+  "function mintAsync(address fundingToken, uint256 amountIn, uint64 intentDeadline, bytes[] perSlotHints) payable returns (bytes32)",
+  "function finalizeMint(bytes32 intentId, uint256 minSharesOut) returns (uint256)",
+  "function burn(uint256 shares, uint256 minUsdtOut, uint64 deadline) returns (bytes32)",
+  "function finalizeBurn(bytes32 redemptionId, bytes[] swapHints) returns (uint256)",
+  "function balanceOf(address) view returns (uint256)",
+];
+const QUEUE_ABI = [
+  "function isFullyAttested(bytes32) view returns (bool)",
+  "event MintIntentCreated(bytes32 indexed intentId, address indexed indexToken, address indexed originator, address fundingToken, uint256 amountIn, uint64 deadline, bytes32[] slotAssetIds, uint256[] slotExpectedAmounts)",
+  "event RedemptionIntentCreated(bytes32 indexed redemptionId, address indexed indexToken, address indexed originator, uint256 shares, uint64 deadline, bytes32[] legAssetIds, uint256[] legExpectedExits)",
+];
+const ERC20_ABI = [
+  "function mint(address to, uint256 amount)",
+  "function transfer(address to, uint256 amount) returns (bool)",
+  "function balanceOf(address) view returns (uint256)",
+  "function approve(address spender, uint256 amount) returns (bool)",
+];
+const ADAPTER_ABI = ["function nativeCustodyHash() view returns (bytes32)"];
+
+const META = {
+  "BTC.BTC":{n:"Bitcoin",s:"BTC",c:"#f7931a",g:"₿"}, "ETH.ETH":{n:"Ethereum",s:"ETH",c:"#627eea",g:"Ξ"},
+  "BCH.BCH":{n:"Bitcoin Cash",s:"BCH",c:"#0ac18e"}, "LTC.LTC":{n:"Litecoin",s:"LTC",c:"#345d9d",g:"Ł"},
+  "DOGE.DOGE":{n:"Dogecoin",s:"DOGE",c:"#c2a633",g:"Ð"}, "AVAX.AVAX":{n:"Avalanche",s:"AVAX",c:"#e84142"},
+  "BSC.BNB":{n:"BNB Chain",s:"BNB",c:"#f3ba2f"}, "GAIA.ATOM":{n:"Cosmos",s:"ATOM",c:"#8b8fa3"},
+  "BASE.ETH":{n:"Base",s:"ETH",c:"#3c7cff"}, "XRP.XRP":{n:"XRP",s:"XRP",c:"#3aa9d6"},
+  "ZEC.ZEC":{n:"Zcash",s:"ZEC",c:"#e5a200"}, "POL.MATIC":{n:"Polygon",s:"POL",c:"#8247e5",i:"matic"},
+  "NOBLE.USDC":{n:"Noble USDC",s:"USDC",c:"#2775ca"}, "SOL.SOL":{n:"Solana",s:"SOL",c:"#14b88a"},
+  "TRON.TRX":{n:"Tron",s:"TRX",c:"#d4404f"},
+};
+const meta = (a) => META[a] || { n:a, s:a.split(".")[0], c:"#9a8f7c" };
+const ICON_BASE = "https://cdn.jsdelivr.net/npm/cryptocurrency-icons@0.18.1/svg/color/";
+const iconUrl = (m) => ICON_BASE + (m.i || m.s.toLowerCase()) + ".svg";
+
+const provider = new ethers.JsonRpcProvider(X.rpc);
+let signer, me, factory, usdt, queue;
+let basket = null;
+let pfs = [];
+const sel = new Map();
+
+const $ = (id) => document.getElementById(id);
+const short = (a) => a.slice(0, 6) + "…" + a.slice(-4);
+const SHARE_DEC = 12;
+function fmtShares(sh) {
+  const n = +ethers.formatUnits(sh, SHARE_DEC);
+  if (!n) return "0";
+  return n.toLocaleString(undefined, { maximumFractionDigits: n < 1 ? 6 : 2 });
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const lock = (id, on) => $(id).classList.toggle("locked", !on);
+
+function log(msg, cls) {
+  const t = new Date().toLocaleTimeString();
+  $("log").innerHTML += `${t}  ${cls ? `<span style="color:var(--${cls})">${msg}</span>` : msg}\n`;
+  $("log").scrollTop = $("log").scrollHeight;
+}
+function toast(msg, type) {
+  const el = document.createElement("div");
+  el.className = "toast" + (type ? " " + type : "");
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 4200);
+}
+function status(id, msg, mode) {
+  const el = $(id);
+  el.className = "status show " + (mode || "");
+  el.innerHTML = (mode === "work" ? '<span class="sp"></span>' : '<span class="dot"></span>') + "<span>" + msg + "</span>";
+}
+function busy(btn, on, label) {
+  btn.disabled = on;
+  if (on) { btn.dataset.label = btn.textContent; btn.innerHTML = '<span class="spin"></span>' + label; }
+  else if (btn.dataset.label) btn.textContent = btn.dataset.label;
+}
+
+/* connect */
+const openModal = () => $("overlay").classList.add("show");
+$("connectBtn").onclick = openModal;
+$("heroCta").onclick = openModal;
+$("modal-x").onclick = () => $("overlay").classList.remove("show");
+$("overlay").onclick = (e) => { if (e.target === $("overlay")) $("overlay").classList.remove("show"); };
+$("opt-demo").onclick = async () => {
+  try { await setupSigner(new ethers.Wallet(X.deployerKey, provider)); }
+  catch (e) { toast("Connect failed: " + e.message, "err"); }
+};
+$("opt-mm").onclick = async () => {
+  try {
+    if (!window.ethereum) return toast("No MetaMask detected", "err");
+    const bp = new ethers.BrowserProvider(window.ethereum);
+    try {
+      await bp.send("wallet_addEthereumChain", [{
+        chainId: "0x" + X.chainId.toString(16), chainName: "Xindex Testnet",
+        rpcUrls: [X.rpc], nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+      }]);
+    } catch (_) {}
+    await bp.send("eth_requestAccounts", []);
+    await setupSigner(await bp.getSigner());
+  } catch (e) { toast("MetaMask connect failed: " + e.message, "err"); }
+};
+
+async function setupSigner(s) {
+  signer = s; me = await signer.getAddress();
+  factory = new ethers.Contract(X.factory, FACTORY_ABI, signer);
+  usdt = new ethers.Contract(X.usdt, ERC20_ABI, signer);
+  queue = new ethers.Contract(X.queue, QUEUE_ABI, provider);
+  $("overlay").classList.remove("show");
+  $("connectBtn").classList.add("hidden");
+  $("balances").classList.remove("hidden");
+  $("acct-chip").innerHTML = '<span class="live"></span><b>' + short(me) + "</b>";
+  lock("builder", true);
+  renderCatalog();
+  renderBasket();
+  await refreshBalances();
+  log("Wallet connected: " + me, "mint");
+  toast("Wallet connected", "ok");
+  loadPfs();
+  if (pfs.length) { renderPfs(); await setActive(pfs[0]); log(`restored ${pfs.length} saved index(es)`, "mint"); }
+}
+
+async function refreshBalances() {
+  const [eth, bal] = await Promise.all([provider.getBalance(me), usdt.balanceOf(me)]);
+  $("bal-eth").textContent = (+ethers.formatEther(eth)).toFixed(2);
+  const u = (+ethers.formatUnits(bal, 6)).toFixed(2);
+  $("bal-usdt").textContent = u; $("usdt-have").textContent = u;
+  if (basket) {
+    const tok = new ethers.Contract(basket.clone, TOKEN_ABI, provider);
+    const sh = await tok.balanceOf(me);
+    $("pos-shares").innerHTML = fmtShares(sh) + ' <span class="unit">shares</span>';
+  }
+}
+
+$("faucet").onclick = async (e) => {
+  e.preventDefault();
+  try {
+    log("Adding 10,000 test USDT…");
+    const amt = ethers.parseUnits("10000", 6);
+    if (X.usdtWhale) {
+      // Mainnet fork: USDT is real Tether (no mint). Impersonate a whale and
+      // transfer (anvil --auto-impersonate accepts the unsigned eth_sendTransaction).
+      await provider.send("anvil_impersonateAccount", [X.usdtWhale]);
+      const data = usdt.interface.encodeFunctionData("transfer", [me, amt]);
+      const txh = await provider.send("eth_sendTransaction", [{ from: X.usdtWhale, to: X.usdt, data }]);
+      await provider.waitForTransaction(txh);
+    } else {
+      await (await usdt.mint(me, amt)).wait();
+    }
+    await refreshBalances(); toast("10,000 test USDT added", "ok");
+  } catch (err) { toast("Faucet failed: " + (err.shortMessage || err.message), "err"); }
+};
+
+/* hero markets watchlist */
+function buildHeroMatrix() {
+  if (!X || !X.chains) return;
+  $("hero-matrix").innerHTML = X.chains.map((c) => {
+    const m = meta(c.asset);
+    return `<div class="mx-cell">
+      <span class="mx-ic" style="--cc:${m.c}"><img src="${iconUrl(m)}" alt="" onerror="this.remove()" /></span>
+      <span class="mx-tk">${m.s}</span><span class="mx-nm">${m.n}</span>
+    </div>`;
+  }).join("");
+  $("hero-matrix-foot").textContent = X.chains.length + " markets";
+}
+
+/* builder — catalog + basket */
+let searchQ = "";
+function renderCatalog() {
+  const q = searchQ.trim().toLowerCase();
+  const items = X.chains.filter((c) => { const m = meta(c.asset); return !q || m.n.toLowerCase().includes(q) || m.s.toLowerCase().includes(q) || c.asset.toLowerCase().includes(q); });
+  $("chains").innerHTML = items.length ? items.map((c) => {
+    const m = meta(c.asset);
+    return `<div class="coin-card ${sel.has(c.asset) ? "on" : ""}" data-asset="${c.asset}">
+      <div class="tick">✓</div>
+      <div class="coin-top">
+        <div class="coin" style="--cc:${m.c}">${m.g || m.s}<img src="${iconUrl(m)}" alt="" onerror="this.remove()" /></div>
+        <div><div class="coin-name">${m.n}</div></div>
+      </div>
+    </div>`;
+  }).join("") : `<div class="catalog-empty">No markets match “${searchQ}”.</div>`;
+  $("chains").querySelectorAll(".coin-card").forEach((card) => { card.onclick = () => toggleAsset(card.dataset.asset); });
+  $("asset-count").textContent = `${sel.size}/${X.chains.length} selected`;
+}
+function toggleAsset(asset) {
+  if (sel.has(asset)) sel.delete(asset); else sel.set(asset, 0);
+  balanceEqually();
+  renderCatalog();
+  renderBasket();
+}
+function balanceEqually() {
+  const ks = [...sel.keys()];
+  if (!ks.length) return;
+  const base = Math.floor(10000 / ks.length);
+  ks.forEach((a, i) => sel.set(a, base + (i === ks.length - 1 ? 10000 - base * ks.length : 0)));
+}
+function normalizeWeights() {
+  const ks = [...sel.keys()];
+  const sum = ks.reduce((t, a) => t + sel.get(a), 0);
+  if (!sum) return balanceEqually();
+  let acc = 0;
+  ks.forEach((a, i) => { const v = i === ks.length - 1 ? 10000 - acc : Math.round((sel.get(a) * 10000) / sum); acc += v; sel.set(a, v); });
+}
+const sliderBg = (color, pct) => `background:linear-gradient(to right, ${color} 0%, ${color} ${pct}%, var(--panel3) ${pct}%, var(--panel3) 100%)`;
+function renderBasket() {
+  const ks = [...sel.keys()];
+  $("basket-n").textContent = `${ks.length} ${ks.length === 1 ? "asset" : "assets"}`;
+  const list = $("basket-list");
+  if (!ks.length) { list.innerHTML = `<div class="basket-empty">No assets yet.<br />Pick markets on the left to build your index.</div>`; updateMeter(); return; }
+  list.innerHTML = ks.map((a) => {
+    const m = meta(a), pct = (sel.get(a) / 100).toFixed(2);
+    return `<div class="brow" data-asset="${a}">
+      <span class="bar-ic" style="--cc:${m.c}"><img src="${iconUrl(m)}" alt="" onerror="this.remove()" /></span>
+      <span class="brow-id"><span class="brow-tk">${m.s}</span><span class="brow-nm">${m.n}</span></span>
+      <input type="range" class="wslider" min="0" max="100" step="0.5" value="${pct}" data-asset="${a}" style="${sliderBg(m.c, pct)}" />
+      <span class="pctwrap"><input type="number" class="pctin" min="0" max="100" step="0.01" value="${pct}" data-asset="${a}" />%</span>
+      <button class="brow-x" data-asset="${a}" title="Remove">×</button>
+    </div>`;
+  }).join("");
+  list.querySelectorAll(".wslider").forEach((s) => { s.oninput = () => onWeight(s.dataset.asset, +s.value, s); });
+  list.querySelectorAll(".pctin").forEach((n) => { n.oninput = () => onWeight(n.dataset.asset, +n.value, n); });
+  list.querySelectorAll(".brow-x").forEach((b) => { b.onclick = () => toggleAsset(b.dataset.asset); });
+  updateMeter();
+}
+function onWeight(asset, val, srcEl) {
+  val = Math.max(0, Math.min(100, val || 0));
+  sel.set(asset, Math.round(val * 100));
+  const m = meta(asset);
+  const row = $("basket-list").querySelector(`.brow[data-asset="${asset}"]`);
+  if (row) {
+    const s = row.querySelector(".wslider"), n = row.querySelector(".pctin");
+    if (s) s.setAttribute("style", sliderBg(m.c, val));
+    if (s && srcEl !== s) s.value = val;
+    if (n && srcEl !== n) n.value = val.toFixed(2);
+  }
+  updateMeter();
+}
+function updateMeter() {
+  const sum = [...sel.values()].reduce((a, b) => a + b, 0);
+  $("meter-fill").style.width = Math.min(sum / 100, 100) + "%";
+  $("meter-fill").className = sum === 10000 ? "ok" : sum > 10000 ? "over" : "";
+  $("sumline").className = "sumline" + (sum === 10000 ? "" : " bad");
+  $("sumline").textContent = sum === 10000 ? "✓ 100% allocated" : `${(sum / 100).toFixed(2)}% / 100%`;
+  updateCreate(sum);
+}
+function updateCreate(sum) { $("createBtn").disabled = !(sel.size && sum === 10000); }
+$("btn-balance").onclick = () => { balanceEqually(); renderBasket(); };
+$("btn-normalize").onclick = () => { normalizeWeights(); renderBasket(); };
+$("asset-search").oninput = (e) => { searchQ = e.target.value; renderCatalog(); };
+
+function composition(assets, weights) {
+  return assets.map((a, i) => {
+    const m = meta(a), pct = (weights[i] / 100).toFixed(2);
+    return `<div class="bar-row">
+      <span class="bar-ic" style="--cc:${m.c}"><img src="${iconUrl(m)}" alt="" onerror="this.remove()" /></span>
+      <span class="bar-tk">${m.s}</span>
+      <span class="bar-track"><span class="bar-fill" style="width:${pct}%;background:${m.c}"></span></span>
+      <span class="bar-w">${pct}%</span>
+    </div>`;
+  }).join("");
+}
+const pfKey = () => "xindex.pf." + (X.factory || "").toLowerCase();
+function loadPfs() { try { pfs = JSON.parse(localStorage.getItem(pfKey()) || "[]"); } catch (_) { pfs = []; } }
+function savePfs() { try { localStorage.setItem(pfKey(), JSON.stringify(pfs)); } catch (_) {} }
+function addPf(pf) { pfs = pfs.filter((p) => p.clone !== pf.clone); pfs.unshift(pf); savePfs(); renderPfs(); }
+function renderPfs() {
+  const list = $("portfolios-list");
+  if (!pfs.length) { $("portfoliosCard").classList.add("hidden"); return; }
+  $("portfoliosCard").classList.remove("hidden");
+  list.innerHTML = pfs.map((p, i) => `
+    <div class="pf-coin ${basket && basket.clone === p.clone ? "active" : ""}" data-i="${i}">
+      <span class="pf-coin-active">Active</span>
+      <div class="pf-coin-badge">${(p.symbol || "IDX").slice(0, 3)}</div>
+      <div class="pf-coin-name">${p.name}</div>
+      <div class="pf-coin-sub">${p.symbol} · ${p.assets.length} ${p.assets.length === 1 ? "asset" : "assets"}</div>
+    </div>`).join("");
+  list.querySelectorAll(".pf-coin").forEach((c) => {
+    c.onclick = async () => { await setActive(pfs[+c.dataset.i]); $("tokenCard").scrollIntoView({ behavior: "smooth", block: "start" }); };
+  });
+}
+async function setActive(pf) {
+  const chains = pf.assets.map((a) => X.chains.find((c) => c.asset === a));
+  basket = { clone: pf.clone, tokens: chains.map((c) => c.sentinel), adapters: chains.map((c) => c.adapter), custodyHashes: pf.custodyHashes, assets: pf.assets, weights: pf.weights };
+  $("inv-name").textContent = pf.symbol; $("pos-title").textContent = pf.name;
+  $("pos-addr").textContent = short(pf.clone); $("pos-alloc").innerHTML = composition(pf.assets, pf.weights);
+  $("token-logo").textContent = pf.symbol.slice(0, 3);
+  $("token-assetcount").textContent = pf.assets.length + (pf.assets.length === 1 ? " asset" : " assets");
+  lock("tokenCard", true);
+  renderPfs();
+  await refreshBalances();
+}
+
+
+/* token-forge animation */
+function forgeOpen(assets) {
+  const stage = $("forge-stage");
+  stage.querySelectorAll(".forge-coin").forEach((c) => c.remove());
+  $("forge-flash").className = "forge-flash"; $("forge-core").className = "forge-core";
+  $("forge-label").className = "forge-label"; $("forge-label").textContent = "";
+  $("forge-sym").textContent = ""; $("forge-cap").style.opacity = "1";
+  const n = assets.length, R = 122;
+  assets.forEach((a, i) => {
+    const m = meta(a), ang = (i / n) * 2 * Math.PI - Math.PI / 2;
+    const el = document.createElement("div"); el.className = "forge-coin";
+    el.style.setProperty("--cc", m.c);
+    el.style.setProperty("--tx", (R * Math.cos(ang)).toFixed(1) + "px");
+    el.style.setProperty("--ty", (R * Math.sin(ang)).toFixed(1) + "px");
+    el.style.setProperty("--d", (i * 0.06).toFixed(2) + "s");
+    el.innerHTML = (m.g || m.s) + '<img src="' + iconUrl(m) + '" alt="" onerror="this.remove()" />';
+    stage.appendChild(el);
+  });
+  $("forge").classList.remove("out"); $("forge").classList.add("show");
+}
+function forgeFuse(sym, name) {
+  return new Promise((resolve) => {
+    $("forge-sym").textContent = sym.slice(0, 3);
+    $("forge-label").textContent = name + " minted";
+    $("forge-cap").style.opacity = "0";
+    document.querySelectorAll("#forge .forge-coin").forEach((c, i) => { c.style.setProperty("--fd", (i * 0.04).toFixed(2) + "s"); c.classList.add("fuse"); });
+    setTimeout(() => { $("forge-flash").classList.add("go"); $("forge-core").classList.add("go"); }, 470);
+    setTimeout(() => $("forge-label").classList.add("go"), 920);
+    setTimeout(resolve, 1850);
+  });
+}
+function forgeClose() { $("forge").classList.add("out"); setTimeout(() => $("forge").classList.remove("show", "out"), 450); }
+
+$("createBtn").onclick = async () => {
+  const ks = [...sel.keys()];
+  busy($("createBtn"), true, "Creating…");
+  status("create-status", "Creating your index…", "work");
+  forgeOpen(ks);
+  try {
+    const chains = ks.map((a) => X.chains.find((c) => c.asset === a));
+    const tokens = chains.map((c) => c.sentinel), adapters = chains.map((c) => c.adapter);
+    const weights = ks.map((a) => sel.get(a));
+    const cfg = [tokens, weights, adapters, $("b-name").value, $("b-sym").value, ethers.ZeroAddress, [], []];
+    log(`Creating index: ${ks.join(", ")}…`);
+    const rc = await (await factory.createIndex(cfg)).wait();
+    let clone;
+    for (const lg of rc.logs) { try { const p = factory.interface.parseLog(lg); if (p && p.name === "IndexCreated") clone = p.args.indexToken; } catch (_) {} }
+    if (!clone) throw new Error("IndexCreated not found");
+    const custodyHashes = [];
+    for (const a of adapters) custodyHashes.push(await new ethers.Contract(a, ADAPTER_ABI, provider).nativeCustodyHash());
+    const pf = { clone, name: $("b-name").value, symbol: $("b-sym").value, assets: ks, weights, custodyHashes };
+    addPf(pf);
+    await setActive(pf);
+    await forgeFuse($("b-sym").value, $("b-name").value);
+    forgeClose();
+    status("create-status", "Index created — it's now in My indexes below.", "ok");
+    toast("Index created", "ok"); log("index created: " + clone, "mint");
+    $("tokenCard").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) { forgeClose(); status("create-status", "Failed: " + (e.shortMessage || e.message), "err"); toast("Create failed", "err"); }
+  busy($("createBtn"), false);
+};
+
+const hints = () => basket.custodyHashes.map((h) => AC.encode(["uint256", "bytes32", "uint256", "uint256"], [1, h, 0, 0]));
+const deadline = () => Math.floor(Date.now() / 1000) + 7200;
+
+$("mintBtn").onclick = async () => {
+  if (!basket) return;
+  const tok = new ethers.Contract(basket.clone, TOKEN_ABI, signer);
+  const amt = ethers.parseUnits($("mint-amt").value || "0", 6);
+  busy($("mintBtn"), true, "Investing…");
+  try {
+    status("mint-status", "Approving USDT…", "work");
+    await (await usdt.approve(basket.clone, amt)).wait();
+    status("mint-status", `Buying assets across ${basket.assets.length} chains…`, "work");
+    log(`Investing ${$("mint-amt").value} USDT…`);
+    const rc = await (await tok.mintAsync(X.usdt, amt, deadline(), hints())).wait();
+    let intentId;
+    for (const lg of rc.logs) { try { const p = queue.interface.parseLog(lg); if (p && p.name === "MintIntentCreated") intentId = p.args.intentId; } catch (_) {} }
+    if (!intentId) throw new Error("MintIntentCreated not found");
+    status("mint-status", "Confirming across chains…", "work");
+    log(`Order submitted (${short(intentId)}) — confirming…`);
+    let ok = false;
+    for (let i = 0; i < 120; i++) { if (await queue.isFullyAttested(intentId)) { ok = true; break; } await sleep(2000); }
+    if (!ok) throw new Error("Confirmation timed out — check the keeper is running.");
+    status("mint-status", "Finalizing…", "work");
+    await (await tok.finalizeMint(intentId, 1)).wait();
+    await refreshBalances();
+    status("mint-status", "Done. Your shares are ready.", "ok");
+    toast("Investment complete", "ok"); log("Shares delivered.", "mint");
+  } catch (e) { status("mint-status", "Failed: " + (e.shortMessage || e.message), "err"); toast("Invest failed", "err"); }
+  busy($("mintBtn"), false);
+};
+
+$("btn-half").onclick = async () => { const tok = new ethers.Contract(basket.clone, TOKEN_ABI, provider); $("burn-amt").value = ethers.formatUnits((await tok.balanceOf(me)) / 2n, SHARE_DEC); };
+$("btn-max").onclick = async () => { const tok = new ethers.Contract(basket.clone, TOKEN_ABI, provider); $("burn-amt").value = ethers.formatUnits(await tok.balanceOf(me), SHARE_DEC); };
+
+$("burnBtn").onclick = async () => {
+  if (!basket) return;
+  const tok = new ethers.Contract(basket.clone, TOKEN_ABI, signer);
+  const shares = ethers.parseUnits($("burn-amt").value || "0", SHARE_DEC);
+  busy($("burnBtn"), true, "Cashing out…");
+  try {
+    const before = await usdt.balanceOf(me);
+    status("burn-status", "Submitting order…", "work");
+    log(`Cashing out ${$("burn-amt").value} shares…`);
+    const rc = await (await tok.burn(shares, 10000, deadline())).wait();
+    let rid;
+    for (const lg of rc.logs) { try { const p = queue.interface.parseLog(lg); if (p && p.name === "RedemptionIntentCreated") rid = p.args.redemptionId; } catch (_) {} }
+    if (!rid) throw new Error("RedemptionIntentCreated not found");
+    status("burn-status", `Selling assets back to USDT across ${basket.assets.length} chains…`, "work");
+    log(`Order submitted (${short(rid)}) — selling across chains…`);
+    let ok = false;
+    for (let i = 0; i < 120; i++) { try { await tok.finalizeBurn.staticCall(rid, hints()); ok = true; break; } catch (_) { await sleep(2000); } }
+    if (!ok) throw new Error("Order timed out — check the keeper is running.");
+    status("burn-status", "Finalizing…", "work");
+    await (await tok.finalizeBurn(rid, hints())).wait();
+    const got = (await usdt.balanceOf(me)) - before;
+    await refreshBalances();
+    status("burn-status", `Done. You received ${(+ethers.formatUnits(got, 6)).toFixed(2)} USDT.`, "ok");
+    toast(`Received ${(+ethers.formatUnits(got, 6)).toFixed(2)} USDT`, "ok"); log("Cash-out complete.", "mint");
+  } catch (e) { status("burn-status", "Failed: " + (e.shortMessage || e.message), "err"); toast("Redeem failed", "err"); }
+  busy($("burnBtn"), false);
+};
+
+/* nav */
+$("newPortfolioBtn").onclick = () => $("builder").scrollIntoView({ behavior: "smooth", block: "center" });
+
+if (!X) { document.body.innerHTML = '<div class="wrap" style="padding-top:60px"><h2>addresses.js missing — run <code>webtest/up-sepolia-web.sh</code> first.</h2></div>'; }
+else { buildHeroMatrix(); renderCatalog(); renderBasket(); log("Ready — connect a wallet to begin."); }
+</script>
+</body>
+</html>

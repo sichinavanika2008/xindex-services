@@ -14,6 +14,7 @@ use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::eips::eip2930::AccessList;
 use alloy_primitives::{Address, Bytes, PrimitiveSignature, TxKind, B256, U256};
+use alloy_rlp::{Encodable, Header};
 
 use xindex_shared::chain_registry::{ChainId, EvmTxType};
 
@@ -56,6 +57,43 @@ impl Unsigned {
         match self {
             Self::Eip1559(t) => t.signature_hash(),
             Self::Legacy(t) => t.signature_hash(),
+        }
+    }
+
+    /// Encode the unsigned payload accepted by the reviewed Vultisig Recipes
+    /// EVM decoder.
+    ///
+    /// Typed EIP-1559 transactions use their normal `0x02 || rlp(fields)`
+    /// signing encoding. The upstream legacy decoder instead requires an
+    /// explicit `0x00` type byte followed by only the six unsigned legacy
+    /// fields; its chain-specific signer adds the EIP-155 chain id while
+    /// deriving the signing hash.
+    #[must_use]
+    pub fn encoded_for_vultisig(&self) -> Vec<u8> {
+        match self {
+            Self::Eip1559(tx) => tx.encoded_for_signing(),
+            Self::Legacy(tx) => {
+                let payload_length = tx.nonce.length()
+                    + tx.gas_price.length()
+                    + tx.gas_limit.length()
+                    + tx.to.length()
+                    + tx.value.length()
+                    + tx.input.length();
+                let header = Header {
+                    list: true,
+                    payload_length,
+                };
+                let mut out = Vec::with_capacity(1 + header.length() + payload_length);
+                out.push(0);
+                header.encode(&mut out);
+                tx.nonce.encode(&mut out);
+                tx.gas_price.encode(&mut out);
+                tx.gas_limit.encode(&mut out);
+                tx.to.encode(&mut out);
+                tx.value.encode(&mut out);
+                tx.input.encode(&mut out);
+                out
+            }
         }
     }
 

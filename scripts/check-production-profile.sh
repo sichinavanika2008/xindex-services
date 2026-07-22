@@ -215,6 +215,41 @@ if [[ -f ../memory/GATE-4-PREFLIGHT.md ]]; then
         'No Vultisig keygen, vault, share, signature, transaction, broadcast or network'
 fi
 
+# The key-free Bitcoin Testnet4 path must remain one composed lifecycle. The
+# connector completion and exact aggregate evidence are committed together
+# before the live connector row is terminally redacted; restart recovery may
+# observe or reconcile the same durable identities but cannot create fresh work.
+require_text crates/executor/src/vultisig_runtime.rs \
+    'pub struct VultisigBitcoinRuntime'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'pub async fn authorize_and_prepare'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'pub async fn sign_and_persist'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'prepare_connector_handoff'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'acknowledge_handoff'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'pub async fn recover_and_persist'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'discover_prepared_connector_handoffs'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'terminal_handoff'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'pub async fn recover_ambiguous'
+require_text crates/executor/src/vultisig_runtime.rs \
+    'FinalizedBitcoinTransactionObservation'
+require_text crates/vultisig-adapter/src/journal.rs \
+    'xindex-vultisig-keysign-authorization-v2'
+require_text crates/vultisig-adapter/migrations/20260721020000_prevent_duplicate_vultisig_authorizations.sql \
+    'vultisig_keysign_reject_live_authorization_after_terminal'
+require_text crates/vultisig-adapter/migrations/20260721020000_prevent_duplicate_vultisig_authorizations.sql \
+    'vultisig_keysign_authorization_upgrade_guard'
+require_text crates/vultisig-connector/src/connector.rs \
+    'participant_identity_sha256'
+require_text crates/executor/migrations/20260721020000_bind_vultisig_connector_handoffs.sql \
+    'connector_completion_id'
+
 # Permissionless posters use node/HSM-managed accounts. These production
 # binaries must not regress to parsing a local signer or accepting a key env.
 for file in \

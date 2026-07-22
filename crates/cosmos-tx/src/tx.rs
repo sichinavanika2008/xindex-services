@@ -36,6 +36,7 @@ use crate::addr::{
 use crate::proto::{put_len_delim, put_varint_field};
 use crate::sigs::AggregatedMultisig;
 use crate::CosmosMultisig;
+use sha2::{Digest, Sha256};
 
 /// proto `type_url` for a bank `MsgSend`.
 const MSG_SEND_TYPE_URL: &str = "/cosmos.bank.v1beta1.MsgSend";
@@ -43,6 +44,8 @@ const MSG_SEND_TYPE_URL: &str = "/cosmos.bank.v1beta1.MsgSend";
 const LEGACY_AMINO_PUBKEY_TYPE_URL: &str = "/cosmos.crypto.multisig.LegacyAminoPubKey";
 /// `cosmos.tx.signing.v1beta1.SignMode.SIGN_MODE_LEGACY_AMINO_JSON`.
 const SIGN_MODE_LEGACY_AMINO_JSON: u64 = 127;
+/// `cosmos.tx.signing.v1beta1.SignMode.SIGN_MODE_DIRECT`.
+const SIGN_MODE_DIRECT: u64 = 1;
 
 /// Inputs for one `MsgSend` `TxRaw`. The numeric strings (`send_amount`,
 /// `fee_amount`) are the canonical-decimal forms shared with the amino
@@ -112,12 +115,16 @@ fn encode_fee(denom: &str, fee_amount: &str, gas_limit: u64) -> Vec<u8> {
 
 /// proto-encode `cosmos.tx.v1beta1.ModeInfo.Single { mode = 1 }`, wrapped
 /// as a `ModeInfo { single = 1 }`.
-fn encode_mode_info_single() -> Vec<u8> {
+fn encode_mode_info_single_mode(mode: u64) -> Vec<u8> {
     let mut single = Vec::new();
-    put_varint_field(1, SIGN_MODE_LEGACY_AMINO_JSON, &mut single);
+    put_varint_field(1, mode, &mut single);
     let mut mode_info = Vec::new();
     put_len_delim(1, &single, &mut mode_info);
     mode_info
+}
+
+fn encode_mode_info_single() -> Vec<u8> {
+    encode_mode_info_single_mode(SIGN_MODE_LEGACY_AMINO_JSON)
 }
 
 /// proto-encode `ModeInfo { multi = 2 }` where
@@ -165,6 +172,117 @@ fn encode_tx_raw(body: &[u8], auth_info: &[u8], signature: &[u8]) -> Vec<u8> {
     put_len_delim(2, auth_info, &mut out);
     put_len_delim(3, signature, &mut out);
     out
+}
+
+/// proto-encode an unsigned `cosmos.tx.v1beta1.TxRaw`. An empty repeated
+/// `signatures` collection is omitted rather than encoded as one empty
+/// signature element.
+fn encode_unsigned_tx_raw(body: &[u8], auth_info: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_len_delim(1, body, &mut out);
+    put_len_delim(2, auth_info, &mut out);
+    out
+}
+
+/// proto-encode `cosmos.tx.v1beta1.SignDoc
+/// { body_bytes = 1, auth_info_bytes = 2, chain_id = 3,
+///   account_number = 4 }`.
+fn encode_sign_doc(body: &[u8], auth_info: &[u8], chain_id: &str, account_number: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_len_delim(1, body, &mut out);
+    put_len_delim(2, auth_info, &mut out);
+    if !chain_id.is_empty() {
+        put_len_delim(3, chain_id.as_bytes(), &mut out);
+    }
+    if account_number != 0 {
+        put_varint_field(4, account_number, &mut out);
+    }
+    out
+}
+
+/// Matching unsigned `TxRaw` and protobuf `SignDoc` for a Vultisig-managed
+/// single secp256k1 account using `SIGN_MODE_DIRECT`.
+///
+/// The body and auth-info bytes are retained privately so final assembly
+/// cannot accidentally rebuild a transaction that differs from the one whose
+/// sign-doc was approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CosmosDirectSigningPackage {
+    body_bytes: Vec<u8>,
+    auth_info_bytes: Vec<u8>,
+    unsigned_tx_bytes: Vec<u8>,
+    sign_doc_bytes: Vec<u8>,
+    signing_hash: [u8; 32],
+}
+
+impl CosmosDirectSigningPackage {
+    /// Unsigned `TxRaw` supplied to the Vultisig verifier. It contains the
+    /// exact body and auth info, with no signature element.
+    #[must_use]
+    pub fn unsigned_tx_bytes(&self) -> &[u8] {
+        &self.unsigned_tx_bytes
+    }
+
+    /// Protobuf `SignDoc` supplied separately to the Vultisig verifier. The
+    /// verifier checks its body/auth-info fields against `unsigned_tx_bytes`.
+    #[must_use]
+    pub fn sign_doc_bytes(&self) -> &[u8] {
+        &self.sign_doc_bytes
+    }
+
+    /// `SHA-256(sign_doc_bytes)`, which is the exact secp256k1 message the
+    /// reviewed Recipes Cosmos SDK derives.
+    #[must_use]
+    pub const fn signing_hash(&self) -> [u8; 32] {
+        self.signing_hash
+    }
+
+    /// Assemble the broadcast-ready `TxRaw` using the exact body and auth info
+    /// retained by this package and one compact low-S `(r || s)` signature.
+    #[must_use]
+    pub fn signed_tx_raw(&self, signature64: &[u8; 64]) -> Vec<u8> {
+        encode_tx_raw(&self.body_bytes, &self.auth_info_bytes, signature64)
+    }
+}
+
+/// Build the Vultisig-compatible protobuf-direct signing package for one
+/// single-key `MsgSend`.
+///
+/// This is deliberately separate from [`build_single_sig_tx_raw`], which
+/// preserves the existing legacy-Amino single-sign path.
+#[must_use]
+pub fn build_direct_signing_package(
+    pubkey_compressed: &[u8; 33],
+    params: &CosmosTxParams<'_>,
+    chain_id: &str,
+    account_number: u64,
+) -> CosmosDirectSigningPackage {
+    let msg = encode_msg_send(
+        params.from_address,
+        params.to_address,
+        params.denom,
+        params.send_amount,
+    );
+    let body_bytes = encode_tx_body(&msg, params.memo);
+
+    let pubkey_proto = encode_secp256k1_pubkey(pubkey_compressed);
+    let pubkey_any = encode_any(SECP256K1_PUBKEY_TYPE_URL, &pubkey_proto);
+    let mode_info = encode_mode_info_single_mode(SIGN_MODE_DIRECT);
+    let signer_info = encode_signer_info(&pubkey_any, &mode_info, params.sequence);
+    let fee = encode_fee(params.denom, params.fee_amount, params.gas_limit);
+    let auth_info_bytes = encode_auth_info(&signer_info, &fee);
+
+    let unsigned_tx_bytes = encode_unsigned_tx_raw(&body_bytes, &auth_info_bytes);
+    let sign_doc_bytes = encode_sign_doc(&body_bytes, &auth_info_bytes, chain_id, account_number);
+    let signing_hash = Sha256::digest(&sign_doc_bytes).into();
+
+    CosmosDirectSigningPackage {
+        body_bytes,
+        auth_info_bytes,
+        unsigned_tx_bytes,
+        sign_doc_bytes,
+        signing_hash,
+    }
 }
 
 /// Assemble the broadcast-ready `TxRaw` bytes for a multisig `MsgSend`.

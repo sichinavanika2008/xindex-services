@@ -944,6 +944,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1256,6 +1262,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2b_simd"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79834656f71332577234b50bfc009996f7449e0c056884e6a02492ded0ca2f3"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "constant_time_eq",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1442,6 +1459,12 @@ dependencies = [
  "quote",
  "unicode-xid",
 ]
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -5634,10 +5657,12 @@ dependencies = [
 name = "xindex-chain-utxo"
 version = "0.0.1"
 dependencies = [
+ "alloy-primitives",
  "bdk_esplora",
  "bech32",
  "bitcoin",
  "bitcoincash-addr",
+ "blake2b_simd",
  "reqwest",
  "serde",
  "serde_json",
@@ -5682,6 +5707,7 @@ version = "0.0.1"
 dependencies = [
  "alloy",
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-sol-types",
  "bitcoin",
  "serde",
@@ -5690,6 +5716,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "xindex-shared",
+ "xindex-zcash-tx",
 ]
 
 [[package]]
@@ -5701,12 +5728,14 @@ dependencies = [
  "bitcoin",
  "k256",
  "tokio",
+ "xindex-chain-utxo",
  "xindex-cosmos-tx",
  "xindex-custody-core",
  "xindex-shared",
  "xindex-solana-tx",
  "xindex-tron-tx",
  "xindex-xrp-tx",
+ "xindex-zcash-tx",
 ]
 
 [[package]]
@@ -5740,6 +5769,7 @@ dependencies = [
  "xindex-chain-utxo",
  "xindex-chain-xrp",
  "xindex-cosmos-tx",
+ "xindex-custody-core",
  "xindex-multisig",
  "xindex-ops",
  "xindex-safe-evm",
@@ -5747,6 +5777,7 @@ dependencies = [
  "xindex-solana-tx",
  "xindex-tron-tx",
  "xindex-vultisig-adapter",
+ "xindex-vultisig-connector",
  "xindex-xrp-tx",
 ]
 
@@ -5964,14 +5995,45 @@ name = "xindex-vultisig-adapter"
 version = "0.0.1"
 dependencies = [
  "alloy-primitives",
+ "base64",
  "bitcoin",
+ "ed25519-dalek",
+ "k256",
  "serde",
  "serde_json",
+ "sha2",
+ "sqlx",
+ "thiserror 1.0.69",
  "tokio",
  "xindex-chain-utxo",
+ "xindex-cosmos-tx",
  "xindex-custody-core",
  "xindex-custody-node",
  "xindex-shared",
+ "xindex-solana-tx",
+ "xindex-tron-tx",
+ "xindex-xrp-tx",
+ "xindex-zcash-tx",
+]
+
+[[package]]
+name = "xindex-vultisig-connector"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "base64",
+ "futures-util",
+ "getrandom 0.3.4",
+ "md-5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "wiremock",
+ "xindex-ops",
+ "xindex-vultisig-adapter",
 ]
 
 [[package]]
@@ -5981,6 +6043,17 @@ dependencies = [
  "k256",
  "ripemd",
  "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "xindex-zcash-tx"
+version = "0.0.1"
+dependencies = [
+ "alloy-primitives",
+ "bitcoin",
+ "blake2b_simd",
+ "serde",
  "thiserror 1.0.69",
 ]
 

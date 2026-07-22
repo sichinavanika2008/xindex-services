@@ -12,6 +12,7 @@
 //! fail-closed REJECT.
 
 use bitcoin::ScriptBuf;
+use xindex_custody_core::btc_authorize::authorize_zcash_spend;
 use xindex_custody_core::gates::CustodyConfig;
 use xindex_custody_core::replay::ReplayStore;
 
@@ -21,12 +22,57 @@ use crate::evm::{decide_evm_deposit, EvmDeposit};
 use crate::Decision;
 use xindex_custody_core::prepare::{PrepareStore, PreparedSpend};
 
+/// Fail-closed reason why a prepared spend could not become a signing
+/// authorization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationRejection {
+    /// Stable wire error code.
+    pub code: &'static str,
+    /// Operator-facing rejection detail.
+    pub message: String,
+}
+
+/// Non-cloneable proof that the complete provider-neutral custody decision
+/// passed for one exact prepared spend and signing payload.
+///
+/// There is deliberately no public constructor. A signing transport may
+/// consume this capability, but possession of a Vultisig API credential alone
+/// cannot manufacture one for arbitrary bytes.
+#[derive(Debug)]
+pub struct AuthorizedPreparedSpend {
+    prepare_key: String,
+    spend: PreparedSpend,
+}
+
+impl AuthorizedPreparedSpend {
+    /// Exact locally reconstructed signing payload used to look up and approve
+    /// the prepared spend.
+    #[must_use]
+    pub fn prepare_key(&self) -> &str {
+        &self.prepare_key
+    }
+
+    /// Exact prepared spend that passed payload, fee, certificate, binding and
+    /// one-shot checks.
+    #[must_use]
+    pub const fn spend(&self) -> &PreparedSpend {
+        &self.spend
+    }
+
+    /// Consume the authorization into the exact lookup key and prepared spend
+    /// that passed the complete custody decision.
+    #[must_use]
+    pub fn into_parts(self) -> (String, PreparedSpend) {
+        (self.prepare_key, self.spend)
+    }
+}
+
 /// Decide a pending custody signature. Looks up the prepared spend by
 /// `prepare_key` (the executor keys `prepare.put` by the signing-payload
 /// sighash hex), runs the family decision core, maps to APPROVE/REJECT.
 ///
-/// `btc_custody_spk` is this approver's own custody `scriptPubKey` (for the
-/// BTC output bind); `None` rejects any BTC spend.
+/// `btc_custody_spk` is this approver's own custody `scriptPubKey` (for every
+/// transparent UTXO output bind); `None` rejects any UTXO spend.
 ///
 /// **SECURITY (TK-01/TK-02):** the executor writes BOTH the store key and the
 /// requested signing payload, so before binding to the RIC this core INDEPENDENTLY
@@ -49,28 +95,76 @@ where
     P: PrepareStore,
     R: ReplayStore,
 {
+    match authorize_callback(
+        prepare_key,
+        prepare,
+        replay,
+        config,
+        btc_custody_spk,
+        now_unix,
+    )
+    .await
+    {
+        Ok(_) => Decision::Approve,
+        Err(rejection) => Decision::Reject {
+            code: rejection.code,
+            message: rejection.message,
+        },
+    }
+}
+
+/// Run the complete callback decision and return an opaque signing
+/// authorization instead of only an `APPROVE` verdict.
+///
+/// This is the provider-neutral boundary used by a Vultisig connector: the
+/// returned capability can only exist after independent payload
+/// reconstruction, fee enforcement, RIC/ACC binding and custody one-shot
+/// consumption all pass.
+///
+/// # Errors
+/// Missing prepared state, reconstruction/fee failure, certificate rejection,
+/// output mismatch, replay conflict, or store failure returns a redacted
+/// [`AuthorizationRejection`] and no capability.
+pub async fn authorize_callback<P, R>(
+    prepare_key: &str,
+    prepare: &P,
+    replay: &R,
+    config: CustodyConfig<'_>,
+    btc_custody_spk: Option<&ScriptBuf>,
+    now_unix: i64,
+) -> Result<AuthorizedPreparedSpend, AuthorizationRejection>
+where
+    P: PrepareStore,
+    R: ReplayStore,
+{
     let spend = match prepare.get(prepare_key).await {
         Ok(Some(s)) => s,
         Ok(None) => {
-            return Decision::Reject {
+            return Err(AuthorizationRejection {
                 code: "no_prepare_context",
                 message: "no prepared spend bound to this signing payload (fail-closed)"
                     .to_string(),
-            };
+            });
         }
         Err(e) => {
-            return Decision::Reject {
+            return Err(AuthorizationRejection {
                 code: "prepare_store_error",
                 message: e.to_string(),
-            };
+            });
         }
     };
     // TK-01/TK-02: the signing payload MUST be the hash of a tx reconstructed
     // from these prepared fields, and the declared fee within the per-chain cap.
     if let Err((code, message)) = crate::recompute::verify_payload_and_fee(&spend, prepare_key) {
-        return Decision::Reject { code, message };
+        return Err(AuthorizationRejection { code, message });
     }
-    decide_prepared(&spend, replay, config, btc_custody_spk, now_unix).await
+    match decide_prepared(&spend, replay, config, btc_custody_spk, now_unix).await {
+        Decision::Approve => Ok(AuthorizedPreparedSpend {
+            prepare_key: prepare_key.to_string(),
+            spend,
+        }),
+        Decision::Reject { code, message } => Err(AuthorizationRejection { code, message }),
+    }
 }
 
 /// Dispatch a [`PreparedSpend`] to its family decision core.
@@ -82,11 +176,24 @@ async fn decide_prepared<R: ReplayStore>(
     now_unix: i64,
 ) -> Decision {
     match spend {
-        PreparedSpend::Btc(ctx) => match btc_custody_spk {
+        PreparedSpend::Btc(ctx) | PreparedSpend::DirectUtxo(ctx) => match btc_custody_spk {
             Some(spk) => decide_redeem_spend(ctx, replay, config, spk, now_unix).await,
             None => Decision::Reject {
                 code: "btc_custody_unconfigured",
                 message: "BTC custody scriptPubKey not configured on this approver".to_string(),
+            },
+        },
+        PreparedSpend::Zcash(ctx) => match btc_custody_spk {
+            Some(spk) => match authorize_zcash_spend(ctx, replay, config, spk, now_unix).await {
+                Ok(_) => Decision::Approve,
+                Err(rejection) => Decision::Reject {
+                    code: rejection.code,
+                    message: rejection.message,
+                },
+            },
+            None => Decision::Reject {
+                code: "zcash_custody_unconfigured",
+                message: "Zcash custody scriptPubKey not configured on this approver".to_string(),
             },
         },
         PreparedSpend::Evm(e) => {
@@ -227,6 +334,49 @@ mod tests {
         let replay = InMemoryReplayStore::new();
         let d = decide_callback(&key, &prepare, &replay, config(&policy), None, NOW).await;
         assert_eq!(d, Decision::Approve, "honest prepared spend must APPROVE");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::expect_used,
+        reason = "authorization success is the test premise"
+    )]
+    async fn full_decision_can_issue_one_non_cloneable_authorization() {
+        let policy = policy();
+        let prepare = InMemoryPrepareStore::new();
+        let spend = evm_prepared(U256::from(AMOUNT), honest_ric());
+        let key = evm_key(&spend);
+        let _ = prepare.put(key.clone(), spend).await;
+        let replay = InMemoryReplayStore::new();
+
+        let authorization = authorize_callback(&key, &prepare, &replay, config(&policy), None, NOW)
+            .await
+            .expect("honest prepared spend must issue an authorization");
+
+        assert_eq!(authorization.prepare_key(), key);
+        assert!(matches!(authorization.spend(), PreparedSpend::Evm(_)));
+
+        let mut redriven = evm_prepared(U256::from(AMOUNT), honest_ric());
+        let PreparedSpend::Evm(ref mut evm) = redriven else {
+            unreachable!("EVM fixture changed variant")
+        };
+        evm.signing.nonce = 1;
+        evm.spend_identity = b"1".to_vec();
+        let redriven_key = evm_key(&redriven);
+        let _ = prepare.put(redriven_key.clone(), redriven).await;
+
+        let replayed =
+            authorize_callback(&redriven_key, &prepare, &replay, config(&policy), None, NOW).await;
+        assert!(
+            matches!(
+                replayed,
+                Err(AuthorizationRejection {
+                    code: xindex_shared::signer_wire::error_codes::INTENT_ALREADY_SIGNED,
+                    ..
+                })
+            ),
+            "the custody one-shot must prevent authorization for a different spend: {replayed:?}"
+        );
     }
 
     #[tokio::test]

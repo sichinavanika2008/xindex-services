@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 xindex-custody-core.workspace = true
 xindex-shared.workspace = true
+xindex-chain-utxo.workspace = true
+xindex-zcash-tx.workspace = true
 # The callback decision core independently reconstructs each family's unsigned
 # transaction from the prepared fields and recomputes the signing payload.
 xindex-cosmos-tx.workspace = true

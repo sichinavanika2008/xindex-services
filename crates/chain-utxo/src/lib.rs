@@ -20,6 +20,7 @@ pub mod client;
 pub mod codec;
 pub mod finalized_inventory;
 pub mod params;
+pub mod single_key;
 pub mod trusted_observer;
 pub mod types;
 pub mod watcher;

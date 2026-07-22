@@ -27,6 +27,7 @@ pub mod solana_redeem;
 pub mod solana_redeem_store;
 pub mod tron_redeem;
 pub mod vultisig_broadcast;
+pub mod vultisig_runtime;
 pub mod xrp_redeem;
 
 pub use broadcast_registry::{
@@ -58,4 +59,8 @@ pub use vultisig_broadcast::{
     VultisigBitcoinFinalityPolicy, VultisigBroadcastPreparationError,
     VultisigBroadcastPreparationFailure, VultisigBroadcastRuntimeError,
     VultisigBroadcastSubmissionFailure,
+};
+pub use vultisig_runtime::{
+    PreparedVultisigBitcoinRuntimeKeysign, ReadyVultisigBitcoinBroadcast, VultisigBitcoinRuntime,
+    VultisigBitcoinRuntimeError,
 };
